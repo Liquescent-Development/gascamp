@@ -353,6 +353,322 @@ mod tests {
         assert_eq!(seqs, vec![1, 2]);
     }
 
+    fn woke(name: &str) -> EventInput {
+        input(
+            EventType::SessionWoke,
+            Some("gc"),
+            None,
+            serde_json::json!({
+                "name": name,
+                "agent": "dev",
+                "rig": "gc",
+                "claude_session_id": "8f3c2e01",
+                "transcript_path": "/tmp/t.jsonl",
+                "pid": 4242,
+                "bead": "gc-1"
+            }),
+        )
+    }
+
+    #[test]
+    fn claim_moves_open_to_in_progress() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::BeadClaimed,
+                Some("gc"),
+                Some("gc-1"),
+                serde_json::json!({"session": "camp/dev/1"}),
+            ))
+            .unwrap();
+        let (status, claimed_by): (String, String) = ledger
+            .conn
+            .query_row(
+                "SELECT status, claimed_by FROM beads WHERE id = 'gc-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), claimed_by.as_str()),
+            ("in_progress", "camp/dev/1")
+        );
+
+        // claiming again is an invalid transition
+        match ledger.append(input(
+            EventType::BeadClaimed,
+            Some("gc"),
+            Some("gc-1"),
+            serde_json::json!({"session": "camp/dev/2"}),
+        )) {
+            Err(CoreError::InvalidTransition { bead, .. }) => assert_eq!(bead, "gc-1"),
+            other => panic!("expected InvalidTransition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_records_outcome_reason_and_search_row() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::BeadClosed,
+                Some("gc"),
+                Some("gc-1"),
+                serde_json::json!({"outcome": "pass", "reason": "shipped the flamboyant widget"}),
+            ))
+            .unwrap();
+        let (status, outcome, reason, closed_ts): (String, String, String, String) = ledger
+            .conn
+            .query_row(
+                "SELECT status, outcome, close_reason, closed_ts FROM beads WHERE id = 'gc-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "closed");
+        assert_eq!(outcome, "pass");
+        assert_eq!(reason, "shipped the flamboyant widget");
+        assert_eq!(closed_ts, "2026-07-05T21:14:03Z");
+        let hit: String = ledger
+            .conn
+            .query_row(
+                "SELECT bead_id FROM search WHERE search MATCH 'flamboyant' AND kind = 'close'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, "gc-1");
+
+        // closing a closed bead is an error
+        assert!(
+            ledger
+                .append(input(
+                    EventType::BeadClosed,
+                    Some("gc"),
+                    Some("gc-1"),
+                    serde_json::json!({"outcome": "fail"}),
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn close_outcome_vocabulary_is_pass_or_fail_only() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        match ledger.append(input(
+            EventType::BeadClosed,
+            Some("gc"),
+            Some("gc-1"),
+            serde_json::json!({"outcome": "skipped"}),
+        )) {
+            Err(CoreError::InvalidEventData { reason, .. }) => {
+                assert!(reason.contains("skipped"), "reason was: {reason}");
+            }
+            other => panic!("expected InvalidEventData, got {other:?}"),
+        }
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+    }
+
+    #[test]
+    fn update_patches_fields_and_rewrites_search() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created(
+                "gc-1",
+                serde_json::json!({"title": "aardvark", "description": "old body"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::BeadUpdated,
+                Some("gc"),
+                Some("gc-1"),
+                serde_json::json!({"title": "zebra"}),
+            ))
+            .unwrap();
+        let (title, description): (String, String) = ledger
+            .conn
+            .query_row(
+                "SELECT title, description FROM beads WHERE id = 'gc-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (title.as_str(), description.as_str()),
+            ("zebra", "old body")
+        );
+        let zebra_hits = count(
+            &ledger,
+            "SELECT count(*) FROM search WHERE search MATCH 'zebra'",
+        );
+        let aardvark_hits = count(
+            &ledger,
+            "SELECT count(*) FROM search WHERE search MATCH 'aardvark'",
+        );
+        assert_eq!((zebra_hits, aardvark_hits), (1, 0));
+
+        // an empty patch is invalid
+        assert!(
+            ledger
+                .append(input(
+                    EventType::BeadUpdated,
+                    Some("gc"),
+                    Some("gc-1"),
+                    serde_json::json!({}),
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn session_woke_registers_and_end_events_update() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger.append(woke("camp/dev/1")).unwrap();
+        let (agent, status, sid, transcript, pid): (String, String, String, String, i64) = ledger
+            .conn
+            .query_row(
+                "SELECT agent, status, claude_session_id, transcript_path, pid
+                 FROM sessions WHERE name = 'camp/dev/1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(agent, "dev");
+        assert_eq!(status, "live");
+        assert_eq!(sid, "8f3c2e01");
+        assert_eq!(transcript, "/tmp/t.jsonl");
+        assert_eq!(pid, 4242);
+
+        // duplicate registration is an error
+        assert!(ledger.append(woke("camp/dev/1")).is_err());
+
+        ledger
+            .append(input(
+                EventType::SessionStopped,
+                Some("gc"),
+                None,
+                serde_json::json!({"name": "camp/dev/1"}),
+            ))
+            .unwrap();
+        let (status, ended): (String, String) = ledger
+            .conn
+            .query_row(
+                "SELECT status, ended_ts FROM sessions WHERE name = 'camp/dev/1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "stopped");
+        assert_eq!(ended, "2026-07-05T21:14:03Z");
+    }
+
+    #[test]
+    fn session_crash_releases_the_claimed_bead() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger.append(woke("camp/dev/1")).unwrap();
+        ledger
+            .append(input(
+                EventType::BeadClaimed,
+                Some("gc"),
+                Some("gc-1"),
+                serde_json::json!({"session": "camp/dev/1"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::SessionCrashed,
+                Some("gc"),
+                None,
+                serde_json::json!({"name": "camp/dev/1"}),
+            ))
+            .unwrap();
+        let (bead_status, claimed_by): (String, Option<String>) = ledger
+            .conn
+            .query_row(
+                "SELECT status, claimed_by FROM beads WHERE id = 'gc-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bead_status, "open");
+        assert_eq!(claimed_by, None);
+        let session_status: String = ledger
+            .conn
+            .query_row(
+                "SELECT status FROM sessions WHERE name = 'camp/dev/1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_status, "crashed");
+    }
+
+    #[test]
+    fn ending_an_unknown_session_is_an_error() {
+        let (_dir, mut ledger) = temp_ledger();
+        match ledger.append(input(
+            EventType::SessionStopped,
+            None,
+            None,
+            serde_json::json!({"name": "camp/ghost/1"}),
+        )) {
+            Err(CoreError::UnknownSession(name)) => assert_eq!(name, "camp/ghost/1"),
+            other => panic!("expected UnknownSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn campd_lifecycle_events_are_log_only() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(input(
+                EventType::CampdStarted,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::CampdStopped,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 2);
+        assert_eq!(count(&ledger, "SELECT count(*) FROM beads"), 0);
+        assert_eq!(count(&ledger, "SELECT count(*) FROM sessions"), 0);
+    }
+
+    #[test]
+    fn unknown_payload_fields_fail_fast() {
+        let (_dir, mut ledger) = temp_ledger();
+        match ledger.append(created(
+            "gc-1",
+            serde_json::json!({"title": "one", "dependson": ["gc-0"]}),
+        )) {
+            Err(CoreError::InvalidEventData { reason, .. }) => {
+                assert!(reason.contains("dependson"), "reason was: {reason}");
+            }
+            other => panic!("expected InvalidEventData, got {other:?}"),
+        }
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 0);
+    }
+
     #[test]
     fn fts5_is_available_and_searchable() {
         let (_dir, ledger) = temp_ledger();
