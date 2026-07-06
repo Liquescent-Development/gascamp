@@ -2,7 +2,10 @@
 //! event log and the state tables folded from it (spec §7).
 
 mod fold;
+mod refold;
 mod schema;
+
+pub use refold::{DriftEntry, RefoldReport};
 
 use std::path::Path;
 
@@ -667,6 +670,162 @@ mod tests {
             other => panic!("expected InvalidEventData, got {other:?}"),
         }
         assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 0);
+    }
+
+    /// A representative slice of ledger life: creates, deps, claim, close,
+    /// sessions, log-only events. 8 events total.
+    fn seed_representative(ledger: &mut Ledger) {
+        ledger
+            .append(input(
+                EventType::CampdStarted,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        ledger
+            .append(created(
+                "gc-1",
+                serde_json::json!({"title": "implement", "description": "the change", "labels": ["cli"]}),
+            ))
+            .unwrap();
+        ledger
+            .append(created(
+                "gc-2",
+                serde_json::json!({"title": "review", "needs": ["gc-1"]}),
+            ))
+            .unwrap();
+        ledger.append(woke("camp/dev/1")).unwrap();
+        ledger
+            .append(input(
+                EventType::BeadClaimed,
+                Some("gc"),
+                Some("gc-1"),
+                serde_json::json!({"session": "camp/dev/1"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::BeadClosed,
+                Some("gc"),
+                Some("gc-1"),
+                serde_json::json!({"outcome": "pass", "reason": "done"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::SessionStopped,
+                Some("gc"),
+                None,
+                serde_json::json!({"name": "camp/dev/1"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::CampdStopped,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn refold_is_clean_after_a_representative_sequence() {
+        let (_dir, mut ledger) = temp_ledger();
+        seed_representative(&mut ledger);
+        let report = ledger.refold_check().unwrap();
+        assert_eq!(report.events_replayed, 8);
+        assert!(
+            report.drift.is_empty(),
+            "unexpected drift: {:?}",
+            report.drift
+        );
+    }
+
+    #[test]
+    fn refold_on_an_empty_log_is_clean() {
+        let (_dir, mut ledger) = temp_ledger();
+        let report = ledger.refold_check().unwrap();
+        assert_eq!(report.events_replayed, 0);
+        assert!(report.drift.is_empty());
+    }
+
+    #[test]
+    fn refold_detects_tampering_in_every_state_table() {
+        let (_dir, mut ledger) = temp_ledger();
+        seed_representative(&mut ledger);
+        ledger
+            .conn
+            .execute("UPDATE beads SET status = 'open' WHERE id = 'gc-1'", [])
+            .unwrap();
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO deps (bead_id, needs_id) VALUES ('gc-2', 'gc-99')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .conn
+            .execute(
+                "UPDATE sessions SET status = 'live', ended_ts = NULL WHERE name = 'camp/dev/1'",
+                [],
+            )
+            .unwrap();
+        ledger
+            .conn
+            .execute("DELETE FROM search WHERE kind = 'close'", [])
+            .unwrap();
+
+        let report = ledger.refold_check().unwrap();
+        for table in ["beads", "deps", "sessions", "search"] {
+            assert!(
+                report.drift.iter().any(|d| d.table == table),
+                "no drift reported for {table}: {:?}",
+                report.drift
+            );
+        }
+        assert!(
+            report
+                .drift
+                .iter()
+                .any(|d| d.table == "beads" && d.detail.contains("gc-1")),
+            "beads drift should name gc-1: {:?}",
+            report.drift
+        );
+    }
+
+    #[test]
+    fn refold_repair_rebuilds_state_from_the_log() {
+        let (_dir, mut ledger) = temp_ledger();
+        seed_representative(&mut ledger);
+        ledger
+            .conn
+            .execute(
+                "UPDATE beads SET status = 'open', outcome = NULL WHERE id = 'gc-1'",
+                [],
+            )
+            .unwrap();
+        assert!(!ledger.refold_check().unwrap().drift.is_empty());
+
+        let repaired = ledger.refold_repair().unwrap();
+        assert_eq!(repaired.events_replayed, 8);
+        assert!(
+            repaired.drift.is_empty(),
+            "drift after repair: {:?}",
+            repaired.drift
+        );
+
+        let (status, outcome): (String, String) = ledger
+            .conn
+            .query_row(
+                "SELECT status, outcome FROM beads WHERE id = 'gc-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), outcome.as_str()), ("closed", "pass"));
     }
 
     #[test]
