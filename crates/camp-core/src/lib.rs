@@ -3,6 +3,7 @@
 
 pub mod clock;
 pub mod error;
+pub mod event;
 pub mod ledger;
 
 /// Monotonic event sequence number (the `events.seq` column).
