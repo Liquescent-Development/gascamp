@@ -242,8 +242,8 @@ struct RigAdded {
 }
 
 /// `rig.added` is log-only: rigs live in camp.toml (decision D). The fold
-/// validates the audit payload shape and the rig name so a malformed config
-/// event fails fast.
+/// validates the audit payload — the rig name, a non-empty path, and a
+/// well-formed prefix — so a malformed config event fails fast.
 fn rig_added(event: &Event) -> Result<(), CoreError> {
     if event.rig.is_none() {
         return Err(CoreError::InvalidEventData {
@@ -251,7 +251,14 @@ fn rig_added(event: &Event) -> Result<(), CoreError> {
             reason: "missing rig name".to_owned(),
         });
     }
-    let _p: RigAdded = payload(event)?;
+    let p: RigAdded = payload(event)?;
+    if p.path.is_empty() {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: "empty rig path".to_owned(),
+        });
+    }
+    crate::id::validate_prefix(&p.prefix)?;
     Ok(())
 }
 

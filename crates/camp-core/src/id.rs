@@ -41,9 +41,11 @@ pub fn parse_bead_id(id: &str) -> Option<(&str, i64)> {
 pub fn next_bead_id(conn: &Connection, prefix: &str) -> Result<String, CoreError> {
     validate_prefix(prefix)?;
     let high: i64 = conn
-        .query_row("SELECT high FROM counters WHERE prefix = ?1", [prefix], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT high FROM counters WHERE prefix = ?1",
+            [prefix],
+            |r| r.get(0),
+        )
         .optional()?
         .unwrap_or(0);
     Ok(format!("{prefix}-{}", high + 1))

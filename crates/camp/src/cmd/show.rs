@@ -39,7 +39,13 @@ pub fn run(camp: &CampDir, bead: String) -> Result<()> {
     println!();
     println!("history:");
     for e in &history {
-        println!("  {:>4}  {}  {:<14}  {}", e.seq, e.ts, e.kind.as_str(), e.data);
+        println!(
+            "  {:>4}  {}  {:<14}  {}",
+            e.seq,
+            e.ts,
+            e.kind.as_str(),
+            e.data
+        );
     }
     Ok(())
 }

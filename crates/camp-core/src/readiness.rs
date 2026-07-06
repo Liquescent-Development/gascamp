@@ -71,7 +71,9 @@ const UNMET_DEP: &str = "(t.id IS NULL OR t.status <> 'closed' OR t.outcome IS N
 
 pub fn is_ready(conn: &Connection, bead: &str) -> Result<bool, CoreError> {
     let status: Option<String> = conn
-        .query_row("SELECT status FROM beads WHERE id = ?1", [bead], |r| r.get(0))
+        .query_row("SELECT status FROM beads WHERE id = ?1", [bead], |r| {
+            r.get(0)
+        })
         .optional()?;
     let status = status.ok_or_else(|| CoreError::UnknownBead(bead.to_owned()))?;
     if status != "open" {

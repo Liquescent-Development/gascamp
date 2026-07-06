@@ -11,7 +11,11 @@ fn camp() -> Command {
 /// A camp plus a throwaway directory to register as a rig.
 fn camp_with_rig_dir() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
-    camp().current_dir(dir.path()).arg("init").assert().success();
+    camp()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .success();
     let rig_dir = dir.path().join("myrepo");
     std::fs::create_dir_all(&rig_dir).unwrap();
     (dir, rig_dir)

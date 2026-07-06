@@ -176,11 +176,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Rig { command } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             match command {
-                RigCommand::Add {
-                    path,
-                    prefix,
-                    name,
-                } => cmd::rig::add(&camp, path, prefix, name),
+                RigCommand::Add { path, prefix, name } => cmd::rig::add(&camp, path, prefix, name),
                 RigCommand::Ls { json } => cmd::rig::ls(&camp, json),
             }
         }
@@ -194,7 +190,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             assignee,
         } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
-            cmd::create::run(&camp, title, rig, description, needs, labels, bead_type, assignee)
+            cmd::create::run(
+                &camp,
+                title,
+                rig,
+                description,
+                needs,
+                labels,
+                bead_type,
+                assignee,
+            )
         }
         Command::Claim { bead, session } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;

@@ -13,7 +13,11 @@ fn camp() -> Command {
 #[test]
 fn create_claim_close_stays_refold_clean_throughout() {
     let dir = tempfile::tempdir().unwrap();
-    camp().current_dir(dir.path()).arg("init").assert().success();
+    camp()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .success();
     let rig_dir = dir.path().join("repo");
     std::fs::create_dir_all(&rig_dir).unwrap();
 

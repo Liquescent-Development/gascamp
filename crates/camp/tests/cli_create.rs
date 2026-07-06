@@ -11,7 +11,11 @@ fn camp() -> Command {
 /// Init a camp and register one rig `gascity` (prefix `gc`).
 fn camp_with_rig() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    camp().current_dir(dir.path()).arg("init").assert().success();
+    camp()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .success();
     let rig_dir = dir.path().join("repo");
     std::fs::create_dir_all(&rig_dir).unwrap();
     camp()
@@ -62,7 +66,11 @@ fn create_defaults_to_the_only_rig() {
 #[test]
 fn create_with_no_rigs_errors() {
     let dir = tempfile::tempdir().unwrap();
-    camp().current_dir(dir.path()).arg("init").assert().success();
+    camp()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .success();
     camp()
         .current_dir(dir.path())
         .args(["create", "orphan"])
