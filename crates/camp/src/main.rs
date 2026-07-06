@@ -5,6 +5,7 @@ mod cmd {
     pub mod doctor;
     pub mod events;
     pub mod init;
+    pub mod rig;
 }
 
 use std::path::PathBuf;
@@ -55,6 +56,32 @@ enum Command {
         #[arg(long)]
         to: Option<i64>,
     },
+    /// Manage rigs (registered repositories)
+    Rig {
+        #[command(subcommand)]
+        command: RigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RigCommand {
+    /// Register a repository as a rig
+    Add {
+        /// Path to the repository
+        path: PathBuf,
+        /// Bead id prefix (default: derived from the name; e.g. --prefix gc)
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Rig name (default: the directory's basename)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List configured rigs
+    Ls {
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -78,6 +105,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Events { json, from, to } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::events::run(&camp, json, from, to)
+        }
+        Command::Rig { command } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            match command {
+                RigCommand::Add {
+                    path,
+                    prefix,
+                    name,
+                } => cmd::rig::add(&camp, path, prefix, name),
+                RigCommand::Ls { json } => cmd::rig::ls(&camp, json),
+            }
         }
     }
 }

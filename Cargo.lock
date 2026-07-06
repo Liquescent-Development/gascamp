@@ -144,6 +144,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tempfile",
+ "toml",
 ]
 
 [[package]]
