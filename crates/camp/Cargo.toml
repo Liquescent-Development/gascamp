@@ -1,0 +1,15 @@
+[package]
+name = "camp"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+camp-core = { workspace = true }
+clap = { version = "4.6.1", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
