@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/camp-core", "crates/camp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/richardkiene/gascamp"
+
+[workspace.dependencies]
+camp-core = { path = "crates/camp-core" }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
