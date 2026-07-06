@@ -10,3 +10,5 @@
 # overrides stay out.
 !.claude/
 .claude/settings.local.json
+# Ephemeral agent worktrees (isolation mode) — never part of the repo.
+.claude/worktrees/
