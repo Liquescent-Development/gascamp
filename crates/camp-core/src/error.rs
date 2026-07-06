@@ -1,0 +1,23 @@
+/// Errors from camp-core. Library code never panics (workspace lints deny
+/// unwrap/expect/panic); every failure surfaces here.
+#[derive(Debug, thiserror::Error)]
+pub enum CoreError {
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("ledger corrupt: {0}")]
+    Corrupt(String),
+    #[error("ledger schema version {found} unsupported (this build supports {supported})")]
+    UnsupportedSchema { found: i64, supported: i64 },
+    #[error("invalid event data for {event_type}: {reason}")]
+    InvalidEventData { event_type: String, reason: String },
+    #[error("bead {bead}: invalid transition: {reason}")]
+    InvalidTransition { bead: String, reason: String },
+    #[error("unknown bead {0}")]
+    UnknownBead(String),
+    #[error("unknown session {0}")]
+    UnknownSession(String),
+    #[error("unknown event type {0:?}")]
+    UnknownEventType(String),
+}
