@@ -1,0 +1,10 @@
+[package]
+name = "camp"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+camp-core = { workspace = true }
