@@ -46,3 +46,9 @@ never silently diverge.
   `make e2e` (real claude -p) is opt-in and local-only.
 - Nothing is complete until it is pushed, CI is green, and every claim in
   the PR description is verified.
+- v1 phases may be dispatched by an orchestrating lead session: the
+  phase-orchestration skill (.claude/skills/) is the lead's contract;
+  docs/superpowers/plans/2026-07-06-v1-orchestration.md holds the
+  dependency map, parallel windows, and per-phase kickoff prompts. Phase
+  workers follow their kickoff prompt; parallel phases follow the guide's
+  shared-file/rebase protocol.
