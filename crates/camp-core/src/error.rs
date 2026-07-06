@@ -20,4 +20,10 @@ pub enum CoreError {
     UnknownSession(String),
     #[error("unknown event type {0:?}")]
     UnknownEventType(String),
+    #[error("config: {0}")]
+    Config(String),
+    #[error("unknown rig {0:?}")]
+    UnknownRig(String),
+    #[error("invalid rig prefix {0:?}: must match ^[a-z][a-z0-9]*$")]
+    InvalidPrefix(String),
 }
