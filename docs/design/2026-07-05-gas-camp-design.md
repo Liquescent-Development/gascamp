@@ -28,8 +28,8 @@ small tasks:
   storms while no useful work is happening.
 
 The thesis of this design: **robustness comes from durable work plus
-convergence, not from heavyweight machinery.** A fsynced append to a journal
-file is exactly as crash-proof as a Dolt commit for a single-box, ten-agent
+convergence, not from heavyweight machinery.** A WAL-mode SQLite transaction
+is exactly as crash-proof as a Dolt commit for a single-box, ten-agent
 daily driver. Gas Camp keeps Gas City's convergence loop — work persists
 outside sessions; any executor advances it idempotently; crash recovery is
 "read the state and continue" — and deletes everything whose cost does not
@@ -46,14 +46,16 @@ Four principles, each falsifiable. Violations are bugs, not trade-offs.
    events — file watches, armed timers, `SIGCHLD`, socket accepts. Idle
    targets: `campd` < 20 MB RSS, 0.0% CPU, zero wakeups except armed timers.
 2. **Cost proportional to job.** The smallest job (Tier 0 sling, §8.1) pays
-   one worker spawn and roughly three journal lines over doing the work by
+   one worker spawn and roughly three ledger writes over doing the work by
    hand — seconds of overhead. Graphs, verification loops, retries, and
    fan-out exist but are opt-in per job.
-3. **Nothing hidden, nothing server-shaped.** All durable truth is
-   human-readable files in one directory; derived indexes are disposable
-   caches rebuilt from those files. No database server, no daemon-private
-   state: `kill -9` any component, restart it, and it re-derives
-   everything. `grep` over the journal is a complete audit tool.
+3. **Nothing hidden, nothing server-shaped.** All durable truth lives in
+   one directory: one documented-schema SQLite ledger (a library and a
+   file, not a server) plus human-readable config and run files. The event
+   history is complete and replayable, and `camp events --json` exports
+   canonical JSONL for any range, so text-tool audit is one command away.
+   No database server, no daemon-private state: `kill -9` any component,
+   restart it, and it picks up exactly where the ledger says things stand.
 4. **Same six primitives as Gas City, zero roles in code.** Agent, Bead,
    Formula, Rig, Pack, Event — the mental model transfers in both
    directions. `campd` moves work; it never reasons about it. If a line of
@@ -108,6 +110,11 @@ re-litigate them:
 - bd/Dolt is deliberately not the ledger: the standing query cost is one of
   the two problems camp exists to remove. An export bridge covers
   graduation (§15.3).
+- The ledger is **one SQLite file**. An earlier journal-file +
+  derived-SQLite split was collapsed during review: a WAL-mode append-only
+  events table already provides durable, replayable, seq-numbered history,
+  so the separate text journal was redundant double-writing. Canonical
+  JSONL is an export (`camp events --json`), not a storage format.
 
 ## 5. System shape
 
@@ -139,7 +146,7 @@ agent definitions.
         └────────────▲───────────┘            └─────────┬──────────┘
                      │ appends + socket pokes           │ hooks
         ┌────────────┴───────────────────────────────────▼──────────┐
-        │  camp dir: journal.jsonl (truth+bus) · state.db (derived) │
+        │  camp dir: camp.db (ledger: event log + state) · camp.toml │
         │  runs/ · camp.toml — all human-readable, all greppable    │
         └───────────────────────────────────────────────────────────┘
 ```
@@ -156,23 +163,24 @@ agent definitions.
   as an example plist, not installed by default) starts `campd` at login for
   users who want orders firing without first running a `camp` command.
 - **Crash-only design:** `campd` holds no exclusive state. On start it
-  replays/loads the ledger, runs adoption (§8.5), and continues. `kill -9`
-  is a supported shutdown method.
+  opens the ledger, processes any events past its cursor, runs adoption
+  (§8.5), and continues. `kill -9` is a supported shutdown method.
 
 ## 6. Primitive mapping
 
 | Gas City primitive | Camp realization | Claude Code feature used |
 |---|---|---|
 | **Agent** (WHO) | a Claude Code agent definition file in a pack — frontmatter (model, tools, permissions) + prompt | agent definitions; teammates (spawned while you are present); headless-but-present sessions (campd-dispatched) |
-| **Bead** (WHAT) | a journal record with derived current state; tasks, mail, and memory are all beads differing by `type`; dependencies are `needs` edges; ready = open ∧ no open blockers | — (camp-owned files) |
-| **Formula** (HOW) | a TOML file, strict subset of Gas City formula v2 (§8.2); cooking materializes a run into the journal | worker sessions execute step beads |
+| **Bead** (WHAT) | a ledger record — append-only event history plus current state; tasks, mail, and memory are all beads differing by `type`; dependencies are `needs` edges; ready = open ∧ no open blockers | — (camp-owned ledger) |
+| **Formula** (HOW) | a TOML file, strict subset of Gas City formula v2 (§8.2); cooking materializes a run into the ledger | worker sessions execute step beads |
 | **Rig** (WHERE) | a registered repo path; beads carry a rig; dispatch sets cwd or worktree | per-session cwd; worktree isolation |
 | **Pack** (CONFIGURES) | a directory, optionally installed as a Claude Code plugin (§11) | plugins (commands, agents, skills, hooks) |
-| **Event** (OBSERVE) | a journal line; the journal is simultaneously store history and bus | hooks emit; statusline/`/status` consume |
+| **Event** (OBSERVE) | an event row in the ledger; the event log is simultaneously store history and bus | hooks emit; statusline/`/status` consume |
 
 Gas City machinery → camp machinery: the **orchestrator** becomes `campd`
 (event-driven, mechanical-only); the **bead store** and **event bus**
-collapse into one journal plus derived views; **sling** is `camp sling`;
+collapse into one SQLite ledger — an append-only event log plus state
+tables; **sling** is `camp sling`;
 **health patrol** is §10; **orders** are §9.
 
 ## 7. The ledger
@@ -183,26 +191,22 @@ collapse into one journal plus derived views; **sling** is `camp sling`;
 camp/                      # ~/camps/<name>/ (multi-rig) or <repo>/.camp/ (single rig)
   camp.toml                # rigs, packs, orders, caps, stall thresholds
   campd.sock               # daemon socket (liveness = accepts connections)
-  journal.jsonl            # active journal segment: append-only, seq-numbered
-  journal/                 # sealed segments + checkpoint
-    000001.jsonl           #   segments seal at 64 MB; plain JSONL, grep-able
-                           #   forever (compression is opt-in config)
-    checkpoint.json        #   full state fold at a seq; startup = checkpoint
-                           #   + active-segment replay, bounded regardless of
-                           #   history size (7.6)
-  state.db                 # derived SQLite view (WAL mode): current beads +
-                           #   deps, session registry, history, FTS5 search,
-                           #   memory — rebuildable from the journal; deleting
-                           #   it is safe (7.4)
+  camp.db                  # THE ledger (SQLite, WAL mode): append-only events
+                           #   table (seq-numbered — the bus and the audit),
+                           #   current beads + deps, session registry, memory,
+                           #   FTS5 search. `camp events --json` exports the
+                           #   canonical JSONL for any range (7.2)
   runs/<run-id>/           # one dir per formula run: pinned formula copy,
                            #   cook manifest, step status snapshot
   worktrees/               # camp-managed worktrees (per agent isolation flag)
 ```
 
-### 7.2. The journal
+### 7.2. The event log
 
-One append-only JSONL file is simultaneously the bead store's history and
-the event bus — a bead mutation *is* an event. Envelope:
+One append-only `events` table is simultaneously the bead store's history
+and the event bus — a bead mutation *is* an event. The canonical JSON form
+(the shape of an `events` row, and what `camp events --json` emits for any
+range):
 
 ```json
 {"seq":412,"ts":"2026-07-05T21:14:03Z","type":"bead.closed","rig":"gascity",
@@ -214,29 +218,27 @@ the event bus — a bead mutation *is* an event. Envelope:
   `order.fired`, `order.completed`); camp-specific events are additive and
   documented in one table in the reference docs (e.g. `agent.stalled`,
   `run.finalized`, `campd.started`).
-- **Writers:** every writer appends through the `camp` CLI (or `campd`
-  itself), guarded by `flock` on a sidecar lock plus single-`write(2)`
-  `O_APPEND` lines; after appending, the writer pokes the `campd` socket.
-  A filesystem watch on the journal catches any foreign writer. `seq` is
-  assigned at append time under the lock; a reader can replay from any
-  sequence number.
-- **Readers never scan the journal for current state.** `camp ls --ready`,
-  `/status`, statusline, `top`, and `camp search` read the derived views in
-  `state.db` (7.4). The journal is for audit, replay, and the bus — not for
-  sifting: an agent that wants something *queries*; it never pages through
+- **A write is one transaction.** Every mutation goes through one library
+  path shared by the CLI and `campd`: a single WAL transaction inserts the
+  event row (monotonic `seq`) *and* applies its state effect — bead
+  status, dependency edges, session registry, memory, FTS index. Current
+  state therefore can never lag the history. After commit, the writer
+  pokes the `campd` socket with the new `seq`; if `campd` is down, writes
+  still succeed and it catches up from its processed-cursor on start. A
+  reader can replay from any sequence number.
+- **Readers never page through history for current state.** `camp ls
+  --ready`, `/status`, statusline, `top`, and `camp search` read the state
+  tables (7.4). The event log is for audit, replay, and the bus — not for
+  sifting: an agent that wants something *queries*; it never scans
   history.
-- **Segments and checkpoints:** the active journal seals at 64 MB into
-  `journal/`, and a `checkpoint.json` — a full fold of state at that
-  sequence number — is written at each seal and on clean shutdown. Startup
-  cost is checkpoint + active-segment replay, bounded by segment size
-  rather than camp age (7.6).
 
 ### 7.3. Readiness is computed on write, never polled
 
-When an append lands (socket poke or file watch), `campd` folds the record
-into `state.db`, recomputes readiness *for the affected subgraph only*, and
-dispatches anything newly ready. Nobody — not `campd`, not agents, not the
-UI — ever asks the store "anything ready?" on a loop.
+When a poke lands (or on startup catch-up), `campd` processes events past
+its cursor: it recomputes readiness *for the affected subgraph only*,
+dispatches anything newly ready, and matches event-triggered orders (§9).
+Nobody — not `campd`, not agents, not the UI — ever asks the store
+"anything ready?" on a loop.
 
 The precise claim, since `grep` is a query too: **camp has queries, but no
 query loops.** A query is a read someone chooses to run when they want
@@ -250,14 +252,16 @@ structurally impossible.
 
 ### 7.4. Derived views, search, and memory
 
-`state.db` is a WAL-mode SQLite file — a library and a file, not a server.
-`campd` is its sole writer (folding journal records); the CLI and agents
-are concurrent readers that never block the writer. It holds current bead
-states and the dependency index, the session registry, closed-bead
-history, and an FTS5 full-text index over titles, descriptions, close
-notes, and memory. It is derived: delete it and it rebuilds from
-checkpoint + journal. (k3s made the same move when it swapped etcd for
-SQLite; camp swaps Dolt for journal + SQLite.)
+`camp.db` is a WAL-mode SQLite file — a library and a file, not a server.
+The CLI and `campd` write through the one shared transactional path
+(7.2); readers are concurrent and never block the writer. It holds the
+append-only event log, current bead states and the dependency index, the
+session registry, closed-bead history, and an FTS5 full-text index over
+titles, descriptions, close notes, and memory. The event-sourcing
+property is kept *internal*: the state tables are a fold of the event
+log, and `camp doctor --refold` rebuilds them from history and
+cross-checks for drift. (k3s made the same move when it swapped etcd for
+SQLite — one proportionate file; camp swaps Dolt for SQLite.)
 
 Agents never sift the ledger — they query it:
 
@@ -272,7 +276,7 @@ Agents never sift the ledger — they query it:
   the same way work does.
 
 **Reachability is a ledger fact.** Every spawned agent gets a registry row
-**at birth** (mirrored by its `session.woke` journal line): camp session
+**at birth** (mirrored by its `session.woke` event): camp session
 name (`<camp>/<agent>/<n>`), pack agent name, rig, Claude Code session ID,
 transcript path, spawn time, and status. "Every agent reachable for
 introspection and conversation" then degrades gracefully and never to
@@ -305,7 +309,7 @@ Two alternatives were considered seriously and are recorded here:
 - **A bd-compatible replacement store** — a real project in its own right,
   not a camp subcomponent. Camp's ledger is deliberately
   concept-compatible with bd (ids, `needs` edges, status, labels, memory),
-  so a bd-CLI-compatible shim over `state.db` can become that project
+  so a bd-CLI-compatible shim over `camp.db` can become that project
   later without changing camp (§17). Explicitly out of scope for v1.
 
 Graduation to bd/Dolt is an export (§15.3), not a backend option.
@@ -314,17 +318,13 @@ Graduation to bd/Dolt is an export (§15.3), not a backend option.
 
 The design point is a heavy day, not a demo: 10–15 hours of continuous
 use, thousands of beads created, ~10 concurrent workers. With
-milestone-level journaling (tool-level detail lives in transcripts, which
-patrol watches rather than journals — §10), that is on the order of
-30–50k journal lines (5–10 MB) per heavy day.
-
-- **Journal:** seals at 64 MB — roughly a heavy week per segment; sealed
-  segments stay plain JSONL forever. Startup replay is checkpoint +
-  active segment: bounded, tens of milliseconds, independent of camp age.
-- **`state.db`:** a year of heavy use is on the order of a million bead
-  records — comfortably SQLite territory; indexed queries and FTS stay in
-  the low-millisecond range. No archival tiering is designed until real
-  usage shows it is needed.
+milestone-level eventing (tool-level detail lives in transcripts, which
+patrol watches rather than records — §10), that is on the order of 30–50k
+event rows per heavy day. A year of heavy use is roughly 10–15 M event
+rows and ~1 M beads — single-digit-GB SQLite territory; indexed reads and
+FTS stay in the low-millisecond range. Backup is file-level: `camp backup`
+runs `VACUUM INTO`, and any snapshot tool works on one file. No archival
+tiering is designed until real usage shows it is needed.
 
 ## 8. Execution model
 
@@ -335,11 +335,11 @@ you:   /sling add a --json flag to `gc ls`, TDD it
 camp:  gc-142 open → worker gc-dev-1 (teammate)
 ```
 
-One journal append (`bead.created`), one worker spawn, done. The worker
+One ledger write (`bead.created`), one worker spawn, done. The worker
 runs the pack's worker skill: claim the bead (`bead.claimed`), do the work,
 emit milestone events, close with an outcome, exit. No formula, no run
 directory, no graph machinery. Overhead over asking Claude directly:
-roughly two seconds and three journal lines. This is the answer to "hours
+roughly two seconds and three ledger writes. This is the answer to "hours
 for a flag."
 
 Routing: `/sling` with no agent argument routes to the pack's default
@@ -401,7 +401,7 @@ history reads natively in a city.
 
 Cooking: `/sling --formula guarded-change <args>` (or `camp sling
 --formula`) pins a copy of the formula into `runs/<run-id>/`, materializes
-root + step beads + edges into the journal, and from that moment the run is
+root + step beads + edges into the ledger, and from that moment the run is
 independent of the file — Gas City's materialization property, kept.
 
 ### 8.3. campd as control dispatcher
@@ -424,9 +424,10 @@ no heuristics, no `if stuck then…` cleverness in Rust.
 ### 8.4. Dispatch: one dispatcher; visibility is invariant, surface is not
 
 The invariant comes first: **no execution path affects visibility.** Every
-worker, however spawned, is registered at birth (§7.4), journals its
-milestones, streams a transcript you can tail live, and can be conversed
-with. Camp runs nothing hidden; some things start *minimized*.
+worker, however spawned, is registered at birth (§7.4), records its
+milestones in the ledger, streams a transcript you can tail live, and can
+be conversed with. Camp runs nothing hidden; some things start
+*minimized*.
 
 - **`campd` dispatches all graph work** — formula steps, orders, patrol
   respawns — whether or not you are watching, because forward progress
@@ -457,7 +458,7 @@ plugin): claim → work → emit milestones (`camp event emit`) → close with
 outcome → exit. Workers run under the permission mode and tool allowlist
 their agent definition declares. `campd`-spawned workers run
 non-interactively: anything the agent definition has not pre-allowed fails
-fast (and lands in the journal) rather than hanging on a prompt no one
+fast (and lands in the ledger) rather than hanging on a prompt no one
 will answer.
 
 ### 8.5. Adoption
@@ -491,11 +492,11 @@ formula = "fix-ci"
   Missed-while-asleep fires apply a catch-up policy: fire once on wake if
   within `catch_up_window` (default `"2h"`, configurable per order; `"0"`
   disables catch-up).
-- **Event orders:** a pattern match evaluated once per journal append —
-  piggybacking on the same fold path as readiness (§7.3), so event orders
-  add no standing cost.
+- **Event orders:** a pattern match evaluated once per event, on the same
+  post-commit processing path as readiness (§7.3), so event orders add no
+  standing cost.
 - **Away-mode is the same code path.** An order fires, `campd` cooks and
-  dispatches headless workers, everything lands in the journal. You come
+  dispatches headless workers, everything lands in the ledger. You come
   back, `/status` shows what happened, and every worker it spawned is
   resumable. Limits stated honestly: with the default on-demand daemon,
   orders fire only while `campd` is running (from first `camp` use until
@@ -514,8 +515,8 @@ Three mechanisms, all push, all mechanical:
 2. **Stall:** one armed timer per *active* worker, reset by activity on
    the worker's transcript file (a filesystem watch on the path recorded
    in its registry row — a working agent appends to it constantly, for
-   free) and by any journal event from that session. Tool-level detail
-   thus stays out of the journal (§7.6) while patrol still sees every
+   free) and by any ledger event from that session. Tool-level detail
+   thus stays out of the event log (§7.6) while patrol still sees every
    heartbeat. Timer fires → `agent.stalled` event → the agent
    definition's policy ladder executes: `nudge` (resume the session with a
    status-request turn), then `restart` (kill, respawn, re-hook the bead)
@@ -565,7 +566,7 @@ mypack/
 - A camp dir stands alone (`~/camps/dev/` + `camp rig add ~/code/gascity`)
   or lives repo-local (`.camp/`, rig = self).
 - Beads carry their rig; bead IDs get per-rig prefixes (`gc-142`,
-  `t3-17`) — one journal, scoped queries, Gas City's namespacing idea
+  `t3-17`) — one ledger, scoped queries, Gas City's namespacing idea
   without a shared database.
 - Dispatch sets the worker's cwd to the rig — or to a camp-managed worktree
   under `<camp>/worktrees/` when the agent definition sets
@@ -580,10 +581,11 @@ mypack/
 
 Each of these is a testable guarantee, not a vibe:
 
-1. Every unit of work is a journal line (grep-able, forever) plus a
-   queryable derived view — and the derived view is disposable, so the
-   journal alone audits the whole system. Queries exist for convenience;
-   no query loop is ever load-bearing (§7.3).
+1. Every unit of work is an append-only event row plus current state in
+   one documented-schema ledger; the event log alone reconstructs the
+   whole system, and `camp events --json` exports it as JSONL so text
+   tools audit it in one command. Queries exist for convenience; no query
+   loop is ever load-bearing (§7.3).
 2. Every agent has a registry entry from birth: role, rig, Claude session
    ID, transcript path. Live → talk in place or attach; exited → resume;
    long gone → transcript persists.
@@ -591,8 +593,9 @@ Each of these is a testable guarantee, not a vibe:
    gc-143 ready → dispatched as gc-dev-2 (session 8f3c…)`.
 4. Every automation is declared in visible TOML; config changes are
    themselves events.
-5. `kill -9` anything; the files tell the whole story; `camp doctor`
-   re-derives state and reports drift.
+5. `kill -9` anything; the ledger tells the whole story; `camp doctor`
+   verifies — and `--refold` rebuilds — current state from the event
+   history and reports drift.
 6. Every verb works identically from slash commands and the `camp` CLI —
    the session is the control plane, not a privileged client.
 
@@ -607,7 +610,7 @@ Targets the implementation is held to (measured in the e2e suite, §16):
 | Sling → worker's first token | ≤ 2 s | minutes (ceremony + tick latency) |
 | Step close → dependent dispatched | ≤ 1 s | next tick + SQL round-trips |
 | "Add a CLI flag" end-to-end | agent's actual work + seconds | hours |
-| Journal append | < 1 ms | SQL transaction |
+| Ledger write (event + state effect, one WAL transaction) | < 1 ms | Dolt SQL transaction |
 | Ranked full-text search over a year of history | < 50 ms (SQLite FTS5) | Dolt SQL query |
 
 The right-hand column reflects the observed behavior that motivated this
@@ -623,15 +626,16 @@ record, not a benchmark of Gas City in general.
 - No GC and a small footprint make the < 20 MB idle-RSS target comfortable
   (single-digit MB is realistic).
 - Concurrency model: **OS threads + event loop primitives, no async
-  runtime in v1.** The daemon's surface — one file watch, one unix socket,
-  ≤ ~10 child processes, a timer heap — does not justify tokio; the
+  runtime in v1.** The daemon's surface — a handful of transcript
+  watches, one unix socket, ≤ ~10 child processes, a timer heap — does
+  not justify tokio; the
   decision is revisited only if the surface grows. Candidate crates:
   `notify` (FSEvents/inotify), `polling` or `mio` (socket + timers),
   `signal-hook` (SIGCHLD), `serde`/`toml`/`serde_json`, `clap` (CLI),
-  `fs2` (flock), `rusqlite` (bundled SQLite, WAL + FTS5), `ratatui` (only
-  if `camp top` earns more than plain text).
+  `rusqlite` (bundled SQLite, WAL + FTS5), `ratatui` (only if `camp top`
+  earns more than plain text).
 - Errors: fail fast, no silent fallbacks; every error path either surfaces
-  to the caller or lands in the journal as an event. No panics in library
+  to the caller or lands in the ledger as an event. No panics in library
   code.
 
 ### 15.2. Compatibility with Gas City is a requirement
@@ -669,9 +673,9 @@ Three concrete contracts, each CI-enforced in the implementation plan:
 
 TDD throughout; unit tests live next to code.
 
-- **Unit (pure, fast):** journal fold → derived views; checkpoint/seal
-  replay equivalence (fold(full journal) ≡ fold(checkpoint + tail));
-  readiness computation
+- **Unit (pure, fast):** event application → state tables, with refold
+  equivalence (state tables ≡ fold(event log), the `doctor --refold`
+  property); readiness computation
   over dependency graphs; formula parse/validate (subset acceptance and
   city-only rejection tables); cron heap with a mocked clock, including
   wall-clock jumps and catch-up windows; stall-timer arming/reset with a
@@ -682,8 +686,8 @@ TDD throughout; unit tests live next to code.
   events, closes with configurable outcomes/timing/crashes) — drives full
   runs through `campd`: fan-out, check loops, retry exhaustion, stall →
   nudge → restart ladders (driven by transcript-watch resets), adoption
-  after `kill -9`. A synthetic-volume fixture (30 heavy days, ≥1M journal
-  lines) asserts the §14 startup, query, and search targets hold; memory
+  after `kill -9`. A synthetic-volume fixture (30 heavy days, ≥1M event
+  rows) asserts the §14 write, query, and search targets hold; memory
   `remember`/`recall` round-trips are covered here too.
 - **Compatibility:** camp's formula corpus validated against the real `gc`
   compiler; event/outcome vocabulary checked against a pinned Gas City
@@ -720,7 +724,7 @@ tunes UX rather than structure:
   City's controller subscribe instead of poll, attacking the standing tax
   at its source for city users too (§7.5). Camp does not depend on it.
 - **Possible future standalone project:** a bd-CLI-compatible shim over
-  camp's `state.db` (§7.5) — "beads-compatible, with camp's efficiency
+  camp's ledger (§7.5) — "beads-compatible, with camp's efficiency
   trade-offs." Deliberately enabled by concept-compatibility, deliberately
   not part of camp v1.
 - **Name.** "Gas Camp" (`camp`/`campd`) is the working name; alternatives
@@ -734,7 +738,7 @@ Camp is not a competitor and not a replacement. It is to Gas City what
 **k3s is to k8s**: the same conceptual API — six primitives, the
 zero-roles law, convergence through persistent work — delivered as one
 small binary with the heavyweight store swapped for something
-proportionate (k3s traded etcd for SQLite; camp trades Dolt for a
-journal + SQLite), sized for one box and ten agents, with a mechanical
+proportionate (k3s traded etcd for SQLite; camp trades Dolt for
+SQLite), sized for one box and ten agents, with a mechanical
 migration path for the day a job turns out to be city-sized. The two
 share vocabulary so that learning either teaches the other.
