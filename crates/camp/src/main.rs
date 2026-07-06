@@ -8,6 +8,7 @@ mod cmd {
     pub mod doctor;
     pub mod events;
     pub mod init;
+    pub mod ls;
     pub mod rig;
 }
 
@@ -106,6 +107,21 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// List beads
+    Ls {
+        /// Only open, unblocked beads
+        #[arg(long, conflicts_with = "mine")]
+        ready: bool,
+        /// Only beads claimed by this session
+        #[arg(long)]
+        mine: Option<String>,
+        /// Scope to a rig
+        #[arg(long)]
+        rig: Option<String>,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -185,6 +201,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::close::run(&camp, bead, outcome, reason)
+        }
+        Command::Ls {
+            ready,
+            mine,
+            rig,
+            json,
+        } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::ls::run(&camp, ready, mine, rig, json)
         }
     }
 }
