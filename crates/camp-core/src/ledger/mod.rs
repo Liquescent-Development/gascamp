@@ -87,6 +87,37 @@ impl Ledger {
         crate::id::next_bead_id(&self.conn, prefix)
     }
 
+    /// True when `bead` is open and every `needs` target passed (decision 6).
+    pub fn is_ready(&self, bead: &str) -> Result<bool, CoreError> {
+        crate::readiness::is_ready(&self.conn, bead)
+    }
+
+    /// Open, unblocked beads, optionally scoped to a rig.
+    pub fn ready_beads(
+        &self,
+        rig: Option<&str>,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::readiness::ready_beads(&self.conn, rig)
+    }
+
+    /// Dependents of `closed_bead` its close just made ready (spec §7.3).
+    pub fn newly_ready(&self, closed_bead: &str) -> Result<Vec<String>, CoreError> {
+        crate::readiness::newly_ready(&self.conn, closed_bead)
+    }
+
+    /// Beads matching `filter`, in creation order.
+    pub fn list_beads(
+        &self,
+        filter: &crate::readiness::ListFilter,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::readiness::list_beads(&self.conn, filter)
+    }
+
+    /// One bead's current state, or `None`.
+    pub fn get_bead(&self, id: &str) -> Result<Option<crate::readiness::BeadRow>, CoreError> {
+        crate::readiness::get_bead(&self.conn, id)
+    }
+
     /// Events with `from <= seq <= to` (unbounded above when `to` is None),
     /// in seq order.
     pub fn events_range(&self, from: Seq, to: Option<Seq>) -> Result<Vec<Event>, CoreError> {
