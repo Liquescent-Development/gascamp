@@ -1,0 +1,6 @@
+/target
+.camp/
+
+# This workspace ships a binary: the lockfile is committed for reproducible
+# builds (overrides the machine-global ignore of Cargo.lock).
+!Cargo.lock

@@ -1,6 +1,7 @@
 # Gas Camp
 
-**Status: design phase.** Nothing here runs yet.
+**Status: under construction.** Implementation plan:
+[`docs/superpowers/plans/2026-07-05-gas-camp-v1-implementation.md`](docs/superpowers/plans/2026-07-05-gas-camp-v1-implementation.md).
 
 Gas Camp is to [Gas City](https://github.com/gastownhall/gascity) what k3s is
 to k8s: the same six orchestration primitives, sized down to one small Rust
