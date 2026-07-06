@@ -132,6 +132,21 @@ impl Ledger {
         }
         Ok(events)
     }
+
+    /// Full event history for one bead, in seq order (spec §7.4 — the one
+    /// sanctioned history read, used by `camp show`). Indexed via `events_bead`.
+    pub fn events_for_bead(&self, bead: &str) -> Result<Vec<Event>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, ts, type, rig, actor, bead, data FROM events
+             WHERE bead = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([bead], row_to_event)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
 }
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
@@ -734,6 +749,30 @@ mod tests {
             Err(CoreError::UnknownSession(name)) => assert_eq!(name, "camp/ghost/1"),
             other => panic!("expected UnknownSession, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn events_for_bead_returns_only_that_beads_history_in_order() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(created("gc-2", serde_json::json!({"title": "two"})))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::BeadClosed,
+                Some("gc"),
+                Some("gc-1"),
+                serde_json::json!({"outcome": "pass"}),
+            ))
+            .unwrap();
+        let hist = ledger.events_for_bead("gc-1").unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].kind, EventType::BeadCreated);
+        assert_eq!(hist[1].kind, EventType::BeadClosed);
+        assert!(hist.iter().all(|e| e.bead.as_deref() == Some("gc-1")));
     }
 
     #[test]
