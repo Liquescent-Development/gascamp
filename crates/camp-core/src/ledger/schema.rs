@@ -58,6 +58,11 @@ CREATE TABLE sessions (
 CREATE VIRTUAL TABLE search USING fts5(
   bead_id UNINDEXED, kind UNINDEXED, content
 );
+
+CREATE TABLE counters (
+  prefix TEXT PRIMARY KEY,
+  high   INTEGER NOT NULL
+) STRICT;
 "#;
 
 const FULL_DDL_PREFIX: &str = r#"

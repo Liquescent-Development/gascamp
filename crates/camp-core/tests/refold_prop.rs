@@ -120,6 +120,7 @@ const DUMPS: &[(&str, &str)] = &[
         "name, agent, rig, claude_session_id, transcript_path, pid, status, bead, spawned_ts, ended_ts",
     ),
     ("search", "bead_id, kind, content"),
+    ("counters", "prefix, high"),
     ("events", "seq, ts, type, rig, actor, bead, data"),
 ];
 
@@ -167,6 +168,13 @@ proptest! {
         let report = ledger_a.refold_check().unwrap();
         prop_assert_eq!(report.events_replayed, accepted_a);
         prop_assert!(report.drift.is_empty(), "drift: {:?}", report.drift);
+
+        // Property 3: id allocation is folded state — refold_repair preserves
+        // the next id for the prefix ("bead") every Create op used.
+        let before = ledger_a.next_bead_id("bead").unwrap();
+        ledger_a.refold_repair().unwrap();
+        let after = ledger_a.next_bead_id("bead").unwrap();
+        prop_assert_eq!(before, after);
 
         // Property 2: two ledgers fed the same sequence are identical.
         drop(ledger_a);

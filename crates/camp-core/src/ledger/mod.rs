@@ -82,6 +82,42 @@ impl Ledger {
         Ok(seqs)
     }
 
+    /// The next unused bead id for `prefix` (spec §12). See `camp_core::id`.
+    pub fn next_bead_id(&self, prefix: &str) -> Result<String, CoreError> {
+        crate::id::next_bead_id(&self.conn, prefix)
+    }
+
+    /// True when `bead` is open and every `needs` target passed (decision 6).
+    pub fn is_ready(&self, bead: &str) -> Result<bool, CoreError> {
+        crate::readiness::is_ready(&self.conn, bead)
+    }
+
+    /// Open, unblocked beads, optionally scoped to a rig.
+    pub fn ready_beads(
+        &self,
+        rig: Option<&str>,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::readiness::ready_beads(&self.conn, rig)
+    }
+
+    /// Dependents of `closed_bead` its close just made ready (spec §7.3).
+    pub fn newly_ready(&self, closed_bead: &str) -> Result<Vec<String>, CoreError> {
+        crate::readiness::newly_ready(&self.conn, closed_bead)
+    }
+
+    /// Beads matching `filter`, in creation order.
+    pub fn list_beads(
+        &self,
+        filter: &crate::readiness::ListFilter,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::readiness::list_beads(&self.conn, filter)
+    }
+
+    /// One bead's current state, or `None`.
+    pub fn get_bead(&self, id: &str) -> Result<Option<crate::readiness::BeadRow>, CoreError> {
+        crate::readiness::get_bead(&self.conn, id)
+    }
+
     /// Events with `from <= seq <= to` (unbounded above when `to` is None),
     /// in seq order.
     pub fn events_range(&self, from: Seq, to: Option<Seq>) -> Result<Vec<Event>, CoreError> {
@@ -90,6 +126,21 @@ impl Ledger {
              WHERE seq >= ?1 AND (?2 IS NULL OR seq <= ?2) ORDER BY seq",
         )?;
         let rows = stmt.query_map(params![from, to], row_to_event)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    /// Full event history for one bead, in seq order (spec §7.4 — the one
+    /// sanctioned history read, used by `camp show`). Indexed via `events_bead`.
+    pub fn events_for_bead(&self, bead: &str) -> Result<Vec<Event>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, ts, type, rig, actor, bead, data FROM events
+             WHERE bead = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([bead], row_to_event)?;
         let mut events = Vec::new();
         for row in rows {
             events.push(row?);
@@ -155,7 +206,7 @@ mod tests {
         assert_eq!(fk, 1);
 
         for table in [
-            "meta", "events", "beads", "deps", "sessions", "cursors", "search",
+            "meta", "events", "beads", "deps", "sessions", "cursors", "search", "counters",
         ] {
             let n: i64 = conn
                 .query_row(
@@ -354,6 +405,73 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(seqs, vec![1, 2]);
+    }
+
+    #[test]
+    fn next_bead_id_starts_at_one_and_follows_creates() {
+        let (_dir, mut ledger) = temp_ledger();
+        assert_eq!(ledger.next_bead_id("gc").unwrap(), "gc-1");
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        assert_eq!(ledger.next_bead_id("gc").unwrap(), "gc-2");
+        ledger
+            .append(created("gc-2", serde_json::json!({"title": "two"})))
+            .unwrap();
+        assert_eq!(ledger.next_bead_id("gc").unwrap(), "gc-3");
+        // per-prefix, independent
+        assert_eq!(ledger.next_bead_id("t3").unwrap(), "t3-1");
+        // the counter is folded state
+        let high: i64 = ledger
+            .conn
+            .query_row("SELECT high FROM counters WHERE prefix = 'gc'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(high, 2);
+    }
+
+    #[test]
+    fn rolled_back_create_does_not_bump_the_counter() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        // duplicate id: whole txn rolls back, counter must stay at 1
+        assert!(
+            ledger
+                .append(created("gc-1", serde_json::json!({"title": "dup"})))
+                .is_err()
+        );
+        assert_eq!(ledger.next_bead_id("gc").unwrap(), "gc-2");
+    }
+
+    #[test]
+    fn counters_are_refold_exact() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(created("gc-2", serde_json::json!({"title": "two"})))
+            .unwrap();
+        assert!(ledger.refold_check().unwrap().drift.is_empty());
+        // tamper the counter, refold must catch it, repair must fix it
+        ledger
+            .conn
+            .execute("UPDATE counters SET high = 99 WHERE prefix = 'gc'", [])
+            .unwrap();
+        assert!(
+            ledger
+                .refold_check()
+                .unwrap()
+                .drift
+                .iter()
+                .any(|d| d.table == "counters")
+        );
+        ledger.refold_repair().unwrap();
+        assert_eq!(ledger.next_bead_id("gc").unwrap(), "gc-3");
+        assert_eq!(count(&ledger, "SELECT count(*) FROM counters"), 1);
     }
 
     fn woke(name: &str) -> EventInput {
@@ -631,6 +749,59 @@ mod tests {
             Err(CoreError::UnknownSession(name)) => assert_eq!(name, "camp/ghost/1"),
             other => panic!("expected UnknownSession, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn events_for_bead_returns_only_that_beads_history_in_order() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(created("gc-2", serde_json::json!({"title": "two"})))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::BeadClosed,
+                Some("gc"),
+                Some("gc-1"),
+                serde_json::json!({"outcome": "pass"}),
+            ))
+            .unwrap();
+        let hist = ledger.events_for_bead("gc-1").unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].kind, EventType::BeadCreated);
+        assert_eq!(hist[1].kind, EventType::BeadClosed);
+        assert!(hist.iter().all(|e| e.bead.as_deref() == Some("gc-1")));
+    }
+
+    #[test]
+    fn rig_added_is_validated_and_log_only() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(EventInput {
+                kind: EventType::RigAdded,
+                rig: Some("gascity".into()),
+                actor: "cli".into(),
+                bead: None,
+                data: serde_json::json!({"path": "/code/gascity", "prefix": "gc"}),
+            })
+            .unwrap();
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+        assert_eq!(count(&ledger, "SELECT count(*) FROM beads"), 0);
+        // malformed payload fails fast, appends nothing
+        assert!(
+            ledger
+                .append(EventInput {
+                    kind: EventType::RigAdded,
+                    rig: Some("x".into()),
+                    actor: "cli".into(),
+                    bead: None,
+                    data: serde_json::json!({"path": "/p", "prefix": "x", "extra": 1}),
+                })
+                .is_err()
+        );
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
     }
 
     #[test]
