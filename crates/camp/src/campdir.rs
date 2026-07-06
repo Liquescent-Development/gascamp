@@ -14,6 +14,10 @@ impl CampDir {
         self.root.join("camp.db")
     }
 
+    pub fn config_path(&self) -> PathBuf {
+        self.root.join("camp.toml")
+    }
+
     pub fn resolve(flag: Option<&Path>) -> Result<CampDir> {
         if let Some(dir) = flag {
             return Self::at(dir);
