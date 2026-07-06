@@ -123,6 +123,7 @@ fn bead_created(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         "INSERT INTO search (bead_id, kind, content) VALUES (?1, 'body', ?2)",
         params![id, format!("{}\n{}", p.title, p.description)],
     )?;
+    crate::id::bump_counter(conn, id)?;
     Ok(())
 }
 

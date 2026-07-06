@@ -5,6 +5,7 @@ pub mod clock;
 pub mod config;
 pub mod error;
 pub mod event;
+pub mod id;
 pub mod ledger;
 pub mod vocab;
 

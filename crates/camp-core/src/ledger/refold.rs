@@ -51,6 +51,11 @@ const STATE_TABLES: &[TableSpec] = &[
         cols: "bead_id, kind, content",
         key: "bead_id || '/' || kind",
     },
+    TableSpec {
+        name: "counters",
+        cols: "prefix, high",
+        key: "prefix",
+    },
 ];
 
 impl Ledger {

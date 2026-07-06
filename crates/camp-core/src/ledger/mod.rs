@@ -82,6 +82,11 @@ impl Ledger {
         Ok(seqs)
     }
 
+    /// The next unused bead id for `prefix` (spec §12). See `camp_core::id`.
+    pub fn next_bead_id(&self, prefix: &str) -> Result<String, CoreError> {
+        crate::id::next_bead_id(&self.conn, prefix)
+    }
+
     /// Events with `from <= seq <= to` (unbounded above when `to` is None),
     /// in seq order.
     pub fn events_range(&self, from: Seq, to: Option<Seq>) -> Result<Vec<Event>, CoreError> {
@@ -155,7 +160,7 @@ mod tests {
         assert_eq!(fk, 1);
 
         for table in [
-            "meta", "events", "beads", "deps", "sessions", "cursors", "search",
+            "meta", "events", "beads", "deps", "sessions", "cursors", "search", "counters",
         ] {
             let n: i64 = conn
                 .query_row(
@@ -354,6 +359,73 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(seqs, vec![1, 2]);
+    }
+
+    #[test]
+    fn next_bead_id_starts_at_one_and_follows_creates() {
+        let (_dir, mut ledger) = temp_ledger();
+        assert_eq!(ledger.next_bead_id("gc").unwrap(), "gc-1");
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        assert_eq!(ledger.next_bead_id("gc").unwrap(), "gc-2");
+        ledger
+            .append(created("gc-2", serde_json::json!({"title": "two"})))
+            .unwrap();
+        assert_eq!(ledger.next_bead_id("gc").unwrap(), "gc-3");
+        // per-prefix, independent
+        assert_eq!(ledger.next_bead_id("t3").unwrap(), "t3-1");
+        // the counter is folded state
+        let high: i64 = ledger
+            .conn
+            .query_row("SELECT high FROM counters WHERE prefix = 'gc'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(high, 2);
+    }
+
+    #[test]
+    fn rolled_back_create_does_not_bump_the_counter() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        // duplicate id: whole txn rolls back, counter must stay at 1
+        assert!(
+            ledger
+                .append(created("gc-1", serde_json::json!({"title": "dup"})))
+                .is_err()
+        );
+        assert_eq!(ledger.next_bead_id("gc").unwrap(), "gc-2");
+    }
+
+    #[test]
+    fn counters_are_refold_exact() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(created("gc-2", serde_json::json!({"title": "two"})))
+            .unwrap();
+        assert!(ledger.refold_check().unwrap().drift.is_empty());
+        // tamper the counter, refold must catch it, repair must fix it
+        ledger
+            .conn
+            .execute("UPDATE counters SET high = 99 WHERE prefix = 'gc'", [])
+            .unwrap();
+        assert!(
+            ledger
+                .refold_check()
+                .unwrap()
+                .drift
+                .iter()
+                .any(|d| d.table == "counters")
+        );
+        ledger.refold_repair().unwrap();
+        assert_eq!(ledger.next_bead_id("gc").unwrap(), "gc-3");
+        assert_eq!(count(&ledger, "SELECT count(*) FROM counters"), 1);
     }
 
     fn woke(name: &str) -> EventInput {
