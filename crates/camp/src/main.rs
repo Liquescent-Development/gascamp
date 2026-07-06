@@ -2,6 +2,8 @@
 
 mod campdir;
 mod cmd {
+    pub mod claim;
+    pub mod close;
     pub mod create;
     pub mod doctor;
     pub mod events;
@@ -85,6 +87,25 @@ enum Command {
         #[arg(long)]
         assignee: Option<String>,
     },
+    /// Claim a bead for a session (open → in_progress)
+    Claim {
+        /// Bead id
+        bead: String,
+        /// Claiming session name
+        #[arg(long)]
+        session: String,
+    },
+    /// Close a bead with an outcome
+    Close {
+        /// Bead id
+        bead: String,
+        /// Outcome
+        #[arg(long, value_parser = ["pass", "fail"])]
+        outcome: String,
+        /// Close note (searchable)
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -152,6 +173,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::create::run(&camp, title, rig, description, needs, labels, bead_type, assignee)
+        }
+        Command::Claim { bead, session } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::claim::run(&camp, bead, session)
+        }
+        Command::Close {
+            bead,
+            outcome,
+            reason,
+        } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::close::run(&camp, bead, outcome, reason)
         }
     }
 }
