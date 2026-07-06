@@ -518,8 +518,10 @@ Three mechanisms, all push, all mechanical:
    free) and by any ledger event from that session. Tool-level detail
    thus stays out of the event log (§7.6) while patrol still sees every
    heartbeat. Timer fires → `agent.stalled` event → the agent
-   definition's policy ladder executes: `nudge` (resume the session with a
-   status-request turn), then `restart` (kill, respawn, re-hook the bead)
+   definition's policy ladder executes: `nudge` (a status-request turn —
+   delivered live over stdin when campd spawned the worker in stream-json
+   input mode, per the A4 resolution in §17, otherwise via session
+   resume), then `restart` (kill, respawn, re-hook the bead)
    with exponential backoff and a bounded budget. Safe because the bead is
    the work; the session is disposable.
 3. **Escalation to judgment is pack content, not Rust:** an order matching
@@ -705,20 +707,44 @@ tunes UX rather than structure:
 - **A1 — teammate interaction mechanics.** Assumed: the user can select an
   attended teammate in the Claude Code TUI and converse mid-run. Fallback
   if weaker than assumed: Tier-0 spawns headless + instant attach.
+  *Resolved 2026-07-06 — holds (claude 2.1.201):* the agent panel lists
+  teammates; arrow-select + Enter messages one directly; a mid-run message
+  is delivered at the teammate's next step boundary and answered without a
+  restart (delivery is not preemption — the agent chooses when to act).
+  Fallback not needed. Evidence:
+  `docs/design/2026-07-06-assumption-findings.md`.
 - **A2 — teammate working directory.** Assumed unresolved whether a
   teammate can run with cwd in a different repo than the session. Camp
   already routes cross-rig work headless by default (§12), so this only
   affects whether *same-rig* attended work in a multi-rig camp can be a
   teammate.
+  *Resolved 2026-07-06 — weaker:* a teammate's cwd is pinned to the parent
+  session's directory; no per-agent cwd exists. Cross-repo access is
+  file-level only (`--add-dir`; headless writes additionally need
+  `acceptEdits`). §12's headless routing for cross-rig work is therefore
+  required, not provisional; same-rig attended teammates are unaffected.
+  Evidence: findings doc above.
 - **A3 — no dependence on harness team persistence.** Camp deliberately
   assumes Claude Code team/task state does **not** survive restarts; the
   ledger is the only durability. If the harness persists more, camp gets
   free UX, not changed semantics.
+  *Resolved 2026-07-06 — holds:* harness task state is per-session
+  (resume-scoped); team config is removed at session end, and a live team
+  could not be carried across a restart in testing. Backgrounded sessions
+  (`claude attach <id>`) are free reachability UX, not shared state.
+  Evidence: findings doc above.
 - **A4 — headless mid-run conversation.** Assumed: conversation with a
   running headless worker is tail-the-transcript now, converse via resume
   after its current turn. If input streaming into a live headless session
   is available, the patrol nudge action (§10) gains a live path instead of
   waiting for the turn boundary.
+  *Resolved 2026-07-06 — stronger:* tail-now and resume-after both hold
+  (resume keeps the session id and appends to the same transcript), and
+  live input **is** available — a `claude -p --input-format stream-json`
+  worker accepts additional user turns over stdin mid-lifetime, so §10's
+  nudge gains the live path for campd-spawned workers. Concurrent resume
+  against a live session also works. Dispatch mechanics for Phase 8 are
+  pinned as fixture facts F1–F7 in the findings doc above.
 - **Upstream proposal, independent of camp:** propose write-event emission
   to beads upstream — a bd that pushes mutation events would let Gas
   City's controller subscribe instead of poll, attacking the standing tax

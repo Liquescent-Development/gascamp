@@ -21,7 +21,7 @@ tools-reference), retrieved 2026-07-06.
 |---|---|---|---|
 | F1 | Session id assignment for `claude -p` | **campd can pre-assign**: `--session-id <uuid>` is accepted and the result envelope echoes the identical id — the registry row can be written *before* exec (registry-at-birth holds). Without the flag, the harness assigns one, reported in the envelope. | D2 (below); cli-reference.md "`--session-id <uuid>` — Use specific session ID" |
 | F2 | Result envelope (`--output-format json`) | A JSON **array** of message objects (docs describe a single object — observed reality is an array). Element types observed: `system/init`, `system/thinking_tokens`, `assistant`, `rate_limit_event`, `result`. Parse rule: the element with `type=="result"` (last), whose keys are: `api_error_status, duration_api_ms, duration_ms, fast_mode_state, is_error, modelUsage, num_turns, permission_denials, result, session_id, stop_reason, subtype, terminal_reason, time_to_request_ms, total_cost_usd, ttft_ms, ttft_stream_ms, type, usage, uuid`. | D1 (below) |
-| F3 | Transcript path scheme | `~/.claude/projects/<munge(cwd)>/<session-id>.jsonl`, where `munge` replaces **every non-alphanumeric character with `-`** (verified against a cwd containing `/`, `-`, `.`; lossy but forward-computable). Format: JSONL, one object per line (queue-operations, hook attachments, messages). Overrides: `CLAUDE_CONFIG_DIR` moves the root; **`cleanupPeriodDays` (default 30) eventually deletes transcripts** — "transcript persists forever" is bounded by the user's retention setting. Worktree-cwd spawns land under a per-worktree project dir (verified with a second rig, A2-1) — patrol must compute the watch path from the *worker's* cwd. | D3, A2-1 (below); sessions.md "Where transcripts are stored" |
+| F3 | Transcript path scheme | `~/.claude/projects/<munge(cwd)>/<session-id>.jsonl`, where `munge` replaces **every non-alphanumeric character with `-`** (per sessions.md; verified here for `/` and `-` against a dash-heavy cwd; lossy but forward-computable). Format: JSONL, one object per line (queue-operations, hook attachments, messages). Overrides: `CLAUDE_CONFIG_DIR` moves the root; **`cleanupPeriodDays` (default 30) eventually deletes transcripts** — "transcript persists forever" is bounded by the user's retention setting. Worktree-cwd spawns land under a per-worktree project dir (verified with a second rig, A2-1) — patrol must compute the watch path from the *worker's* cwd. | D3, A2-1 (below); sessions.md "Where transcripts are stored" |
 | F4 | Exit codes | success `0` · CLI usage error `1` (`error: unknown option …`) · resume of unknown id `1` (`No conversation found with session ID: …`) · SIGTERM `143` · SIGKILL `137` · **denied/blocked tool call: still `0`** with `is_error:false` — denials populate the envelope's `permission_denials` array (tool_name, tool_use_id, tool_input) instead of failing the process. SIGCHLD mapping for campd: nonzero/signal ⇒ `session.crashed`; exit 0 ⇒ `session.stopped`; a *denial* is not a crash — worker failure routing must come from the worker contract (close events) and envelope parsing, not the exit code. | D4 (below) |
 | F5 | Child stdin handling | Piped stdin is read as prompt input; `< /dev/null` works. **An open non-pipe stdin costs 3 s**: `Warning: no stdin data received in 3s, proceeding without it.` campd must spawn workers with stdin at `/dev/null` — except stream-json workers, where campd deliberately holds the stdin pipe (see A4). | D5, A4-2 warning (below) |
 | F6 | `--resume` semantics | Same session id (envelope echoes it), **appends to the same transcript file** (observed 28 → 35 lines), full context available (codeword recalled). Forking is a separate explicit flag (`--fork-session`). Registry rows therefore stay valid across nudges — no id churn. | A4-2 (below); sessions.md "Resume a session" |
@@ -84,23 +84,45 @@ claude -p 'Reply with exactly: NULLSTDIN-OK' … < /dev/null             → res
 Claude Code TUI and converse mid-run. Decided fallback if weaker: Tier-0
 spawns headless + instant attach.
 
-**Observed (docs so far; TUI check pending):** agent-teams.md ("Control
-your agent team") documents exactly the assumed affordance:
+**Observed:** the docs and the operator's TUI run agree. agent-teams.md
+("Control your agent team") documents the affordance:
 
 > "The lead's terminal lists teammates in the agent panel below the prompt
 > input. From the panel: Up and down arrows: select a teammate · Enter:
 > open the selected teammate's transcript and message it directly ·
 > Escape: interrupt the selected teammate's current turn"
 
-Whether a message sent mid-turn is *delivered* mid-turn or queues until the
-teammate's turn boundary is **not documented** — that is the operator
-check (protocol M1).
+Operator check M1 (2026-07-06): a teammate `probe-mate` running five
+sequential announced 20 s sleeps was selectable in the agent panel; the
+operator opened it and sent "Also report the current step number." while
+it was mid-task. The message appears in probe-mate's transcript **between
+step 1 and step 2** — delivered into the running conversation at the next
+step boundary, not held until the task ended — and probe-mate answered it
+without being restarted (its report includes "The current step number is
+5 — the final step, now complete"). After finishing, the teammate stays
+idle-but-alive and can take follow-up messages.
 
-**Evidence:** agent-teams.md citation above; operator report pending.
+The one undocumented nuance, now pinned: **mid-run delivery is not
+preemption.** The message lands at the teammate's next step boundary and
+the *agent* chooses when to act on it — in the observed run it
+acknowledged at task end. Operator's words: "it queued my message to the
+probe-mate and then ran it at the first chance after it was working."
 
-**Verdict:** PENDING OPERATOR
+**Evidence:** agent-teams.md citation above; operator transcripts (lead +
+probe-mate) reported verbatim in the working session, key lines
+reproduced here:
+probe-mate transcript order was `Bash(echo PROBE-STEP-1 && sleep 20)` →
+`❯ Also report the current step number.` → `Bash(echo PROBE-STEP-2 …)` →
+… → final summary answering the question.
 
-**Spec impact:** PENDING OPERATOR
+**Verdict:** holds
+
+**Spec impact:** none structural — §17 A1 is resolved as holds in this PR;
+§8.4's one-surface-exception (attended Tier-0 as teammate) stands and the
+decided fallback is not needed. One behavior note for pack authors and
+§10: a message to an attended teammate is delivered at its next step
+boundary and answered at the agent's discretion — consistent with patrol's
+annotate-only rule for attended sessions.
 
 ## A2 — Teammate working directory across repos
 
@@ -109,7 +131,18 @@ a different repo than the session. Camp already routes cross-rig work
 headless by default (§12), so this only affects whether *same-rig* attended
 work in a multi-rig camp can be a teammate.
 
-**Observed (scripted half; TUI check pending):**
+**Observed:**
+
+- Operator check M2 (2026-07-06): a teammate `cross-mate`, spawned from a
+  session whose cwd was rig-a and tasked with reporting `pwd` and writing
+  a file into rig-b, reported
+  `pwd = …/phase2/rig-a` — **its cwd was the parent session's, not the
+  target repo's** — while the rig-b write itself succeeded as file-level
+  access (the attended session's permission classifier auto-allowed it;
+  transcript line: "Allowed by auto mode classifier"). No affordance
+  re-rooted the teammate into the other repo.
+
+The scripted half agrees:
 
 - No per-agent cwd exists: sub-agents.md — "A subagent starts in the main
   conversation's current working directory"; the Agent tool has no cwd
@@ -142,10 +175,21 @@ A2-3 (subagent pwd): "/…/phase2/rig-a" — inherits parent session cwd
 
 Docs citations: sub-agents.md "Manage subagent context";
 permissions.md "Working directories"; tools-reference.md "Agent tool behavior".
+Operator transcripts (lead + cross-mate) reported verbatim in the working
+session; the load-bearing lines are reproduced above.
 
-**Verdict:** PENDING OPERATOR
+**Verdict:** weaker
 
-**Spec impact:** PENDING OPERATOR
+**Spec impact:** a teammate cannot run with cwd in a different repo than
+the session — the open question §17 left is now answered on the
+restrictive branch. Structure is unchanged by design: §12 already routes
+cross-rig work to campd-spawned headless sessions "regardless of how
+assumption A2 resolves," so that default is now *required* rather than
+provisional; same-rig attended teammates (the only case §17 said this
+affects) work exactly as designed. Cross-repo *file* access exists for
+teammates (absolute paths under an approving permission mode; headless:
+`--add-dir` + `acceptEdits`) but does not substitute for per-rig cwd.
+§17's A2 bullet is resolved accordingly in this PR.
 
 ## A3 — No dependence on harness team persistence
 
@@ -169,19 +213,35 @@ on even if it wanted to:
   full session id appeared under `~/.claude/tasks/`.
 - Resume probe A3-3: resuming session 1 by id found and deleted the task
   (`CLEANED`) — persistence serves *resumed* sessions only.
+- Operator check M3 (TUI restart, 2026-07-06): exiting a session with a
+  teammate still registered offers `Exit anyway / Move to background and
+  exit / Stay`. "Move to background" preserved the subagent as an
+  attachable background session (`claude agents`, `claude attach <id>`,
+  `claude logs <id>`, `claude stop <id>`), **but the TUI reported "1 team
+  couldn't be moved and was stopped"** — the team itself did not survive.
+  A fresh session's agents list (left arrow) shows prior/backgrounded
+  agents as dormant "send a prompt to start" entries — recoverable
+  *conversation contexts*, not a running team or a shared task store.
 
-**Evidence:** probe outputs quoted above; agent-teams.md "Architecture":
+**Evidence:** probe outputs quoted above; operator M3 report (verbatim in
+the working session) summarized in the bullet above; agent-teams.md
+"Architecture":
 "The team config directory is removed when the session ends. The task list
 directory persists locally … so resumed sessions keep their tasks."
-Operator check M3 (TUI restart) pending as confirmation; it cannot weaken
-this verdict — camp's assumption is about *non-dependence*, and no
-cross-session discovery mechanism exists to depend on.
+M3 confirms rather than weakens the verdict — camp's assumption is about
+*non-dependence*, and even the richest persistence UX observed
+(backgrounded sessions) preserves individual contexts while the team was
+explicitly stopped; no cross-session discovery mechanism exists to depend
+on.
 
 **Verdict:** holds
 
-**Spec impact:** none — §17 confirmed as written. The "free UX" upside is
-real but resume-scoped: a camp registry row's session id is enough to
-recover a worker's harness-side task state along with its conversation.
+**Spec impact:** none — §17 confirmed as written (resolution recorded in
+this PR). The "free UX" upside is real but resume-scoped: a camp registry
+row's session id is enough to recover a worker's harness-side task state
+along with its conversation, and backgrounded interactive sessions add
+`claude attach <id>` alongside `claude --resume` in §7.4's reachability
+ladder.
 
 ## A4 — Headless mid-run conversation
 
