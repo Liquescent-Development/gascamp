@@ -21,6 +21,7 @@ pub enum EventType {
     SessionCrashed,
     CampdStarted,
     CampdStopped,
+    RigAdded,
 }
 
 impl EventType {
@@ -34,6 +35,7 @@ impl EventType {
         EventType::SessionCrashed,
         EventType::CampdStarted,
         EventType::CampdStopped,
+        EventType::RigAdded,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -47,6 +49,7 @@ impl EventType {
             EventType::SessionCrashed => "session.crashed",
             EventType::CampdStarted => "campd.started",
             EventType::CampdStopped => "campd.stopped",
+            EventType::RigAdded => "rig.added",
         }
     }
 
@@ -159,5 +162,11 @@ mod tests {
     #[test]
     fn unknown_event_type_is_an_error() {
         assert!(EventType::parse("bogus.event").is_err());
+    }
+
+    #[test]
+    fn rig_added_round_trips_through_its_name() {
+        assert_eq!(EventType::parse("rig.added").unwrap(), EventType::RigAdded);
+        assert_eq!(EventType::RigAdded.as_str(), "rig.added");
     }
 }

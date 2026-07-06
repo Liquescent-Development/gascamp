@@ -706,6 +706,35 @@ mod tests {
     }
 
     #[test]
+    fn rig_added_is_validated_and_log_only() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(EventInput {
+                kind: EventType::RigAdded,
+                rig: Some("gascity".into()),
+                actor: "cli".into(),
+                bead: None,
+                data: serde_json::json!({"path": "/code/gascity", "prefix": "gc"}),
+            })
+            .unwrap();
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+        assert_eq!(count(&ledger, "SELECT count(*) FROM beads"), 0);
+        // malformed payload fails fast, appends nothing
+        assert!(
+            ledger
+                .append(EventInput {
+                    kind: EventType::RigAdded,
+                    rig: Some("x".into()),
+                    actor: "cli".into(),
+                    bead: None,
+                    data: serde_json::json!({"path": "/p", "prefix": "x", "extra": 1}),
+                })
+                .is_err()
+        );
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+    }
+
+    #[test]
     fn campd_lifecycle_events_are_log_only() {
         let (_dir, mut ledger) = temp_ledger();
         ledger

@@ -21,6 +21,7 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::SessionWoke => session_woke(conn, event),
         EventType::SessionStopped => session_ended(conn, event, "stopped"),
         EventType::SessionCrashed => session_ended(conn, event, "crashed"),
+        EventType::RigAdded => rig_added(event),
         // Log-only events: no state effect.
         EventType::CampdStarted | EventType::CampdStopped => Ok(()),
     }
@@ -231,6 +232,27 @@ fn bead_closed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
             Ok(())
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RigAdded {
+    path: String,
+    prefix: String,
+}
+
+/// `rig.added` is log-only: rigs live in camp.toml (decision D). The fold
+/// validates the audit payload shape and the rig name so a malformed config
+/// event fails fast.
+fn rig_added(event: &Event) -> Result<(), CoreError> {
+    if event.rig.is_none() {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: "missing rig name".to_owned(),
+        });
+    }
+    let _p: RigAdded = payload(event)?;
+    Ok(())
 }
 
 fn rewrite_body_search_row(conn: &Connection, id: &str) -> Result<(), CoreError> {

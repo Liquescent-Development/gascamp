@@ -16,7 +16,8 @@ pub const GC_MIRRORED_EVENTS: &[&str] = &[
 ];
 
 /// Camp-specific names — additive; never redefinitions of gc names.
-pub const CAMP_SPECIFIC_EVENTS: &[&str] = &["bead.claimed", "campd.started", "campd.stopped"];
+pub const CAMP_SPECIFIC_EVENTS: &[&str] =
+    &["bead.claimed", "campd.started", "campd.stopped", "rig.added"];
 
 /// Values `bead.closed` accepts for `outcome` — a strict subset of gc's
 /// outcome vocabulary (spec §8.2).
