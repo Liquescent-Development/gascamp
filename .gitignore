@@ -4,3 +4,9 @@
 # This workspace ships a binary: the lockfile is committed for reproducible
 # builds (overrides the machine-global ignore of Cargo.lock).
 !Cargo.lock
+
+# Project Claude Code config (skill, hooks, settings) is versioned
+# (overrides the machine-global ignore of .claude/); per-user local
+# overrides stay out.
+!.claude/
+.claude/settings.local.json
