@@ -133,16 +133,8 @@ fn create_label_and_type_round_trip_through_show() {
     camp()
         .current_dir(dir.path())
         .args([
-            "create",
-            "a memory",
-            "--rig",
-            "gascity",
-            "--type",
-            "memory",
-            "--label",
-            "note",
-            "--label",
-            "idea",
+            "create", "a memory", "--rig", "gascity", "--type", "memory", "--label", "note",
+            "--label", "idea",
         ])
         .assert()
         .success()

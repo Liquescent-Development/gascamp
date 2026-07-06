@@ -31,6 +31,21 @@ pub fn add(
     validate_prefix(&prefix).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let config_path = camp.config_path();
+
+    // Serialize the whole check → append-event → write critical section
+    // against other `rig add` processes with an exclusive advisory lock on
+    // camp.toml (decision H). Without it, two concurrent adds could both pass
+    // the duplicate check, both emit rig.added, then clobber each other's
+    // camp.toml write — losing a rig from the source-of-truth file. The lock
+    // is held across the load, so the loser re-reads the winner's rig and
+    // fails its duplicate check cleanly. Advisory locks release on drop /
+    // process exit, so a crash never leaves a stuck lock (crash-only design).
+    let lock_file = std::fs::File::open(&config_path)
+        .with_context(|| format!("cannot open {} to lock it", config_path.display()))?;
+    lock_file
+        .lock()
+        .with_context(|| format!("cannot acquire exclusive lock on {}", config_path.display()))?;
+
     let config = CampConfig::load(&config_path)?;
     if config.rigs.iter().any(|r| r.name == name) {
         bail!("a rig named {name:?} already exists");
@@ -54,6 +69,7 @@ pub fn add(
         data: serde_json::json!({ "path": abs, "prefix": prefix }),
     })?;
     append_rig_toml(&config_path, &rig)?;
+    drop(lock_file); // release only after the write has landed
 
     println!("added rig {name} ({prefix}) -> {}", abs.display());
     Ok(())

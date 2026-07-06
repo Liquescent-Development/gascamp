@@ -92,3 +92,41 @@ fn bad_prefix_is_rejected() {
         .failure()
         .code(1);
 }
+
+/// Two distinct rigs both persist through the locked read-modify-write path
+/// (decision H) — the second add appends without clobbering the first.
+#[test]
+fn two_distinct_rigs_both_persist() {
+    let (dir, rig_dir) = camp_with_rig_dir();
+    let rig_dir2 = dir.path().join("second");
+    std::fs::create_dir_all(&rig_dir2).unwrap();
+    camp()
+        .current_dir(dir.path())
+        .args(["rig", "add"])
+        .arg(&rig_dir)
+        .args(["--prefix", "gc", "--name", "gascity"])
+        .assert()
+        .success();
+    camp()
+        .current_dir(dir.path())
+        .args(["rig", "add"])
+        .arg(&rig_dir2)
+        .args(["--prefix", "t3", "--name", "tools"])
+        .assert()
+        .success();
+
+    let toml = std::fs::read_to_string(dir.path().join(".camp/camp.toml")).unwrap();
+    for needle in ["gascity", "tools", "gc", "t3"] {
+        assert!(
+            toml.contains(needle),
+            "camp.toml missing {needle:?}: {toml}"
+        );
+    }
+    camp()
+        .current_dir(dir.path())
+        .args(["rig", "ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("gascity"))
+        .stdout(predicates::str::contains("tools"));
+}
