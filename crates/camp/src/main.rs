@@ -2,6 +2,7 @@
 
 mod campdir;
 mod cmd {
+    pub mod create;
     pub mod doctor;
     pub mod events;
     pub mod init;
@@ -61,6 +62,29 @@ enum Command {
         #[command(subcommand)]
         command: RigCommand,
     },
+    /// Create a bead in the ledger
+    Create {
+        /// Bead title
+        title: String,
+        /// Rig (default: the only configured rig)
+        #[arg(long)]
+        rig: Option<String>,
+        /// Longer description
+        #[arg(long)]
+        description: Option<String>,
+        /// A bead this one depends on (repeatable)
+        #[arg(long = "needs")]
+        needs: Vec<String>,
+        /// A label (repeatable)
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        /// Bead type (task|mail|memory; default task)
+        #[arg(long = "type")]
+        bead_type: Option<String>,
+        /// Routing hint to a pack agent
+        #[arg(long)]
+        assignee: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -116,6 +140,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 } => cmd::rig::add(&camp, path, prefix, name),
                 RigCommand::Ls { json } => cmd::rig::ls(&camp, json),
             }
+        }
+        Command::Create {
+            title,
+            rig,
+            description,
+            needs,
+            labels,
+            bead_type,
+            assignee,
+        } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::create::run(&camp, title, rig, description, needs, labels, bead_type, assignee)
         }
     }
 }
