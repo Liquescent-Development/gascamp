@@ -126,9 +126,7 @@ fn bead_created(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Values `bead.closed` accepts for `outcome` — camp's vocabulary is a strict
-/// subset of gc's (spec §8.2); vocab tests pin this against the gc reference.
-pub(crate) const CAMP_OUTCOMES: &[&str] = &["pass", "fail"];
+use crate::vocab::CAMP_OUTCOMES;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

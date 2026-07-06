@@ -5,6 +5,7 @@ pub mod clock;
 pub mod error;
 pub mod event;
 pub mod ledger;
+pub mod vocab;
 
 /// Monotonic event sequence number (the `events.seq` column).
 pub type Seq = i64;
