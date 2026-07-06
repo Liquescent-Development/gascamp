@@ -10,6 +10,7 @@ mod cmd {
     pub mod init;
     pub mod ls;
     pub mod rig;
+    pub mod show;
 }
 
 use std::path::PathBuf;
@@ -122,6 +123,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show a bead's current state and full event history
+    Show {
+        /// Bead id
+        bead: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -210,6 +216,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::ls::run(&camp, ready, mine, rig, json)
+        }
+        Command::Show { bead } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::show::run(&camp, bead)
         }
     }
 }
