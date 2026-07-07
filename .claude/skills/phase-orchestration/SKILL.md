@@ -26,8 +26,11 @@ never enters it.
   PR, or a PR comment. Nothing load-bearing may live only in your context:
   a replacement lead must be able to take over from `gh pr list` + the
   orchestration guide alone.
-- You never merge. The operator reviews and merges every PR, and approves
-  every phase plan (master plan decisions 10 and 11 as amended).
+- You never merge. The operator reviews and merges every PR and retains
+  override authority over every gate. Phase plans are approved by the
+  dispatched Opus 4.8 plan reviewer (master plan decision 10 as amended
+  2026-07-07, operator directive), with operator involvement by
+  escalation only; sequencing follows decision 11 as amended.
 
 ## Phase lifecycle — run this checklist per phase
 
@@ -38,9 +41,32 @@ never enters it.
    and `{PARALLEL_NOTE}` (in-flight siblings, their files, worktree
    instruction — or the runs-alone line). Parallel siblings must be
    isolated per the guide's worktree conventions.
-3. **Plan gate (decision 10):** the teammate's first deliverable is its
-   execution-ready plan doc, then it stops. Relay the doc path to the
-   operator. Do not authorize execution until the operator approves.
+3. **Plan gate — auto plan review (decision 10 as amended 2026-07-07,
+   operator directive):** the teammate's first deliverable is still its
+   execution-ready plan doc, then it stops. The moment the doc path
+   arrives, dispatch an Opus 4.8 plan-review subagent — read-only,
+   isolated worktree, never posts to GitHub — with the plan doc path, the
+   phase's master-plan contract section, the spec, and the orchestration
+   guide named as context. It judges: does the plan satisfy the phase
+   contract (files, interfaces, semantics, test obligations, exit
+   criteria); does it respect merged-phase interfaces; are flagged
+   contract deviations justified and additive; is the TDD task structure
+   execution-ready. The verdict is binary — APPROVE (non-blocking notes
+   are relayed with the approval but do not gate) or REJECT with
+   concrete, actionable findings. Relay the verdict to the teammate
+   directly; no operator round-trip. A rejected plan loops — teammate
+   revises, a fresh reviewer pass judges the revision — until APPROVE.
+   You never substitute your own judgment for the reviewer's and never
+   skip the review: not for a small phase, not when the operator is away,
+   not under schedule pressure. Durability: your APPROVE relay instructs
+   the teammate to record the approval note (date, verdict, non-blocking
+   notes, any deviations the reviewer accepted) at the top of its plan
+   doc in its first execution commit, so the verdict lives in the
+   committed doc where a replacement lead will find it — never only in
+   your context. Operator involvement is by escalation only: a plan
+   proposing a spec edit, anything spending real API money, a
+   reviewer/teammate deadlock after two reject rounds, or the operator
+   asking. The operator retains override authority at all times.
 4. **Execution:** stay out of the way. Track one-line status via the task
    list. If the teammate reports a spec divergence, escalate immediately —
    spec edits are serialized through the operator.
@@ -66,9 +92,13 @@ never enters it.
 
 ## Escalation — always operator-bound
 
-Plan approvals · PR review/merge · spec divergences (and ordering when two
+Plan-gate escalations — a plan proposing a spec edit, a reviewer/teammate
+deadlock after two reject rounds, the operator asking (plan approval
+itself belongs to the Opus 4.8 reviewer; decision 10 as amended
+2026-07-07) · PR review/merge · spec divergences (and ordering when two
 phases both need spec edits) · manual TUI verification · teammates blocked
-on judgment · anything spending real API money (Phase 15's e2e run).
+on judgment · anything spending real API money (Phase 15's e2e run, or a
+plan proposing real API spend).
 
 ## Recovery — if you are a fresh lead
 
@@ -88,3 +118,4 @@ kickoff prompts — branches, plan docs, and PRs carry all real state.
 | "I'll remember this decision" | You won't survive a restart (A3 finding). Write it to a PR comment. |
 | "I'll paraphrase the kickoff" | Blocks are verbatim. If a block is wrong, fix it via PR. |
 | "This PR is clean, skip the review" | Every phase PR gets the Opus 4.8 review before presentation. Standing order — the operator decides on findings, not you. |
+| "The plan looks fine, I'll approve it myself / skip the plan review" | Plan approval is the Opus 4.8 plan reviewer's verdict, never yours (decision 10 as amended 2026-07-07). Dispatch the review; relay the verdict. |
