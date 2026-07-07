@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Plan approved by Opus 4.8 plan review, 2026-07-07 (automated plan gate per operator directive).** Binding rulings: Decision B ACCEPTED; Decision C ACCEPTED (factor `append_batch`'s per-input body into a shared private `insert_and_fold`); Decision L REJECTED — positional parameters, no `LoopCtx`, Poke-arm swap kept to one line, `CONFIG_WATCH = Token(1)` with connection tokens from 2 (Phase 8 allocates its SIGCHLD token around it); Decision E — proceed with the hard-coded `orders::formula_path` convention, the spec-text edit is ON HOLD pending the operator's answer (spec edits stay serialized). Reviewer corrections applied: Task 10.6's expected cursor values (`process_past_cursor` drains same-transaction appends in the same call: `end == 2`, `cursor == 2`) and Task 10.10's fixpoint wording (appended events drain in the SAME `catch_up` pass).
+
 **Goal:** Spec §9: cron- and event-triggered formulas driven by a timer heap (a timer, never a tick). campd sleeps until the earliest cron deadline (idle heap = infinite poll wait), event orders evaluate on the same post-commit processing path as readiness (zero standing cost), wall-clock jumps recompute deadlines with a bounded catch-up policy, camp.toml is watched via `notify` and hot-reloads with a `config.changed` event, `camp order ls` / `camp order run <name>` expose the surface, and the optional launchd agent ships as an example plist with the honest away-mode limits documented.
 
 **Architecture:** camp-core gains `orders/{mod,parse,cron}.rs`: a self-contained 5-field cron engine on jiff (parse + timezone-aware `next_after`), the `CronHeap` (min-heap of next fire times with the catch-up-window policy), `[[order]]` config compilation with errors that name the order and the field, and the fire pipeline. Every fire — cron, event, or manual — is one durable `order.fired` event; campd's event processor reacts to `order.fired` by cooking the formula (Phase 5's `cook`), so away-mode, event triggers, and `camp order run` are literally one code path. Completion is mechanical: when the root bead of an order-cooked run closes, the processor appends `order.completed`/`order.failed` in the same transaction as the cursor advance. The camp binary gains `daemon/orders.rs` (runtime state: compiled orders, heap, reload) and extends the Phase 7 event loop: `poll_timeout` becomes the heap's next deadline, a notify→mio self-pipe wakes the loop on camp.toml edits, and each wake compares expected vs actual wall time to recompute after jumps.
@@ -13,7 +15,7 @@
 Copied from AGENTS.md, the master plan, and the operator's standing rules. Every task's requirements implicitly include this section.
 
 - **Spec is authoritative:** `docs/design/2026-07-05-gas-camp-design.md`; its §4 decision record is settled. If implementation reality contradicts the spec, stop and update the spec via PR in the same change (this plan carries one such edit — Decision E; spec edits are serialized through the lead).
-- **Master plan contract:** `docs/superpowers/plans/2026-07-05-gas-camp-v1-implementation.md`, section "Phase 10 — Orders (`phase-10-orders`)". Files, interfaces, semantics, test list, and exit criteria are binding. Two documented interface refinements need operator sign-off at plan approval (Decision B and Decision C).
+- **Master plan contract:** `docs/superpowers/plans/2026-07-05-gas-camp-v1-implementation.md`, section "Phase 10 — Orders (`phase-10-orders`)". Files, interfaces, semantics, test list, and exit criteria are binding. The two documented interface refinements (Decisions B and C) were ACCEPTED at the 2026-07-07 plan review.
 - **Invariant 1 — the soul of this phase:** the cron machinery is a timer heap, never a tick. `CronHeap::next_deadline()` is the poll timeout; an empty heap means `None` = infinite wait; no timeout-driven code path exists that isn't an armed timer. No sleeps, no polling loops, anywhere (test harnesses excepted, per Phase 7 precedent).
 - **Event orders add no standing cost:** the pattern match runs once per committed event on the same post-commit processing path as readiness (spec §7.3/§9), inside the campd cursor's exactly-once transaction machinery.
 - **Every campd action is an event with its cause (spec §13.3):** `order.fired` carries its trigger (`cron` + scheduled time, `event` + cause seq, or `manual`); cook events carry actor `order:<name>:<fired-seq>`; completion events carry the order, the run, and the outcome.
@@ -39,7 +41,7 @@ Copied from AGENTS.md, the master plan, and the operator's standing rules. Every
 
 ## Plan-Time Decision Log
 
-Decisions made while writing this plan. **B, C, and E refine or extend the master-plan contract and need operator sign-off at plan approval.** The rest are implementation choices inside the contract.
+Decisions made while writing this plan, with the 2026-07-07 plan-review rulings folded in. **B and C (contract refinements) are ACCEPTED; L's original form is REJECTED (positional-parameter fallback adopted below); E's code convention proceeds with the spec-text edit ON HOLD pending the operator.** The rest are implementation choices inside the contract.
 
 - **A. Cron engine in-house on jiff — no cron crate.** External cron crates (`cron`, `croner`) pull chrono as a second time library next to jiff and don't produce errors that name the cron field. The 5-field engine (minute, hour, day-of-month, month, day-of-week; `*`, lists, ranges, steps; numeric values only — no month/day names in v1, rejected with a clear error) is ~200 lines with an exhaustive table test. Vixie-cron semantics where defined: when **both** day-of-month and day-of-week are restricted, a day matches if **either** matches (the classic OR rule); `7` in day-of-week normalizes to `0` (Sunday).
 - **B. `fire_due` returns `Vec<Fire>`, not the master plan's `Vec<&Order>` (operator sign-off).** The `order.fired` event must record the *scheduled* fire time and whether the fire is a late catch-up — an `&Order` alone cannot carry that. `pub struct Fire { pub order: String, pub scheduled: Timestamp, pub catch_up: bool }` preserves the pinned shape's intent (the caller looks the `Order` up by name in O(1)); `recompute → Vec<CatchUp>` stays exactly as pinned. Same information, one added struct, no lost capability.
@@ -52,16 +54,16 @@ Decisions made while writing this plan. **B, C, and E refine or extend the maste
 - **I. Event-order recursion is documented, not guarded.** An order triggering on an event type its own firing produces (`event:order.fired`, or `event:bead.created` matching cooked beads) recurses; the settle fixpoint would loop, appending events each cycle — visible in the ledger, user-declared, exactly as a `* * * * *` cron on an expensive formula is. campd executes declared structure (spec §8.3); no heuristic cycle-breaker. The hazard is documented in `orders/mod.rs` docs and the contrib README.
 - **J. Order names are pinned to `^[a-z0-9][a-z0-9_-]*$`** so the `order:<name>:<fired-seq>` actor encoding parses unambiguously (split on the last `:` for the seq). Validation error names the order and the field.
 - **K. Order-level failures are evented and survivable; infrastructure failures are fatal.** `execute_fire` returns `Ok(None)` after appending `order.failed {order, fired_seq, error}` for order-level failures (formula missing/invalid, rig unresolvable, cook error, order removed by a reload before its cook ran) — the daemon logs and continues. Only a failure to *record* the failure (ledger append error) propagates. Timer-path settle errors mirror Phase 7 Decision H: stderr + continue; the cursor holds position and the error resurfaces on the next poke.
-- **L. `event_loop::run` parameters bundle into `LoopCtx` (flagged to the lead — Phase 8 coordination).** Phase 10 adds three loop inputs (orders runtime, clock, config pipe); Phase 8 will add more (dispatch). `struct LoopCtx<'a> { ledger, readiness, runtime, clock }` keeps the churn to one mechanical signature change now and gives Phase 8 an obvious extension point. Function bodies are otherwise untouched (extend, don't rework). This goes beyond the bare poll-timeout seam, so per the lead's 2026-07-07 instruction it is explicitly flagged at plan approval; if the lead prefers, the fallback is passing the three extra parameters positionally (same code paths, uglier signature, zero structural difference for Phase 8's rebase).
+- **L. `event_loop::run` gains three positional parameters (plan-review ruling: the `LoopCtx` bundling proposed here was REJECTED — Phase 8 coordination).** The signature becomes `run(listener, socket_path, ledger, processor, runtime: &mut OrdersRuntime, clock: &dyn Clock, config_rx: &mut mio::unix::pipe::Receiver)` — the existing `ledger`/`processor` parameters untouched, three appended. The Poke arm's change is the minimal one-line swap (`cursor::catch_up(...)` → `orders::settle(...)`); `CONFIG_WATCH = Token(1)`, connection tokens start at 2 (the lead is pointing Phase 8's SIGCHLD token around these). No other restructuring of Phase 7 code.
 - **M. Rig resolution at fire time mirrors `cmd/create`'s rule** (explicit name, else the sole configured rig, else a hard error naming the fix) but is implemented in `orders/mod.rs` — `cmd/create.rs` is not refactored to share it, deliberately, to keep sibling-phase conflict surface at zero. Flagged as a post-v1 DRY cleanup for the lead.
 - **N. Cron next-fire search horizon is 6 years** (`366 × 6` days): covers the worst legal gap (`0 0 29 2 *` ≈ 4 years around a leap cycle; the 2100 century gap is out of v1's service life and documented). An expression with no fire inside the horizon is rejected when the heap arms it (daemon start / reload / `order ls` shows `never`) — a dead order is config junk, fail fast. DST: candidate civil times resolve through jiff's `Disambiguation::Compatible` — nonexistent times (spring-forward gap) shift forward by the gap length and fire once; ambiguous times (fall-back fold) fire at the first occurrence only; a candidate resolving to an instant ≤ `after` (possible in the fold's second pass) is skipped, keeping `next_after` strictly monotonic.
 
 ## What later phases rely on (interfaces Phase 10 produces)
 
-- **Phase 11 (patrol):** stall timers join the same poll-timeout mechanism — `OrdersRuntime::poll_timeout` is the model: the loop takes `min` of armed deadline sources; `LoopCtx` is the slot to carry patrol state.
+- **Phase 11 (patrol):** stall timers join the same poll-timeout mechanism — `OrdersRuntime::poll_timeout` is the model: the loop takes `min` of armed deadline sources, and patrol state arrives as further `run` parameters.
 - **Phase 12 (packs):** formula resolution goes through one function, `orders::formula_path(camp_root, name)` — pack layering replaces its body, local `formulas/` stays the highest layer. `orders.toml` pack content compiles through the same `compile_orders`.
 - **Phase 14 (export bridge):** `[[order]]` tables and `order.*` events are the "city-order declarations" input (spec §15.3).
-- **Phase 8 (parallel):** `Ledger::append_on(conn, ts, input)` is the conn-scoped write path the Phase 7 cursor comment promised dispatch; `LoopCtx` is where dispatch state lands.
+- **Phase 8 (parallel):** `Ledger::append_on(conn, ts, input)` is the conn-scoped write path the Phase 7 cursor comment promised dispatch; dispatch state arrives as further `run` parameters, and its SIGCHLD token is allocated around `CONFIG_WATCH = Token(1)`.
 
 ## File Structure
 
@@ -80,7 +82,7 @@ Decisions made while writing this plan. **B, C, and E refine or extend the maste
 | `crates/camp/src/cmd/order.rs` (new) | `camp order ls [--json]`, `camp order run <name>` |
 | `crates/camp/src/main.rs` (mod) | `Order` subcommand wiring |
 | `crates/camp/src/daemon/orders.rs` (new) | `OrdersRuntime` (build/reload/poll_timeout/fire_due/recompute), `CampdProcessor`, `settle`, startup reconciliation |
-| `crates/camp/src/daemon/event_loop.rs` (mod) | `LoopCtx`, heap deadline → poll timeout, jump detection, fire appends, `CONFIG_WATCH` pipe |
+| `crates/camp/src/daemon/event_loop.rs` (mod) | heap deadline → poll timeout, jump detection, fire appends, `CONFIG_WATCH` pipe (three positional params added to `run`) |
 | `crates/camp/src/daemon/mod.rs` (mod) | startup order: last-seen read → runtime build → watcher → settle → reconcile → recompute → loop |
 | `crates/camp/Cargo.toml` (mod) | + `notify`, + `jiff`, mio `os-ext` |
 | `crates/camp/tests/cli_order.rs` (new) | order ls/run against the real binary |
@@ -1235,12 +1237,14 @@ fn order_fired(event: &Event) -> Result<(), CoreError> {
             }
             Ok(())
         }).unwrap();
-        assert_eq!(end, 1, "cursor stops at the event that was processed");
+        // process_past_cursor drains pages until empty WITHIN one call: the
+        // config.changed appended while processing seq 1 lands at seq 2 and
+        // is processed by the same call (plan-review correction).
+        assert_eq!(end, 2, "the same call drains events appended mid-processing");
         let events = ledger.events_range(1, None).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind, EventType::ConfigChanged);
-        // the appended event is PAST the cursor: the next pass processes it
-        assert_eq!(ledger.cursor("t").unwrap(), 1);
+        assert_eq!(ledger.cursor("t").unwrap(), 2);
     }
 
     #[test]
@@ -1682,7 +1686,7 @@ pub fn settle(ledger: &mut Ledger, readiness: &mut ReadinessProcessor,
               runtime: &mut OrdersRuntime, clock: &dyn Clock) -> Result<(), CoreError>;
 ```
 
-Processor semantics (the heart of "same path as readiness"): for each event, in order — (1) delegate to `ReadinessProcessor::process`; (2) if the event is `order.fired`, queue `pending_cook_from_fired`; (3) if `completion_input` yields one, `Ledger::append_on(conn, &clock.now_utc(), input)` (atomic with the cursor); (4) for every event-triggered order where `event_trigger_matches`, `append_on` a `fired_input(name, &FireCause::Event { cause_seq: event.seq })` — the appended `order.fired` lands past the cursor and is processed (and its cook queued) by the settle fixpoint's next pass. `settle` loops: `catch_up` → drain `readiness.take_pending()` (Phase 8's hook, kept drained) → `take_pending_cooks`; if empty, done; else for each cook, look up the order by name (`None` → the order was removed by a reload between fire and cook: append `order.failed {order, fired_seq, error:"order no longer configured"}`) and `execute_fire` (its `Ok(None)`/evented-failure contract means settle only propagates infrastructure errors), then loop again.
+Processor semantics (the heart of "same path as readiness"): for each event, in order — (1) delegate to `ReadinessProcessor::process`; (2) if the event is `order.fired`, queue `pending_cook_from_fired`; (3) if `completion_input` yields one, `Ledger::append_on(conn, &clock.now_utc(), input)` (atomic with the cursor); (4) for every event-triggered order where `event_trigger_matches`, `append_on` a `fired_input(name, &FireCause::Event { cause_seq: event.seq })` — the appended `order.fired` lands past the cursor and is drained (and its cook queued) in the SAME `catch_up` call, which pages until no events remain (plan-review correction); the cooks then execute after `catch_up` returns, and the next settle iteration folds the resulting `run.cooked`/`bead.created` events. `settle` loops: `catch_up` → drain `readiness.take_pending()` (Phase 8's hook, kept drained) → `take_pending_cooks`; if empty, done; else for each cook, look up the order by name (`None` → the order was removed by a reload between fire and cook: append `order.failed {order, fired_seq, error:"order no longer configured"}`) and `execute_fire` (its `Ok(None)`/evented-failure contract means settle only propagates infrastructure errors), then loop again.
 
 `poll_timeout`: `next_deadline()` → `None` if no heap entries (idle = infinite wait); else `deadline − now` as a std `Duration`, clamped ≥ `Duration::ZERO`, plus 1 ms (round up so the wake lands at-or-after the deadline, never a hot spin just before it).
 
@@ -1751,7 +1755,7 @@ Write each with full assertions in the style of the earlier tasks (they are comp
 
 **Interfaces:**
 - Consumes: 10.10; `mio::unix::pipe` (add `os-ext` to mio features), `notify = "8"`.
-- Produces: the assembled daemon. `event_loop::run(listener, socket_path, config_rx: mio::unix::pipe::Receiver, ctx: LoopCtx)` where `pub struct LoopCtx<'a> { pub ledger: &'a mut Ledger, pub readiness: &'a mut ReadinessProcessor, pub runtime: &'a mut OrdersRuntime, pub clock: &'a dyn Clock }` (Decision L).
+- Produces: the assembled daemon. Per the Decision L ruling, `event_loop::run` keeps its existing parameters and appends three positional ones: `run(listener, socket_path, ledger, processor, runtime: &mut OrdersRuntime, clock: &dyn Clock, config_rx: &mut mio::unix::pipe::Receiver)`. No `LoopCtx`.
 
 Loop shape (replacing the current fixed `poll_timeout()` fn — its doc comment moves onto `OrdersRuntime::poll_timeout`, "the only timeout expression in campd" now sourced from the heap):
 
@@ -1763,7 +1767,7 @@ const JUMP_TOLERANCE: SignedDuration = SignedDuration::from_secs(30);
 
 let mut last_seen = Timestamp::now();
 loop {
-    let timeout = ctx.runtime.poll_timeout(Timestamp::now());
+    let timeout = runtime.poll_timeout(Timestamp::now());
     let wall_before = Timestamp::now();
     let mono_before = Instant::now();
     poll.poll(&mut events, timeout).context("poll")?;
@@ -1772,16 +1776,16 @@ loop {
     let wall_delta = now.duration_since(wall_before);
     let mono_delta = SignedDuration::try_from(mono_before.elapsed()).unwrap_or(SignedDuration::MAX);
     let fires: Vec<Fire> = if (wall_delta - mono_delta).abs() > JUMP_TOLERANCE {
-        ctx.runtime.recompute(now, last_seen).into_iter()
+        runtime.recompute(now, last_seen).into_iter()
             .map(|c| Fire { order: c.order, scheduled: c.scheduled, catch_up: true })
             .collect()
     } else {
-        ctx.runtime.fire_due(now)
+        runtime.fire_due(now)
     };
     last_seen = now;
     let mut wake_ledger_work = !fires.is_empty();
     for fire in fires {
-        ctx.ledger.append(camp_core::orders::fired_input(
+        ledger.append(camp_core::orders::fired_input(
             &fire.order,
             &FireCause::Cron { scheduled: fire.scheduled, catch_up: fire.catch_up },
         ))?;
@@ -1790,21 +1794,22 @@ loop {
         match event.token() {
             LISTENER => { /* unchanged accept loop */ }
             CONFIG_WATCH => {
-                drain_pipe(&mut config_rx)?; // read until WouldBlock, discard bytes
-                if let Some(input) = ctx.runtime.reload_if_changed(now)? {
-                    ctx.ledger.append(input)?;
+                drain_pipe(config_rx)?; // read until WouldBlock, discard bytes
+                if let Some(input) = runtime.reload_if_changed(now)? {
+                    ledger.append(input)?;
                     wake_ledger_work = true;
                 }
             }
             token => { /* unchanged connection serving; drain_lines' Poke arm
                           calls orders::settle(...) instead of cursor::catch_up
-                          (and still drains readiness pending for Phase 8) */ }
+                          — the one-line swap (Decision L ruling) — and still
+                          drains readiness pending for Phase 8 */ }
         }
     }
     if wake_ledger_work {
         // Timer-path settle errors mirror Phase 7 Decision H: surface to
         // stderr, keep serving; the cursor holds and the error re-surfaces.
-        if let Err(e) = orders::settle(ctx.ledger, ctx.readiness, ctx.runtime, ctx.clock) {
+        if let Err(e) = orders::settle(ledger, processor, runtime, clock) {
             eprintln!("campd: settle failed: {e}");
         }
     }
@@ -1852,10 +1857,11 @@ for c in runtime.recompute(now, last_seen0) {
     ))?;
 }
 orders::settle(&mut ledger, &mut readiness, &mut runtime, &clock)?;
-// ... readiness line (unchanged), then:
-event_loop::run(listener, &socket_path, receiver, LoopCtx {
-    ledger: &mut ledger, readiness: &mut readiness, runtime: &mut runtime, clock: &clock,
-})
+// ... readiness line (unchanged), then (positional params per the ruling):
+event_loop::run(
+    listener, &socket_path, &mut ledger, &mut readiness,
+    &mut runtime, &clock, &mut receiver,
+)
 ```
 
 The watcher handle stays alive in `run`'s scope (drop = watch dies). Startup settle/reconcile failures are fatal (fail fast, Phase 7 precedent).
@@ -2029,7 +2035,7 @@ It is an example, never auto-installed — visible automation only.)
 ```
 
 - [ ] **Step 3: README pointer.** After the design-doc paragraph in `README.md`, add: `Orders can fire at login via the optional launchd agent — see [contrib/launchd/](contrib/launchd/README.md).`
-- [ ] **Step 4: Spec edit (Decision E; lead-serialized).** In §7.1's layout block, after the `runs/<run-id>/` line, add `  formulas/                # camp-local formula definitions, resolved by name (§9; packs layer beneath, §11)`. In §9, after the `[[order]]` example block, add the sentence: `An order's formula names <camp>/formulas/<name>.toml; when packs land (§11) they layer beneath these local definitions, last-wins.`
+- [ ] **Step 4: Spec edit (Decision E) — ON HOLD per the plan-approval ruling.** The `orders::formula_path` code convention proceeds; the spec-text edit (in §7.1's layout block, after the `runs/<run-id>/` line, add `  formulas/                # camp-local formula definitions, resolved by name (§9; packs layer beneath, §11)`; in §9, after the `[[order]]` example block, add: `An order's formula names <camp>/formulas/<name>.toml; when packs land (§11) they layer beneath these local definitions, last-wins.`) is applied ONLY once the lead relays the operator's go-ahead. If the answer arrives before this PR merges, it lands in this PR; otherwise the lead sequences it separately and this step is recorded as deferred in the PR description.
 - [ ] **Step 5: Commit.** `git commit -m "docs: launchd fire-at-login example with honest away-mode limits; spec: formulas/ resolution"`
 
 ---
