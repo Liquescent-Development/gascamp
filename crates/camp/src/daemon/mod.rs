@@ -3,6 +3,7 @@
 //! ledger, appends campd.started, catches up past its cursor, announces
 //! readiness on stdout, and sleeps on the socket.
 
+pub mod autostart;
 pub mod cursor;
 pub mod event_loop;
 pub mod socket;

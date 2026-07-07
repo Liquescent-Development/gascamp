@@ -7,13 +7,14 @@ use crate::campdir::CampDir;
 /// `camp claim <bead> --session <name>`: open → in_progress (worker contract).
 pub fn run(camp: &CampDir, bead: String, session: String) -> Result<()> {
     let mut ledger = Ledger::open(&camp.db_path())?;
-    ledger.append(EventInput {
+    let seq = ledger.append(EventInput {
         kind: EventType::BeadClaimed,
         rig: None,
         actor: "cli".into(),
         bead: Some(bead.clone()),
         data: serde_json::json!({ "session": session }),
     })?;
+    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
     println!("claimed {bead}");
     Ok(())
 }

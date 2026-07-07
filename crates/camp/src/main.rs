@@ -15,9 +15,12 @@ mod cmd {
     pub mod rig;
     pub mod search;
     pub mod show;
+    pub mod stop;
+    pub mod top;
 }
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -156,6 +159,12 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Run the daemon in the foreground (also reachable via a campd symlink)
+    Daemon,
+    /// Stop the running daemon gracefully
+    Stop,
+    /// One campd status snapshot as plain text (auto-starts the daemon)
+    Top,
 }
 
 #[derive(Subcommand)]
@@ -179,15 +188,48 @@ enum RigCommand {
     },
 }
 
+/// The camp binary in daemon mode (plan decision 2: `[[bin]] camp` plus a
+/// campd symlink created on install; `main` dispatches on argv[0]).
+#[derive(Parser)]
+#[command(
+    name = "campd",
+    version,
+    about = "Gas Camp daemon (the camp binary in daemon mode)"
+)]
+struct CampdCli {
+    /// Camp directory (default: $CAMP_DIR, else walk up from cwd for .camp/)
+    #[arg(long, value_name = "DIR")]
+    camp: Option<PathBuf>,
+}
+
 fn main() -> ExitCode {
+    if invoked_as_campd() {
+        let cli = CampdCli::parse();
+        return report("campd", run_daemon(cli.camp.as_deref()));
+    }
     let cli = Cli::parse();
-    match run(cli) {
+    report("camp", run(cli))
+}
+
+fn invoked_as_campd() -> bool {
+    std::env::args_os()
+        .next()
+        .is_some_and(|arg0| Path::new(&arg0).file_stem() == Some(OsStr::new("campd")))
+}
+
+fn report(name: &str, result: anyhow::Result<()>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("camp: {error:#}");
+            eprintln!("{name}: {error:#}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_daemon(camp_flag: Option<&Path>) -> anyhow::Result<()> {
+    let camp = CampDir::resolve(camp_flag)?;
+    daemon::run(&camp)
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
@@ -265,6 +307,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Recall { query, limit } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::recall::run(&camp, &query, limit)
+        }
+        Command::Daemon => run_daemon(cli.camp.as_deref()),
+        Command::Stop => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::stop::run(&camp)
+        }
+        Command::Top => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::top::run(&camp)
         }
     }
 }
