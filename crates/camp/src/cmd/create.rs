@@ -43,13 +43,14 @@ pub fn run(
         data["assignee"] = serde_json::json!(a);
     }
 
-    ledger.append(EventInput {
+    let seq = ledger.append(EventInput {
         kind: EventType::BeadCreated,
         rig: Some(rig_cfg.name.clone()),
         actor: "cli".into(),
         bead: Some(id.clone()),
         data,
     })?;
+    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
     println!("{id}");
     Ok(())
 }

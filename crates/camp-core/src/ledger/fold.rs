@@ -22,6 +22,7 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::SessionStopped => session_ended(conn, event, "stopped"),
         EventType::SessionCrashed => session_ended(conn, event, "crashed"),
         EventType::RigAdded => rig_added(event),
+        EventType::CampdAutostarted => campd_autostarted(event),
         // Log-only events: no state effect.
         EventType::CampdStarted | EventType::CampdStopped => Ok(()),
     }
@@ -259,6 +260,26 @@ fn rig_added(event: &Event) -> Result<(), CoreError> {
         });
     }
     crate::id::validate_prefix(&p.prefix)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampdAutostarted {
+    verb: String,
+}
+
+/// `campd.autostarted` is log-only: the CLI records which verb caused the
+/// spawn (spec §13.3 — every action carries its cause). The fold validates
+/// the audit payload so a malformed event fails fast.
+fn campd_autostarted(event: &Event) -> Result<(), CoreError> {
+    let p: CampdAutostarted = payload(event)?;
+    if p.verb.is_empty() {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: "empty verb".to_owned(),
+        });
+    }
     Ok(())
 }
 

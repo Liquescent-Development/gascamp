@@ -21,6 +21,20 @@ pub struct Ledger {
     clock: Box<dyn Clock>,
 }
 
+/// How many events `process_past_cursor` holds in memory at once (PR #8
+/// review finding 4): large enough that a page is one indexed read, small
+/// enough that a 1M-event first-start catch-up never balloons RSS.
+const CATCH_UP_PAGE_SIZE: usize = 500;
+
+/// One `{"op":"status"}` snapshot (master plan Phase 7 protocol): computed
+/// from the state tables at request time — no cached copy to drift.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StatusSummary {
+    pub live_sessions: Vec<String>,
+    pub ready: u64,
+    pub open: u64,
+}
+
 impl Ledger {
     pub fn open(db_path: &Path) -> Result<Self, CoreError> {
         Self::open_with_clock(db_path, Box::new(SystemClock))
@@ -126,6 +140,102 @@ impl Ledger {
              WHERE seq >= ?1 AND (?2 IS NULL OR seq <= ?2) ORDER BY seq",
         )?;
         let rows = stmt.query_map(params![from, to], row_to_event)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    /// Live session names, ready-bead count, and open-bead count. `open`
+    /// counts `status='open'` beads (blocked ones included; claimed and
+    /// closed ones not).
+    pub fn status_summary(&self) -> Result<StatusSummary, CoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM sessions WHERE status = 'live' ORDER BY name")?;
+        let live_sessions: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let ready = crate::readiness::ready_beads(&self.conn, None)?.len() as u64;
+        let open: i64 = self.conn.query_row(
+            "SELECT count(*) FROM beads WHERE status = 'open'",
+            [],
+            |r| r.get(0),
+        )?;
+        let open = u64::try_from(open)
+            .map_err(|_| CoreError::Corrupt(format!("negative open-bead count {open}")))?;
+        Ok(StatusSummary {
+            live_sessions,
+            ready,
+            open,
+        })
+    }
+
+    /// The named consumer cursor's position; 0 when the consumer has never
+    /// processed anything (spec §7.2: campd "catches up from its
+    /// processed-cursor on start"). `cursors` is consumer bookkeeping —
+    /// deliberately outside refold.
+    pub fn cursor(&self, name: &str) -> Result<Seq, CoreError> {
+        use rusqlite::OptionalExtension;
+        let seq: Option<Seq> = self
+            .conn
+            .query_row("SELECT seq FROM cursors WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(seq.unwrap_or(0))
+    }
+
+    /// Process every event past the named cursor, exactly once (spec §7.3).
+    ///
+    /// Each event runs in its own `BEGIN IMMEDIATE` transaction that executes
+    /// `process` and advances the cursor together: a crash or a `process`
+    /// error never loses an event and never replays one. `process` receives
+    /// the transaction's connection, so any writes it makes commit atomically
+    /// with the cursor advance. On error the cursor stays on the last
+    /// successfully processed event and the error surfaces to the caller.
+    /// Returns the cursor position after the run.
+    ///
+    /// The backlog drains one page at a time (PR #8 review finding 4): peak
+    /// memory is bounded by `CATCH_UP_PAGE_SIZE` events even on a first
+    /// start against a year-scale ledger, keeping the idle-RSS budget
+    /// (invariant 1) intact after catch-up.
+    pub fn process_past_cursor(
+        &mut self,
+        name: &str,
+        process: &mut dyn FnMut(&Connection, &Event) -> Result<(), CoreError>,
+    ) -> Result<Seq, CoreError> {
+        let mut cursor = self.cursor(name)?;
+        loop {
+            let page = self.events_page(cursor + 1, CATCH_UP_PAGE_SIZE)?;
+            if page.is_empty() {
+                return Ok(cursor);
+            }
+            for event in page {
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                process(&tx, &event)?;
+                tx.execute(
+                    "INSERT INTO cursors (name, seq) VALUES (?1, ?2)
+                     ON CONFLICT(name) DO UPDATE SET seq = excluded.seq",
+                    params![name, event.seq],
+                )?;
+                tx.commit()?;
+                cursor = event.seq;
+            }
+        }
+    }
+
+    /// At most `limit` events with `seq >= from`, in seq order — the
+    /// pagination read behind `process_past_cursor`.
+    fn events_page(&self, from: Seq, limit: usize) -> Result<Vec<Event>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, ts, type, rig, actor, bead, data FROM events
+             WHERE seq >= ?1 ORDER BY seq LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![from, limit as i64], row_to_event)?;
         let mut events = Vec::new();
         for row in rows {
             events.push(row?);
@@ -816,6 +926,237 @@ mod tests {
     }
 
     #[test]
+    fn status_summary_reports_live_sessions_ready_and_open() {
+        let (_dir, mut ledger) = temp_ledger();
+        // empty camp: all zeroes
+        assert_eq!(
+            ledger.status_summary().unwrap(),
+            StatusSummary {
+                live_sessions: vec![],
+                ready: 0,
+                open: 0
+            }
+        );
+
+        // gc-1 ready; gc-2 open but blocked on gc-1
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(created(
+                "gc-2",
+                serde_json::json!({"title": "two", "needs": ["gc-1"]}),
+            ))
+            .unwrap();
+        // one live session, one stopped
+        ledger.append(woke("camp/dev/1")).unwrap();
+        ledger
+            .append(input(
+                EventType::SessionWoke,
+                Some("gc"),
+                None,
+                serde_json::json!({"name": "camp/dev/2", "agent": "dev"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::SessionStopped,
+                Some("gc"),
+                None,
+                serde_json::json!({"name": "camp/dev/2"}),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            ledger.status_summary().unwrap(),
+            StatusSummary {
+                live_sessions: vec!["camp/dev/1".to_owned()],
+                ready: 1,
+                open: 2
+            }
+        );
+    }
+
+    #[test]
+    fn cursor_defaults_to_zero_and_tracks_processing() {
+        let (_dir, mut ledger) = temp_ledger();
+        assert_eq!(ledger.cursor("campd").unwrap(), 0);
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(created("gc-2", serde_json::json!({"title": "two"})))
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let end = ledger
+            .process_past_cursor("campd", &mut |_conn, event| {
+                seen.push(event.seq);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(end, 2);
+        assert_eq!(seen, vec![1, 2]);
+        assert_eq!(ledger.cursor("campd").unwrap(), 2);
+
+        // nothing pending: nothing is reprocessed (exactly once)
+        let mut again = Vec::new();
+        ledger
+            .process_past_cursor("campd", &mut |_conn, event| {
+                again.push(event.seq);
+                Ok(())
+            })
+            .unwrap();
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn a_processing_error_halts_the_cursor_and_resume_repeats_nothing() {
+        let (_dir, mut ledger) = temp_ledger();
+        for i in 1..=3 {
+            ledger
+                .append(created(
+                    &format!("gc-{i}"),
+                    serde_json::json!({"title": "t"}),
+                ))
+                .unwrap();
+        }
+        let result = ledger.process_past_cursor("campd", &mut |_conn, event| {
+            if event.seq == 2 {
+                return Err(CoreError::Corrupt("injected".to_owned()));
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            ledger.cursor("campd").unwrap(),
+            1,
+            "cursor halts before the failure"
+        );
+
+        // resume with a healthy processor: exactly the unprocessed tail
+        let mut tail = Vec::new();
+        ledger
+            .process_past_cursor("campd", &mut |_conn, event| {
+                tail.push(event.seq);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(tail, vec![2, 3]);
+    }
+
+    #[test]
+    fn processor_effects_commit_atomically_with_the_cursor() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(created("gc-2", serde_json::json!({"title": "two"})))
+            .unwrap();
+        // The processor writes a marker row through the transaction's
+        // connection, then fails on seq 2: seq 1's effect+cursor committed,
+        // seq 2's effect rolled back with its cursor advance.
+        let result = ledger.process_past_cursor("campd", &mut |conn, event| {
+            conn.execute(
+                "INSERT INTO cursors (name, seq) VALUES ('marker', ?1)
+                 ON CONFLICT(name) DO UPDATE SET seq = excluded.seq",
+                [event.seq],
+            )?;
+            if event.seq == 2 {
+                return Err(CoreError::Corrupt("injected".to_owned()));
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        let marker: i64 = ledger
+            .conn
+            .query_row("SELECT seq FROM cursors WHERE name = 'marker'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(marker, 1, "seq 2's effect must roll back with the cursor");
+        assert_eq!(ledger.cursor("campd").unwrap(), 1);
+    }
+
+    /// PR #8 review finding 4: catch-up must not materialize the whole
+    /// backlog at once — it drains in pages. These assertions pin the
+    /// pagination's correctness (order preserved, nothing skipped or
+    /// repeated across page boundaries); the memory bound itself is the
+    /// page-size constant.
+    #[test]
+    fn process_past_cursor_pages_through_a_large_backlog() {
+        let (_dir, mut ledger) = temp_ledger();
+        // 2.4x the page size, plus a partial final page
+        let total = CATCH_UP_PAGE_SIZE as i64 * 2 + 203;
+        for i in 1..=total {
+            ledger
+                .append(created(
+                    &format!("gc-{i}"),
+                    serde_json::json!({"title": "t"}),
+                ))
+                .unwrap();
+        }
+        let mut seen = Vec::new();
+        let end = ledger
+            .process_past_cursor("campd", &mut |_conn, event| {
+                seen.push(event.seq);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(end, total);
+        assert_eq!(seen.len() as i64, total, "every event exactly once");
+        assert_eq!(seen, (1..=total).collect::<Vec<_>>(), "in seq order");
+        assert_eq!(ledger.cursor("campd").unwrap(), total);
+
+        // nothing left
+        let mut again = Vec::new();
+        ledger
+            .process_past_cursor("campd", &mut |_conn, event| {
+                again.push(event.seq);
+                Ok(())
+            })
+            .unwrap();
+        assert!(again.is_empty());
+    }
+
+    /// A processing error just past a page boundary halts the cursor on the
+    /// boundary; resume covers exactly the tail (finding 4 must not weaken
+    /// the exactly-once guarantee).
+    #[test]
+    fn a_mid_page_error_resumes_exactly_across_page_boundaries() {
+        let (_dir, mut ledger) = temp_ledger();
+        let page = CATCH_UP_PAGE_SIZE as i64;
+        let total = page + 103;
+        for i in 1..=total {
+            ledger
+                .append(created(
+                    &format!("gc-{i}"),
+                    serde_json::json!({"title": "t"}),
+                ))
+                .unwrap();
+        }
+        let poison = page + 1; // first event of the second page
+        let result = ledger.process_past_cursor("campd", &mut |_conn, event| {
+            if event.seq == poison {
+                return Err(CoreError::Corrupt("injected".to_owned()));
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(ledger.cursor("campd").unwrap(), page);
+
+        let mut tail = Vec::new();
+        ledger
+            .process_past_cursor("campd", &mut |_conn, event| {
+                tail.push(event.seq);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(tail, (poison..=total).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn campd_lifecycle_events_are_log_only() {
         let (_dir, mut ledger) = temp_ledger();
         ledger
@@ -837,6 +1178,57 @@ mod tests {
         assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 2);
         assert_eq!(count(&ledger, "SELECT count(*) FROM beads"), 0);
         assert_eq!(count(&ledger, "SELECT count(*) FROM sessions"), 0);
+    }
+
+    #[test]
+    fn campd_autostarted_is_validated_and_log_only() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(input(
+                EventType::CampdAutostarted,
+                None,
+                None,
+                serde_json::json!({"verb": "top"}),
+            ))
+            .unwrap();
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+        assert_eq!(count(&ledger, "SELECT count(*) FROM beads"), 0);
+        assert_eq!(count(&ledger, "SELECT count(*) FROM sessions"), 0);
+
+        // missing verb fails fast, appends nothing
+        assert!(
+            ledger
+                .append(input(
+                    EventType::CampdAutostarted,
+                    None,
+                    None,
+                    serde_json::json!({})
+                ))
+                .is_err()
+        );
+        // unknown fields fail fast
+        assert!(
+            ledger
+                .append(input(
+                    EventType::CampdAutostarted,
+                    None,
+                    None,
+                    serde_json::json!({"verb": "top", "extra": 1}),
+                ))
+                .is_err()
+        );
+        // empty verb fails fast
+        assert!(
+            ledger
+                .append(input(
+                    EventType::CampdAutostarted,
+                    None,
+                    None,
+                    serde_json::json!({"verb": ""}),
+                ))
+                .is_err()
+        );
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
     }
 
     #[test]

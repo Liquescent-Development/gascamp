@@ -61,13 +61,14 @@ pub fn add(
     };
 
     let mut ledger = Ledger::open(&camp.db_path())?;
-    ledger.append(EventInput {
+    let seq = ledger.append(EventInput {
         kind: EventType::RigAdded,
         rig: Some(name.clone()),
         actor: "cli".into(),
         bead: None,
         data: serde_json::json!({ "path": abs, "prefix": prefix }),
     })?;
+    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
     append_rig_toml(&config_path, &rig)?;
     drop(lock_file); // release only after the write has landed
 
