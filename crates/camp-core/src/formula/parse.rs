@@ -665,7 +665,10 @@ mode = "fanout"
             "steps.b.retry.backoff",
             "steps.c.on_complete.mode",
         ] {
-            assert!(c.contains(&expected.to_owned()), "missing {expected}: {c:?}");
+            assert!(
+                c.contains(&expected.to_owned()),
+                "missing {expected}: {c:?}"
+            );
         }
     }
 

@@ -263,14 +263,21 @@ fn common_comparator_shape(req: &str) -> Result<(), String> {
              Gas City's constraint grammar)"
         )
     };
-    let op = OPS.iter().find(|op| req.starts_with(**op)).ok_or_else(err)?;
+    let op = OPS
+        .iter()
+        .find(|op| req.starts_with(**op))
+        .ok_or_else(err)?;
     let version = req[op.len()..].trim_start();
     let parts: Vec<&str> = version.split('.').collect();
     let three_plain_numbers = parts.len() == 3
         && parts
             .iter()
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
-    if three_plain_numbers { Ok(()) } else { Err(err()) }
+    if three_plain_numbers {
+        Ok(())
+    } else {
+        Err(err())
+    }
 }
 
 /// Iterative-state DFS cycle detection; reports one violation per distinct
@@ -525,10 +532,7 @@ mod tests {
             ),
             "f",
         );
-        assert!(
-            has(&v, "requires.formula_compiler", "comparator"),
-            "{v:?}"
-        );
+        assert!(has(&v, "requires.formula_compiler", "comparator"), "{v:?}");
         let v = violations_for(
             &format!(
                 "{HEADER}[requires]\nformula_compiler = \">=3.0.0\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n"
@@ -585,13 +589,13 @@ mod tests {
             assert!(v.is_empty(), "{good} must be accepted: {v:?}");
         }
         for bad in [
-            "^2",             // Cargo caret
-            "^2.0.0",         // Cargo caret
-            "~2.1",           // Cargo tilde
-            "2.*",            // wildcard
-            "2.0.0",          // bare version: caret in Cargo, exact in Go
-            ">=2.0",          // partial version
-            ">=2.0.0, <3.0.0" // range list, unverified against gc
+            "^2",              // Cargo caret
+            "^2.0.0",          // Cargo caret
+            "~2.1",            // Cargo tilde
+            "2.*",             // wildcard
+            "2.0.0",           // bare version: caret in Cargo, exact in Go
+            ">=2.0",           // partial version
+            ">=2.0.0, <3.0.0", // range list, unverified against gc
         ] {
             let v = violations_for(
                 &format!("{HEADER}[requires]\nformula_compiler = \"{bad}\"\n{body}"),
@@ -610,8 +614,7 @@ mod tests {
         // mode) must still count as "has a check" — no spurious
         // timeout-requires-check, no silently skipped combination rules,
         // and the declaration rule still fires.
-        let bad_check =
-            "[steps.check]\nmax_attempts = 1\n[steps.check.check]\nmode = \"inference\"\npath = \"v.sh\"\n";
+        let bad_check = "[steps.check]\nmax_attempts = 1\n[steps.check.check]\nmode = \"inference\"\npath = \"v.sh\"\n";
         let v = violations_for(
             &format!(
                 "{HEADER}[[steps]]\nid = \"a\"\ntitle = \"t\"\ntimeout = \"5m\"\n{bad_check}[steps.retry]\nmax_attempts = 2\n"
