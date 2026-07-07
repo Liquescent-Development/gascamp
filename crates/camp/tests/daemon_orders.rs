@@ -259,6 +259,48 @@ fn an_event_order_fires_on_matching_close_and_not_otherwise() {
     stop_campd(&root, child);
 }
 
+/// Test-harness-only wait for a `config.changed` PAST a known seq matching
+/// a predicate. The test's own `std::fs::write` is a non-atomic
+/// truncate-then-write, and inotify fires on both steps: campd may
+/// legitimately read the torn intermediate state, reject it with
+/// `applied:false`, and apply the complete write a moment later —
+/// surviving exactly that torn-write sequence IS the designed reload
+/// behavior (plan Decision H), so the test matches on content, never on
+/// event order. (Proven in anger: CI's inotify caught the torn state that
+/// macOS FSEvents coalesced away locally.)
+fn wait_for_config_changed(
+    root: &Path,
+    after_seq: i64,
+    want: impl Fn(&serde_json::Value) -> bool,
+    what: &str,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(hit) = events_of(root, "config.changed")
+            .into_iter()
+            .find(|e| e["seq"].as_i64().unwrap() > after_seq && want(&e["data"]))
+        {
+            return hit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no config.changed ({what}) past seq {after_seq}; saw: {:?}",
+            events_of(root, "config.changed")
+                .iter()
+                .map(|e| e["data"].clone())
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn last_seq(root: &Path) -> i64 {
+    events_json(root)
+        .last()
+        .and_then(|e| e["seq"].as_i64())
+        .unwrap_or(0)
+}
+
 #[test]
 fn editing_camp_toml_hot_reloads_with_a_config_changed_event() {
     let dir = tempfile::tempdir().unwrap();
@@ -266,49 +308,41 @@ fn editing_camp_toml_hot_reloads_with_a_config_changed_event() {
     let child = spawn_campd(&root);
     let good = std::fs::read_to_string(root.join("camp.toml")).unwrap();
 
-    // 1. a new order appears → applied
+    // 1. a new order appears → applied with one order
+    let before = last_seq(&root);
     std::fs::write(
         root.join("camp.toml"),
         format!("{good}\n[[order]]\nname=\"late\"\non=\"cron:0 0 1 1 *\"\nformula=\"one-step\"\n"),
     )
     .unwrap();
-    let changed = wait_for(&root, "config.changed", Duration::from_secs(15));
-    assert_eq!(changed[0]["data"]["applied"], true);
-    assert_eq!(changed[0]["data"]["orders"], 1);
+    wait_for_config_changed(
+        &root,
+        before,
+        |d| d["applied"] == true && d["orders"] == 1,
+        "applied, orders=1",
+    );
     // the reloaded order is live: fire it through the daemon
     run_ok(&root, &["order", "run", "late"]);
     wait_for(&root, "run.cooked", Duration::from_secs(10));
 
     // 2. a broken edit → rejected, campd still serves
+    let before = last_seq(&root);
     std::fs::write(root.join("camp.toml"), "junk [[[").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let rejected = loop {
-        let all = events_of(&root, "config.changed");
-        if let Some(r) = all.iter().find(|e| e["data"]["applied"] == false) {
-            break r.clone();
-        }
-        assert!(Instant::now() < deadline, "no rejected config.changed");
-        std::thread::sleep(Duration::from_millis(250));
-    };
+    let rejected = wait_for_config_changed(&root, before, |d| d["applied"] == false, "rejected");
     assert!(!rejected["data"]["error"].as_str().unwrap().is_empty());
     // note: camp.toml is currently junk, so plain CLI verbs would fail —
     // campd itself keeps running on the last applied config (the order
-    // from step 1 is still known; the ledger read below needs no config).
+    // from step 1 is still known; the ledger reads here need no config).
 
-    // 3. restore → applied again
+    // 3. restore → applied again, back to zero orders
+    let before = last_seq(&root);
     std::fs::write(root.join("camp.toml"), &good).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let applied: Vec<_> = events_of(&root, "config.changed")
-            .into_iter()
-            .filter(|e| e["data"]["applied"] == true)
-            .collect();
-        if applied.len() >= 2 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "no re-applied config.changed");
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    wait_for_config_changed(
+        &root,
+        before,
+        |d| d["applied"] == true && d["orders"] == 0,
+        "re-applied, orders=0",
+    );
     stop_campd(&root, child);
 }
 
