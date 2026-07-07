@@ -73,33 +73,20 @@ impl Ledger {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut seqs = Vec::with_capacity(inputs.len());
         for input in inputs {
-            let EventInput {
-                kind,
-                rig,
-                actor,
-                bead,
-                data,
-            } = input;
-            tx.execute(
-                "INSERT INTO events (ts, type, rig, actor, bead, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![ts, kind.as_str(), rig, actor, bead, data.to_string()],
-            )?;
-            let seq = tx.last_insert_rowid();
-            let event = Event {
-                seq,
-                ts: ts.clone(),
-                kind,
-                rig,
-                actor,
-                bead,
-                data,
-            };
-            fold::apply(&tx, &event)?;
-            seqs.push(seq);
+            seqs.push(insert_and_fold(&tx, &ts, input)?);
         }
         tx.commit()?;
         Ok(seqs)
+    }
+
+    /// The single write path (insert the event row + fold its state effect)
+    /// on a caller-provided connection. MUST run inside a transaction the
+    /// caller commits — the sanctioned caller is a `process_past_cursor`
+    /// processor (spec §7.3), whose appends then commit atomically with the
+    /// cursor advance (exactly-once even across kill -9). Same fold, same
+    /// validation, same refold story as `append`.
+    pub fn append_on(conn: &Connection, ts: &str, input: EventInput) -> Result<Seq, CoreError> {
+        insert_and_fold(conn, ts, input)
     }
 
     /// The next unused bead id for `prefix` (spec §12). See `camp_core::id`.
@@ -264,6 +251,35 @@ impl Ledger {
         Ok(events)
     }
 
+    /// The `ts` of the highest-seq event, if any — campd's "when did anyone
+    /// last see the world" startup anchor for cron catch-up (spec §9,
+    /// Phase 10 plan Decision F). Read BEFORE appending `campd.started`.
+    pub fn last_event_ts(&self) -> Result<Option<String>, CoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row("SELECT ts FROM events ORDER BY seq DESC LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Every event of one type, in seq order (via the `events_type` index).
+    /// Order counts are small; this backs fire reconciliation, not user
+    /// queries (spec §7.2: state reads go to the state tables).
+    pub fn events_of_type(&self, kind: crate::event::EventType) -> Result<Vec<Event>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, ts, type, rig, actor, bead, data FROM events
+             WHERE type = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([kind.as_str()], row_to_event)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
     /// Ranked full-text search over titles, descriptions, close notes, and
     /// memory (spec §7.4), best match first. See [`crate::search::search`].
     pub fn search(
@@ -274,6 +290,36 @@ impl Ledger {
     ) -> Result<Vec<crate::search::SearchHit>, CoreError> {
         crate::search::search(&self.conn, query, type_filter, limit)
     }
+}
+
+/// The one write path shared by `append`/`append_batch`/`append_on`: insert
+/// the event row (monotonic seq) and apply its fold in the caller's open
+/// transaction (spec §7.2 — a write is one transaction).
+fn insert_and_fold(conn: &Connection, ts: &str, input: EventInput) -> Result<Seq, CoreError> {
+    let EventInput {
+        kind,
+        rig,
+        actor,
+        bead,
+        data,
+    } = input;
+    conn.execute(
+        "INSERT INTO events (ts, type, rig, actor, bead, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![ts, kind.as_str(), rig, actor, bead, data.to_string()],
+    )?;
+    let seq = conn.last_insert_rowid();
+    let event = Event {
+        seq,
+        ts: ts.to_owned(),
+        kind,
+        rig,
+        actor,
+        bead,
+        data,
+    };
+    fold::apply(conn, &event)?;
+    Ok(seq)
 }
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
@@ -1160,6 +1206,111 @@ mod tests {
             })
             .unwrap();
         assert_eq!(tail, (poison..=total).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn append_on_writes_through_a_processor_transaction_atomically() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(input(
+                EventType::CampdStarted,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        // A processor that appends a config.changed for the event it sees:
+        let end = ledger
+            .process_past_cursor("t", &mut |conn, event| {
+                if event.kind == EventType::CampdStarted {
+                    Ledger::append_on(
+                        conn,
+                        "2026-07-06T07:00:00Z",
+                        EventInput {
+                            kind: EventType::ConfigChanged,
+                            rig: None,
+                            actor: "campd".into(),
+                            bead: None,
+                            data: serde_json::json!({"path":"camp.toml","applied":true,"orders":0}),
+                        },
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        // process_past_cursor drains pages until empty WITHIN one call: the
+        // config.changed appended while processing seq 1 lands at seq 2 and
+        // is processed by the same call.
+        assert_eq!(end, 2, "the same call drains events appended mid-processing");
+        let events = ledger.events_range(1, None).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, EventType::ConfigChanged);
+        assert_eq!(ledger.cursor("t").unwrap(), 2);
+    }
+
+    #[test]
+    fn append_on_rejects_invalid_payloads_like_append() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(input(
+                EventType::CampdStarted,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        let err = ledger.process_past_cursor("t", &mut |conn, _event| {
+            Ledger::append_on(
+                conn,
+                "2026-07-06T07:00:00Z",
+                EventInput {
+                    kind: EventType::ConfigChanged,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: None,
+                    data: serde_json::json!({"applied": true}), // missing path/orders
+                },
+            )?;
+            Ok(())
+        });
+        assert!(err.is_err());
+        // the failed processor transaction rolled back: no event, no cursor move
+        assert_eq!(ledger.events_range(1, None).unwrap().len(), 1);
+        assert_eq!(ledger.cursor("t").unwrap(), 0);
+    }
+
+    #[test]
+    fn last_event_ts_and_events_of_type() {
+        let (_dir, mut ledger) = temp_ledger();
+        assert_eq!(ledger.last_event_ts().unwrap(), None);
+        ledger
+            .append(input(
+                EventType::CampdStarted,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::CampdStopped,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        assert_eq!(
+            ledger.last_event_ts().unwrap().as_deref(),
+            Some("2026-07-05T21:14:03Z") // temp_ledger's FixedClock
+        );
+        assert_eq!(
+            ledger.events_of_type(EventType::CampdStarted).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            ledger.events_of_type(EventType::OrderFired).unwrap().len(),
+            0
+        );
     }
 
     #[test]
