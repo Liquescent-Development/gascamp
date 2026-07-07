@@ -154,7 +154,14 @@ fn cook_materializes_a_diamond_run_in_one_transaction() {
 fn cooked_graphs_satisfy_phase_3_readiness_roots_ready_dependents_not() {
     let (dir, mut ledger) = temp_ledger();
     let formula = parse_and_validate(&fixture("diamond")).unwrap();
-    let cooked = cook(&mut ledger, &formula, &dir.path().join("runs"), &rig(), "cli").unwrap();
+    let cooked = cook(
+        &mut ledger,
+        &formula,
+        &dir.path().join("runs"),
+        &rig(),
+        "cli",
+    )
+    .unwrap();
 
     let ready: Vec<String> = ledger
         .ready_beads(None)
@@ -208,7 +215,14 @@ fn cook_is_file_independent_afterwards() {
     let scratch = dir.path().join("minimal.toml");
     std::fs::copy(fixture("minimal"), &scratch).unwrap();
     let formula = parse_and_validate(&scratch).unwrap();
-    let cooked = cook(&mut ledger, &formula, &dir.path().join("runs"), &rig(), "cli").unwrap();
+    let cooked = cook(
+        &mut ledger,
+        &formula,
+        &dir.path().join("runs"),
+        &rig(),
+        "cli",
+    )
+    .unwrap();
     std::fs::remove_file(&scratch).unwrap();
 
     // the run lives on: beads dispatchable, pinned copy present

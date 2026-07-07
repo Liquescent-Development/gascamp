@@ -32,10 +32,16 @@ fn every_valid_fixture_is_accepted() {
     let files = toml_files("valid");
     assert_eq!(
         files,
-        ["diamond", "fan-out", "guarded-change", "minimal", "retry-fetch"]
-            .into_iter()
-            .map(String::from)
-            .collect::<BTreeSet<_>>(),
+        [
+            "diamond",
+            "fan-out",
+            "guarded-change",
+            "minimal",
+            "retry-fetch"
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<BTreeSet<_>>(),
         "valid corpus drifted from the plan"
     );
     for stem in files {
@@ -126,7 +132,13 @@ fn every_invalid_fixture_is_rejected_naming_the_construct() {
 fn multi_violation_fixture_reports_every_problem_at_once() {
     let err = parse_and_validate(&corpus("invalid").join("multi-violation.toml"))
         .expect_err("multi-violation must be rejected");
-    for construct in ["pour", "tags", "formula", "steps.a.needs", "steps.a.timeout"] {
+    for construct in [
+        "pour",
+        "tags",
+        "formula",
+        "steps.a.needs",
+        "steps.a.timeout",
+    ] {
         assert!(
             err.violations.iter().any(|v| v.construct == construct),
             "missing {construct:?} in:\n{err}"

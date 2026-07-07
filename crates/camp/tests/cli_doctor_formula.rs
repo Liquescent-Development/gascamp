@@ -17,7 +17,11 @@ fn write(dir: &std::path::Path, name: &str, text: &str) -> std::path::PathBuf {
 #[test]
 fn doctor_formula_exits_0_on_a_valid_formula() {
     let dir = tempfile::tempdir().unwrap();
-    camp().current_dir(dir.path()).arg("init").assert().success();
+    camp()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .success();
     let f = write(
         dir.path(),
         "minimal.toml",
@@ -35,7 +39,11 @@ fn doctor_formula_exits_0_on_a_valid_formula() {
 #[test]
 fn doctor_formula_exits_1_listing_every_violation() {
     let dir = tempfile::tempdir().unwrap();
-    camp().current_dir(dir.path()).arg("init").assert().success();
+    camp()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .success();
     let f = write(
         dir.path(),
         "broken.toml",
@@ -58,7 +66,11 @@ fn doctor_formula_exits_1_listing_every_violation() {
 #[test]
 fn doctor_requires_exactly_one_of_refold_or_formula() {
     let dir = tempfile::tempdir().unwrap();
-    camp().current_dir(dir.path()).arg("init").assert().success();
+    camp()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .success();
     camp()
         .current_dir(dir.path())
         .arg("doctor")

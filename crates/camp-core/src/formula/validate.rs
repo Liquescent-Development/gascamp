@@ -51,19 +51,29 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
 
     // S3 — at least one step.
     if raw.steps.is_empty() {
-        violation(out, "steps", "a camp formula must declare at least one step");
+        violation(
+            out,
+            "steps",
+            "a camp formula must declare at least one step",
+        );
     }
 
     // S4 — ids: required, non-empty, unique.
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for step in &raw.steps {
         match step.id.as_deref() {
-            None | Some("") => {
-                violation(out, format!("{}.id", step_loc(step)), "step `id` is required")
-            }
+            None | Some("") => violation(
+                out,
+                format!("{}.id", step_loc(step)),
+                "step `id` is required",
+            ),
             Some(id) => {
                 if !seen.insert(id) {
-                    violation(out, format!("steps.{id}.id"), format!("duplicate step id {id:?}"));
+                    violation(
+                        out,
+                        format!("steps.{id}.id"),
+                        format!("duplicate step id {id:?}"),
+                    );
                 }
             }
         }
@@ -82,7 +92,11 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
         let mut seen_needs: BTreeSet<&str> = BTreeSet::new();
         for need in &step.needs {
             if Some(need.as_str()) == step.id.as_deref() {
-                violation(out, format!("{loc}.needs"), format!("step {need:?} needs itself"));
+                violation(
+                    out,
+                    format!("{loc}.needs"),
+                    format!("step {need:?} needs itself"),
+                );
             } else if !known.contains(need.as_str()) {
                 violation(
                     out,
@@ -337,8 +351,11 @@ mod tests {
         );
         assert!(has(&v, "formula", "file stem"), "{v:?}");
         assert!(
-            violations_for(&format!("{HEADER}[[steps]]\nid = \"a\"\ntitle = \"t\"\n"), "f")
-                .is_empty()
+            violations_for(
+                &format!("{HEADER}[[steps]]\nid = \"a\"\ntitle = \"t\"\n"),
+                "f"
+            )
+            .is_empty()
         );
     }
 
@@ -386,8 +403,7 @@ mod tests {
 
     #[test]
     fn combination_rules_mirror_gc() {
-        let check =
-            "[steps.check]\nmax_attempts = 1\n[steps.check.check]\nmode = \"exec\"\npath = \"v.sh\"\n";
+        let check = "[steps.check]\nmax_attempts = 1\n[steps.check.check]\nmode = \"exec\"\npath = \"v.sh\"\n";
         let requires = "[requires]\nformula_compiler = \">=2.0.0\"\n";
         // check + retry
         let v = violations_for(
@@ -429,8 +445,7 @@ mod tests {
 
     #[test]
     fn graph_only_constructs_require_the_explicit_declaration() {
-        let check =
-            "[steps.check]\nmax_attempts = 1\n[steps.check.check]\nmode = \"exec\"\npath = \"v.sh\"\n";
+        let check = "[steps.check]\nmax_attempts = 1\n[steps.check.check]\nmode = \"exec\"\npath = \"v.sh\"\n";
         let v = violations_for(
             &format!("{HEADER}[[steps]]\nid = \"a\"\ntitle = \"t\"\n{check}"),
             "f",
@@ -461,7 +476,10 @@ mod tests {
             ),
             "f",
         );
-        assert!(has(&v, "requires.formula_compiler", "semver comparator"), "{v:?}");
+        assert!(
+            has(&v, "requires.formula_compiler", "semver comparator"),
+            "{v:?}"
+        );
         let v = violations_for(
             &format!(
                 "{HEADER}[requires]\nformula_compiler = \">=3.0.0\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n"

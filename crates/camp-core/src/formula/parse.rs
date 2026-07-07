@@ -264,7 +264,12 @@ fn walk_requires(table: &toml::Table, out: &mut Vec<Violation>) -> Option<String
             });
         }
     }
-    get_string(requires, "formula_compiler", "requires.formula_compiler", out)
+    get_string(
+        requires,
+        "formula_compiler",
+        "requires.formula_compiler",
+        out,
+    )
 }
 
 fn walk_steps(table: &toml::Table, out: &mut Vec<Violation>) -> Vec<RawStep> {
@@ -373,9 +378,7 @@ fn walk_check(step: &toml::Table, construct: &str, out: &mut Vec<Violation>) -> 
         Some(m) => {
             out.push(Violation {
                 construct: mode_construct,
-                message: format!(
-                    "check mode {m:?} is not supported; only \"exec\" is (spec §8.2)"
-                ),
+                message: format!("check mode {m:?} is not supported; only \"exec\" is (spec §8.2)"),
             });
             return None;
         }
@@ -422,7 +425,12 @@ fn walk_retry(step: &toml::Table, construct: &str, out: &mut Vec<Violation>) -> 
         }
     }
     let max_attempts = get_max_attempts(retry, &format!("{construct}.max_attempts"), out);
-    let on_exhausted = get_string(retry, "on_exhausted", &format!("{construct}.on_exhausted"), out);
+    let on_exhausted = get_string(
+        retry,
+        "on_exhausted",
+        &format!("{construct}.on_exhausted"),
+        out,
+    );
     Some(RawRetry {
         max_attempts,
         on_exhausted,
@@ -490,7 +498,10 @@ fn walk_on_complete(
                 }
             }
         }
-        Some(_) => out.push(wrong_type(&format!("{construct}.vars"), "a table of strings")),
+        Some(_) => out.push(wrong_type(
+            &format!("{construct}.vars"),
+            "a table of strings",
+        )),
     }
     // for_each and bond must be set together (gc formula-spec-v2 §3.4);
     // reported here because it is a shape rule, not a semantic one.
@@ -635,7 +646,8 @@ mod tests {
             "advice",
             "pointcuts",
         ] {
-            let text = format!("{key} = 1\nformula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n");
+            let text =
+                format!("{key} = 1\nformula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n");
             let v = violations(&text);
             assert!(
                 v.iter()
