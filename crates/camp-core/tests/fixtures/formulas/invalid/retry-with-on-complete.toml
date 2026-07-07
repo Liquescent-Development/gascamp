@@ -1,0 +1,15 @@
+formula = "retry-with-on-complete"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "a"
+title = "t"
+
+[steps.retry]
+max_attempts = 2
+
+[steps.on_complete]
+for_each = "output.items"
+bond = "minimal"

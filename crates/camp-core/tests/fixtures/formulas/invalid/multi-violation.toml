@@ -1,0 +1,9 @@
+formula = "wrong-name"
+pour = true
+
+[[steps]]
+id = "a"
+title = "t"
+tags = ["x"]
+needs = ["ghost"]
+timeout = "5m"

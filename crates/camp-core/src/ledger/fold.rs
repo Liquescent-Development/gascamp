@@ -23,6 +23,7 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::SessionCrashed => session_ended(conn, event, "crashed"),
         EventType::RigAdded => rig_added(event),
         EventType::CampdAutostarted => campd_autostarted(event),
+        EventType::RunCooked => run_cooked(event),
         // Log-only events: no state effect.
         EventType::CampdStarted | EventType::CampdStopped => Ok(()),
     }
@@ -66,6 +67,10 @@ struct BeadCreated {
     labels: Vec<String>,
     #[serde(default)]
     assignee: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    step_id: Option<String>,
 }
 
 fn default_bead_type() -> String {
@@ -96,8 +101,8 @@ fn bead_created(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     }
     conn.execute(
         "INSERT INTO beads (id, rig, type, title, description, status, assignee, labels,
-                            created_ts, updated_ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8, ?8)",
+                            run_id, step_id, created_ts, updated_ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8, ?9, ?10, ?10)",
         params![
             id,
             rig,
@@ -106,6 +111,8 @@ fn bead_created(conn: &Connection, event: &Event) -> Result<(), CoreError> {
             p.description,
             p.assignee,
             serde_json::to_string(&p.labels)?,
+            p.run_id,
+            p.step_id,
             event.ts,
         ],
     )?;
@@ -279,6 +286,36 @@ fn campd_autostarted(event: &Event) -> Result<(), CoreError> {
             event_type: event.kind.as_str().to_owned(),
             reason: "empty verb".to_owned(),
         });
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunCooked {
+    run_id: String,
+    formula: String,
+    root: String,
+    #[allow(dead_code)] // audit content: validated for shape, not read back
+    steps: std::collections::BTreeMap<String, String>,
+}
+
+/// `run.cooked` is log-only: the run's durable truth is its beads (created
+/// in the same transaction) and the pinned run dir. The fold validates the
+/// audit payload so a malformed cook event fails fast.
+fn run_cooked(event: &Event) -> Result<(), CoreError> {
+    let p: RunCooked = payload(event)?;
+    for (field, value) in [
+        ("run_id", &p.run_id),
+        ("formula", &p.formula),
+        ("root", &p.root),
+    ] {
+        if value.is_empty() {
+            return Err(CoreError::InvalidEventData {
+                event_type: event.kind.as_str().to_owned(),
+                reason: format!("empty {field}"),
+            });
+        }
     }
     Ok(())
 }

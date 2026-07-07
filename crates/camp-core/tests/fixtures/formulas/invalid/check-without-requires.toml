@@ -1,0 +1,12 @@
+formula = "check-without-requires"
+
+[[steps]]
+id = "a"
+title = "t"
+
+[steps.check]
+max_attempts = 3
+
+[steps.check.check]
+mode = "exec"
+path = "scripts/verify.sh"

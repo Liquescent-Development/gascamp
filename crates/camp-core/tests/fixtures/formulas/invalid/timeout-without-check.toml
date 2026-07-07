@@ -1,0 +1,9 @@
+formula = "timeout-without-check"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "a"
+title = "t"
+timeout = "5m"

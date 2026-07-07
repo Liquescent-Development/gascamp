@@ -1,0 +1,9 @@
+formula = "dup-step-id"
+
+[[steps]]
+id = "a"
+title = "t"
+
+[[steps]]
+id = "a"
+title = "t"

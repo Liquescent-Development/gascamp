@@ -1,0 +1,6 @@
+formula = "contract"
+contract = true
+
+[[steps]]
+id = "a"
+title = "t"

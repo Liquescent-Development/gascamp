@@ -28,3 +28,30 @@ pub fn run(camp: &CampDir, repair: bool) -> Result<()> {
         );
     }
 }
+
+/// `camp doctor --formula <path>`: validate one formula file against the
+/// camp subset (spec §8.2). Exit 0 = valid camp formula (and therefore a
+/// valid Gas City formula-v2 file, repo invariant 6); exit 1 = every
+/// violation printed, not just the first.
+pub fn run_formula(path: &std::path::Path) -> Result<()> {
+    match camp_core::formula::parse_and_validate(path) {
+        Ok(formula) => {
+            println!(
+                "formula ok: {} ({} step(s))",
+                formula.name,
+                formula.steps.len()
+            );
+            Ok(())
+        }
+        Err(err) => {
+            for violation in &err.violations {
+                println!("{violation}");
+            }
+            bail!(
+                "{}: {} violation(s) — camp accepts a strict subset of Gas City formula v2 (spec §8.2)",
+                err.path.display(),
+                err.violations.len()
+            );
+        }
+    }
+}

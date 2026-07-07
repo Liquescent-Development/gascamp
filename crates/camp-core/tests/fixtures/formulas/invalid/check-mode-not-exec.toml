@@ -1,0 +1,15 @@
+formula = "check-mode-not-exec"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "a"
+title = "t"
+
+[steps.check]
+max_attempts = 3
+
+[steps.check.check]
+mode = "inference"
+path = "v.sh"

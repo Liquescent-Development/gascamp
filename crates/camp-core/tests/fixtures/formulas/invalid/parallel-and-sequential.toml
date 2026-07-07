@@ -1,0 +1,14 @@
+formula = "parallel-and-sequential"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "a"
+title = "t"
+
+[steps.on_complete]
+for_each = "output.items"
+bond = "minimal"
+parallel = true
+sequential = true

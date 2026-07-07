@@ -1,0 +1,13 @@
+formula = "retry-fetch"
+description = "Bounded transient retries with a soft-fail disposition"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "fetch"
+title = "Fetch the dataset"
+
+[steps.retry]
+max_attempts = 3
+on_exhausted = "soft_fail"
