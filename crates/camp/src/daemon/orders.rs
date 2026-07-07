@@ -97,6 +97,10 @@ impl OrdersRuntime {
         std::mem::take(&mut self.pending_cooks)
     }
 
+    pub fn pending_cook_count(&self) -> usize {
+        self.pending_cooks.len()
+    }
+
     /// Hot reload (spec §13.4, plan Decision H). Reads camp.toml and
     /// compares bytes against the last applied text: identical → `None`
     /// (editor double-events cost nothing — no debounce timers). A real
@@ -264,8 +268,8 @@ pub fn settle(
         if cooks.is_empty() {
             return Ok(());
         }
-        for cook in cooks {
-            match runtime.order(&cook.order) {
+        for (i, cook) in cooks.iter().enumerate() {
+            let outcome = match runtime.order(&cook.order) {
                 Some(order) => {
                     let order = order.clone();
                     // Ok(None) = deduped or evented order-level failure —
@@ -276,23 +280,38 @@ pub fn settle(
                         &runtime.camp_root,
                         &order,
                         cook.fired_seq,
-                    )?;
+                    )
+                    .map(|_| ())
                 }
                 None => {
                     // The order vanished (reload) between fire and cook:
                     // evented, never silent.
-                    ledger.append(EventInput {
-                        kind: EventType::OrderFailed,
-                        rig: None,
-                        actor: "campd".into(),
-                        bead: None,
-                        data: serde_json::json!({
-                            "order": cook.order,
-                            "fired_seq": cook.fired_seq,
-                            "error": "order no longer configured at cook time",
-                        }),
-                    })?;
+                    ledger
+                        .append(EventInput {
+                            kind: EventType::OrderFailed,
+                            rig: None,
+                            actor: "campd".into(),
+                            bead: None,
+                            data: serde_json::json!({
+                                "order": cook.order,
+                                "fired_seq": cook.fired_seq,
+                                "error": "order no longer configured at cook time",
+                            }),
+                        })
+                        .map(|_| ())
                 }
+            };
+            if let Err(error) = outcome {
+                // Infrastructure error (PR #13 review MEDIUM 3): the cursor
+                // is already past these fires' order.fired events, so a
+                // dropped cook would never run again until a restart's
+                // reconciliation. Requeue the failing cook and every
+                // unexecuted one, then surface the error — the next settle
+                // (poke, timer, reload) retries; dedupe keeps replays safe.
+                for survivor in &cooks[i..] {
+                    runtime.queue_cook(survivor.clone());
+                }
+                return Err(error);
             }
         }
     }
@@ -596,6 +615,50 @@ mod tests {
         assert_eq!(input.data["applied"], false);
         assert!(!input.data["error"].as_str().unwrap().is_empty());
         assert!(rt.order("new").is_some(), "old config retained");
+    }
+
+    /// PR #13 review MEDIUM 3: an infrastructure error mid-cook-list must
+    /// not lose the taken cooks — the cursor is already past their
+    /// order.fired events, so without a requeue they would never cook
+    /// until a restart's reconciliation. Injection: a raw second
+    /// connection installs a trigger that aborts order.failed inserts, so
+    /// execute_fire's failure-eventing (an order with a missing formula)
+    /// becomes an infra error.
+    #[test]
+    fn an_infra_error_mid_cook_list_requeues_the_survivors() {
+        let (dir, mut ledger) =
+            fixture("[[order]]\nname=\"broken\"\non=\"cron:0 0 1 1 *\"\nformula=\"no-such\"\n");
+        let mut rt = runtime(&dir, "2026-07-06T07:20:00Z");
+        ledger
+            .append(fired_input("broken", &FireCause::Manual))
+            .unwrap();
+        ledger
+            .append(fired_input("broken", &FireCause::Manual))
+            .unwrap();
+
+        let raw = rusqlite::Connection::open(dir.path().join("camp.db")).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER inject_infra_error BEFORE INSERT ON events
+             WHEN NEW.type = 'order.failed'
+             BEGIN SELECT RAISE(ABORT, 'injected infrastructure error'); END;",
+        )
+        .unwrap();
+
+        let mut readiness = ReadinessProcessor::default();
+        let err = settle(&mut ledger, &mut readiness, &mut rt, &clock());
+        assert!(err.is_err(), "the infra error must surface");
+        // BOTH cooks survive for the next settle (the failing one included)
+        assert_eq!(rt.pending_cook_count(), 2);
+
+        // infrastructure recovers → the next settle drains them
+        raw.execute_batch("DROP TRIGGER inject_infra_error").unwrap();
+        settle(&mut ledger, &mut readiness, &mut rt, &clock()).unwrap();
+        assert_eq!(rt.pending_cook_count(), 0);
+        assert_eq!(
+            ledger.events_of_type(EventType::OrderFailed).unwrap().len(),
+            2,
+            "both fires resolve once the ledger writes again"
+        );
     }
 
     /// PR #13 review MEDIUM 2: the downtime catch-up anchor is the last
