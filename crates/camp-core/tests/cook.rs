@@ -273,6 +273,24 @@ fn cook_rejects_unknown_needs_ids_in_hand_built_formulas() {
 }
 
 #[test]
+fn cook_survives_a_run_id_collision_by_regenerating_the_suffix() {
+    // Review finding 6: same-second suffix collision retries once instead
+    // of failing with "File exists". fastrand's thread-local RNG makes the
+    // collision deterministic: learn the first draw, re-seed, pre-create.
+    let (dir, mut ledger) = temp_ledger();
+    fastrand::seed(7);
+    let colliding = format!("20260705T211403Z-{:06x}", fastrand::u32(..) & 0xFF_FFFF);
+    let runs = dir.path().join("runs");
+    std::fs::create_dir_all(runs.join(&colliding)).unwrap();
+
+    fastrand::seed(7); // cook's first draw now collides
+    let formula = parse_and_validate(&fixture("minimal")).unwrap();
+    let cooked = cook(&mut ledger, &formula, &runs, &rig(), "cli").unwrap();
+    assert_ne!(cooked.run_id, colliding, "suffix must be regenerated");
+    assert!(runs.join(&cooked.run_id).join("minimal.toml").exists());
+}
+
+#[test]
 fn cook_fs_failures_are_not_reported_as_ledger_corruption() {
     // Review finding 4: disk trouble during cook must not read as a damaged
     // ledger. run_dir here is a FILE, so create_dir_all fails.

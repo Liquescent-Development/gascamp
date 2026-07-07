@@ -37,11 +37,9 @@ pub fn cook(
     }
 
     let ts = ledger.now_utc();
-    let run_id = format!(
-        "{}-{:06x}",
-        ts.replace(['-', ':'], ""),
-        fastrand::u32(..) & 0xFF_FFFF
-    );
+    let compact_ts = ts.replace(['-', ':'], "");
+    let new_run_id = || format!("{compact_ts}-{:06x}", fastrand::u32(..) & 0xFF_FFFF);
+    let mut run_id = new_run_id();
 
     // ---- id block allocation (Phase 3 counter). A concurrent writer racing
     // the same block makes the batch fail on the duplicate id and roll back
@@ -80,11 +78,27 @@ pub fn cook(
     }
 
     // ---- files first: runs/<run-id>/ with pinned copy + manifest
-    let dir = run_dir.join(&run_id);
     std::fs::create_dir_all(run_dir)
         .map_err(|e| CoreError::Cook(format!("cannot create {}: {e}", run_dir.display())))?;
-    std::fs::create_dir(&dir)
-        .map_err(|e| CoreError::Cook(format!("cannot create {}: {e}", dir.display())))?;
+    // Same-second suffix collision (24 random bits): regenerate once
+    // (review finding 6); a second collision fails loudly.
+    let mut dir = run_dir.join(&run_id);
+    if let Err(e) = std::fs::create_dir(&dir) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(CoreError::Cook(format!(
+                "cannot create {}: {e}",
+                dir.display()
+            )));
+        }
+        run_id = new_run_id();
+        dir = run_dir.join(&run_id);
+        std::fs::create_dir(&dir).map_err(|e| {
+            CoreError::Cook(format!(
+                "run id collision persisted after retry at {}: {e}",
+                dir.display()
+            ))
+        })?;
+    }
     let write = |name: &str, bytes: &[u8]| -> Result<(), CoreError> {
         std::fs::write(dir.join(name), bytes)
             .map_err(|e| CoreError::Cook(format!("cannot write {}/{name}: {e}", dir.display())))
