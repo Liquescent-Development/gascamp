@@ -16,6 +16,9 @@ pub struct CampConfig {
     pub camp: CampSection,
     #[serde(default)]
     pub rigs: Vec<RigConfig>,
+    /// `[[order]]` tables (spec §9); compiled by `orders::parse::compile_orders`.
+    #[serde(default, rename = "order", skip_serializing_if = "Vec::is_empty")]
+    pub orders: Vec<crate::orders::parse::OrderConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,6 +118,7 @@ prefix = "gc"
                 path: "/code/gascity".into(),
                 prefix: "gc".into(),
             }],
+            orders: vec![],
         };
         let text = toml::to_string(&cfg).unwrap();
         assert_eq!(CampConfig::parse(&text).unwrap(), cfg);

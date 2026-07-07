@@ -4,6 +4,7 @@
 //! and the fire pipeline (here).
 
 pub mod cron;
+pub mod parse;
 
 use cron::CronExpr;
 
