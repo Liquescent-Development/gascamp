@@ -25,15 +25,12 @@ pub const READY_PREFIX: &str = "campd listening on ";
 
 pub fn run(camp: &CampDir) -> Result<()> {
     let mut ledger = Ledger::open(&camp.db_path())?;
-    // "When did anyone last see the world" — read BEFORE campd.started
-    // lands, so cron fires missed while campd was down catch up under the
-    // window (spec §9; Phase 10 plan Decision F).
-    let last_seen0: jiff::Timestamp = match ledger.last_event_ts()? {
-        Some(ts) => ts
-            .parse()
-            .with_context(|| format!("parsing the ledger's last event ts {ts:?}"))?,
-        None => jiff::Timestamp::now(),
-    };
+    // "When did campd last OBSERVE the world" — the cursor-position ts,
+    // read BEFORE the startup settle advances the cursor, so cron fires
+    // missed while campd was down catch up under the window even when a
+    // daemon-less CLI write landed in between (spec §9; plan Decision F as
+    // amended per the PR #13 review, MEDIUM 2).
+    let last_seen0 = orders::catch_up_anchor(&ledger, jiff::Timestamp::now())?;
     let socket_path = camp.socket_path();
     let std_listener = socket::bind_or_replace(&socket_path)?;
     std_listener

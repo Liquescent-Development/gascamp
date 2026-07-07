@@ -159,6 +159,35 @@ fn compile_and_arm(
     Ok((config, orders, heap))
 }
 
+/// The downtime catch-up anchor (spec §9; PR #13 review MEDIUM 2): the
+/// `ts` of the event at campd's CURSOR position — the last instant campd
+/// demonstrably observed the world. Anchoring on the ledger's last event
+/// of any actor would let a daemon-less CLI write mask a missed cron fire
+/// that spec §9 guarantees fires once on wake. campd's own fires advance
+/// the cursor when processed, so nothing refires across a restart. A
+/// never-advanced cursor (fresh camp) anchors at `now`: nothing was ever
+/// scheduled, nothing to catch up. Read BEFORE the startup settle — settle
+/// advances the cursor.
+pub fn catch_up_anchor(ledger: &Ledger, now: Timestamp) -> Result<Timestamp, CoreError> {
+    let cursor = ledger.cursor(cursor::CAMPD_CURSOR)?;
+    if cursor == 0 {
+        return Ok(now);
+    }
+    let event = ledger
+        .events_range(cursor, Some(cursor))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            CoreError::Corrupt(format!("campd cursor points at missing event seq {cursor}"))
+        })?;
+    event.ts.parse().map_err(|e| {
+        CoreError::Corrupt(format!(
+            "event seq {cursor} has unparseable ts {:?}: {e}",
+            event.ts
+        ))
+    })
+}
+
 /// The campd processor: readiness (Phase 7) plus orders (Phase 10), one
 /// pass per committed event, inside the cursor transaction.
 pub struct CampdProcessor<'a> {
@@ -567,6 +596,80 @@ mod tests {
         assert_eq!(input.data["applied"], false);
         assert!(!input.data["error"].as_str().unwrap().is_empty());
         assert!(rt.order("new").is_some(), "old config retained");
+    }
+
+    /// PR #13 review MEDIUM 2: the downtime catch-up anchor is the last
+    /// instant campd OBSERVED (its cursor position), never the ledger's
+    /// last event of any actor — a daemon-less CLI write between a missed
+    /// fire and campd's start must not mask the miss (spec §9: "missed
+    /// fires within catch_up_window fire once on wake").
+    #[test]
+    fn downtime_catch_up_survives_an_intervening_cli_write() {
+        use camp_core::clock::FixedClock;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("camp.toml"),
+            format!(
+                "{BASE_TOML}[[order]]\nname=\"hourly\"\non=\"cron:0 * * * *\"\nformula=\"one-step\"\n"
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("camp.db");
+
+        // campd's last life: processed through campd.started at 06:50.
+        {
+            let mut ledger =
+                Ledger::open_with_clock(&db, Box::new(FixedClock::new("2026-07-06T06:50:00Z")))
+                    .unwrap();
+            ledger
+                .append(EventInput {
+                    kind: EventType::CampdStarted,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: None,
+                    data: serde_json::json!({}),
+                })
+                .unwrap();
+            ledger
+                .process_past_cursor(super::super::cursor::CAMPD_CURSOR, &mut |_c, _e| Ok(()))
+                .unwrap();
+        }
+        // campd dies; the 07:00 fire is missed; a daemon-less CLI write
+        // lands at 07:30 (campd's cursor never advances past it).
+        let mut ledger =
+            Ledger::open_with_clock(&db, Box::new(FixedClock::new("2026-07-06T07:30:00Z")))
+                .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title":"intervening write"}),
+            })
+            .unwrap();
+
+        // campd restarts at 07:40: the anchor is 06:50 (cursor position),
+        // NOT 07:30 (last event), so recompute catches the 07:00 fire.
+        let now = ts("2026-07-06T07:40:00Z");
+        let anchor = catch_up_anchor(&ledger, now).unwrap();
+        assert_eq!(anchor, ts("2026-07-06T06:50:00Z"));
+        let mut rt = OrdersRuntime::build(dir.path(), now, TimeZone::UTC).unwrap();
+        let catch_ups = rt.recompute(now, anchor);
+        assert_eq!(catch_ups.len(), 1, "{catch_ups:?}");
+        assert_eq!(catch_ups[0].order, "hourly");
+        assert_eq!(catch_ups[0].scheduled, ts("2026-07-06T07:00:00Z"));
+        // the masked-anchor counterexample: anchored on the CLI write's ts,
+        // the missed fire would be invisible
+        assert!(rt.recompute(now, ts("2026-07-06T07:30:00Z")).is_empty());
+    }
+
+    /// A fresh camp (cursor at 0) has nothing to catch up: anchor == now.
+    #[test]
+    fn catch_up_anchor_is_now_for_an_unprocessed_ledger() {
+        let (_dir, ledger) = fixture("");
+        let now = ts("2026-07-06T07:40:00Z");
+        assert_eq!(catch_up_anchor(&ledger, now).unwrap(), now);
     }
 
     #[test]

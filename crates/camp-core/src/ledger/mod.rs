@@ -251,19 +251,6 @@ impl Ledger {
         Ok(events)
     }
 
-    /// The `ts` of the highest-seq event, if any — campd's "when did anyone
-    /// last see the world" startup anchor for cron catch-up (spec §9,
-    /// Phase 10 plan Decision F). Read BEFORE appending `campd.started`.
-    pub fn last_event_ts(&self) -> Result<Option<String>, CoreError> {
-        use rusqlite::OptionalExtension;
-        Ok(self
-            .conn
-            .query_row("SELECT ts FROM events ORDER BY seq DESC LIMIT 1", [], |r| {
-                r.get(0)
-            })
-            .optional()?)
-    }
-
     /// Every event of one type, in seq order (via the `events_type` index).
     /// Order counts are small; this backs fire reconciliation, not user
     /// queries (spec §7.2: state reads go to the state tables).
@@ -1283,9 +1270,8 @@ mod tests {
     }
 
     #[test]
-    fn last_event_ts_and_events_of_type() {
+    fn events_of_type_lists_exactly_that_kind() {
         let (_dir, mut ledger) = temp_ledger();
-        assert_eq!(ledger.last_event_ts().unwrap(), None);
         ledger
             .append(input(
                 EventType::CampdStarted,
@@ -1302,10 +1288,6 @@ mod tests {
                 serde_json::json!({}),
             ))
             .unwrap();
-        assert_eq!(
-            ledger.last_event_ts().unwrap().as_deref(),
-            Some("2026-07-05T21:14:03Z") // temp_ledger's FixedClock
-        );
         assert_eq!(
             ledger
                 .events_of_type(EventType::CampdStarted)
