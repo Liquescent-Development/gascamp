@@ -11,3 +11,7 @@ tailable, and conversable. Camp for lunch, city for fleets, and a documented
 migration path from one to the other.
 
 Start with the design document: [`docs/design/2026-07-05-gas-camp-design.md`](docs/design/2026-07-05-gas-camp-design.md).
+
+Orders (cron- and event-triggered formulas) can fire at login via the
+optional launchd agent — see [contrib/launchd/](contrib/launchd/README.md)
+for the install one-liner and the honest away-mode limits.

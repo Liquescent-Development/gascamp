@@ -198,6 +198,8 @@ camp/                      # ~/camps/<name>/ (multi-rig) or <repo>/.camp/ (singl
                            #   canonical JSONL for any range (7.2)
   runs/<run-id>/           # one dir per formula run: pinned formula copy,
                            #   cook manifest, step status snapshot
+  formulas/                # camp-local formula definitions, resolved by
+                           #   name (§9; packs layer beneath, §11)
   worktrees/               # camp-managed worktrees (per agent isolation flag)
 ```
 
@@ -485,6 +487,9 @@ name    = "ci-red"
 on      = "event:bead.closed[label=ci-red]"
 formula = "fix-ci"
 ```
+
+An order's `formula` names `<camp>/formulas/<name>.toml`; when packs land
+(§11) they layer beneath these local definitions, last-wins.
 
 - **Cron orders:** `campd` keeps a min-heap of next fire times and sleeps
   until the earliest deadline — a timer, not a tick. On wall-clock jumps
