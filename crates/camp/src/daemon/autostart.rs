@@ -74,10 +74,58 @@ fn start_detached(camp: &CampDir, verb: &str) -> Result<()> {
         .read_line(&mut line)
         .context("reading campd's readiness line")?;
     if !line.starts_with(READY_PREFIX) {
+        // Our child may have lost the start race to another daemon that is
+        // now live: a campd whose bind is refused exits without a readiness
+        // line (PR #8 review finding 2). The socket, not our child, is the
+        // truth (spec §5) — re-probe before declaring failure.
+        if UnixStream::connect(camp.socket_path()).is_ok() {
+            return Ok(());
+        }
         bail!(
             "campd failed to start (no readiness line); see {}",
             camp.log_path().display()
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// PR #8 review finding 2: when our spawned campd loses the start race
+    /// to another daemon, it exits without a readiness line. The socket,
+    /// not our child, is the truth (spec §5): a live socket after the
+    /// child's EOF is a won race, not "campd failed to start".
+    #[test]
+    fn start_detached_recognizes_a_lost_race() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".camp");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        let camp = CampDir { root };
+        // Another daemon already owns the socket (a bound listener accepts
+        // via its backlog). Any child spawned below therefore exits without
+        // printing a readiness line. (The child here is this test binary
+        // rejecting bogus args — the same observable shape as a campd that
+        // lost the bind race: stdout EOF, no line.)
+        let _winner = UnixListener::bind(camp.socket_path()).unwrap();
+
+        let result = start_detached(&camp, "test");
+        assert!(
+            result.is_ok(),
+            "a live socket after child EOF is a won race, not a failure: {:?}",
+            result.err()
+        );
+        // the causal trail is still recorded
+        let ledger = camp_core::ledger::Ledger::open(&camp.db_path()).unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind.as_str() == "campd.autostarted")
+        );
+    }
 }
