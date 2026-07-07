@@ -25,8 +25,10 @@ use super::orders::{self, OrdersRuntime};
 use super::socket::{Request, Response};
 
 const LISTENER: Token = Token(0);
-/// The notify→mio self-pipe (camp.toml watch). Phase 8 allocates its
-/// SIGCHLD token around this — coordinate before renumbering.
+/// The notify→mio self-pipe (camp.toml watch). Authoritative campd token
+/// layout (lead ruling, PR #13 review MEDIUM 4): 0 = listener, 1 = config
+/// watch, 2 = Phase 8's SIGCHLD self-pipe, 3+ = connections. Coordinate
+/// with the lead before renumbering.
 const CONFIG_WATCH: Token = Token(1);
 
 /// Upper bound on a single request line (PR #8 review finding 3). Real
@@ -75,7 +77,9 @@ pub fn run(
     // bursts, and per-connection memory is already bounded by
     // MAX_REQUEST_BYTES.
     let mut conns: HashMap<Token, Conn> = HashMap::new();
-    let mut next_token = 2usize; // 0 = listener, 1 = config watch
+    // Token(2) is RESERVED for Phase 8's SIGCHLD self-pipe (the layout
+    // above); connections start at 3.
+    let mut next_token = 3usize;
 
     let mut last_seen = Timestamp::now();
     loop {
