@@ -38,3 +38,43 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
+
+  gc-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: read pinned gascity ref
+        id: gc-ref
+        run: echo "ref=$(cat ci/gc-compat/GASCITY_REF)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: gastownhall/gascity
+          ref: ${{ steps.gc-ref.outputs.ref }}
+          path: gascity-src
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gascity-src/go.mod
+          cache-dependency-path: gascity-src/go.sum
+      - name: build shim inside the gascity checkout
+        run: |
+          mkdir -p gascity-src/cmd/camp-corpus-validate
+          cp ci/gc-compat/camp_corpus_validate.go gascity-src/cmd/camp-corpus-validate/main.go
+          cd gascity-src
+          go build -o "$RUNNER_TEMP/camp-corpus-validate" ./cmd/camp-corpus-validate
+      - name: validate corpus against the real gc compiler
+        run: |
+          "$RUNNER_TEMP/camp-corpus-validate" crates/camp-core/tests/fixtures/formulas/valid
+      - name: shim self-test — a broken formula must exit 1
+        run: |
+          mkdir -p "$RUNNER_TEMP/selftest"
+          cp ci/gc-compat/selftest-invalid.toml "$RUNNER_TEMP/selftest/"
+          set +e
+          "$RUNNER_TEMP/camp-corpus-validate" "$RUNNER_TEMP/selftest"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 1 ]; then
+            echo "self-test: expected exit 1 on a broken formula, got $rc — the shim cannot be trusted" >&2
+            exit 1
+          fi
+      - name: vocabulary cross-check
+        run: ci/gc-compat/check_vocab.sh gascity-src "$GITHUB_WORKSPACE"

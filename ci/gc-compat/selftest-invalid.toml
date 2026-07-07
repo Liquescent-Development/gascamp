@@ -1,0 +1,17 @@
+# Deliberately broken formula for the Phase 6 CI shim self-test.
+# The gc-compat job runs camp-corpus-validate over a directory containing
+# only this file and requires exit 1 — proving the shim actually fails on
+# bad input. Broken several independent ways so no single relaxed gc rule
+# can silently defuse the self-test:
+#   - steps[0] has no title        (gc: "title is required")
+#   - steps[1] duplicates id "a"   (gc: "duplicate id")
+#   - needs references "ghost"     (gc: "unknown step")
+formula = "selftest-invalid"
+
+[[steps]]
+id = "a"
+
+[[steps]]
+id = "a"
+title = "duplicate id, unknown dependency"
+needs = ["ghost"]
