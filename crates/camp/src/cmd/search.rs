@@ -19,9 +19,10 @@ pub fn run_filtered(
 ) -> Result<()> {
     let ledger = Ledger::open(&camp.db_path())?;
     for hit in ledger.search(query, type_filter, limit)? {
-        // Snippets can span the fold's title'\n'description boundary; the
-        // output is one line per hit, so flatten embedded line breaks.
-        let snippet = hit.snippet.replace(['\n', '\r'], " ");
+        // Snippets can span the fold's title'\n'description boundary and
+        // carry any whitespace the author typed; the output is one 3-column
+        // TSV row per hit, so flatten line breaks AND tabs.
+        let snippet = hit.snippet.replace(['\n', '\r', '\t'], " ");
         println!("{}\t{}\t{}", hit.bead_id, hit.kind, snippet.trim());
     }
     Ok(())

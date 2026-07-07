@@ -218,6 +218,42 @@ fn malformed_fts_query_is_a_clean_exit_1() {
     }
 }
 
+/// The output contract is one 3-column TSV row per hit
+/// (`<bead_id>\t<kind>\t<snippet>`), so whitespace stored inside the text —
+/// tabs included — must not inject extra columns or rows for line-oriented
+/// parsers (PR #6 review nit).
+#[test]
+fn tabbed_content_stays_one_clean_tsv_row() {
+    let dir = camp_with_rig();
+    camp()
+        .current_dir(dir.path())
+        .args(["remember", "deploy\trunbook lives in ops/wiki"])
+        .assert()
+        .success()
+        .stdout(predicates::str::diff("gc-1\n"));
+
+    let out = camp()
+        .current_dir(dir.path())
+        .args(["recall", "runbook"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 1, "one hit, one row: {out:?}");
+    let cols: Vec<&str> = lines[0].split('\t').collect();
+    assert_eq!(cols.len(), 3, "exactly 3 columns: {cols:?}");
+    assert_eq!(cols[0], "gc-1");
+    assert_eq!(cols[1], "body");
+    assert!(
+        cols[2].contains("deploy runbook"),
+        "snippet flattens the tab: {:?}",
+        cols[2]
+    );
+}
+
 #[test]
 fn no_hits_is_success_with_empty_output() {
     let dir = camp_with_rig();

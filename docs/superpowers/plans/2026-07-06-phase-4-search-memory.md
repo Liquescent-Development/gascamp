@@ -679,11 +679,13 @@ pub fn run_filtered(
 ) -> Result<()> {
     let ledger = Ledger::open(&camp.db_path())?;
     for hit in ledger.search(query, type_filter, limit)? {
-        // Snippets can span the fold's title'\n'description boundary; the
-        // output is one line per hit, so flatten embedded line breaks.
+        // Snippets can span the fold's title'\n'description boundary and
+        // carry any whitespace the author typed; the output is one 3-column
+        // TSV row per hit, so flatten line breaks AND tabs.
         // (Added during execution: the limit test caught 2 output lines per
-        // hit because FTS5 snippets carry the stored newline through.)
-        let snippet = hit.snippet.replace(['\n', '\r'], " ");
+        // hit because FTS5 snippets carry the stored newline through; the
+        // PR #6 review then caught tabs injecting spurious TSV columns.)
+        let snippet = hit.snippet.replace(['\n', '\r', '\t'], " ");
         println!("{}\t{}\t{}", hit.bead_id, hit.kind, snippet.trim());
     }
     Ok(())
