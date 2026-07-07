@@ -1,5 +1,9 @@
 # Phase 6 — gc Compatibility Gates in CI Implementation Plan
 
+> Plan approved by Opus 4.8 plan review, 2026-07-07 (automated plan gate per
+> operator directive), as relayed by the orchestration lead. Zero blocking
+> findings; Task 8's required-check scope remains operator-bound.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Spec §15.2 contracts 1 (formula subset invariant) and 2 (vocabulary mirror) become CI checks: a `gc-compat` job validates the Phase 5 formula corpus against the real Gas City compiler at a pinned ref and cross-checks the event/outcome vocabulary against gc source.
