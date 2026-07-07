@@ -329,6 +329,46 @@ fn camp_top_autostarts_campd_with_the_event_trail() {
     run_ok(&root, &["stop"]);
 }
 
+/// PR #8 review findings 1 and 2 through the real surface: eight
+/// concurrent `camp top` invocations against a daemonless camp. Every one
+/// must succeed (losers of the start race must recognize the winner, not
+/// error), and exactly one campd may end up owning the socket (the
+/// replacement critical section is serialized — no split brain).
+#[test]
+fn concurrent_top_autostarts_exactly_one_campd() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_camp(dir.path());
+    let _guard = StopGuard {
+        sock: root.join("campd.sock"),
+    };
+
+    let children: Vec<Child> = (0..8)
+        .map(|_| {
+            camp_cmd(&root)
+                .arg("top")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "camp top failed under concurrent auto-start: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let started = event_types(&root)
+        .iter()
+        .filter(|t| t.as_str() == "campd.started")
+        .count();
+    assert_eq!(started, 1, "exactly one campd may win the start race");
+
+    run_ok(&root, &["stop"]);
+}
+
 #[test]
 fn campd_symlink_runs_daemon_mode() {
     let dir = tempfile::tempdir().unwrap();
