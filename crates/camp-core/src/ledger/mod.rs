@@ -840,6 +840,57 @@ mod tests {
     }
 
     #[test]
+    fn campd_autostarted_is_validated_and_log_only() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(input(
+                EventType::CampdAutostarted,
+                None,
+                None,
+                serde_json::json!({"verb": "top"}),
+            ))
+            .unwrap();
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+        assert_eq!(count(&ledger, "SELECT count(*) FROM beads"), 0);
+        assert_eq!(count(&ledger, "SELECT count(*) FROM sessions"), 0);
+
+        // missing verb fails fast, appends nothing
+        assert!(
+            ledger
+                .append(input(
+                    EventType::CampdAutostarted,
+                    None,
+                    None,
+                    serde_json::json!({})
+                ))
+                .is_err()
+        );
+        // unknown fields fail fast
+        assert!(
+            ledger
+                .append(input(
+                    EventType::CampdAutostarted,
+                    None,
+                    None,
+                    serde_json::json!({"verb": "top", "extra": 1}),
+                ))
+                .is_err()
+        );
+        // empty verb fails fast
+        assert!(
+            ledger
+                .append(input(
+                    EventType::CampdAutostarted,
+                    None,
+                    None,
+                    serde_json::json!({"verb": ""}),
+                ))
+                .is_err()
+        );
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+    }
+
+    #[test]
     fn unknown_payload_fields_fail_fast() {
         let (_dir, mut ledger) = temp_ledger();
         match ledger.append(created(
