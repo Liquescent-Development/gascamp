@@ -287,6 +287,25 @@ fn responded_fired_seqs(ledger: &Ledger) -> Result<std::collections::BTreeSet<Se
     Ok(responded)
 }
 
+/// Was this exact cron fire (order + scheduled instant) already declared
+/// as an `order.fired`? A fire's scheduled instant is unique per cron
+/// occurrence, so re-declaring one is NEVER legitimate — this probe makes
+/// declaration idempotent across the kill -9 window between a fire's
+/// append and the settle that advances the cursor past it (PR #13
+/// fix-pass review: the recompute after restart must not re-declare what
+/// settle is about to cook). Indexed by type (LOW-5 style).
+pub fn cron_fire_declared(
+    ledger: &Ledger,
+    order_name: &str,
+    scheduled: Timestamp,
+) -> Result<bool, CoreError> {
+    ledger.has_event_with_data_strs(
+        EventType::OrderFired,
+        ("order", order_name),
+        ("scheduled_ts", &canonical_ts(scheduled)),
+    )
+}
+
 /// Has this fire already been answered (cooked, or failed with an event)?
 /// Two targeted existence probes bounded by the `events_type` index —
 /// never a ledger scan (PR #13 review LOW 5).

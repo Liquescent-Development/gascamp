@@ -14,7 +14,6 @@ use anyhow::{Context, Result};
 use camp_core::clock::Clock;
 use camp_core::event::{EventInput, EventType};
 use camp_core::ledger::Ledger;
-use camp_core::orders::FireCause;
 use camp_core::orders::cron::Fire;
 use jiff::{SignedDuration, Timestamp};
 use mio::net::{UnixListener, UnixStream};
@@ -97,14 +96,12 @@ pub fn run(
         let mono_delta =
             SignedDuration::try_from(mono_before.elapsed()).unwrap_or(SignedDuration::MAX);
         let fires: Vec<Fire> = if (wall_delta - mono_delta).abs() > JUMP_TOLERANCE {
+            // into_fire computes the catch_up flag exactly as fire_due
+            // does (PR #13 fix-pass review: one rule, one flag).
             runtime
                 .recompute(now, last_seen)
                 .into_iter()
-                .map(|c| Fire {
-                    order: c.order,
-                    scheduled: c.scheduled,
-                    catch_up: true,
-                })
+                .map(|c| c.into_fire(now))
                 .collect()
         } else {
             runtime.fire_due(now)
@@ -113,16 +110,7 @@ pub fn run(
         // Declare the fires (durable first); the settle below cooks them.
         // A ledger that refuses the declaration is fatal — campd must not
         // run automation it cannot record.
-        let mut wake_ledger_work = !fires.is_empty();
-        for fire in fires {
-            ledger.append(camp_core::orders::fired_input(
-                &fire.order,
-                &FireCause::Cron {
-                    scheduled: fire.scheduled,
-                    catch_up: fire.catch_up,
-                },
-            ))?;
-        }
+        let mut wake_ledger_work = orders::declare_cron_fires(ledger, &fires)?;
         for event in events.iter() {
             match event.token() {
                 LISTENER => loop {

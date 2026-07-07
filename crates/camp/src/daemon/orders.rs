@@ -195,6 +195,30 @@ fn compile_and_arm(
     Ok((config, orders, heap))
 }
 
+/// Declare cron fires durably (one `order.fired` each) ahead of the
+/// settle that cooks them — idempotently: a fire campd already declared
+/// for the same (order, scheduled instant) is skipped, so the kill -9
+/// window between a declaration and its settle cannot double-cook on
+/// restart (PR #13 fix-pass review, spec §9 "fire once"). Returns whether
+/// anything was appended.
+pub fn declare_cron_fires(ledger: &mut Ledger, fires: &[Fire]) -> Result<bool, CoreError> {
+    let mut declared = false;
+    for fire in fires {
+        if camp_core::orders::cron_fire_declared(ledger, &fire.order, fire.scheduled)? {
+            continue;
+        }
+        ledger.append(fired_input(
+            &fire.order,
+            &FireCause::Cron {
+                scheduled: fire.scheduled,
+                catch_up: fire.catch_up,
+            },
+        ))?;
+        declared = true;
+    }
+    Ok(declared)
+}
+
 /// A poisoned mutex still yields its data — the watcher thread holds the
 /// lock only for a store, and campd must not die (or panic) over a
 /// poisoned error slot.
@@ -787,6 +811,99 @@ mod tests {
             ledger.events_of_type(EventType::OrderFailed).unwrap().len(),
             2,
             "both fires resolve once the ledger writes again"
+        );
+    }
+
+    /// PR #13 fix-pass review, NEW MEDIUM: kill -9 between
+    /// `ledger.append(order.fired)` and the settle that advances the
+    /// cursor past it must not double-cook. On restart, settle cooks the
+    /// crashed fire (it sits past the cursor); the recompute that follows
+    /// must NOT re-declare the same (order, scheduled) fire — the anchor
+    /// alone cannot see it (the cursor-position ts predates the fire).
+    #[test]
+    fn a_fire_crashed_before_its_settle_cooks_exactly_once_on_restart() {
+        use camp_core::clock::FixedClock;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("camp.toml"),
+            format!(
+                "{BASE_TOML}[[order]]\nname=\"hourly\"\non=\"cron:0 * * * *\"\nformula=\"one-step\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("formulas")).unwrap();
+        std::fs::write(
+            dir.path().join("formulas/one-step.toml"),
+            "formula = \"one-step\"\n\n[[steps]]\nid = \"s1\"\ntitle = \"one step\"\n",
+        )
+        .unwrap();
+        let db = dir.path().join("camp.db");
+
+        // campd's last life: observed the world at 06:50...
+        {
+            let mut ledger =
+                Ledger::open_with_clock(&db, Box::new(FixedClock::new("2026-07-06T06:50:00Z")))
+                    .unwrap();
+            ledger
+                .append(EventInput {
+                    kind: EventType::CampdStarted,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: None,
+                    data: serde_json::json!({}),
+                })
+                .unwrap();
+            ledger
+                .process_past_cursor(super::super::cursor::CAMPD_CURSOR, &mut |_c, _e| Ok(()))
+                .unwrap();
+        }
+        // ...declared the 07:00 fire at 07:00:10, then died BEFORE the
+        // settle advanced the cursor past it.
+        let mut ledger =
+            Ledger::open_with_clock(&db, Box::new(FixedClock::new("2026-07-06T07:00:10Z")))
+                .unwrap();
+        ledger
+            .append(fired_input(
+                "hourly",
+                &FireCause::Cron {
+                    scheduled: ts("2026-07-06T07:00:00Z"),
+                    catch_up: false,
+                },
+            ))
+            .unwrap();
+
+        // The restart sequence, exactly as daemon::run performs it:
+        let now = ts("2026-07-06T07:40:00Z");
+        let anchor = catch_up_anchor(&ledger, now).unwrap();
+        assert_eq!(
+            anchor,
+            ts("2026-07-06T06:50:00Z"),
+            "anchor predates the fire"
+        );
+        let mut rt = runtime(&dir, "2026-07-06T07:40:00Z");
+        let mut readiness = ReadinessProcessor::default();
+        settle(&mut ledger, &mut readiness, &mut rt, &clock()).unwrap();
+        for cook in camp_core::orders::unresponded_fires(&ledger).unwrap() {
+            rt.queue_cook(cook);
+        }
+        let fires: Vec<Fire> = rt
+            .recompute(now, anchor)
+            .into_iter()
+            .map(|c| c.into_fire(now))
+            .collect();
+        declare_cron_fires(&mut ledger, &fires).unwrap();
+        settle(&mut ledger, &mut readiness, &mut rt, &clock()).unwrap();
+
+        // spec §9 "fire once": ONE declaration, ONE cooked run.
+        assert_eq!(
+            ledger.events_of_type(EventType::OrderFired).unwrap().len(),
+            1,
+            "the crashed declaration must not be re-declared"
+        );
+        assert_eq!(
+            ledger.events_of_type(EventType::RunCooked).unwrap().len(),
+            1,
+            "exactly one cook"
         );
     }
 

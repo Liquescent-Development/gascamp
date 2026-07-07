@@ -309,6 +309,31 @@ impl Ledger {
             .is_some())
     }
 
+    /// Is there any event of `kind` whose `data.<f1>` and `data.<f2>`
+    /// equal these strings? Targeted existence probe over the type-indexed
+    /// subset (PR #13 fix-pass review: idempotent cron-fire declaration).
+    pub fn has_event_with_data_strs(
+        &self,
+        kind: crate::event::EventType,
+        (f1, v1): (&str, &str),
+        (f2, v2): (&str, &str),
+    ) -> Result<bool, CoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE type = ?1
+                   AND json_extract(data, '$.' || ?2) = ?3
+                   AND json_extract(data, '$.' || ?4) = ?5
+                 LIMIT 1",
+                params![kind.as_str(), f1, v1, f2, v2],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Ranked full-text search over titles, descriptions, close notes, and
     /// memory (spec §7.4), best match first. See [`crate::search::search`].
     pub fn search(
@@ -1354,6 +1379,42 @@ mod tests {
         assert!(
             !ledger
                 .has_event_with_actor(EventType::RunCooked, "test")
+                .unwrap()
+        );
+        // two-string-field probe (idempotent cron-fire declaration)
+        ledger
+            .append(input(
+                EventType::OrderFired,
+                None,
+                None,
+                serde_json::json!({"order":"t","trigger":"cron","scheduled_ts":"2026-07-06T07:00:00Z"}),
+            ))
+            .unwrap();
+        assert!(
+            ledger
+                .has_event_with_data_strs(
+                    EventType::OrderFired,
+                    ("order", "t"),
+                    ("scheduled_ts", "2026-07-06T07:00:00Z"),
+                )
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .has_event_with_data_strs(
+                    EventType::OrderFired,
+                    ("order", "t"),
+                    ("scheduled_ts", "2026-07-06T08:00:00Z"),
+                )
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .has_event_with_data_strs(
+                    EventType::OrderFired,
+                    ("order", "u"),
+                    ("scheduled_ts", "2026-07-06T07:00:00Z"),
+                )
                 .unwrap()
         );
     }

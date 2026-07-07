@@ -85,15 +85,12 @@ pub fn run(camp: &CampDir) -> Result<()> {
     }
     // Cron fires missed while campd was down, under each order's window.
     let now = jiff::Timestamp::now();
-    for c in runtime.recompute(now, last_seen0) {
-        ledger.append(camp_core::orders::fired_input(
-            &c.order,
-            &camp_core::orders::FireCause::Cron {
-                scheduled: c.scheduled,
-                catch_up: true,
-            },
-        ))?;
-    }
+    let fires: Vec<camp_core::orders::cron::Fire> = runtime
+        .recompute(now, last_seen0)
+        .into_iter()
+        .map(|c| c.into_fire(now))
+        .collect();
+    orders::declare_cron_fires(&mut ledger, &fires)?;
     orders::settle(&mut ledger, &mut processor, &mut runtime, &clock)?;
 
     let mut stdout = std::io::stdout();
