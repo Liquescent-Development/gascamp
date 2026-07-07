@@ -651,7 +651,8 @@ mod tests {
         assert_eq!(rt.pending_cook_count(), 2);
 
         // infrastructure recovers → the next settle drains them
-        raw.execute_batch("DROP TRIGGER inject_infra_error").unwrap();
+        raw.execute_batch("DROP TRIGGER inject_infra_error")
+            .unwrap();
         settle(&mut ledger, &mut readiness, &mut rt, &clock()).unwrap();
         assert_eq!(rt.pending_cook_count(), 0);
         assert_eq!(

@@ -267,6 +267,48 @@ impl Ledger {
         Ok(events)
     }
 
+    /// Is there any event of `kind` with exactly this actor? A targeted
+    /// existence probe bounded by the `events_type` index (PR #13 review
+    /// LOW 5) — the fire-dedupe hot path must not scan the ledger.
+    pub fn has_event_with_actor(
+        &self,
+        kind: crate::event::EventType,
+        actor: &str,
+    ) -> Result<bool, CoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM events WHERE type = ?1 AND actor = ?2 LIMIT 1",
+                params![kind.as_str(), actor],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Is there any event of `kind` whose `data.<field>` equals this
+    /// integer? `json_extract` over the type-indexed subset (PR #13 review
+    /// LOW 5).
+    pub fn has_event_with_data_i64(
+        &self,
+        kind: crate::event::EventType,
+        field: &str,
+        value: i64,
+    ) -> Result<bool, CoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE type = ?1 AND json_extract(data, '$.' || ?2) = ?3 LIMIT 1",
+                params![kind.as_str(), field, value],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Ranked full-text search over titles, descriptions, close notes, and
     /// memory (spec §7.4), best match first. See [`crate::search::search`].
     pub fn search(
@@ -1267,6 +1309,53 @@ mod tests {
         // the failed processor transaction rolled back: no event, no cursor move
         assert_eq!(ledger.events_range(1, None).unwrap().len(), 1);
         assert_eq!(ledger.cursor("t").unwrap(), 0);
+    }
+
+    #[test]
+    fn targeted_event_existence_queries() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(input(
+                EventType::OrderFailed,
+                None,
+                None,
+                serde_json::json!({"order":"t","fired_seq":41,"error":"e"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::ConfigChanged,
+                None,
+                None,
+                serde_json::json!({"path":"p","applied":true,"orders":0}),
+            ))
+            .unwrap();
+        assert!(
+            ledger
+                .has_event_with_data_i64(EventType::OrderFailed, "fired_seq", 41)
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .has_event_with_data_i64(EventType::OrderFailed, "fired_seq", 42)
+                .unwrap()
+        );
+        // actor equality, bounded by the type index
+        assert!(
+            ledger
+                .has_event_with_actor(EventType::ConfigChanged, "test")
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .has_event_with_actor(EventType::ConfigChanged, "order:t:41")
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .has_event_with_actor(EventType::RunCooked, "test")
+                .unwrap()
+        );
     }
 
     #[test]

@@ -268,8 +268,10 @@ pub fn formula_path(camp_root: &Path, formula: &str) -> PathBuf {
 }
 
 /// Every `fired_seq` that already has a response: a `run.cooked` whose
-/// actor encodes it, or an `order.failed` carrying it. Backs cook dedupe
-/// and startup reconciliation; order-event counts are small.
+/// actor encodes it, or an `order.failed` carrying it. STARTUP-ONLY (the
+/// one-shot `unresponded_fires` reconciliation) — the per-fire hot path
+/// uses the targeted `fire_response_exists` probes instead (PR #13 review
+/// LOW 5).
 fn responded_fired_seqs(ledger: &Ledger) -> Result<std::collections::BTreeSet<Seq>, CoreError> {
     let mut responded = std::collections::BTreeSet::new();
     for cooked in ledger.events_of_type(EventType::RunCooked)? {
@@ -286,8 +288,17 @@ fn responded_fired_seqs(ledger: &Ledger) -> Result<std::collections::BTreeSet<Se
 }
 
 /// Has this fire already been answered (cooked, or failed with an event)?
-pub fn fire_response_exists(ledger: &Ledger, fired_seq: Seq) -> Result<bool, CoreError> {
-    Ok(responded_fired_seqs(ledger)?.contains(&fired_seq))
+/// Two targeted existence probes bounded by the `events_type` index —
+/// never a ledger scan (PR #13 review LOW 5).
+pub fn fire_response_exists(
+    ledger: &Ledger,
+    order_name: &str,
+    fired_seq: Seq,
+) -> Result<bool, CoreError> {
+    Ok(
+        ledger.has_event_with_actor(EventType::RunCooked, &cook_actor(order_name, fired_seq))?
+            || ledger.has_event_with_data_i64(EventType::OrderFailed, "fired_seq", fired_seq)?,
+    )
 }
 
 /// `order.fired` events with no response — fires orphaned by a crash
@@ -322,7 +333,7 @@ pub fn execute_fire(
     order: &Order,
     fired_seq: Seq,
 ) -> Result<Option<crate::formula::CookedRun>, CoreError> {
-    if fire_response_exists(ledger, fired_seq)? {
+    if fire_response_exists(ledger, &order.name, fired_seq)? {
         return Ok(None);
     }
     let fail = |ledger: &mut Ledger, error: String| -> Result<(), CoreError> {
