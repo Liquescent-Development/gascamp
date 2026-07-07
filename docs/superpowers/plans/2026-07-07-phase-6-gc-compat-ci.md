@@ -587,10 +587,21 @@ gh pr comment --body "Exit-criterion demo: <failing-run-url> shows gc-compat rej
 
 - [ ] **Step 1: After the merge, create the protection**
 
+**Operator decision (2026-07-07, relayed by the lead): ALL FIVE checks required, `strict: false`.** The contexts array below reflects it; the plan's earlier gc-compat-only default is superseded.
+
 ```bash
 gh api -X PUT repos/richardkiene/gascamp/branches/main/protection --input - <<'JSON'
 {
-  "required_status_checks": { "strict": false, "contexts": ["gc-compat"] },
+  "required_status_checks": {
+    "strict": false,
+    "contexts": [
+      "fmt",
+      "clippy",
+      "test (ubuntu-latest)",
+      "test (macos-latest)",
+      "gc-compat"
+    ]
+  },
   "enforce_admins": false,
   "required_pull_request_reviews": null,
   "restrictions": null
@@ -603,13 +614,13 @@ JSON
 ```bash
 gh api repos/richardkiene/gascamp/branches/main/protection/required_status_checks
 ```
-Expected: JSON with `"contexts": ["gc-compat"]`.
+Expected: JSON with all five contexts, `gc-compat` among them.
 
 - [ ] **Step 3: Report to the lead**
 
 PR number, CI status, both demo run URLs, and each master-plan exit criterion quoted with its evidence.
 
-**Open question for the operator (answer at plan approval):** should the required-check set be `gc-compat` only (the contract's letter) or all five checks (`fmt`, `clippy`, `test (ubuntu-latest)`, `test (macos-latest)`, `gc-compat` — formalizing the existing "gates green before push" rule)? The plan defaults to `gc-compat` only; say the word and Step 1's `contexts` array becomes the five-name list.
+**Open question for the operator — ANSWERED 2026-07-07:** all five checks (`fmt`, `clippy`, `test (ubuntu-latest)`, `test (macos-latest)`, `gc-compat`), formalizing the existing "gates green before push" rule. Step 1's `contexts` array above reflects the decision.
 
 ---
 
