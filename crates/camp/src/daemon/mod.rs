@@ -43,10 +43,13 @@ pub fn run(camp: &CampDir) -> Result<()> {
     // backlog must not pretend to be up (fail fast).
     let mut processor = ReadinessProcessor::default();
     cursor::catch_up(&mut ledger, &mut processor)?;
+    // Phase 8 dispatches the newly-ready set; until then the recompute is
+    // bookkeeping only, drained so it never accumulates in a long-lived
+    // daemon.
+    let _newly_ready = processor.take_pending();
 
     let mut stdout = std::io::stdout();
-    writeln!(stdout, "{READY_PREFIX}{}", socket_path.display())
-        .context("announcing readiness")?;
+    writeln!(stdout, "{READY_PREFIX}{}", socket_path.display()).context("announcing readiness")?;
     stdout.flush().context("flushing the readiness line")?;
 
     event_loop::run(listener, &socket_path, &mut ledger, &mut processor)
@@ -56,7 +59,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write as _};
+    use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::time::Duration;

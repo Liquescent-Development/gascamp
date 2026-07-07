@@ -14,7 +14,7 @@ use camp_core::ledger::Ledger;
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
 
-use super::cursor::{self, EventProcessor};
+use super::cursor::{self, ReadinessProcessor};
 use super::socket::{Request, Response};
 
 const LISTENER: Token = Token(0);
@@ -41,7 +41,7 @@ pub fn run(
     mut listener: UnixListener,
     socket_path: &Path,
     ledger: &mut Ledger,
-    processor: &mut dyn EventProcessor,
+    processor: &mut ReadinessProcessor,
 ) -> Result<()> {
     let mut poll = Poll::new().context("creating the poller")?;
     let mut events = Events::with_capacity(64);
@@ -111,7 +111,7 @@ pub fn run(
 fn serve_connection(
     conn: &mut Conn,
     ledger: &mut Ledger,
-    processor: &mut dyn EventProcessor,
+    processor: &mut ReadinessProcessor,
 ) -> Result<ConnState> {
     let mut eof = false;
     let mut chunk = [0u8; 4096];
@@ -141,7 +141,13 @@ fn serve_connection(
                 // stderr, and leaves the cursor before the failing event —
                 // surfaced, never skipped.
                 let response = match cursor::catch_up(ledger, processor) {
-                    Ok(_) => Response::Ok { ok: true },
+                    Ok(_) => {
+                        // Phase 8 dispatches the newly-ready set; drained
+                        // here so the bookkeeping stays bounded in a
+                        // long-lived daemon.
+                        let _newly_ready = processor.take_pending();
+                        Response::Ok { ok: true }
+                    }
                     Err(e) => {
                         eprintln!("campd: catch-up failed: {e}");
                         Response::Error {
@@ -181,7 +187,11 @@ fn serve_connection(
             }
         }
     }
-    Ok(if eof { ConnState::Closed } else { ConnState::Open })
+    Ok(if eof {
+        ConnState::Closed
+    } else {
+        ConnState::Open
+    })
 }
 
 fn respond(stream: &mut UnixStream, response: &Response) -> Result<()> {

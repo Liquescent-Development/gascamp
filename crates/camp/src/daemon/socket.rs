@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     /// Post-commit poke (spec §7.2). `seq` is advisory: catch-up processes
     /// everything past the cursor regardless.
-    Poke { seq: Seq },
+    Poke {
+        seq: Seq,
+    },
     Status,
     Stop,
 }

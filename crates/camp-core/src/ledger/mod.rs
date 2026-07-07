@@ -153,11 +153,11 @@ impl Ledger {
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let ready = crate::readiness::ready_beads(&self.conn, None)?.len() as u64;
-        let open: i64 =
-            self.conn
-                .query_row("SELECT count(*) FROM beads WHERE status = 'open'", [], |r| {
-                    r.get(0)
-                })?;
+        let open: i64 = self.conn.query_row(
+            "SELECT count(*) FROM beads WHERE status = 'open'",
+            [],
+            |r| r.get(0),
+        )?;
         let open = u64::try_from(open)
             .map_err(|_| CoreError::Corrupt(format!("negative open-bead count {open}")))?;
         Ok(StatusSummary {

@@ -78,15 +78,15 @@ fn campd_cursor(root: &Path) -> i64 {
 
 fn max_seq(root: &Path) -> i64 {
     let conn = rusqlite::Connection::open(root.join("camp.db")).unwrap();
-    conn.query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| {
-        r.get(0)
-    })
-    .unwrap()
+    conn.query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| r.get(0))
+        .unwrap()
 }
 
 fn event_types(root: &Path) -> Vec<String> {
     let conn = rusqlite::Connection::open(root.join("camp.db")).unwrap();
-    let mut stmt = conn.prepare("SELECT type FROM events ORDER BY seq").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT type FROM events ORDER BY seq")
+        .unwrap();
     let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
     rows.map(Result::unwrap).collect()
 }
@@ -201,7 +201,10 @@ fn kill_dash_nine_stale_socket_restart_and_exactly_once_catch_up() {
     daemon.kill_dash_nine();
 
     let sock = root.join("campd.sock");
-    assert!(sock.exists(), "SIGKILL leaves the socket file behind (stale)");
+    assert!(
+        sock.exists(),
+        "SIGKILL leaves the socket file behind (stale)"
+    );
     assert!(
         UnixStream::connect(&sock).is_err(),
         "stale socket refuses connections"
@@ -222,7 +225,10 @@ fn kill_dash_nine_stale_socket_restart_and_exactly_once_catch_up() {
     assert_eq!(campd_cursor(&root), max_seq(&root));
     let status = daemon2.request(r#"{"op":"status"}"#);
     assert_eq!(status["ok"], true);
-    assert_eq!(status["ready"], 1, "gc-2 was unblocked by gc-1's pass close");
+    assert_eq!(
+        status["ready"], 1,
+        "gc-2 was unblocked by gc-1's pass close"
+    );
     assert_eq!(status["open"], 1);
 }
 
@@ -236,10 +242,7 @@ fn camp_stop_is_graceful() {
     assert_eq!(out, "campd stopped\n");
     let status = daemon.child.wait().unwrap();
     assert!(status.success(), "graceful stop exits 0");
-    assert!(
-        !root.join("campd.sock").exists(),
-        "stop unlinks the socket"
-    );
+    assert!(!root.join("campd.sock").exists(), "stop unlinks the socket");
     assert!(event_types(&root).contains(&"campd.stopped".to_owned()));
 }
 

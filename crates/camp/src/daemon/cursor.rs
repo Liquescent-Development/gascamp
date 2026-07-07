@@ -57,10 +57,7 @@ impl EventProcessor for ReadinessProcessor {
 /// itself append events (Phase 8 dispatch); re-checking until the cursor
 /// stops moving drains those too. Bounded by the backlog — convergence,
 /// not polling. Returns the final cursor position.
-pub fn catch_up(
-    ledger: &mut Ledger,
-    processor: &mut dyn EventProcessor,
-) -> Result<Seq, CoreError> {
+pub fn catch_up(ledger: &mut Ledger, processor: &mut dyn EventProcessor) -> Result<Seq, CoreError> {
     loop {
         let before = ledger.cursor(CAMPD_CURSOR)?;
         let after = ledger.process_past_cursor(CAMPD_CURSOR, &mut |conn, event| {
