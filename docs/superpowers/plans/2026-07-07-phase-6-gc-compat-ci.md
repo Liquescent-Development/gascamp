@@ -32,6 +32,7 @@ These were all verified by actually running the real compiler locally; the execu
 5. gascity's `go.mod` says `go 1.26.4` and a `go.sum` exists (used for `setup-go` cache keying).
 6. `crates/camp-core/tests/formula_corpus.rs` enumerates `valid/` with `read_dir` — the Task 7 demo file will fail the Rust `test` job **and** `gc-compat`; that is expected and stated in the demo PR comment.
 7. `main` currently has **no branch protection** (`gh api .../branches/main/protection` → 404). "Required for merge" (Task 8) means creating it.
+8. **Execution-time correction (2026-07-07):** `go run` collapses every nonzero program exit code to 1 (verified with a minimal `os.Exit(2)` probe — `go run` exits 1). Through `go run`, the self-test's exact `rc == 1` assertion could not distinguish "shim rejected the formula" (program exit 1) from "shim saw no formulas" (program exit 2) — precisely the vacuous pass the assertion exists to prevent. Therefore CI and the local mirrors `go build` the shim once and run the binary directly, preserving true exit codes. Same decision-3 mechanism (shim copied into the checkout, compiled there); only the invocation differs from the originally drafted YAML.
 
 ## File Structure
 
@@ -152,10 +153,13 @@ mkdir -p "$GC_SRC/cmd/camp-corpus-validate"
 cp ci/gc-compat/camp_corpus_validate.go "$GC_SRC/cmd/camp-corpus-validate/main.go"
 ```
 
-- [ ] **Step 3: Run over the valid corpus — the positive case**
+- [ ] **Step 3: Build the binary and run over the valid corpus — the positive case**
+
+(`go build`, not `go run` — see verified fact 8: `go run` collapses program exit codes to 1.)
 
 ```bash
-cd "$GC_SRC" && go run ./cmd/camp-corpus-validate "<repo-root>/crates/camp-core/tests/fixtures/formulas/valid"; echo "exit=$?"
+cd "$GC_SRC" && go build -o /tmp/camp-corpus-validate ./cmd/camp-corpus-validate
+/tmp/camp-corpus-validate "<repo-root>/crates/camp-core/tests/fixtures/formulas/valid"; echo "exit=$?"
 ```
 Expected (order alphabetical; exit 0):
 ```
@@ -167,10 +171,10 @@ OK   retry-fetch
 exit=0
 ```
 
-- [ ] **Step 4: Run over an empty dir — usage guard fires**
+- [ ] **Step 4: Run over an empty dir — usage guard fires with its true exit code**
 
 ```bash
-mkdir -p /tmp/gc-compat-empty && cd "$GC_SRC" && go run ./cmd/camp-corpus-validate /tmp/gc-compat-empty; echo "exit=$?"
+mkdir -p /tmp/gc-compat-empty && /tmp/camp-corpus-validate /tmp/gc-compat-empty; echo "exit=$?"
 ```
 Expected: `no formulas found in ...` on stderr, `exit=2`.
 
@@ -220,15 +224,14 @@ needs = ["ghost"]
 ```bash
 rm -rf /tmp/gc-compat-selftest && mkdir -p /tmp/gc-compat-selftest
 cp ci/gc-compat/selftest-invalid.toml /tmp/gc-compat-selftest/
-cd "$GC_SRC" && go run ./cmd/camp-corpus-validate /tmp/gc-compat-selftest; echo "exit=$?"
+/tmp/camp-corpus-validate /tmp/gc-compat-selftest; echo "exit=$?"
 ```
-Expected (exit 1, all three violations reported):
+Expected (exit 1 — the program's own code, no `go run` remapping — all three violations reported):
 ```
 FAIL selftest-invalid: resolving formula "selftest-invalid": formula validation failed:
   - steps[0] (a): title is required (unless using expand)
   - steps[1]: duplicate id "a" (first defined at steps[0])
   - steps[1] (a): needs references unknown step "ghost"
-exit status 1
 exit=1
 ```
 
@@ -439,21 +442,21 @@ Add to `.github/workflows/ci.yml` (after the `test` job, same indentation as the
         with:
           go-version-file: gascity-src/go.mod
           cache-dependency-path: gascity-src/go.sum
-      - name: copy shim into the gascity checkout
+      - name: build shim inside the gascity checkout
         run: |
           mkdir -p gascity-src/cmd/camp-corpus-validate
           cp ci/gc-compat/camp_corpus_validate.go gascity-src/cmd/camp-corpus-validate/main.go
+          cd gascity-src
+          go build -o "$RUNNER_TEMP/camp-corpus-validate" ./cmd/camp-corpus-validate
       - name: validate corpus against the real gc compiler
         run: |
-          cd gascity-src
-          go run ./cmd/camp-corpus-validate "$GITHUB_WORKSPACE/crates/camp-core/tests/fixtures/formulas/valid"
+          "$RUNNER_TEMP/camp-corpus-validate" crates/camp-core/tests/fixtures/formulas/valid
       - name: shim self-test — a broken formula must exit 1
         run: |
           mkdir -p "$RUNNER_TEMP/selftest"
           cp ci/gc-compat/selftest-invalid.toml "$RUNNER_TEMP/selftest/"
-          cd gascity-src
           set +e
-          go run ./cmd/camp-corpus-validate "$RUNNER_TEMP/selftest"
+          "$RUNNER_TEMP/camp-corpus-validate" "$RUNNER_TEMP/selftest"
           rc=$?
           set -e
           if [ "$rc" -ne 1 ]; then
@@ -464,7 +467,7 @@ Add to `.github/workflows/ci.yml` (after the `test` job, same indentation as the
         run: ci/gc-compat/check_vocab.sh gascity-src "$GITHUB_WORKSPACE"
 ```
 
-Notes the executor should not "fix": the second checkout goes to `path: gascity-src` and does not disturb the gascamp checkout; the self-test asserts `rc == 1` exactly (exit 2 = "no formulas found" must also fail the job — a self-test that cannot see its fixture is itself a failure); `check_vocab.sh` verifies the checkout HEAD against the pin, so a checkout of the wrong ref cannot slip through.
+Notes the executor should not "fix": the second checkout goes to `path: gascity-src` and does not disturb the gascamp checkout; the shim is `go build`-compiled and the **binary** is invoked directly because `go run` collapses program exit codes to 1 (verified fact 8) — the self-test asserts `rc == 1` exactly, so exit 2 ("no formulas found" — a self-test that cannot see its fixture) fails the job as its own distinct condition; `check_vocab.sh` verifies the checkout HEAD against the pin, so a checkout of the wrong ref cannot slip through.
 
 - [ ] **Step 2: Lint the workflow**
 
@@ -477,10 +480,11 @@ Expected: no output, exit 0.
 
 ```bash
 cd "$GC_SRC" \
-  && go run ./cmd/camp-corpus-validate "<repo-root>/crates/camp-core/tests/fixtures/formulas/valid" \
+  && go build -o /tmp/camp-corpus-validate ./cmd/camp-corpus-validate \
+  && /tmp/camp-corpus-validate "<repo-root>/crates/camp-core/tests/fixtures/formulas/valid" \
   && rm -rf /tmp/gc-compat-selftest && mkdir -p /tmp/gc-compat-selftest \
   && cp <repo-root>/ci/gc-compat/selftest-invalid.toml /tmp/gc-compat-selftest/ \
-  && { go run ./cmd/camp-corpus-validate /tmp/gc-compat-selftest; test $? -eq 1; } \
+  && { /tmp/camp-corpus-validate /tmp/gc-compat-selftest; test $? -eq 1; } \
   && <repo-root>/ci/gc-compat/check_vocab.sh "$GC_SRC" "<repo-root>" \
   && echo LOCAL-GC-COMPAT-GREEN
 ```
