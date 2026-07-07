@@ -26,6 +26,12 @@ pub(crate) struct RawStep {
     pub check: Option<Check>,
     pub retry: Option<RawRetry>,
     pub on_complete: Option<OnComplete>,
+    /// The keys were PRESENT in the TOML, even if their tables failed to
+    /// parse — presence (not parse success) drives the S8/S9/S11 rules so
+    /// a malformed table never mutes them (review finding 5).
+    pub has_check: bool,
+    pub has_retry: bool,
+    pub has_on_complete: bool,
 }
 
 pub(crate) struct RawRetry {
@@ -337,6 +343,9 @@ fn walk_step(index: usize, step: &toml::Table, out: &mut Vec<Violation>) -> RawS
         check,
         retry,
         on_complete,
+        has_check: step.contains_key("check"),
+        has_retry: step.contains_key("retry"),
+        has_on_complete: step.contains_key("on_complete"),
     }
 }
 

@@ -113,8 +113,9 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
             }
         }
 
-        // S8 — timeout requires check (gc formula-spec-v2 §1.3).
-        if step.timeout.is_some() && step.check.is_none() {
+        // S8 — timeout requires check (gc formula-spec-v2 §1.3). Presence,
+        // not parse success: a malformed check table is still a check.
+        if step.timeout.is_some() && !step.has_check {
             violation(
                 out,
                 format!("{loc}.timeout"),
@@ -123,22 +124,23 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
             );
         }
 
-        // S9 — combination rules (gc formula-spec-v2 §3.1/§3.2).
-        if step.check.is_some() && step.retry.is_some() {
+        // S9 — combination rules (gc formula-spec-v2 §3.1/§3.2), gated on
+        // key presence so malformed tables never mute them.
+        if step.has_check && step.has_retry {
             violation(
                 out,
                 format!("{loc}.check"),
                 "`check` must not be combined with `retry` (gc formula-spec-v2 §3.1)",
             );
         }
-        if step.check.is_some() && step.assignee.is_some() {
+        if step.has_check && step.assignee.is_some() {
             violation(
                 out,
                 format!("{loc}.check"),
                 "`check` must not be combined with `assignee` (gc formula-spec-v2 §3.1)",
             );
         }
-        if step.retry.is_some() && step.on_complete.is_some() {
+        if step.has_retry && step.has_on_complete {
             violation(
                 out,
                 format!("{loc}.retry"),
@@ -173,11 +175,12 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
     // S7 — acyclic needs graph (unknown ids were already S6).
     check_cycles(raw, out);
 
-    // S11 — the explicit-declaration rule (gc compile.go:51 concept).
+    // S11 — the explicit-declaration rule (gc compile.go:51 concept),
+    // gated on key presence so malformed tables never mute it.
     let uses_graph_only = raw
         .steps
         .iter()
-        .any(|s| s.check.is_some() || s.retry.is_some() || s.on_complete.is_some());
+        .any(|s| s.has_check || s.has_retry || s.has_on_complete);
     if uses_graph_only && raw.formula_compiler.is_none() {
         violation(
             out,
@@ -519,5 +522,35 @@ mod tests {
             "f",
         );
         assert!(has(&v, "steps.a.on_complete.for_each", "output."), "{v:?}");
+    }
+
+    #[test]
+    fn malformed_check_still_counts_as_check_for_s8_s9_and_s11() {
+        // Review finding 5: a check TABLE that fails inner parsing (bad
+        // mode) must still count as "has a check" — no spurious
+        // timeout-requires-check, no silently skipped combination rules,
+        // and the declaration rule still fires.
+        let bad_check =
+            "[steps.check]\nmax_attempts = 1\n[steps.check.check]\nmode = \"inference\"\npath = \"v.sh\"\n";
+        let v = violations_for(
+            &format!(
+                "{HEADER}[[steps]]\nid = \"a\"\ntitle = \"t\"\ntimeout = \"5m\"\n{bad_check}[steps.retry]\nmax_attempts = 2\n"
+            ),
+            "f",
+        );
+        // the real problem is reported…
+        assert!(has(&v, "steps.a.check.check.mode", "exec"), "{v:?}");
+        // …S8 must NOT claim the step lacks a check
+        assert!(
+            !v.iter().any(|v| v.construct == "steps.a.timeout"),
+            "spurious timeout-requires-check: {v:?}"
+        );
+        // …S9 check-vs-retry still fires on presence
+        assert!(has(&v, "steps.a.check", "retry"), "{v:?}");
+        // …and S11 still demands the declaration
+        assert!(
+            has(&v, "requires", "graph-only constructs must declare"),
+            "{v:?}"
+        );
     }
 }
