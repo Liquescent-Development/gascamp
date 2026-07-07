@@ -182,12 +182,27 @@ pub struct Fire {
     pub catch_up: bool,
 }
 
-/// A missed-while-not-watching fire recovered by `recompute` — always a
-/// catch-up (master-plan pinned shape).
+/// A missed-while-not-watching fire recovered by `recompute`
+/// (master-plan pinned shape).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatchUp {
     pub order: String,
     pub scheduled: Timestamp,
+}
+
+impl CatchUp {
+    /// The `Fire` this catch-up declares, with the catch_up flag computed
+    /// exactly as `fire_due` computes it — lateness beyond
+    /// `ON_TIME_TOLERANCE` (PR #13 fix-pass review: identical wake states
+    /// must record identical flags on the oversleep and jump paths).
+    pub fn into_fire(self, now: Timestamp) -> Fire {
+        let catch_up = now.duration_since(self.scheduled) > ON_TIME_TOLERANCE;
+        Fire {
+            order: self.order,
+            scheduled: self.scheduled,
+            catch_up,
+        }
+    }
 }
 
 /// Min-heap of (next fire, order index). The earliest deadline is campd's
@@ -722,6 +737,41 @@ mod tests {
         assert_eq!(catch_ups[0].order, "hourly");
         assert_eq!(catch_ups[0].scheduled, ts("2026-07-06T09:00:00Z")); // most recent
         assert_eq!(heap.next_deadline(), Some(ts("2026-07-06T10:00:00Z")));
+    }
+
+    /// PR #13 fix-pass review LOW: identical wake states must record the
+    /// same catch_up flag whichever path (oversleep fire_due vs jump
+    /// recompute) observed them — the flag is computed from the chosen
+    /// fire's lateness in ONE place, `CatchUp::into_fire`.
+    #[test]
+    fn into_fire_computes_the_catch_up_flag_from_lateness() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        let armed = ts("2026-07-06T06:30:00Z");
+        heap.arm(cron_order("hourly", "0 * * * *", TWO_HOURS), armed)
+            .unwrap();
+        // jump detected 30 s after a fire: the chosen fire (08:00) is
+        // within ON_TIME_TOLERANCE — an on-time fire, not a catch-up...
+        let now = ts("2026-07-06T08:00:30Z");
+        let catch_ups = heap.recompute(now, armed);
+        assert_eq!(catch_ups.len(), 1);
+        let fire = catch_ups[0].clone().into_fire(now);
+        assert_eq!(fire.scheduled, ts("2026-07-06T08:00:00Z"));
+        assert!(!fire.catch_up, "within tolerance = on-time, as in fire_due");
+        // ...while a 90-minute-late choice is a catch-up on both paths.
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        heap.arm(cron_order("daily", "0 8 * * *", TWO_HOURS), armed)
+            .unwrap();
+        let now = ts("2026-07-06T09:30:00Z");
+        let catch_ups = heap.recompute(now, armed);
+        assert_eq!(catch_ups.len(), 1);
+        let fire = catch_ups[0].clone().into_fire(now);
+        assert!(fire.catch_up);
+
+        let mut oversleep = CronHeap::new(TimeZone::UTC);
+        oversleep
+            .arm(cron_order("daily", "0 8 * * *", TWO_HOURS), armed)
+            .unwrap();
+        assert_eq!(oversleep.fire_due(now), vec![fire], "one rule, one flag");
     }
 
     #[test]
