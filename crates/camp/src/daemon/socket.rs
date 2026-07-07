@@ -51,7 +51,29 @@ pub enum Response {
 /// bind; existing file that refuses connections (stale, e.g. after
 /// kill -9) → unlink and rebind; existing file that accepts → another
 /// campd is alive → hard error.
+///
+/// The whole negotiation is serialized with an exclusive advisory lock on
+/// `<socket>.lock` (PR #8 review finding 1): without it, two daemons racing
+/// past a stale socket can both probe-refuse, both unlink, both bind — the
+/// loser ends up live but orphaned on an unlinked inode (split brain). The
+/// lock releases on drop / process exit, so a crash never wedges startup
+/// (crash-only, spec §5). The lock file is a serialization primitive, not
+/// status: liveness stays "the socket accepts" — no pidfiles, no
+/// lockfiles-as-status.
 pub fn bind_or_replace(path: &Path) -> Result<UnixListener> {
+    let lock_path = path.with_extension("lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening bind lock {}", lock_path.display()))?;
+    lock_file
+        .lock()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    // Lock held for the whole probe → unlink → rebind section; released on
+    // return (drop). A loser blocks here, then sees the winner's live
+    // socket and refuses cleanly.
     match UnixListener::bind(path) {
         Ok(listener) => Ok(listener),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -208,5 +230,42 @@ mod tests {
             err.to_string().contains("already running"),
             "error was: {err:#}"
         );
+    }
+
+    /// PR #8 review finding 1: the stale-socket replacement critical
+    /// section (probe → unlink → rebind) must be serialized. Without a
+    /// guard, two daemons racing past a stale socket can both probe-refuse,
+    /// both unlink, both bind — leaving one live but orphaned on an
+    /// unlinked inode (split brain: the one-standing-process shape breaks).
+    #[test]
+    fn concurrent_bind_or_replace_elects_exactly_one_daemon() {
+        use std::sync::{Arc, Barrier};
+        for round in 0..50 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("campd.sock");
+            // a stale socket, kill -9 shape: bound, then dropped un-unlinked
+            drop(UnixListener::bind(&path).unwrap());
+
+            let barrier = Arc::new(Barrier::new(8));
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    bind_or_replace(&path)
+                }));
+            }
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let winners = results.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(
+                winners, 1,
+                "round {round}: exactly one daemon may own the socket"
+            );
+            assert!(
+                UnixStream::connect(&path).is_ok(),
+                "round {round}: the socket path must lead to the winner after the race"
+            );
+        }
     }
 }
