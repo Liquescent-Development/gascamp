@@ -133,6 +133,53 @@ impl Ledger {
         Ok(events)
     }
 
+    /// The named consumer cursor's position; 0 when the consumer has never
+    /// processed anything (spec §7.2: campd "catches up from its
+    /// processed-cursor on start"). `cursors` is consumer bookkeeping —
+    /// deliberately outside refold.
+    pub fn cursor(&self, name: &str) -> Result<Seq, CoreError> {
+        use rusqlite::OptionalExtension;
+        let seq: Option<Seq> = self
+            .conn
+            .query_row("SELECT seq FROM cursors WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(seq.unwrap_or(0))
+    }
+
+    /// Process every event past the named cursor, exactly once (spec §7.3).
+    ///
+    /// Each event runs in its own `BEGIN IMMEDIATE` transaction that executes
+    /// `process` and advances the cursor together: a crash or a `process`
+    /// error never loses an event and never replays one. `process` receives
+    /// the transaction's connection, so any writes it makes commit atomically
+    /// with the cursor advance. On error the cursor stays on the last
+    /// successfully processed event and the error surfaces to the caller.
+    /// Returns the cursor position after the run.
+    pub fn process_past_cursor(
+        &mut self,
+        name: &str,
+        process: &mut dyn FnMut(&Connection, &Event) -> Result<(), CoreError>,
+    ) -> Result<Seq, CoreError> {
+        let mut cursor = self.cursor(name)?;
+        let pending = self.events_range(cursor + 1, None)?;
+        for event in pending {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            process(&tx, &event)?;
+            tx.execute(
+                "INSERT INTO cursors (name, seq) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET seq = excluded.seq",
+                params![name, event.seq],
+            )?;
+            tx.commit()?;
+            cursor = event.seq;
+        }
+        Ok(cursor)
+    }
+
     /// Full event history for one bead, in seq order (spec §7.4 — the one
     /// sanctioned history read, used by `camp show`). Indexed via `events_bead`.
     pub fn events_for_bead(&self, bead: &str) -> Result<Vec<Event>, CoreError> {
@@ -813,6 +860,108 @@ mod tests {
                 .is_err()
         );
         assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+    }
+
+    #[test]
+    fn cursor_defaults_to_zero_and_tracks_processing() {
+        let (_dir, mut ledger) = temp_ledger();
+        assert_eq!(ledger.cursor("campd").unwrap(), 0);
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(created("gc-2", serde_json::json!({"title": "two"})))
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let end = ledger
+            .process_past_cursor("campd", &mut |_conn, event| {
+                seen.push(event.seq);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(end, 2);
+        assert_eq!(seen, vec![1, 2]);
+        assert_eq!(ledger.cursor("campd").unwrap(), 2);
+
+        // nothing pending: nothing is reprocessed (exactly once)
+        let mut again = Vec::new();
+        ledger
+            .process_past_cursor("campd", &mut |_conn, event| {
+                again.push(event.seq);
+                Ok(())
+            })
+            .unwrap();
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn a_processing_error_halts_the_cursor_and_resume_repeats_nothing() {
+        let (_dir, mut ledger) = temp_ledger();
+        for i in 1..=3 {
+            ledger
+                .append(created(
+                    &format!("gc-{i}"),
+                    serde_json::json!({"title": "t"}),
+                ))
+                .unwrap();
+        }
+        let result = ledger.process_past_cursor("campd", &mut |_conn, event| {
+            if event.seq == 2 {
+                return Err(CoreError::Corrupt("injected".to_owned()));
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            ledger.cursor("campd").unwrap(),
+            1,
+            "cursor halts before the failure"
+        );
+
+        // resume with a healthy processor: exactly the unprocessed tail
+        let mut tail = Vec::new();
+        ledger
+            .process_past_cursor("campd", &mut |_conn, event| {
+                tail.push(event.seq);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(tail, vec![2, 3]);
+    }
+
+    #[test]
+    fn processor_effects_commit_atomically_with_the_cursor() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(created("gc-2", serde_json::json!({"title": "two"})))
+            .unwrap();
+        // The processor writes a marker row through the transaction's
+        // connection, then fails on seq 2: seq 1's effect+cursor committed,
+        // seq 2's effect rolled back with its cursor advance.
+        let result = ledger.process_past_cursor("campd", &mut |conn, event| {
+            conn.execute(
+                "INSERT INTO cursors (name, seq) VALUES ('marker', ?1)
+                 ON CONFLICT(name) DO UPDATE SET seq = excluded.seq",
+                [event.seq],
+            )?;
+            if event.seq == 2 {
+                return Err(CoreError::Corrupt("injected".to_owned()));
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        let marker: i64 = ledger
+            .conn
+            .query_row("SELECT seq FROM cursors WHERE name = 'marker'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(marker, 1, "seq 2's effect must roll back with the cursor");
+        assert_eq!(ledger.cursor("campd").unwrap(), 1);
     }
 
     #[test]
