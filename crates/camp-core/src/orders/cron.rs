@@ -71,6 +71,93 @@ impl CronExpr {
     }
 }
 
+/// How far `next_after` searches before declaring an expression dead
+/// (plan Decision N): covers the worst legal gap, `0 0 29 2 *` across a
+/// leap cycle. The year-2100 century gap is outside v1's service life.
+const SEARCH_HORIZON_DAYS: i32 = 366 * 6;
+
+impl CronExpr {
+    /// The earliest instant strictly after `after` matching this expression
+    /// in `tz`. Nonexistent civil times (DST spring-forward gap) resolve
+    /// forward and fire once; ambiguous ones (fall-back fold) fire at the
+    /// first occurrence only (jiff `Disambiguation::Compatible`); any
+    /// resolution ≤ `after` — possible when `after` sits in a fold's second
+    /// pass — is skipped, so the result is strictly monotonic. `None` = no
+    /// fire within the search horizon.
+    pub fn next_after(&self, after: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> Option<jiff::Timestamp> {
+        let zoned_after = after.to_zoned(tz.clone());
+        let start_date = zoned_after.date();
+        let mut date = start_date;
+        for _ in 0..SEARCH_HORIZON_DAYS {
+            if self.day_matches(date) {
+                if let Some(ts) = self.first_fire_on(date, start_date, &zoned_after, after, tz) {
+                    return Some(ts);
+                }
+            }
+            date = date.tomorrow().ok()?; // ran off the calendar: no fire
+        }
+        None
+    }
+
+    /// The earliest matching instant on `date` that resolves strictly after
+    /// `after`, if any.
+    fn first_fire_on(
+        &self,
+        date: jiff::civil::Date,
+        start_date: jiff::civil::Date,
+        zoned_after: &jiff::Zoned,
+        after: jiff::Timestamp,
+        tz: &jiff::tz::TimeZone,
+    ) -> Option<jiff::Timestamp> {
+        for hour in 0..=23u8 {
+            if !self.hours.contains(hour) {
+                continue;
+            }
+            for minute in 0..=59u8 {
+                if !self.minutes.contains(minute) {
+                    continue;
+                }
+                let Ok(time) = jiff::civil::Time::new(hour as i8, minute as i8, 0, 0) else {
+                    continue; // unreachable: hour/minute are range-checked
+                };
+                let candidate = jiff::civil::DateTime::from_parts(date, time);
+                // Cheap civil-level cut on the first day: only candidates
+                // past `after`'s local time can be fires.
+                if date == start_date && candidate <= zoned_after.datetime() {
+                    continue;
+                }
+                let Ok(zoned) = tz.to_ambiguous_zoned(candidate).compatible() else {
+                    continue; // no resolution: not a fire
+                };
+                let ts = zoned.timestamp();
+                if ts > after {
+                    return Some(ts);
+                }
+                // fold second-pass edge: resolution ≤ after — keep searching
+            }
+        }
+        None
+    }
+
+    /// Vixie day rule: the month must match; if BOTH day-of-month and
+    /// day-of-week are restricted, either may match; if one is restricted,
+    /// it decides; if neither, all days match.
+    fn day_matches(&self, date: jiff::civil::Date) -> bool {
+        let month = u8::try_from(date.month()).unwrap_or(0);
+        if !self.months.contains(month) {
+            return false;
+        }
+        let dom = u8::try_from(date.day()).unwrap_or(0);
+        let dow = u8::try_from(date.weekday().to_sunday_zero_offset()).unwrap_or(7);
+        match (self.days_of_month.restricted, self.days_of_week.restricted) {
+            (true, true) => self.days_of_month.contains(dom) || self.days_of_week.contains(dow),
+            (true, false) => self.days_of_month.contains(dom),
+            (false, true) => self.days_of_week.contains(dow),
+            (false, false) => true,
+        }
+    }
+}
+
 /// Parse one field: comma-separated items of `*[/step]` or `a[-b][/step]`.
 /// `wrap_seven`: the day-of-week field accepts 7 as an alias for 0 (Sunday);
 /// its `allowed` store is still indexed 0-6.
@@ -183,6 +270,85 @@ mod tests {
             CronExpr::parse("0 0 * * 0")
                 .unwrap()
                 .with_source("0 0 * * 7")
+        );
+    }
+
+    use jiff::Timestamp;
+    use jiff::tz::TimeZone;
+
+    fn ny() -> TimeZone {
+        TimeZone::get("America/New_York").unwrap()
+    }
+
+    fn ts(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
+
+    fn next(expr: &str, after: &str, tz: &TimeZone) -> Option<String> {
+        CronExpr::parse(expr)
+            .unwrap()
+            .next_after(ts(after), tz)
+            .map(|t| t.to_string())
+    }
+
+    #[test]
+    fn next_fire_table_utc() {
+        let utc = TimeZone::UTC;
+        for (expr, after, expect) in [
+            // strictly after: an exact hit advances to the next match
+            ("0 7 * * *", "2026-07-06T07:00:00Z", "2026-07-07T07:00:00Z"),
+            ("0 7 * * *", "2026-07-06T06:59:59Z", "2026-07-06T07:00:00Z"),
+            // weekday constraint: Fri 2026-07-10 19:00 → Mon 2026-07-13 07:00
+            ("0 7 * * 1-5", "2026-07-10T19:00:00Z", "2026-07-13T07:00:00Z"),
+            // dom/dow OR rule (both restricted): the 15th OR a Monday
+            ("0 0 15 * 1", "2026-07-10T00:00:00Z", "2026-07-13T00:00:00Z"),
+            ("0 0 15 * 1", "2026-07-13T00:00:00Z", "2026-07-15T00:00:00Z"),
+            // month-end: only months with a 31st
+            ("0 0 31 * *", "2026-01-31T00:00:01Z", "2026-03-31T00:00:00Z"),
+            // leap day: next Feb 29 after 2026 is 2028
+            ("0 0 29 2 *", "2026-03-01T00:00:00Z", "2028-02-29T00:00:00Z"),
+            // steps
+            ("*/15 * * * *", "2026-07-06T07:41:00Z", "2026-07-06T07:45:00Z"),
+        ] {
+            assert_eq!(
+                next(expr, after, &utc).as_deref(),
+                Some(expect),
+                "{expr} after {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn spring_forward_gap_fires_once_shifted_compatible() {
+        // 2026-03-08 02:30 EST does not exist (02:00→03:00). Compatible
+        // disambiguation shifts forward by the gap: fires 03:30 EDT = 07:30Z.
+        assert_eq!(
+            next("30 2 * * *", "2026-03-08T05:00:00Z", &ny()).as_deref(), // 00:00 EST
+            Some("2026-03-08T07:30:00Z")
+        );
+    }
+
+    #[test]
+    fn fall_back_fold_fires_first_occurrence_only() {
+        // 2026-11-01 01:30 happens twice (EDT 05:30Z, then EST 06:30Z).
+        // Compatible picks the earlier; the second pass is not a fire.
+        assert_eq!(
+            next("30 1 * * *", "2026-11-01T04:00:00Z", &ny()).as_deref(), // 00:00 EDT
+            Some("2026-11-01T05:30:00Z")
+        );
+        // ...and from within the fold's second pass (01:45 EST = 06:45Z),
+        // the next fire is the NEXT day — never an instant ≤ after.
+        assert_eq!(
+            next("30 1 * * *", "2026-11-01T06:45:00Z", &ny()).as_deref(),
+            Some("2026-11-02T06:30:00Z")
+        );
+    }
+
+    #[test]
+    fn impossible_dates_return_none() {
+        assert_eq!(
+            next("0 0 30 2 *", "2026-01-01T00:00:00Z", &TimeZone::UTC),
+            None
         );
     }
 
