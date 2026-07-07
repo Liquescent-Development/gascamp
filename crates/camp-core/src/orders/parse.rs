@@ -17,6 +17,14 @@ use crate::orders::{Order, Trigger};
 /// camp.toml disables catch-up.
 pub const DEFAULT_CATCH_UP_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// The largest accepted catch-up window (PR #13 review LOW 7): the window
+/// bounds the synchronous missed-fire scan every startup and jump
+/// recompute performs, so an unbounded window is a latency bug waiting in
+/// camp.toml. 7 days ≈ 10K scan steps for a minutely order — ample for
+/// "laptop was off over a long weekend", rejected loudly beyond that
+/// (consistent with the never-firing-cron fail-fast).
+pub const MAX_CATCH_UP_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// One raw `[[order]]` table, exactly as spec §9 writes it. Unknown keys
 /// are rejected at parse (deny_unknown_fields — a typo never becomes dead
 /// config).
@@ -141,7 +149,14 @@ fn parse_window(text: &str) -> Result<Duration, String> {
     if signed.is_negative() {
         return Err(format!("{text:?} is negative"));
     }
-    Duration::try_from(signed).map_err(|e| format!("{text:?}: {e}"))
+    let window = Duration::try_from(signed).map_err(|e| format!("{text:?}: {e}"))?;
+    if window > MAX_CATCH_UP_WINDOW {
+        return Err(format!(
+            "{text:?} exceeds the {}d maximum catch-up window",
+            MAX_CATCH_UP_WINDOW.as_secs() / 86_400
+        ));
+    }
+    Ok(window)
 }
 
 #[cfg(test)]
@@ -199,6 +214,7 @@ formula = "fix-ci"
         for (text, expect) in [
             ("30m", Duration::from_secs(30 * 60)),
             ("2h", Duration::from_secs(2 * 60 * 60)),
+            ("168h", MAX_CATCH_UP_WINDOW), // exactly the 7d cap: accepted
             ("0", Duration::ZERO),
         ] {
             let cfg = one_order_cfg(&format!(
@@ -239,6 +255,12 @@ formula = "fix-ci"
             (
                 "name=\"x\"\non=\"cron:0 7 * * *\"\nformula=\"f\"\ncatch_up_window=\"soon\"",
                 vec!["x", "catch_up_window"],
+            ),
+            // PR #13 review LOW 7: an unbounded window turns every startup
+            // or jump recompute into an unbounded synchronous scan.
+            (
+                "name=\"x\"\non=\"cron:0 7 * * *\"\nformula=\"f\"\ncatch_up_window=\"8760h\"",
+                vec!["x", "catch_up_window", "maximum"],
             ),
             (
                 "name=\"x\"\non=\"cron:0 7 * * *\"\nformula=\"f\"\nrig=\"nope\"",
