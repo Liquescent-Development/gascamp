@@ -9,7 +9,10 @@ mod cmd {
     pub mod events;
     pub mod init;
     pub mod ls;
+    pub mod recall;
+    pub mod remember;
     pub mod rig;
+    pub mod search;
     pub mod show;
 }
 
@@ -128,6 +131,30 @@ enum Command {
         /// Bead id
         bead: String,
     },
+    /// Ranked full-text search over everything, all time
+    Search {
+        /// FTS5 query (bare terms AND; "quoted phrase"; prefix*)
+        query: String,
+        /// Maximum number of hits
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Store a persistent memory (a memory-type bead; title = the fact)
+    Remember {
+        /// The fact to remember
+        fact: String,
+        /// Rig (default: the only configured rig)
+        #[arg(long)]
+        rig: Option<String>,
+    },
+    /// Search memories only
+    Recall {
+        /// FTS5 query (bare terms AND; "quoted phrase"; prefix*)
+        query: String,
+        /// Maximum number of hits
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -225,6 +252,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Show { bead } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::show::run(&camp, bead)
+        }
+        Command::Search { query, limit } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::search::run(&camp, &query, limit)
+        }
+        Command::Remember { fact, rig } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::remember::run(&camp, fact, rig)
+        }
+        Command::Recall { query, limit } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::recall::run(&camp, &query, limit)
         }
     }
 }

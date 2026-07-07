@@ -679,7 +679,12 @@ pub fn run_filtered(
 ) -> Result<()> {
     let ledger = Ledger::open(&camp.db_path())?;
     for hit in ledger.search(query, type_filter, limit)? {
-        println!("{}\t{}\t{}", hit.bead_id, hit.kind, hit.snippet);
+        // Snippets can span the fold's title'\n'description boundary; the
+        // output is one line per hit, so flatten embedded line breaks.
+        // (Added during execution: the limit test caught 2 output lines per
+        // hit because FTS5 snippets carry the stored newline through.)
+        let snippet = hit.snippet.replace(['\n', '\r'], " ");
+        println!("{}\t{}\t{}", hit.bead_id, hit.kind, snippet.trim());
     }
     Ok(())
 }
