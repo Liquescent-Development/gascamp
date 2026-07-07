@@ -48,13 +48,19 @@ enum Command {
     /// Create a new camp (./.camp by default; --camp DIR to choose the place)
     Init,
     /// Verify ledger invariants
+    #[command(group(
+        clap::ArgGroup::new("mode").required(true).args(["refold", "formula"])
+    ))]
     Doctor {
         /// Rebuild state from the event log and report drift (spec §13.5)
-        #[arg(long, required = true)]
+        #[arg(long)]
         refold: bool,
         /// Replace the state tables with the refolded content
         #[arg(long, requires = "refold")]
         repair: bool,
+        /// Validate a formula file against the camp subset (spec §8.2)
+        #[arg(long, value_name = "PATH", conflicts_with = "refold")]
+        formula: Option<PathBuf>,
     },
     /// Print events from the ledger
     Events {
@@ -235,10 +241,18 @@ fn run_daemon(camp_flag: Option<&Path>) -> anyhow::Result<()> {
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Init => cmd::init::run(cli.camp.as_deref()),
-        Command::Doctor { refold: _, repair } => {
-            let camp = CampDir::resolve(cli.camp.as_deref())?;
-            cmd::doctor::run(&camp, repair)
-        }
+        Command::Doctor {
+            refold: _,
+            repair,
+            formula,
+        } => match formula {
+            // --formula validates a file, not a camp — no CampDir needed.
+            Some(path) => cmd::doctor::run_formula(&path),
+            None => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::doctor::run(&camp, repair)
+            }
+        },
         Command::Events { json, from, to } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::events::run(&camp, json, from, to)
