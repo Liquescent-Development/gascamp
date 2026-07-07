@@ -3,6 +3,16 @@
 //! append_batch transaction for root + steps + run.cooked. Gas City's
 //! materialization property, kept: after cook the run is independent of
 //! the formula file.
+//!
+//! Crash window (deliberate, reviewed): files land BEFORE the ledger
+//! transaction, so a hard kill between the run-dir write and the
+//! append_batch commit leaves an orphan runs/<run-id>/ directory with no
+//! ledger record. That is the safe direction — a DB-first ordering could
+//! commit a run whose pinned formula never hit disk, breaking the
+//! file-independence property. An orphan dir references nothing, nothing
+//! references it, and the missing run.cooked event makes it
+//! self-explaining. A future `camp doctor` check may sweep run dirs that
+//! have no run.cooked event; v1 does not build it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
