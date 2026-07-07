@@ -186,4 +186,69 @@ mod tests {
         assert_eq!(stop, serde_json::json!({"ok": true}));
         handle.join().unwrap().unwrap();
     }
+
+    /// PR #8 re-review finding 1: a client pipelining more than the 64 KB
+    /// cap of VALID newline-delimited requests in one burst must get every
+    /// one answered. The cap-break interacts with mio's edge-triggered
+    /// registration: if the daemon stops reading at the cap, answers the
+    /// complete lines, and returns to poll with data still in the kernel
+    /// receive buffer, no new readable event ever fires (the client is done
+    /// writing) — the connection wedges.
+    #[test]
+    fn pipelined_valid_requests_beyond_the_cap_are_all_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".camp");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        let camp = CampDir { root: root.clone() };
+        let handle = std::thread::spawn(move || run(&camp));
+
+        let sock = root.join("campd.sock");
+        let mut stream = connect_with_retry(&sock);
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Reader thread drains responses concurrently (a client that never
+        // reads would hit the decision-J write-backpressure drop instead —
+        // a different, intended behavior).
+        const N: usize = 3500;
+        let reader_stream = stream.try_clone().unwrap();
+        reader_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut reader = BufReader::new(reader_stream);
+            let mut answered = 0usize;
+            let mut line = String::new();
+            for _ in 0..N {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(n) if n > 0 && line.trim_end() == r#"{"ok":true}"# => answered += 1,
+                    _ => break, // EOF, timeout, or a wrong answer: stop counting
+                }
+            }
+            answered
+        });
+
+        // one burst of valid pokes, comfortably past the cap
+        let mut burst = String::new();
+        for i in 0..N {
+            burst.push_str(&format!("{{\"op\":\"poke\",\"seq\":{i}}}\n"));
+        }
+        assert!(
+            burst.len() > event_loop::MAX_REQUEST_BYTES,
+            "the burst must exceed the cap for this test to mean anything"
+        );
+        stream.write_all(burst.as_bytes()).unwrap();
+
+        let answered = reader.join().unwrap();
+        assert_eq!(answered, N, "every pipelined request must be answered");
+
+        // graceful shutdown
+        let mut fresh = connect_with_retry(&sock);
+        let stop = request(&mut fresh, r#"{"op":"stop"}"#);
+        assert_eq!(stop, serde_json::json!({"ok": true}));
+        handle.join().unwrap().unwrap();
+    }
 }
