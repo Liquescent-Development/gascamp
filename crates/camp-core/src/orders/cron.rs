@@ -89,12 +89,11 @@ impl CronExpr {
         after: jiff::Timestamp,
         tz: &jiff::tz::TimeZone,
     ) -> Option<jiff::Timestamp> {
-        let zoned_after = after.to_zoned(tz.clone());
-        let start_date = zoned_after.date();
+        let start_date = after.to_zoned(tz.clone()).date();
         let mut date = start_date;
         for _ in 0..SEARCH_HORIZON_DAYS {
             if self.day_matches(date)
-                && let Some(ts) = self.first_fire_on(date, start_date, &zoned_after, after, tz)
+                && let Some(ts) = self.first_fire_on(date, after, tz)
             {
                 return Some(ts);
             }
@@ -104,12 +103,14 @@ impl CronExpr {
     }
 
     /// The earliest matching instant on `date` that resolves strictly after
-    /// `after`, if any.
+    /// `after`, if any. Every candidate is resolved and compared as a
+    /// TIMESTAMP — deliberately no civil-time shortcut on the first day
+    /// (PR #13 review MEDIUM 1): in a spring-forward gap an earlier civil
+    /// time resolves to a LATER instant, so a civil-level cut loses the
+    /// gap-shifted fire when queried from inside the gap.
     fn first_fire_on(
         &self,
         date: jiff::civil::Date,
-        start_date: jiff::civil::Date,
-        zoned_after: &jiff::Zoned,
         after: jiff::Timestamp,
         tz: &jiff::tz::TimeZone,
     ) -> Option<jiff::Timestamp> {
@@ -125,11 +126,6 @@ impl CronExpr {
                     continue; // unreachable: hour/minute are range-checked
                 };
                 let candidate = jiff::civil::DateTime::from_parts(date, time);
-                // Cheap civil-level cut on the first day: only candidates
-                // past `after`'s local time can be fires.
-                if date == start_date && candidate <= zoned_after.datetime() {
-                    continue;
-                }
                 let Ok(zoned) = tz.to_ambiguous_zoned(candidate).compatible() else {
                     continue; // no resolution: not a fire
                 };
@@ -244,8 +240,10 @@ impl CronHeap {
 
     /// Pop everything due at `now`, reschedule each from `now`, and return
     /// the fires the caller must declare. Applies the catch-up rule (plan
-    /// Decision F), so a poll that overslept a system sleep behaves exactly
-    /// like a detected wall-clock jump.
+    /// Decision F) through the SAME `most_recent_missed` selection as
+    /// `recompute` (PR #13 review LOW 6), so a poll that overslept a
+    /// system sleep behaves exactly like a detected wall-clock jump —
+    /// identical chosen fire, identical `scheduled_ts`.
     pub fn fire_due(&mut self, now: Timestamp) -> Vec<Fire> {
         let mut fires = Vec::new();
         while let Some(Reverse((deadline, idx))) = self.entries.peek().copied() {
@@ -261,12 +259,22 @@ impl CronHeap {
                     scheduled: deadline,
                     catch_up: false,
                 });
-            } else if window_allows(order.catch_up_window, lateness) {
-                fires.push(Fire {
-                    order: order.name.clone(),
-                    scheduled: deadline,
-                    catch_up: true,
-                });
+            } else if let Trigger::Cron { expr } = &order.trigger {
+                // Missed. Scan (deadline-1s, now] — the popped deadline is
+                // the oldest candidate — and fire the most recent one still
+                // inside the window, once; none in-window = skip entirely.
+                let scan_from = deadline
+                    .checked_sub(SignedDuration::from_secs(1))
+                    .unwrap_or(deadline);
+                if let Some(scheduled) =
+                    most_recent_missed(expr, order.catch_up_window, now, scan_from, &self.tz)
+                {
+                    fires.push(Fire {
+                        order: order.name.clone(),
+                        scheduled,
+                        catch_up: now.duration_since(scheduled) > ON_TIME_TOLERANCE,
+                    });
+                }
             } // else: missed outside the window — skip; reschedule only
             // A None next_after here: the expression ran off the horizon
             // after years of service — the order goes quiet and
@@ -529,6 +537,20 @@ mod tests {
     }
 
     #[test]
+    fn queried_from_inside_the_gap_still_finds_the_shifted_fire() {
+        // PR #13 review MEDIUM 1: 07:15Z is 03:15 EDT — inside the shifted
+        // morning, BEFORE the gap-shifted 02:30→03:30 EDT fire (07:30Z).
+        // The candidate's civil time (02:30) is earlier than `after`'s
+        // civil time (03:15) yet resolves to a LATER instant; a civil-level
+        // cut would skip it and silently lose the day's fire on any heap
+        // rearm inside the gap window (reload, restart, jump recompute).
+        assert_eq!(
+            next("30 2 * * *", "2026-03-08T07:15:00Z", &ny()).as_deref(),
+            Some("2026-03-08T07:30:00Z")
+        );
+    }
+
+    #[test]
     fn fall_back_fold_fires_first_occurrence_only() {
         // 2026-11-01 01:30 happens twice (EDT 05:30Z, then EST 06:30Z).
         // Compatible picks the earlier; the second pass is not a fire.
@@ -624,6 +646,39 @@ mod tests {
         assert_eq!(fires[0].scheduled, ts("2026-07-06T08:00:00Z"));
         // rescheduled from now: next fire tomorrow 08:00
         assert_eq!(heap.next_deadline(), Some(ts("2026-07-07T08:00:00Z")));
+    }
+
+    #[test]
+    fn oversleep_and_jump_agree_on_the_most_recent_missed_fire() {
+        // PR #13 review LOW 6: an oversleep (fire_due sees a stale
+        // deadline) and a detected jump (recompute) must apply ONE rule.
+        // Hourly order armed at 06:30, wakes at 10:30 with a 2h window:
+        // missed 07:00/08:00/09:00/10:00; the popped deadline (07:00) is
+        // outside the window, but 09:00 and 10:00 are within — the most
+        // recent (10:00) fires once, exactly as recompute would.
+        let armed = ts("2026-07-06T06:30:00Z");
+        let woke = ts("2026-07-06T10:30:00Z");
+
+        let mut oversleep = CronHeap::new(TimeZone::UTC);
+        oversleep
+            .arm(cron_order("hourly", "0 * * * *", TWO_HOURS), armed)
+            .unwrap();
+        let fires = oversleep.fire_due(woke);
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert_eq!(fires[0].scheduled, ts("2026-07-06T10:00:00Z"));
+        assert!(fires[0].catch_up);
+        assert_eq!(oversleep.next_deadline(), Some(ts("2026-07-06T11:00:00Z")));
+
+        let mut jump = CronHeap::new(TimeZone::UTC);
+        jump.arm(cron_order("hourly", "0 * * * *", TWO_HOURS), armed)
+            .unwrap();
+        let catch_ups = jump.recompute(woke, armed);
+        assert_eq!(catch_ups.len(), 1);
+        assert_eq!(
+            catch_ups[0].scheduled, fires[0].scheduled,
+            "oversleep and jump must choose the same fire"
+        );
+        assert_eq!(jump.next_deadline(), oversleep.next_deadline());
     }
 
     #[test]
