@@ -1,9 +1,0 @@
-# PR-REVIEW DEMO ONLY — deliberately gc-invalid; reverted before merge.
-# Proves the gc-compat gate fails on a bad corpus file (Phase 6 exit
-# criterion).
-formula = "demo-gc-reject"
-
-[[steps]]
-id = "demo"
-title = "references a step that does not exist"
-needs = ["nonexistent"]
