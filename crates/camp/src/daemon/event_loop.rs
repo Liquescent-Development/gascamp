@@ -147,6 +147,13 @@ pub fn run(
                 },
                 CONFIG_WATCH => {
                     drain_pipe(config_rx)?;
+                    // A dead watcher is a durable, rejected config.changed —
+                    // hot reload degraded, in the ledger (PR #13 review
+                    // LOW 8), never just a stderr line.
+                    if let Some(input) = runtime.take_watch_error_event() {
+                        ledger.append(input)?;
+                        wake_ledger_work = true;
+                    }
                     if let Some(input) = runtime.reload_if_changed(now)? {
                         // spec §13.4: the config change is itself an event,
                         // applied or rejected.

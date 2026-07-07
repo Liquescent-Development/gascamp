@@ -56,21 +56,12 @@ pub fn run(camp: &CampDir) -> Result<()> {
     // loop through a self-pipe. The camp ROOT is watched non-recursively —
     // editors rename-replace, and a file watch dies with the inode.
     let (sender, mut receiver) = mio::unix::pipe::new().context("creating the watch pipe")?;
+    // Watcher errors land in the ledger, not just stderr (PR #13 review
+    // LOW 8): the callback stores them in the runtime's slot and wakes the
+    // loop, which appends the rejected config.changed.
+    let watch_errors = runtime.watch_error_slot();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        match result {
-            Ok(event)
-                if event
-                    .paths
-                    .iter()
-                    .any(|p| p.file_name() == Some(std::ffi::OsStr::new("camp.toml"))) =>
-            {
-                use std::io::Write as _;
-                // A full pipe (WouldBlock) is fine: the signal coalesces.
-                let _ = (&sender).write(&[1]);
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("campd: camp.toml watch error: {e}"),
-        }
+        orders::on_watch_event(result, Some(&sender), &watch_errors);
     })
     .context("creating the camp.toml watcher")?;
     notify::Watcher::watch(

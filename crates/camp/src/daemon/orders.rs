@@ -9,6 +9,7 @@
 //! not polling — each iteration consumes ledger progress.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -39,6 +40,9 @@ pub struct OrdersRuntime {
     orders: Vec<Order>,
     heap: CronHeap,
     pending_cooks: Vec<PendingCook>,
+    /// Errors from the notify watcher thread, awaiting their ledger event
+    /// (PR #13 review LOW 8). The callback fills it; the loop drains it.
+    watch_error: Arc<Mutex<Option<String>>>,
 }
 
 impl OrdersRuntime {
@@ -59,6 +63,7 @@ impl OrdersRuntime {
             orders,
             heap,
             pending_cooks: Vec::new(),
+            watch_error: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -97,8 +102,35 @@ impl OrdersRuntime {
         std::mem::take(&mut self.pending_cooks)
     }
 
+    /// Test observability only: production code drains via
+    /// `take_pending_cooks`.
+    #[cfg(test)]
     pub fn pending_cook_count(&self) -> usize {
         self.pending_cooks.len()
+    }
+
+    /// The slot the notify callback stores watcher errors into (LOW 8).
+    pub fn watch_error_slot(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.watch_error)
+    }
+
+    /// Drain a stored watcher error into its durable event: a rejected
+    /// `config.changed` — hot reload is degraded and the ledger says so
+    /// (invariant 5, spec §13.4), not just a stderr line nobody reads on a
+    /// detached daemon.
+    pub fn take_watch_error_event(&mut self) -> Option<EventInput> {
+        let msg = lock_unpoisoned(&self.watch_error).take()?;
+        Some(EventInput {
+            kind: EventType::ConfigChanged,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "path": "camp.toml",
+                "applied": false,
+                "error": format!("camp.toml watch error (hot reload degraded): {msg}"),
+            }),
+        })
     }
 
     /// Hot reload (spec §13.4, plan Decision H). Reads camp.toml and
@@ -161,6 +193,43 @@ fn compile_and_arm(
         }
     }
     Ok((config, orders, heap))
+}
+
+/// A poisoned mutex still yields its data — the watcher thread holds the
+/// lock only for a store, and campd must not die (or panic) over a
+/// poisoned error slot.
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The notify callback body (runs on the watcher's thread): a camp.toml
+/// event or a watcher error writes one byte into the loop's self-pipe;
+/// errors are additionally stored for `take_watch_error_event` (PR #13
+/// review LOW 8). A full pipe (WouldBlock) is fine — the signal coalesces.
+/// `sender` is optional only so unit tests can omit it.
+pub(super) fn on_watch_event(
+    result: notify::Result<notify::Event>,
+    sender: Option<&mio::unix::pipe::Sender>,
+    error_slot: &Mutex<Option<String>>,
+) {
+    use std::ffi::OsStr;
+    use std::io::Write as _;
+    let signal = match result {
+        Ok(event) => event
+            .paths
+            .iter()
+            .any(|p| p.file_name() == Some(OsStr::new("camp.toml"))),
+        Err(e) => {
+            *lock_unpoisoned(error_slot) = Some(format!("{e}"));
+            true
+        }
+    };
+    if signal && let Some(sender) = sender {
+        let _ = (&*sender).write(&[1]);
+    }
 }
 
 /// The downtime catch-up anchor (spec §9; PR #13 review MEDIUM 2): the
@@ -615,6 +684,65 @@ mod tests {
         assert_eq!(input.data["applied"], false);
         assert!(!input.data["error"].as_str().unwrap().is_empty());
         assert!(rt.order("new").is_some(), "old config retained");
+    }
+
+    /// PR #13 review LOW 8: a failing camp.toml watcher must surface in
+    /// the ledger (invariant 5, spec §13.4) — a stderr line on a detached
+    /// daemon silently disables hot reload.
+    #[test]
+    fn a_watcher_error_becomes_a_rejected_config_changed_event() {
+        let (dir, _ledger) = fixture("");
+        let mut rt = runtime(&dir, "2026-07-06T07:20:00Z");
+        let slot = rt.watch_error_slot();
+        // the notify callback (its own thread) stores the error...
+        on_watch_event(
+            Err(notify::Error::generic("inotify watch limit reached")),
+            None,
+            &slot,
+        );
+        // ...and the loop turns it into a durable rejected config.changed
+        let input = rt.take_watch_error_event().unwrap();
+        assert_eq!(input.kind, EventType::ConfigChanged);
+        assert_eq!(input.data["applied"], false);
+        assert!(
+            input.data["error"]
+                .as_str()
+                .unwrap()
+                .contains("inotify watch limit reached"),
+            "{}",
+            input.data
+        );
+        // drained: a second take is empty
+        assert!(rt.take_watch_error_event().is_none());
+    }
+
+    #[test]
+    fn on_watch_event_signals_the_pipe_and_filters_paths() {
+        use std::io::Read as _;
+        let (sender, mut receiver) = mio::unix::pipe::new().unwrap();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut buf = [0u8; 8];
+
+        // an unrelated path: no signal
+        let mut other = notify::Event::new(notify::EventKind::Any);
+        other.paths.push("/tmp/other.txt".into());
+        on_watch_event(Ok(other), Some(&sender), &slot);
+        assert!(matches!(
+            receiver.read(&mut buf),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        // camp.toml: one byte wakes the loop
+        let mut hit = notify::Event::new(notify::EventKind::Any);
+        hit.paths.push("/camp/.camp/camp.toml".into());
+        on_watch_event(Ok(hit), Some(&sender), &slot);
+        assert!(receiver.read(&mut buf).unwrap() > 0);
+        assert!(slot.lock().unwrap().is_none(), "no error stored for an Ok");
+
+        // an error: stored AND signaled
+        on_watch_event(Err(notify::Error::generic("boom")), Some(&sender), &slot);
+        assert!(receiver.read(&mut buf).unwrap() > 0);
+        assert!(slot.lock().unwrap().as_deref().unwrap().contains("boom"));
     }
 
     /// PR #13 review MEDIUM 3: an infrastructure error mid-cook-list must
