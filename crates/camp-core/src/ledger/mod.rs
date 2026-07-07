@@ -1091,7 +1091,10 @@ mod tests {
         let total = CATCH_UP_PAGE_SIZE as i64 * 2 + 203;
         for i in 1..=total {
             ledger
-                .append(created(&format!("gc-{i}"), serde_json::json!({"title": "t"})))
+                .append(created(
+                    &format!("gc-{i}"),
+                    serde_json::json!({"title": "t"}),
+                ))
                 .unwrap();
         }
         let mut seen = Vec::new();
@@ -1127,7 +1130,10 @@ mod tests {
         let total = page + 103;
         for i in 1..=total {
             ledger
-                .append(created(&format!("gc-{i}"), serde_json::json!({"title": "t"})))
+                .append(created(
+                    &format!("gc-{i}"),
+                    serde_json::json!({"title": "t"}),
+                ))
                 .unwrap();
         }
         let poison = page + 1; // first event of the second page
