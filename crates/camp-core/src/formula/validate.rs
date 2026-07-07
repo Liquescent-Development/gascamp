@@ -190,8 +190,26 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
         );
     }
 
-    // S12 — the comparator itself.
+    // S12 — the comparator itself. Camp accepts only the operator subset
+    // verified to parse AND mean the same thing in Rust `semver` (Cargo
+    // dialect) and gc's Go constraint grammar: one explicit operator plus
+    // a full major.minor.patch version. Cargo-only sugar (caret, tilde,
+    // wildcards, bare versions — caret in Cargo but EXACT in Go — and
+    // range lists) is rejected before it can leak through invariant 6
+    // (review finding 2, route a; decision logged in the Phase 5 plan).
     if let Some(req) = raw.formula_compiler.as_deref() {
+        if let Err(message) = common_comparator_shape(req) {
+            violation(out, "requires.formula_compiler", message);
+        } else {
+            check_comparator_capability(req, out);
+        }
+    }
+}
+
+/// The comparator, past the shape gate: parse with `semver` and require the
+/// camp capability to satisfy it (mirroring gc's host-capability check).
+fn check_comparator_capability(req: &str, out: &mut Vec<Violation>) {
+    {
         match semver::VersionReq::parse(req) {
             Err(e) => violation(
                 out,
@@ -225,6 +243,34 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
             }
         }
     }
+}
+
+/// Review finding 2, route (a): the comparator shape camp accepts — one
+/// explicit operator (>=, >, <=, <, =) followed by a full
+/// major.minor.patch version of plain digits. This is the subset verified
+/// to be syntactically valid AND semantically identical in Rust `semver`
+/// and gc's Go constraint grammar. Everything else (caret, tilde,
+/// wildcards, bare versions, partial versions, range lists, pre-release
+/// tags) is rejected: camp must never accept a requirement gc would
+/// reject or read differently (repo invariant 6).
+fn common_comparator_shape(req: &str) -> Result<(), String> {
+    const OPS: &[&str] = &[">=", "<=", ">", "<", "="]; // two-char ops first
+    let err = || {
+        format!(
+            "formula_compiler {req:?} is outside camp's comparator subset: use one \
+             explicit operator (>=, >, <=, <, =) and a full version, for example \
+             \">=2.0.0\" (camp accepts only the operator forms verified against \
+             Gas City's constraint grammar)"
+        )
+    };
+    let op = OPS.iter().find(|op| req.starts_with(**op)).ok_or_else(err)?;
+    let version = req[op.len()..].trim_start();
+    let parts: Vec<&str> = version.split('.').collect();
+    let three_plain_numbers = parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    if three_plain_numbers { Ok(()) } else { Err(err()) }
 }
 
 /// Iterative-state DFS cycle detection; reports one violation per distinct
@@ -480,7 +526,7 @@ mod tests {
             "f",
         );
         assert!(
-            has(&v, "requires.formula_compiler", "semver comparator"),
+            has(&v, "requires.formula_compiler", "comparator"),
             "{v:?}"
         );
         let v = violations_for(
@@ -522,6 +568,40 @@ mod tests {
             "f",
         );
         assert!(has(&v, "steps.a.on_complete.for_each", "output."), "{v:?}");
+    }
+
+    #[test]
+    fn comparator_surface_is_the_verified_common_subset_not_the_cargo_dialect() {
+        // Review finding 2 (route a): camp accepts only comparators whose
+        // syntax AND semantics are verified identical between Rust semver
+        // and gc's Go constraint grammar — one explicit operator + a full
+        // major.minor.patch version. Cargo-only sugar is out.
+        let body = "[[steps]]\nid = \"a\"\ntitle = \"t\"\n";
+        for good in [">=2.0.0", ">1.0.0", "<=2.0.0", "<3.0.0", "=2.0.0"] {
+            let v = violations_for(
+                &format!("{HEADER}[requires]\nformula_compiler = \"{good}\"\n{body}"),
+                "f",
+            );
+            assert!(v.is_empty(), "{good} must be accepted: {v:?}");
+        }
+        for bad in [
+            "^2",             // Cargo caret
+            "^2.0.0",         // Cargo caret
+            "~2.1",           // Cargo tilde
+            "2.*",            // wildcard
+            "2.0.0",          // bare version: caret in Cargo, exact in Go
+            ">=2.0",          // partial version
+            ">=2.0.0, <3.0.0" // range list, unverified against gc
+        ] {
+            let v = violations_for(
+                &format!("{HEADER}[requires]\nformula_compiler = \"{bad}\"\n{body}"),
+                "f",
+            );
+            assert!(
+                has(&v, "requires.formula_compiler", "operator"),
+                "{bad} must be rejected naming the operator subset: {v:?}"
+            );
+        }
     }
 
     #[test]

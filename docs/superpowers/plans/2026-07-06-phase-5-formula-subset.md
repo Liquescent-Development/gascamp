@@ -3105,6 +3105,52 @@ PR body must state: the acceptance/rejection surface (link spec §8.2), the cont
 - **Spec alignment:** no spec § contradicts this plan; the one behavioral sharpening (`timeout` requires `check`) is already how spec §8.2 words the construct ("step-level timeout (general bound on the check script)"). If implementation reveals any real spec divergence, stop and update the spec in this same PR.
 - **What Phase 5 does NOT do:** no execution of checks/retries/fan-out (Phase 9), no dispatch (Phase 8), no `camp sling --formula` verb (Phase 8 wraps cook), no gc-compat CI job (Phase 6).
 
+## Post-review amendments (2026-07-06, PR #10 Opus review — operator-directed)
+
+Decision log:
+
+- **Comparator dialect (finding 2, MEDIUM — route a chosen).** `[requires]
+  formula_compiler` accepts only camp's verified-common comparator subset:
+  one explicit operator (`>=`, `>`, `<=`, `<`, `=`) followed by a full
+  `major.minor.patch` version of plain digits. Rationale: Rust `semver`
+  parses the Cargo dialect, where `^2`, `~2.1`, `2.*`, comma range lists,
+  and *bare versions* are legal — and a bare `2.0.0` means caret in Cargo
+  but EXACT equality in gc's Go constraint grammar, a silent semantic
+  divergence invariant 6 cannot tolerate and Phase 6 could not catch
+  (fixtures only exercised `>=2.0.0`). The shape gate
+  (`validate::common_comparator_shape`) runs before `semver::VersionReq`;
+  within the gated subset the two grammars agree syntactically and
+  semantically. Route (b) — verifying gc's full grammar at the pinned ref
+  and fixturing every operator form — can widen the subset later without
+  breaking any accepted formula. New rejection fixtures:
+  `caret-requirement.toml`, `bare-version-requirement.toml`.
+- **Cook input validation (finding 1, MEDIUM).** `cook` resolves every
+  `needs` edge before touching disk or the ledger; an unknown step id in a
+  hand-built `Formula` is `CoreError::Cook`, never a silently dropped edge.
+- **`CoreError::Cook` (finding 4).** Cook precondition and run-dir
+  filesystem failures no longer masquerade as `Corrupt` ("ledger
+  corrupt:"); `Corrupt` stays for genuine integrity findings (e.g.
+  unparseable `next_bead_id`).
+- **Presence-gated rules (finding 5).** `RawStep.has_check/has_retry/
+  has_on_complete` (TOML key presence) drive S8/S9/S11 so a malformed
+  check/retry/on_complete table cannot mute the combination or
+  declaration rules or fabricate "timeout requires check".
+- **Nested unknown-key locations (finding 3).** Unknown keys inside
+  check/retry/on_complete report full dotted locations; new fixture
+  `nested-unknown-key.toml`.
+- **Run-id collision retry (finding 6).** `create_dir` `AlreadyExists` on
+  the leaf regenerates the 6-hex suffix once; a second collision is a
+  `Cook` error naming the collision.
+- **Orphan-dir crash window (finding 7, docs).** Documented in cook.rs's
+  module comment; a future `doctor` check may flag run dirs lacking a
+  `run.cooked` event (deliberately not built now).
+- **Tally message (finding 8).** `[steps.tally]` rejection explains gc
+  removed it too, instead of pointing authors at a city.
+- **Dev-dep cleanup (finding 9).** Dropped the redundant `rusqlite`
+  `[dev-dependencies]` entry (integration tests see regular deps).
+
+The invalid corpus is now 51 files; Task 5's original count is superseded.
+
 ## Self-review (performed while writing)
 
 1. **Spec coverage:** every master-plan Phase 5 bullet maps to a task — interfaces (T1/T4/T7), acceptance table (T3/T4), combination + explicit-declaration rules (T4), rejection table incl. deny-unknown (T3/T5), cook mechanics + `run.cooked` + one-transaction (T6/T7), fixture corpus incl. spec-verbatim guarded-change and the five named shapes (T5), doctor exit codes (T8), gates/CI (T9). The contract's five pinned struct/signature items appear verbatim in T1/T4/T7 with deviations flagged up top.
