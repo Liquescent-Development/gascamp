@@ -61,7 +61,14 @@ pub enum Response {
 /// status: liveness stays "the socket accepts" — no pidfiles, no
 /// lockfiles-as-status.
 pub fn bind_or_replace(path: &Path) -> Result<UnixListener> {
-    let lock_path = path.with_extension("lock");
+    // Literally `<socket>.lock` (campd.sock.lock) — appended, not
+    // with_extension, which would silently rename to campd.lock and
+    // contradict every doc that names this file (re-review finding 2).
+    let lock_path = {
+        let mut os = path.as_os_str().to_owned();
+        os.push(".lock");
+        std::path::PathBuf::from(os)
+    };
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -207,6 +214,13 @@ mod tests {
         let listener = bind_or_replace(&path).unwrap();
         drop(listener);
         assert!(path.exists());
+        // The bind lock lives literally at `<socket>.lock` — the path every
+        // doc names (PR #8 re-review finding 2: with_extension put it at
+        // campd.lock, a file the docs never mention).
+        assert!(
+            dir.path().join("campd.sock.lock").exists(),
+            "bind lock must be at <socket>.lock"
+        );
     }
 
     #[test]
