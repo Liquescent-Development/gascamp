@@ -140,6 +140,7 @@ dependencies = [
  "assert_cmd",
  "camp-core",
  "clap",
+ "jiff",
  "mio",
  "predicates",
  "rusqlite",
