@@ -14,6 +14,7 @@ use rusqlite::Connection;
 use crate::Seq;
 use crate::error::CoreError;
 use crate::event::{Event, EventInput, EventType};
+use crate::ledger::Ledger;
 use cron::CronExpr;
 
 /// What trips an order (spec §9): a cron schedule or an event pattern.
@@ -262,6 +263,136 @@ pub fn completion_input(conn: &Connection, event: &Event) -> Result<Option<Event
 /// body; local definitions stay the highest layer (spec §11).
 pub fn formula_path(camp_root: &Path, formula: &str) -> PathBuf {
     camp_root.join("formulas").join(format!("{formula}.toml"))
+}
+
+/// Every `fired_seq` that already has a response: a `run.cooked` whose
+/// actor encodes it, or an `order.failed` carrying it. Backs cook dedupe
+/// and startup reconciliation; order-event counts are small.
+fn responded_fired_seqs(ledger: &Ledger) -> Result<std::collections::BTreeSet<Seq>, CoreError> {
+    let mut responded = std::collections::BTreeSet::new();
+    for cooked in ledger.events_of_type(EventType::RunCooked)? {
+        if let Some((_, fired_seq)) = parse_cook_actor(&cooked.actor) {
+            responded.insert(fired_seq);
+        }
+    }
+    for failed in ledger.events_of_type(EventType::OrderFailed)? {
+        if let Some(fired_seq) = failed.data.get("fired_seq").and_then(|v| v.as_i64()) {
+            responded.insert(fired_seq);
+        }
+    }
+    Ok(responded)
+}
+
+/// Has this fire already been answered (cooked, or failed with an event)?
+pub fn fire_response_exists(ledger: &Ledger, fired_seq: Seq) -> Result<bool, CoreError> {
+    Ok(responded_fired_seqs(ledger)?.contains(&fired_seq))
+}
+
+/// `order.fired` events with no response — fires orphaned by a crash
+/// between the declaration and its cook. campd cooks them at startup
+/// (plan Decision D: observation over state, kill -9 self-heals).
+pub fn unresponded_fires(ledger: &Ledger) -> Result<Vec<PendingCook>, CoreError> {
+    let responded = responded_fired_seqs(ledger)?;
+    let mut pending = Vec::new();
+    for fired in ledger.events_of_type(EventType::OrderFired)? {
+        if !responded.contains(&fired.seq) {
+            if let Some(cook) = pending_cook_from_fired(&fired)? {
+                pending.push(cook);
+            }
+        }
+    }
+    Ok(pending)
+}
+
+/// Execute the cook for a declared fire: resolve the formula file, parse
+/// and validate it, resolve the rig, and cook with the order actor.
+///
+/// Returns `Ok(Some(run))` on success, `Ok(None)` when the fire already
+/// has a response (dedupe — replay-safe) or when an ORDER-level failure
+/// occurred (missing/invalid formula, unresolvable rig, cook error): those
+/// are appended as `order.failed {order, fired_seq, error}` and never take
+/// campd down (plan Decision K). Only infrastructure failures — the ledger
+/// refusing the failure event itself — return `Err`.
+pub fn execute_fire(
+    ledger: &mut Ledger,
+    config: &crate::config::CampConfig,
+    camp_root: &Path,
+    order: &Order,
+    fired_seq: Seq,
+) -> Result<Option<crate::formula::CookedRun>, CoreError> {
+    if fire_response_exists(ledger, fired_seq)? {
+        return Ok(None);
+    }
+    let mut fail = |ledger: &mut Ledger, error: String| -> Result<(), CoreError> {
+        ledger.append(EventInput {
+            kind: EventType::OrderFailed,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "order": order.name, "fired_seq": fired_seq, "error": error,
+            }),
+        })?;
+        Ok(())
+    };
+    let path = formula_path(camp_root, &order.formula);
+    if !path.exists() {
+        fail(
+            ledger,
+            format!(
+                "formula {:?} not found at {}",
+                order.formula,
+                path.display()
+            ),
+        )?;
+        return Ok(None);
+    }
+    let formula = match crate::formula::parse_and_validate(&path) {
+        Ok(formula) => formula,
+        Err(e) => {
+            fail(ledger, format!("formula {:?}: {e}", order.formula))?;
+            return Ok(None);
+        }
+    };
+    let rig = match resolve_rig(config, order) {
+        Ok(rig) => rig.clone(),
+        Err(reason) => {
+            fail(ledger, reason)?;
+            return Ok(None);
+        }
+    };
+    match crate::formula::cook(
+        ledger,
+        &formula,
+        &camp_root.join("runs"),
+        &rig,
+        &cook_actor(&order.name, fired_seq),
+    ) {
+        Ok(run) => Ok(Some(run)),
+        Err(e) => {
+            fail(ledger, format!("cook failed: {e}"))?;
+            Ok(None)
+        }
+    }
+}
+
+/// The `cmd/create` rig rule at fire time (plan Decision M): the order's
+/// explicit rig, else the sole configured rig, else an error naming the
+/// fix.
+fn resolve_rig<'a>(
+    config: &'a crate::config::CampConfig,
+    order: &Order,
+) -> Result<&'a crate::config::RigConfig, String> {
+    match &order.rig {
+        Some(name) => config
+            .rig(name)
+            .map_err(|_| format!("field \"rig\": unknown rig {name:?}")),
+        None => match config.rigs.as_slice() {
+            [only] => Ok(only),
+            [] => Err("no rigs configured; run camp rig add <path> first".into()),
+            _ => Err("multiple rigs configured; set rig on the order".into()),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +680,133 @@ mod tests {
         assert_eq!(
             formula_path(std::path::Path::new("/camp/.camp"), "triage-inbox"),
             std::path::PathBuf::from("/camp/.camp/formulas/triage-inbox.toml")
+        );
+    }
+
+    // ---- execute_fire + reconciliation (Task 10.8; needs Phase 5's cook)
+
+    fn camp_fixture() -> (tempfile::TempDir, Ledger, crate::config::CampConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let config = crate::config::CampConfig::parse(
+            "[camp]\nname=\"d\"\n\n[[rigs]]\nname=\"gc\"\npath=\"/p\"\nprefix=\"gc\"\n",
+        )
+        .unwrap();
+        (dir, ledger, config)
+    }
+
+    fn write_formula(camp_root: &Path, name: &str) {
+        std::fs::create_dir_all(camp_root.join("formulas")).unwrap();
+        std::fs::write(
+            camp_root.join("formulas").join(format!("{name}.toml")),
+            format!("formula = \"{name}\"\n\n[[steps]]\nid = \"s1\"\ntitle = \"one step\"\n"),
+        )
+        .unwrap();
+    }
+
+    fn cron_order_named(name: &str, formula: &str) -> Order {
+        Order {
+            name: name.into(),
+            trigger: Trigger::Cron {
+                expr: CronExpr::parse("0 0 1 1 *").unwrap(),
+            },
+            formula: formula.into(),
+            rig: None,
+            catch_up_window: std::time::Duration::from_secs(2 * 60 * 60),
+        }
+    }
+
+    #[test]
+    fn execute_fire_cooks_the_formula_with_the_order_actor() {
+        let (dir, mut ledger, config) = camp_fixture();
+        write_formula(dir.path(), "one-step");
+        let order = cron_order_named("t", "one-step");
+        let fired = ledger.append(fired_input("t", &FireCause::Manual)).unwrap();
+        let run = execute_fire(&mut ledger, &config, dir.path(), &order, fired)
+            .unwrap()
+            .unwrap();
+        // cook events carry the order actor; run dir pinned under <camp>/runs/
+        let cooked = ledger.events_of_type(EventType::RunCooked).unwrap();
+        assert_eq!(cooked.len(), 1);
+        assert_eq!(cooked[0].actor, cook_actor("t", fired));
+        assert!(
+            dir.path()
+                .join("runs")
+                .join(&run.run_id)
+                .join("manifest.json")
+                .exists()
+        );
+        // dedupe: a second execution for the same fired_seq is a no-op
+        assert!(
+            execute_fire(&mut ledger, &config, dir.path(), &order, fired)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ledger.events_of_type(EventType::RunCooked).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn execute_fire_failure_is_evented_not_thrown() {
+        let (dir, mut ledger, config) = camp_fixture();
+        let order = cron_order_named("t", "missing-formula");
+        let fired = ledger.append(fired_input("t", &FireCause::Manual)).unwrap();
+        assert!(
+            execute_fire(&mut ledger, &config, dir.path(), &order, fired)
+                .unwrap()
+                .is_none()
+        );
+        let failed = ledger.events_of_type(EventType::OrderFailed).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].data["fired_seq"], fired);
+        assert!(
+            failed[0].data["error"]
+                .as_str()
+                .unwrap()
+                .contains("missing-formula")
+        );
+    }
+
+    #[test]
+    fn execute_fire_with_no_resolvable_rig_is_evented() {
+        let (dir, mut ledger, _config) = camp_fixture();
+        write_formula(dir.path(), "one-step");
+        let riglss = crate::config::CampConfig::parse("[camp]\nname=\"d\"\n").unwrap();
+        let order = cron_order_named("t", "one-step");
+        let fired = ledger.append(fired_input("t", &FireCause::Manual)).unwrap();
+        assert!(
+            execute_fire(&mut ledger, &riglss, dir.path(), &order, fired)
+                .unwrap()
+                .is_none()
+        );
+        let failed = ledger.events_of_type(EventType::OrderFailed).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].data["error"].as_str().unwrap().contains("rig"));
+    }
+
+    #[test]
+    fn unresponded_fires_reconciles_exactly_the_unanswered_ones() {
+        let (dir, mut ledger, config) = camp_fixture();
+        write_formula(dir.path(), "one-step");
+        let order = cron_order_named("t", "one-step");
+        let answered = ledger.append(fired_input("t", &FireCause::Manual)).unwrap();
+        execute_fire(&mut ledger, &config, dir.path(), &order, answered).unwrap();
+        let orphaned = ledger.append(fired_input("t", &FireCause::Manual)).unwrap();
+        let failed = ledger.append(fired_input("u", &FireCause::Manual)).unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::OrderFailed,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({"order":"u","fired_seq":failed,"error":"e"}),
+            })
+            .unwrap();
+        assert_eq!(
+            unresponded_fires(&ledger).unwrap(),
+            vec![PendingCook {
+                order: "t".into(),
+                fired_seq: orphaned
+            }]
         );
     }
 }
