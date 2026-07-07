@@ -5,6 +5,7 @@
 
 pub mod autostart;
 pub mod cursor;
+pub mod orders;
 pub mod event_loop;
 pub mod socket;
 
