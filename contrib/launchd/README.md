@@ -23,7 +23,8 @@ It is an example, never auto-installed — visible automation only.
   `camp` use and `camp stop`/reboot. This agent closes the from-login gap.
 - A powered-off or sleeping laptop fires nothing until wake. On wake,
   fires missed within an order's `catch_up_window` (default `"2h"`; `"0"`
-  disables) fire once, flagged `catch_up: true`; older ones are skipped.
+  disables; 7 days maximum) fire once, flagged `catch_up: true`; older
+  ones are skipped.
 - campd never guards against self-triggering orders: an order matching an
   event its own formula run produces recurses, visibly, in the ledger.
   That power is yours, like a `* * * * *` cron on an expensive formula.
