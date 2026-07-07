@@ -92,9 +92,9 @@ fn format_window(window: std::time::Duration) -> String {
         "off".to_owned()
     } else {
         let secs = window.as_secs();
-        if secs % 3600 == 0 {
+        if secs.is_multiple_of(3600) {
             format!("{}h", secs / 3600)
-        } else if secs % 60 == 0 {
+        } else if secs.is_multiple_of(60) {
             format!("{}m", secs / 60)
         } else {
             format!("{secs}s")
@@ -118,6 +118,9 @@ pub fn run_order(camp: &CampDir, name: &str) -> Result<()> {
     let mut ledger = Ledger::open(&camp.db_path())?;
     let seq = ledger.append(fired_input(&order.name, &FireCause::Manual))?;
     crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
-    println!("fired order {} (seq {seq}); campd cooks and dispatches it", order.name);
+    println!(
+        "fired order {} (seq {seq}); campd cooks and dispatches it",
+        order.name
+    );
     Ok(())
 }

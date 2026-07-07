@@ -409,12 +409,8 @@ mod tests {
         std::fs::write(dir.path().join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
         let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
         let mut processor = ReadinessProcessor::default();
-        let mut runtime = OrdersRuntime::build(
-            dir.path(),
-            Timestamp::now(),
-            jiff::tz::TimeZone::UTC,
-        )
-        .unwrap();
+        let mut runtime =
+            OrdersRuntime::build(dir.path(), Timestamp::now(), jiff::tz::TimeZone::UTC).unwrap();
         let clock = camp_core::clock::SystemClock;
 
         let (mut client, daemon_end) = StdUnixStream::pair().unwrap();

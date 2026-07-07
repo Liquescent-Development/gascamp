@@ -1241,7 +1241,10 @@ mod tests {
         // process_past_cursor drains pages until empty WITHIN one call: the
         // config.changed appended while processing seq 1 lands at seq 2 and
         // is processed by the same call.
-        assert_eq!(end, 2, "the same call drains events appended mid-processing");
+        assert_eq!(
+            end, 2,
+            "the same call drains events appended mid-processing"
+        );
         let events = ledger.events_range(1, None).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind, EventType::ConfigChanged);
@@ -1304,7 +1307,10 @@ mod tests {
             Some("2026-07-05T21:14:03Z") // temp_ledger's FixedClock
         );
         assert_eq!(
-            ledger.events_of_type(EventType::CampdStarted).unwrap().len(),
+            ledger
+                .events_of_type(EventType::CampdStarted)
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
@@ -1417,7 +1423,9 @@ mod tests {
             ),
         ] {
             assert!(
-                ledger.append(input(kind, None, None, data.clone())).is_err(),
+                ledger
+                    .append(input(kind, None, None, data.clone()))
+                    .is_err(),
                 "{kind:?} {data}"
             );
         }

@@ -107,9 +107,9 @@ fn parse_trigger(on: &str) -> Result<Trigger, String> {
                 let inner = bracket
                     .strip_suffix(']')
                     .ok_or_else(|| format!("unterminated filter in {rest:?}"))?;
-                let value = inner
-                    .strip_prefix("label=")
-                    .ok_or_else(|| format!("only [label=…] filters are supported, got {inner:?}"))?;
+                let value = inner.strip_prefix("label=").ok_or_else(|| {
+                    format!("only [label=…] filters are supported, got {inner:?}")
+                })?;
                 if value.is_empty() {
                     return Err("label filter value must not be empty".into());
                 }
@@ -134,7 +134,9 @@ fn parse_trigger(on: &str) -> Result<Trigger, String> {
 
 fn parse_window(text: &str) -> Result<Duration, String> {
     let signed: jiff::SignedDuration = text.parse().map_err(|e| {
-        format!("{text:?} is not a duration ({e}); use forms like \"2h\", \"30m\", or \"0\" to disable")
+        format!(
+            "{text:?} is not a duration ({e}); use forms like \"2h\", \"30m\", or \"0\" to disable"
+        )
     })?;
     if signed.is_negative() {
         return Err(format!("{text:?} is negative"));

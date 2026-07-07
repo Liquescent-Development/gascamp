@@ -20,8 +20,8 @@ use camp_core::ledger::Ledger;
 use camp_core::orders::cron::{CatchUp, CronHeap, Fire};
 use camp_core::orders::parse::compile_orders;
 use camp_core::orders::{
-    FireCause, Order, PendingCook, Trigger, completion_input, event_trigger_matches,
-    execute_fire, fired_input, pending_cook_from_fired,
+    FireCause, Order, PendingCook, Trigger, completion_input, event_trigger_matches, execute_fire,
+    fired_input, pending_cook_from_fired,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -193,7 +193,12 @@ impl EventProcessor for CampdProcessor<'_> {
             Ledger::append_on(
                 conn,
                 &self.clock.now_utc(),
-                fired_input(&name, &FireCause::Event { cause_seq: event.seq }),
+                fired_input(
+                    &name,
+                    &FireCause::Event {
+                        cause_seq: event.seq,
+                    },
+                ),
             )?;
         }
         Ok(())
@@ -327,11 +332,12 @@ mod tests {
     fn build_rejects_bad_config_and_never_firing_cron() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("camp.toml"), "not toml [[[").unwrap();
-        assert!(OrdersRuntime::build(dir.path(), ts("2026-07-06T07:00:00Z"), TimeZone::UTC).is_err());
-
-        let (dir, _ledger) = fixture(
-            "[[order]]\nname=\"dead\"\non=\"cron:0 0 30 2 *\"\nformula=\"one-step\"\n",
+        assert!(
+            OrdersRuntime::build(dir.path(), ts("2026-07-06T07:00:00Z"), TimeZone::UTC).is_err()
         );
+
+        let (dir, _ledger) =
+            fixture("[[order]]\nname=\"dead\"\non=\"cron:0 0 30 2 *\"\nformula=\"one-step\"\n");
         let Err(err) = OrdersRuntime::build(dir.path(), ts("2026-07-06T07:00:00Z"), TimeZone::UTC)
         else {
             panic!("a never-firing cron order must be rejected at build")
@@ -351,7 +357,10 @@ mod tests {
         let timeout = rt.poll_timeout(ts("2026-07-06T07:59:59Z")).unwrap();
         // 1 s to the deadline, rounded up by 1 ms
         assert!(timeout >= std::time::Duration::from_secs(1), "{timeout:?}");
-        assert!(timeout <= std::time::Duration::from_millis(1500), "{timeout:?}");
+        assert!(
+            timeout <= std::time::Duration::from_millis(1500),
+            "{timeout:?}"
+        );
     }
 
     #[test]
@@ -360,10 +369,11 @@ mod tests {
             fixture("[[order]]\nname=\"h\"\non=\"cron:0 8 * * *\"\nformula=\"one-step\"\n");
         let rt = runtime(&dir, "2026-07-06T07:20:00Z");
         // just before the deadline: at least the 1 ms round-up remains
-        let timeout = rt
-            .poll_timeout(ts("2026-07-06T07:59:59.999999Z"))
-            .unwrap();
-        assert!(timeout >= std::time::Duration::from_millis(1), "{timeout:?}");
+        let timeout = rt.poll_timeout(ts("2026-07-06T07:59:59.999999Z")).unwrap();
+        assert!(
+            timeout >= std::time::Duration::from_millis(1),
+            "{timeout:?}"
+        );
         // past the deadline: zero — poll returns immediately, fire_due fires
         assert_eq!(
             rt.poll_timeout(ts("2026-07-06T08:00:01Z")),
@@ -373,9 +383,8 @@ mod tests {
 
     #[test]
     fn settle_cooks_a_manual_fire_and_completes_on_root_close() {
-        let (dir, mut ledger) = fixture(
-            "[[order]]\nname=\"one-shot\"\non=\"cron:0 0 1 1 *\"\nformula=\"one-step\"\n",
-        );
+        let (dir, mut ledger) =
+            fixture("[[order]]\nname=\"one-shot\"\non=\"cron:0 0 1 1 *\"\nformula=\"one-step\"\n");
         let mut rt = runtime(&dir, "2026-07-06T07:20:00Z");
         let fired = ledger
             .append(fired_input("one-shot", &FireCause::Manual))
@@ -454,7 +463,12 @@ mod tests {
             })
             .unwrap();
         settle_all(&mut ledger, &mut rt);
-        assert!(ledger.events_of_type(EventType::OrderFired).unwrap().is_empty());
+        assert!(
+            ledger
+                .events_of_type(EventType::OrderFired)
+                .unwrap()
+                .is_empty()
+        );
         // a labeled bead closing: fire + cook in ONE settle call (fixpoint)
         ledger
             .append(EventInput {
@@ -551,15 +565,14 @@ mod tests {
         std::fs::write(dir.path().join("camp.toml"), "junk [[[").unwrap();
         let input = rt.reload_if_changed(now).unwrap().unwrap();
         assert_eq!(input.data["applied"], false);
-        assert!(input.data["error"].as_str().unwrap().len() > 0);
+        assert!(!input.data["error"].as_str().unwrap().is_empty());
         assert!(rt.order("new").is_some(), "old config retained");
     }
 
     #[test]
     fn startup_reconciliation_cooks_orphaned_fires() {
-        let (dir, mut ledger) = fixture(
-            "[[order]]\nname=\"one-shot\"\non=\"cron:0 0 1 1 *\"\nformula=\"one-step\"\n",
-        );
+        let (dir, mut ledger) =
+            fixture("[[order]]\nname=\"one-shot\"\non=\"cron:0 0 1 1 *\"\nformula=\"one-step\"\n");
         let mut rt = runtime(&dir, "2026-07-06T07:20:00Z");
         // A fire whose cook was lost: cursor advanced past it (simulated
         // kill -9 between order.fired and the cook).
@@ -573,18 +586,29 @@ mod tests {
             .unwrap();
         // settle alone sees nothing (cursor is past the fire)…
         settle_all(&mut ledger, &mut rt);
-        assert!(ledger.events_of_type(EventType::RunCooked).unwrap().is_empty());
+        assert!(
+            ledger
+                .events_of_type(EventType::RunCooked)
+                .unwrap()
+                .is_empty()
+        );
         // …reconciliation queues it, the next settle cooks it, exactly once
         for cook in camp_core::orders::unresponded_fires(&ledger).unwrap() {
             rt.queue_cook(cook);
         }
         settle_all(&mut ledger, &mut rt);
-        assert_eq!(ledger.events_of_type(EventType::RunCooked).unwrap().len(), 1);
+        assert_eq!(
+            ledger.events_of_type(EventType::RunCooked).unwrap().len(),
+            1
+        );
         // repeating reconciliation cooks nothing further
         for cook in camp_core::orders::unresponded_fires(&ledger).unwrap() {
             rt.queue_cook(cook);
         }
         settle_all(&mut ledger, &mut rt);
-        assert_eq!(ledger.events_of_type(EventType::RunCooked).unwrap().len(), 1);
+        assert_eq!(
+            ledger.events_of_type(EventType::RunCooked).unwrap().len(),
+            1
+        );
     }
 }

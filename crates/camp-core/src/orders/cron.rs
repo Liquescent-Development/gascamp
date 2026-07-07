@@ -84,15 +84,19 @@ impl CronExpr {
     /// resolution ≤ `after` — possible when `after` sits in a fold's second
     /// pass — is skipped, so the result is strictly monotonic. `None` = no
     /// fire within the search horizon.
-    pub fn next_after(&self, after: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> Option<jiff::Timestamp> {
+    pub fn next_after(
+        &self,
+        after: jiff::Timestamp,
+        tz: &jiff::tz::TimeZone,
+    ) -> Option<jiff::Timestamp> {
         let zoned_after = after.to_zoned(tz.clone());
         let start_date = zoned_after.date();
         let mut date = start_date;
         for _ in 0..SEARCH_HORIZON_DAYS {
-            if self.day_matches(date) {
-                if let Some(ts) = self.first_fire_on(date, start_date, &zoned_after, after, tz) {
-                    return Some(ts);
-                }
+            if self.day_matches(date)
+                && let Some(ts) = self.first_fire_on(date, start_date, &zoned_after, after, tz)
+            {
+                return Some(ts);
             }
             date = date.tomorrow().ok()?; // ran off the calendar: no fire
         }
@@ -264,13 +268,13 @@ impl CronHeap {
                     catch_up: true,
                 });
             } // else: missed outside the window — skip; reschedule only
-            if let Trigger::Cron { expr } = &self.orders[idx].trigger {
-                if let Some(next) = expr.next_after(now, &self.tz) {
-                    self.entries.push(Reverse((next, idx)));
-                }
-                // None: the expression ran off the horizon after years of
-                // service — the order goes quiet and `camp order ls` shows
-                // "never". Documented, not hidden.
+            // A None next_after here: the expression ran off the horizon
+            // after years of service — the order goes quiet and
+            // `camp order ls` shows "never". Documented, not hidden.
+            if let Trigger::Cron { expr } = &self.orders[idx].trigger
+                && let Some(next) = expr.next_after(now, &self.tz)
+            {
+                self.entries.push(Reverse((next, idx)));
             }
         }
         fires
@@ -289,15 +293,14 @@ impl CronHeap {
             let Trigger::Cron { expr } = &order.trigger else {
                 continue;
             };
-            if now > last_seen {
-                if let Some(scheduled) =
+            if now > last_seen
+                && let Some(scheduled) =
                     most_recent_missed(expr, order.catch_up_window, now, last_seen, &self.tz)
-                {
-                    catch_ups.push(CatchUp {
-                        order: order.name.clone(),
-                        scheduled,
-                    });
-                }
+            {
+                catch_ups.push(CatchUp {
+                    order: order.name.clone(),
+                    scheduled,
+                });
             }
             if let Some(next) = expr.next_after(now, &self.tz) {
                 self.entries.push(Reverse((next, idx)));
@@ -488,7 +491,11 @@ mod tests {
             ("0 7 * * *", "2026-07-06T07:00:00Z", "2026-07-07T07:00:00Z"),
             ("0 7 * * *", "2026-07-06T06:59:59Z", "2026-07-06T07:00:00Z"),
             // weekday constraint: Fri 2026-07-10 19:00 → Mon 2026-07-13 07:00
-            ("0 7 * * 1-5", "2026-07-10T19:00:00Z", "2026-07-13T07:00:00Z"),
+            (
+                "0 7 * * 1-5",
+                "2026-07-10T19:00:00Z",
+                "2026-07-13T07:00:00Z",
+            ),
             // dom/dow OR rule (both restricted): the 15th OR a Monday
             ("0 0 15 * 1", "2026-07-10T00:00:00Z", "2026-07-13T00:00:00Z"),
             ("0 0 15 * 1", "2026-07-13T00:00:00Z", "2026-07-15T00:00:00Z"),
@@ -497,7 +504,11 @@ mod tests {
             // leap day: next Feb 29 after 2026 is 2028
             ("0 0 29 2 *", "2026-03-01T00:00:00Z", "2028-02-29T00:00:00Z"),
             // steps
-            ("*/15 * * * *", "2026-07-06T07:41:00Z", "2026-07-06T07:45:00Z"),
+            (
+                "*/15 * * * *",
+                "2026-07-06T07:41:00Z",
+                "2026-07-06T07:45:00Z",
+            ),
         ] {
             assert_eq!(
                 next(expr, after, &utc).as_deref(),

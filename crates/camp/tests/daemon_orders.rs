@@ -164,7 +164,11 @@ fn a_cron_order_fires_and_cooks_with_no_user_session() {
     let ls = run_ok(&root, &["ls", "--ready", "--json"]);
     let beads: serde_json::Value = serde_json::from_str(&ls).unwrap();
     assert!(
-        beads.as_array().unwrap().iter().any(|b| b["title"] == "one step"),
+        beads
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["title"] == "one step"),
         "{beads}"
     );
     stop_campd(&root, child);
@@ -185,7 +189,10 @@ fn a_manual_fire_cooks_and_completes_via_the_fake_agent_contract() {
 
     let cooked = wait_for(&root, "run.cooked", Duration::from_secs(10));
     let root_bead = cooked[0]["data"]["root"].as_str().unwrap().to_owned();
-    let step_bead = cooked[0]["data"]["steps"]["s1"].as_str().unwrap().to_owned();
+    let step_bead = cooked[0]["data"]["steps"]["s1"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let fired_seq = events_of(&root, "order.fired")[0]["seq"].as_i64().unwrap();
 
     // The fake-agent contract, spoken through the camp CLI:
@@ -201,7 +208,10 @@ fn a_manual_fire_cooks_and_completes_via_the_fake_agent_contract() {
 
     stop_campd(&root, child);
     // state == history after the whole dance
-    let out = camp_cmd(&root).args(["doctor", "--refold"]).output().unwrap();
+    let out = camp_cmd(&root)
+        .args(["doctor", "--refold"])
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "doctor --refold: {}",

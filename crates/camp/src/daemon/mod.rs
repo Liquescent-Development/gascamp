@@ -76,8 +76,12 @@ pub fn run(camp: &CampDir) -> Result<()> {
         }
     })
     .context("creating the camp.toml watcher")?;
-    notify::Watcher::watch(&mut watcher, &camp.root, notify::RecursiveMode::NonRecursive)
-        .context("watching the camp directory")?;
+    notify::Watcher::watch(
+        &mut watcher,
+        &camp.root,
+        notify::RecursiveMode::NonRecursive,
+    )
+    .context("watching the camp directory")?;
 
     // Startup settle is fatal on error: a daemon that cannot process its
     // backlog must not pretend to be up (fail fast). Settle drains events

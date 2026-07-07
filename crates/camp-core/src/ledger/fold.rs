@@ -569,7 +569,7 @@ fn order_failed(event: &Event) -> Result<(), CoreError> {
             Ok(())
         }
         _ => Err(bad(
-            "exactly one of error / root_bead must be present".into(),
+            "exactly one of error / root_bead must be present".into()
         )),
     }
 }

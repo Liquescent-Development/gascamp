@@ -126,7 +126,10 @@ fn order_run_unknown_name_lists_the_options() {
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("nope") && err.contains("morning-triage"), "{err}");
+    assert!(
+        err.contains("nope") && err.contains("morning-triage"),
+        "{err}"
+    );
 }
 
 #[test]

@@ -20,7 +20,9 @@ use cron::CronExpr;
 /// What trips an order (spec §9): a cron schedule or an event pattern.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Trigger {
-    Cron { expr: CronExpr },
+    Cron {
+        expr: CronExpr,
+    },
     Event {
         event_type: String,
         label: Option<String>,
@@ -295,10 +297,10 @@ pub fn unresponded_fires(ledger: &Ledger) -> Result<Vec<PendingCook>, CoreError>
     let responded = responded_fired_seqs(ledger)?;
     let mut pending = Vec::new();
     for fired in ledger.events_of_type(EventType::OrderFired)? {
-        if !responded.contains(&fired.seq) {
-            if let Some(cook) = pending_cook_from_fired(&fired)? {
-                pending.push(cook);
-            }
+        if !responded.contains(&fired.seq)
+            && let Some(cook) = pending_cook_from_fired(&fired)?
+        {
+            pending.push(cook);
         }
     }
     Ok(pending)
@@ -323,7 +325,7 @@ pub fn execute_fire(
     if fire_response_exists(ledger, fired_seq)? {
         return Ok(None);
     }
-    let mut fail = |ledger: &mut Ledger, error: String| -> Result<(), CoreError> {
+    let fail = |ledger: &mut Ledger, error: String| -> Result<(), CoreError> {
         ledger.append(EventInput {
             kind: EventType::OrderFailed,
             rig: None,
@@ -507,9 +509,7 @@ mod tests {
     #[test]
     fn pending_cook_comes_from_fired_events_only() {
         let (_dir, mut ledger) = test_ledger();
-        ledger
-            .append(fired_input("t", &FireCause::Manual))
-            .unwrap();
+        ledger.append(fired_input("t", &FireCause::Manual)).unwrap();
         append_created(&mut ledger, "gc-1", &[]);
         let mut cooks = Vec::new();
         ledger
@@ -742,7 +742,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(ledger.events_of_type(EventType::RunCooked).unwrap().len(), 1);
+        assert_eq!(
+            ledger.events_of_type(EventType::RunCooked).unwrap().len(),
+            1
+        );
     }
 
     #[test]
