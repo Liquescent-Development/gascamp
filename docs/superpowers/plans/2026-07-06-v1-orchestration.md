@@ -4,7 +4,7 @@
 |---|---|
 | Date | 2026-07-06 |
 | Scope | How the remaining v1 phases (3–15) are dispatched, parallelized, verified, and recovered |
-| Authority | Operator > spec (`docs/design/2026-07-05-gas-camp-design.md`) > master plan (`2026-07-05-gas-camp-v1-implementation.md`, incl. decision 11 as amended 2026-07-06) > this guide |
+| Authority | Operator > spec (`docs/design/2026-07-05-gas-camp-design.md`) > master plan (`2026-07-05-gas-camp-v1-implementation.md`, incl. decision 10 as amended 2026-07-07 by operator directive and decision 11 as amended 2026-07-06) > this guide |
 | Companion | `.claude/skills/phase-orchestration/SKILL.md` — the lead session's behavioral contract |
 
 This guide is data and prompts; the skill is behavior. A fresh lead session
@@ -15,14 +15,23 @@ A3 finding in `docs/design/2026-07-06-assumption-findings.md`).
 
 ## Roles
 
-- **Operator (the human):** approves each phase's execution plan (master
-  plan decision 10), reviews and merges every PR, and answers escalations.
-  Nothing merges without the operator.
+- **Operator (the human):** reviews and merges every PR, answers
+  escalations, and retains override authority over every gate. Nothing
+  merges without the operator. *Amended 2026-07-07 (operator directive):
+  the operator no longer approves each phase's execution plan — the
+  lead's dispatched Opus 4.8 plan reviewer does (master plan decision 10
+  as amended by this directive). Operator involvement in plan approval is
+  by escalation only: a plan proposing a spec edit, anything spending
+  real API money, a reviewer/teammate deadlock after two reject rounds,
+  or the operator asking.*
 - **Lead (one session):** dispatcher only. Spawns one teammate per phase
-  with a kickoff prompt composed from this guide, relays plan approvals,
-  verifies completion evidence, triggers rebases after merges, and batches
-  what needs the operator. The lead never edits code or docs deliverables,
-  never reads diffs, never debugs. Its behavioral contract is the
+  with a kickoff prompt composed from this guide, runs the plan gate
+  (*amended 2026-07-07, operator directive:* dispatches an Opus 4.8
+  plan-review subagent per its contract's step 3 and relays the verdict —
+  decision 10 as amended by this directive), verifies completion
+  evidence, triggers rebases after merges, and batches what needs the
+  operator. The lead never edits code or docs deliverables, never reads
+  diffs, never debugs. Its behavioral contract is the
   `phase-orchestration` skill.
 - **Phase teammate (one session per phase):** does the actual work exactly
   as a solo session would — reads AGENTS.md, the spec, and its master-plan
@@ -120,18 +129,29 @@ the checkable ones itself with `gh`, and never by reading the diff:
 3. The teammate quoted its master-plan **exit criteria** line by line with
    how each was verified (test names, command outputs).
 4. The phase's execution-ready plan doc is committed under
-   `docs/superpowers/plans/`.
+   `docs/superpowers/plans/`, carrying its plan-review approval note
+   (*amended 2026-07-07, operator directive:* verdict, date, and any
+   reviewer-accepted deviations recorded in the doc per the skill's
+   step 3).
 5. Any spec divergence found was handled spec-first (spec edit in the same
    PR), or explicitly reported as "none".
 6. Branch is rebased on current main.
 
 ## Escalation to the operator
 
-Always operator-bound: execution-plan approvals (decision 10), PR
-review/merge, any spec divergence, any manual TUI verification, ordering
-of concurrent spec edits, a teammate blocked on judgment. Batch
-non-urgent items ("plans for 4 and 5 await approval; PR #7 is green") —
-but never batch a blocked teammate behind a slow item.
+Always operator-bound: PR review/merge, any spec divergence, any manual
+TUI verification, ordering of concurrent spec edits, a teammate blocked
+on judgment, and the plan-gate escalation cases — a plan proposing a spec
+edit, anything spending real API money, a reviewer/teammate deadlock
+after two reject rounds, or the operator asking. Batch non-urgent items
+("PRs #7 and #8 are green with review verdicts attached") — but never
+batch a blocked teammate behind a slow item.
+
+*Amended 2026-07-07 (operator directive): execution-plan approval (master
+plan decision 10 as amended by this directive) moved from the operator to
+the lead's dispatched Opus 4.8 plan reviewer; only the plan-gate
+escalation cases above reach the operator. The operator retains override
+authority at all times.*
 
 ## Recovery protocol (fresh lead after a lead-session loss)
 
@@ -153,6 +173,14 @@ Compose each kickoff as: **PREAMBLE** (slots filled) + **the phase block**
 verbatim. Do not paraphrase blocks; edit this file via PR if one is wrong.
 
 ## PREAMBLE (common to all phases)
+
+*Amended 2026-07-07 (operator directive): the approval the PREAMBLE tells
+the teammate to await is now the plan-review verdict relayed by the lead
+(master plan decision 10 as amended by this directive), no longer operator
+approval. The teammate-facing behavior is unchanged — stop, report the
+plan doc path, await approval — so only the word "operator" was dropped
+from the block below. This note stays outside the fenced block: kickoffs
+are composed from the block verbatim.*
 
 ```
 Work in the gascamp repository (private repo richardkiene/gascamp, default
@@ -179,8 +207,8 @@ your contract: files, exact interfaces, semantics, test obligations, exit
 criteria. Per the plan's decision 10, your FIRST step is to expand your
 phase into its own execution-ready plan doc in docs/superpowers/plans/
 using the superpowers:writing-plans skill, then STOP and report the plan
-doc's path back to the team lead for operator approval. Do not execute
-until approval comes back.
+doc's path back to the team lead for approval. Do not execute until
+approval comes back.
 3. Any extra documents named in your phase block.
 
 Method and rules:
