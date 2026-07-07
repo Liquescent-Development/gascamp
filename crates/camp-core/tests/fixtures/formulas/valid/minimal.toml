@@ -1,0 +1,5 @@
+formula = "minimal"
+
+[[steps]]
+id = "only"
+title = "Do the one thing"

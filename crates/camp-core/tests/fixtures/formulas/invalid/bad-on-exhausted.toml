@@ -1,0 +1,12 @@
+formula = "bad-on-exhausted"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "a"
+title = "t"
+
+[steps.retry]
+max_attempts = 2
+on_exhausted = "explode"

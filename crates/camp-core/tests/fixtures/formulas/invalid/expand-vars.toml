@@ -1,0 +1,6 @@
+formula = "expand-vars"
+
+[[steps]]
+id = "a"
+title = "t"
+expand_vars = true

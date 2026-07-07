@@ -1,0 +1,18 @@
+formula = "check-with-retry"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "a"
+title = "t"
+
+[steps.check]
+max_attempts = 3
+
+[steps.check.check]
+mode = "exec"
+path = "v.sh"
+
+[steps.retry]
+max_attempts = 2

@@ -1,0 +1,22 @@
+formula = "guarded-change"
+description = "Implement with script verification and bounded retries"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "implement"
+title = "Implement the change"
+
+[steps.check]
+max_attempts = 3
+
+[steps.check.check]
+mode = "exec"
+path = "scripts/verify.sh"
+timeout = "5m"
+
+[[steps]]
+id = "review"
+title = "Review the final diff"
+needs = ["implement"]

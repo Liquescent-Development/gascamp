@@ -1,0 +1,6 @@
+formula = "tally"
+
+[[steps]]
+id = "a"
+title = "t"
+tally = true
