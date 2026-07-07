@@ -304,7 +304,11 @@ mod tests {
     /// The cap is injected small (1 KB) so a multi-cap burst of VALID
     /// pipelined requests fits inside real kernel socketpair buffers on
     /// every platform; the burst is also bigger than one 4 KB read chunk,
-    /// so the cap-break fires with bytes still queued.
+    /// so the cap-break fires with bytes still queued. A reader thread
+    /// drains responses concurrently, like a real pipelining client — on
+    /// Linux, per-write skb overhead is charged against SO_SNDBUF, so
+    /// hundreds of tiny unread responses would exhaust the send buffer far
+    /// below its nominal size and WouldBlock the daemon's response write.
     #[test]
     fn one_readable_event_drains_a_pipelined_backlog_beyond_the_cap() {
         const TEST_CAP: usize = 1024;
@@ -319,9 +323,29 @@ mod tests {
             buf: Vec::new(),
         };
 
+        let n = 280usize; // ~6.4 KB of pokes: > 4 KB chunk, > 6x the cap
+
+        // Response reader, started first so it is always draining.
+        let reader_end = client.try_clone().unwrap();
+        reader_end
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(reader_end);
+            let mut answered = 0usize;
+            let mut line = String::new();
+            while answered < n {
+                line.clear();
+                match std::io::BufRead::read_line(&mut reader, &mut line) {
+                    Ok(bytes) if bytes > 0 => answered += 1,
+                    _ => break, // EOF or timeout: stop counting
+                }
+            }
+            answered
+        });
+
         // Pre-queue the whole burst BEFORE the one and only "readable
         // event" — exactly what a pipelining client produces.
-        let n = 280usize; // ~6.4 KB of pokes: > 4 KB chunk, > 6x the cap
         let mut burst = String::new();
         for i in 0..n {
             burst.push_str(&format!("{{\"op\":\"poke\",\"seq\":{i}}}\n"));
@@ -330,30 +354,13 @@ mod tests {
         assert!(burst.len() > 4096, "burst must exceed one read chunk");
         client.write_all(burst.as_bytes()).unwrap();
 
-        // One event's worth of serving.
+        // One event's worth of serving must answer every request.
         let state = serve_connection(&mut conn, &mut ledger, &mut processor, TEST_CAP).unwrap();
         assert!(matches!(state, ConnState::Open));
-
-        // That one call must have answered every request.
-        client.set_nonblocking(true).unwrap();
-        let mut responses = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            match client.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read) => responses.extend_from_slice(&chunk[..read]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) => panic!("reading responses: {e}"),
-            }
-        }
-        let answered = bytecount(&responses, b'\n');
+        let answered = reader.join().unwrap();
         assert_eq!(
             answered, n,
             "one readable event must drain the whole queued backlog"
         );
-    }
-
-    fn bytecount(haystack: &[u8], needle: u8) -> usize {
-        haystack.iter().filter(|&&b| b == needle).count()
     }
 }
