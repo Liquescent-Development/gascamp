@@ -8,9 +8,11 @@ pub mod event;
 pub mod id;
 pub mod ledger;
 pub mod readiness;
+pub mod search;
 pub mod vocab;
 
 pub use readiness::{BeadRow, ListFilter};
+pub use search::SearchHit;
 
 /// Monotonic event sequence number (the `events.seq` column).
 pub type Seq = i64;
