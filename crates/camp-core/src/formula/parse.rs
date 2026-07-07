@@ -318,6 +318,15 @@ fn walk_step(index: usize, step: &toml::Table, out: &mut Vec<Violation>) -> RawS
     for key in sorted_keys(step) {
         if ACCEPTED_STEP.contains(&key) {
             continue;
+        } else if key == "tally" {
+            // Not a pointer to the city: gc formula-v2 hard-removed
+            // [steps.tally] too (review finding 8).
+            out.push(Violation {
+                construct: "tally".to_owned(),
+                message: "`tally` was removed from Gas City formula v2; neither camp \
+                          nor current gc accepts it (spec §8.2)"
+                    .to_owned(),
+            });
         } else if CITY_ONLY_STEP.contains(&key) {
             out.push(city_only(key));
         } else {
@@ -597,6 +606,20 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn tally_rejection_notes_that_gc_also_rejects_it() {
+        // Review finding 8: pointing tally authors at a Gas City would be
+        // wrong advice — gc formula-v2 hard-rejects [steps.tally] too.
+        let text = "formula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ntally = true\n";
+        let v = violations(text);
+        let tally = v
+            .iter()
+            .find(|v| v.construct == "tally")
+            .expect("tally violation");
+        assert!(tally.message.contains("removed"), "{}", tally.message);
+        assert!(tally.message.contains("Gas City"), "{}", tally.message);
+    }
 
     #[test]
     fn nested_unknown_keys_carry_their_location() {
