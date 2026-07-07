@@ -26,4 +26,6 @@ pub enum CoreError {
     UnknownRig(String),
     #[error("invalid rig prefix {0:?}: must match ^[a-z][a-z0-9]*$")]
     InvalidPrefix(String),
+    #[error("invalid search query {query:?}: {reason}")]
+    InvalidSearchQuery { query: String, reason: String },
 }

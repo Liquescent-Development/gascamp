@@ -28,7 +28,7 @@
 - `search` FTS5 table (Phase 1, `schema.rs:58-60`): `fts5(bead_id UNINDEXED, kind UNINDEXED, content)` — content is column index 2 for `snippet()`.
 - Fold writes: `bead_created` inserts `(id, 'body', title || '\n' || description)`; `bead_updated` rewrites the body row; `bead_closed` inserts `(id, 'close', reason)` when reason is non-empty (`fold.rs:123-126, 187, 224-231, 265-276`).
 - `memory` is already a legal bead type (`fold.rs:13`: `BEAD_TYPES = ["task", "mail", "memory"]`) and `camp create --type memory` already works (covered by `cli_create.rs::create_label_and_type_round_trip_through_show`).
-- `rusqlite` 0.40.1 implements fallible `ToSql for usize` (`to_sql.rs:276`, `to_sql_self_fallible!`) — `limit` binds directly; overflow is an error, not a panic.
+- `rusqlite` 0.40.1's fallible `ToSql for usize` (`to_sql.rs:276`) is gated behind the off-by-default `fallible_uint` feature, which this workspace does not enable — so `search()` converts with `i64::try_from(limit)` and maps overflow to `InvalidSearchQuery` (fail fast, never truncate). *(Corrected during execution: the plan originally said `limit` binds directly; the compile failed because the impl is feature-gated.)*
 - FTS5's `bm25()` clamps non-positive IDF to `1e-6` (bundled `sqlite3.c:245021`), so bm25 values are always negative-is-better and document-length normalization ranks a short adjacent-terms doc above a long scattered-terms doc even when every doc contains the query terms.
 - The FTS5 query text is a **bound parameter** parsed when the statement first steps; a parse failure surfaces as plain `SQLITE_ERROR` (code 1) with fts5's message (e.g. `fts5: syntax error near "("`). Our own SQL is fixed and known-good, so `SQLITE_ERROR` from this statement can only mean a bad user query.
 - `Ledger.conn` is private; core tests drive search through a new `Ledger::search` wrapper (same pattern as `is_ready`/`ready_beads` wrapping `readiness.rs` free functions).
@@ -334,7 +334,7 @@ fn translate_fts_error(query: &str, e: rusqlite::Error) -> CoreError {
 Notes for the implementer:
 - `snippet(search, 2, '', '', '…', 12)`: column 2 is `content`; empty highlight markers (plain text for the CLI); `…` ellipsis; at most 12 tokens.
 - The `bead_id`/`kind` ORDER BY tail is a deterministic tiebreak for equal bm25 scores only.
-- `limit: usize` binds directly (rusqlite's fallible `ToSql for usize`); overflow is an error, not a truncation.
+- `limit: usize` is converted with `i64::try_from` (rusqlite's `ToSql for usize` is feature-gated off); overflow maps to `InvalidSearchQuery`, never a truncation.
 - Deduping is deliberately absent: a bead matched in both its body and its close note yields two hits distinguished by `kind`.
 
 3c. Register the module in `crates/camp-core/src/lib.rs` — the module list becomes (new lines marked):

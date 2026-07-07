@@ -147,6 +147,17 @@ impl Ledger {
         }
         Ok(events)
     }
+
+    /// Ranked full-text search over titles, descriptions, close notes, and
+    /// memory (spec §7.4), best match first. See [`crate::search::search`].
+    pub fn search(
+        &self,
+        query: &str,
+        type_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::search::SearchHit>, CoreError> {
+        crate::search::search(&self.conn, query, type_filter, limit)
+    }
 }
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
