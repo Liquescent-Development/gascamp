@@ -30,8 +30,8 @@ pub fn cook(
     if formula.steps.is_empty() {
         // parse_and_validate guarantees this (rule S3); cook re-checks its
         // own precondition rather than cooking an empty run.
-        return Err(CoreError::Corrupt(format!(
-            "cook: formula {:?} has no steps — cook requires parse_and_validate output",
+        return Err(CoreError::Cook(format!(
+            "formula {:?} has no steps — cook requires parse_and_validate output",
             formula.name
         )));
     }
@@ -59,17 +59,35 @@ pub fn cook(
         );
     }
 
+    // Resolve every needs edge BEFORE touching disk or the ledger: a
+    // hand-built Formula (bypassing parse_and_validate) naming an unknown
+    // step must fail loudly, never cook a bead with a silently missing
+    // edge (review finding 1).
+    let mut step_needs: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for step in &formula.steps {
+        let mut needs = Vec::with_capacity(step.needs.len());
+        for id in &step.needs {
+            let bead = step_beads.get(id).ok_or_else(|| {
+                CoreError::Cook(format!(
+                    "formula {:?} step {:?} needs unknown step id {id:?} — \
+                     cook requires parse_and_validate output",
+                    formula.name, step.id
+                ))
+            })?;
+            needs.push(bead.clone());
+        }
+        step_needs.insert(step.id.as_str(), needs);
+    }
+
     // ---- files first: runs/<run-id>/ with pinned copy + manifest
     let dir = run_dir.join(&run_id);
-    std::fs::create_dir_all(run_dir).map_err(|e| {
-        CoreError::Corrupt(format!("cook: cannot create {}: {e}", run_dir.display()))
-    })?;
+    std::fs::create_dir_all(run_dir)
+        .map_err(|e| CoreError::Cook(format!("cannot create {}: {e}", run_dir.display())))?;
     std::fs::create_dir(&dir)
-        .map_err(|e| CoreError::Corrupt(format!("cook: cannot create {}: {e}", dir.display())))?;
+        .map_err(|e| CoreError::Cook(format!("cannot create {}: {e}", dir.display())))?;
     let write = |name: &str, bytes: &[u8]| -> Result<(), CoreError> {
-        std::fs::write(dir.join(name), bytes).map_err(|e| {
-            CoreError::Corrupt(format!("cook: cannot write {}/{name}: {e}", dir.display()))
-        })
+        std::fs::write(dir.join(name), bytes)
+            .map_err(|e| CoreError::Cook(format!("cannot write {}/{name}: {e}", dir.display())))
     };
     write(&format!("{}.toml", formula.name), formula.source.as_bytes())?;
     let manifest = serde_json::json!({
@@ -101,11 +119,7 @@ pub fn cook(
         data: root_data,
     });
     for step in &formula.steps {
-        let needs: Vec<&String> = step
-            .needs
-            .iter()
-            .filter_map(|id| step_beads.get(id))
-            .collect();
+        let needs = &step_needs[step.id.as_str()];
         let mut data = serde_json::json!({
             "title": step.title,
             "run_id": run_id,
@@ -146,7 +160,7 @@ pub fn cook(
         // original error, never instead of it and never silently.
         return Err(match std::fs::remove_dir_all(&dir) {
             Ok(()) => batch_err,
-            Err(cleanup) => CoreError::Corrupt(format!(
+            Err(cleanup) => CoreError::Cook(format!(
                 "cook failed ({batch_err}) and the run dir {} could not be removed: {cleanup}",
                 dir.display()
             )),

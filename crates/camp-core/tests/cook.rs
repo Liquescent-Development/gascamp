@@ -237,6 +237,60 @@ fn cook_is_file_independent_afterwards() {
 }
 
 #[test]
+fn cook_rejects_unknown_needs_ids_in_hand_built_formulas() {
+    // Review finding 1: a caller constructing Formula directly (bypassing
+    // parse_and_validate) must not get a bead silently missing an edge.
+    use camp_core::formula::{Formula, Step};
+    let (dir, mut ledger) = temp_ledger();
+    let step = |id: &str, needs: &[&str]| Step {
+        id: id.into(),
+        title: "t".into(),
+        description: None,
+        needs: needs.iter().map(|s| (*s).to_owned()).collect(),
+        assignee: None,
+        timeout: None,
+        check: None,
+        retry: None,
+        on_complete: None,
+    };
+    let formula = Formula {
+        name: "hand".into(),
+        description: None,
+        requires: None,
+        steps: vec![step("a", &[]), step("b", &["ghost"])],
+        source: String::new(),
+    };
+    let runs = dir.path().join("runs");
+    let err = cook(&mut ledger, &formula, &runs, &rig(), "cli").unwrap_err();
+    assert!(
+        matches!(err, camp_core::error::CoreError::Cook(_)),
+        "want Cook error, got {err:?}"
+    );
+    assert!(err.to_string().contains("ghost"), "{err}");
+    // fail fast: nothing landed — no events, no beads, no run dir
+    assert!(ledger.events_range(1, None).unwrap().is_empty());
+    assert!(!runs.exists() || std::fs::read_dir(&runs).unwrap().count() == 0);
+}
+
+#[test]
+fn cook_fs_failures_are_not_reported_as_ledger_corruption() {
+    // Review finding 4: disk trouble during cook must not read as a damaged
+    // ledger. run_dir here is a FILE, so create_dir_all fails.
+    let (dir, mut ledger) = temp_ledger();
+    let blocker = dir.path().join("runs");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let formula = parse_and_validate(&fixture("minimal")).unwrap();
+    let err = cook(&mut ledger, &formula, &blocker, &rig(), "cli").unwrap_err();
+    assert!(
+        matches!(err, camp_core::error::CoreError::Cook(_)),
+        "want Cook error, got {err:?}"
+    );
+    let text = err.to_string();
+    assert!(text.starts_with("cook:"), "{text}");
+    assert!(!text.contains("ledger corrupt"), "{text}");
+}
+
+#[test]
 fn cook_atomicity_fault_injection_leaves_nothing() {
     let (dir, mut ledger) = temp_ledger();
     // Occupy gc-2 through the public API (the counter advances to 2), then
