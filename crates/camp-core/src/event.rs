@@ -24,6 +24,10 @@ pub enum EventType {
     CampdAutostarted,
     RigAdded,
     RunCooked,
+    OrderFired,
+    OrderCompleted,
+    OrderFailed,
+    ConfigChanged,
 }
 
 impl EventType {
@@ -40,6 +44,10 @@ impl EventType {
         EventType::CampdAutostarted,
         EventType::RigAdded,
         EventType::RunCooked,
+        EventType::OrderFired,
+        EventType::OrderCompleted,
+        EventType::OrderFailed,
+        EventType::ConfigChanged,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -56,6 +64,10 @@ impl EventType {
             EventType::CampdAutostarted => "campd.autostarted",
             EventType::RigAdded => "rig.added",
             EventType::RunCooked => "run.cooked",
+            EventType::OrderFired => "order.fired",
+            EventType::OrderCompleted => "order.completed",
+            EventType::OrderFailed => "order.failed",
+            EventType::ConfigChanged => "config.changed",
         }
     }
 

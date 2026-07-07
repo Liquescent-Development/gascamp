@@ -1163,6 +1163,116 @@ mod tests {
     }
 
     #[test]
+    fn order_events_are_validated_and_log_only() {
+        let (_dir, mut ledger) = temp_ledger();
+        for data in [
+            serde_json::json!({"order":"t","trigger":"cron","scheduled_ts":"2026-07-06T07:00:00Z"}),
+            serde_json::json!({"order":"t","trigger":"cron","scheduled_ts":"2026-07-06T07:00:00Z","catch_up":true}),
+            serde_json::json!({"order":"t","trigger":"event","cause_seq":4}),
+            serde_json::json!({"order":"t","trigger":"manual"}),
+        ] {
+            ledger
+                .append(input(EventType::OrderFired, None, None, data))
+                .unwrap();
+        }
+        ledger
+            .append(input(
+                EventType::OrderCompleted,
+                None,
+                None,
+                serde_json::json!({"order":"t","fired_seq":1,"root_bead":"gc-1","run_id":"r","outcome":"pass"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::OrderFailed,
+                None,
+                None,
+                serde_json::json!({"order":"t","fired_seq":1,"error":"formula not found"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::OrderFailed,
+                None,
+                None,
+                serde_json::json!({"order":"t","fired_seq":1,"root_bead":"gc-1","run_id":"r","outcome":"fail"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::ConfigChanged,
+                None,
+                None,
+                serde_json::json!({"path":"camp.toml","applied":true,"orders":2}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::ConfigChanged,
+                None,
+                None,
+                serde_json::json!({"path":"camp.toml","applied":false,"error":"unknown field"}),
+            ))
+            .unwrap();
+        // all log-only: no state effect
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 9);
+        assert_eq!(count(&ledger, "SELECT count(*) FROM beads"), 0);
+    }
+
+    #[test]
+    fn malformed_order_events_are_rejected() {
+        let (_dir, mut ledger) = temp_ledger();
+        for (kind, data) in [
+            (
+                EventType::OrderFired,
+                serde_json::json!({"order":"t","trigger":"vibes"}),
+            ),
+            (
+                EventType::OrderFired,
+                serde_json::json!({"order":"t","trigger":"cron"}), // no scheduled_ts
+            ),
+            (
+                EventType::OrderFired,
+                serde_json::json!({"order":"t","trigger":"event"}), // no cause_seq
+            ),
+            (
+                EventType::OrderFired,
+                serde_json::json!({"order":"t","trigger":"manual","catch_up":true}),
+            ),
+            (
+                EventType::OrderCompleted,
+                serde_json::json!({"order":"t","fired_seq":1,"root_bead":"gc-1","run_id":"r","outcome":"fail"}),
+            ),
+            (
+                EventType::OrderFailed,
+                serde_json::json!({"order":"t","fired_seq":1}), // neither shape
+            ),
+            (
+                EventType::OrderFailed,
+                serde_json::json!({"order":"t","fired_seq":1,"error":"e","root_bead":"gc-1"}), // both
+            ),
+            (
+                EventType::ConfigChanged,
+                serde_json::json!({"path":"p","applied":true,"error":"e"}),
+            ),
+            (
+                EventType::ConfigChanged,
+                serde_json::json!({"path":"p","applied":false}),
+            ),
+            (
+                EventType::OrderFired,
+                serde_json::json!({"order":"t","trigger":"manual","bogus":1}),
+            ),
+        ] {
+            assert!(
+                ledger.append(input(kind, None, None, data.clone())).is_err(),
+                "{kind:?} {data}"
+            );
+        }
+    }
+
+    #[test]
     fn campd_lifecycle_events_are_log_only() {
         let (_dir, mut ledger) = temp_ledger();
         ledger
