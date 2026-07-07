@@ -21,6 +21,7 @@ pub enum EventType {
     SessionCrashed,
     CampdStarted,
     CampdStopped,
+    CampdAutostarted,
     RigAdded,
 }
 
@@ -35,6 +36,7 @@ impl EventType {
         EventType::SessionCrashed,
         EventType::CampdStarted,
         EventType::CampdStopped,
+        EventType::CampdAutostarted,
         EventType::RigAdded,
     ];
 
@@ -49,6 +51,7 @@ impl EventType {
             EventType::SessionCrashed => "session.crashed",
             EventType::CampdStarted => "campd.started",
             EventType::CampdStopped => "campd.stopped",
+            EventType::CampdAutostarted => "campd.autostarted",
             EventType::RigAdded => "rig.added",
         }
     }

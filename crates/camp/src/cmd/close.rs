@@ -11,13 +11,14 @@ pub fn run(camp: &CampDir, bead: String, outcome: String, reason: Option<String>
     if let Some(r) = reason {
         data["reason"] = serde_json::json!(r);
     }
-    ledger.append(EventInput {
+    let seq = ledger.append(EventInput {
         kind: EventType::BeadClosed,
         rig: None,
         actor: "cli".into(),
         bead: Some(bead.clone()),
         data,
     })?;
+    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
     println!("closed {bead} ({outcome})");
     Ok(())
 }

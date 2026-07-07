@@ -1,0 +1,254 @@
+//! campd: the only standing process (spec §5). Crash-only: no exclusive
+//! state, `kill -9` is a supported shutdown method; on start it opens the
+//! ledger, appends campd.started, catches up past its cursor, announces
+//! readiness on stdout, and sleeps on the socket.
+
+pub mod autostart;
+pub mod cursor;
+pub mod event_loop;
+pub mod socket;
+
+use std::io::Write;
+
+use anyhow::{Context, Result};
+use camp_core::event::{EventInput, EventType};
+use camp_core::ledger::Ledger;
+
+use crate::campdir::CampDir;
+use cursor::ReadinessProcessor;
+
+/// The single line campd prints to stdout once the socket accepts.
+/// Auto-start (and the tests) block on it — an OS pipe read, not a
+/// sleep/retry loop. stdout is never written again after this line.
+pub const READY_PREFIX: &str = "campd listening on ";
+
+pub fn run(camp: &CampDir) -> Result<()> {
+    let mut ledger = Ledger::open(&camp.db_path())?;
+    let socket_path = camp.socket_path();
+    let std_listener = socket::bind_or_replace(&socket_path)?;
+    std_listener
+        .set_nonblocking(true)
+        .context("setting the listener non-blocking")?;
+    let listener = mio::net::UnixListener::from_std(std_listener);
+
+    ledger.append(EventInput {
+        kind: EventType::CampdStarted,
+        rig: None,
+        actor: "campd".into(),
+        bead: None,
+        data: serde_json::json!({}),
+    })?;
+
+    // Startup catch-up is fatal on error: a daemon that cannot process its
+    // backlog must not pretend to be up (fail fast).
+    let mut processor = ReadinessProcessor::default();
+    cursor::catch_up(&mut ledger, &mut processor)?;
+    // Phase 8 dispatches the newly-ready set; until then the recompute is
+    // bookkeeping only, drained so it never accumulates in a long-lived
+    // daemon.
+    let _newly_ready = processor.take_pending();
+
+    let mut stdout = std::io::stdout();
+    writeln!(stdout, "{READY_PREFIX}{}", socket_path.display()).context("announcing readiness")?;
+    stdout.flush().context("flushing the readiness line")?;
+
+    event_loop::run(listener, &socket_path, &mut ledger, &mut processor)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// Test-harness-only readiness wait (the daemon itself never polls;
+    /// out-of-process callers get the stdout readiness line instead).
+    fn connect_with_retry(sock: &Path) -> UnixStream {
+        for _ in 0..500 {
+            if let Ok(stream) = UnixStream::connect(sock) {
+                return stream;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("campd socket {} never accepted", sock.display());
+    }
+
+    fn request(stream: &mut UnixStream, line: &str) -> serde_json::Value {
+        stream.write_all(line.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        let mut resp = String::new();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        reader.read_line(&mut resp).unwrap();
+        serde_json::from_str(resp.trim_end()).expect("campd response is JSON")
+    }
+
+    #[test]
+    fn daemon_serves_status_poke_and_stop_over_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".camp");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        let camp = CampDir { root: root.clone() };
+        let handle = std::thread::spawn(move || run(&camp));
+
+        let sock = root.join("campd.sock");
+        let mut stream = connect_with_retry(&sock);
+
+        let status = request(&mut stream, r#"{"op":"status"}"#);
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["campd_pid"], std::process::id());
+        assert_eq!(status["ready"], 0);
+        assert_eq!(status["open"], 0);
+        assert_eq!(status["live_sessions"], serde_json::json!([]));
+
+        let poke = request(&mut stream, r#"{"op":"poke","seq":1}"#);
+        assert_eq!(poke, serde_json::json!({"ok": true}));
+
+        // an unknown op gets a clean error response on a fresh connection
+        let mut bad = UnixStream::connect(&sock).unwrap();
+        let err = request(&mut bad, r#"{"op":"dance"}"#);
+        assert_eq!(err["ok"], false);
+        assert!(err["error"].as_str().unwrap().contains("bad request"));
+
+        let stop = request(&mut stream, r#"{"op":"stop"}"#);
+        assert_eq!(stop, serde_json::json!({"ok": true}));
+        handle.join().unwrap().unwrap();
+        assert!(!sock.exists(), "stop must unlink the socket");
+
+        // the ledger tells the story and the cursor is caught up
+        let ledger = Ledger::open(&root.join("camp.db")).unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        let types: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(types, vec!["campd.started", "campd.stopped"]);
+        assert_eq!(
+            ledger.cursor(cursor::CAMPD_CURSOR).unwrap(),
+            1,
+            "startup catch-up covered campd.started; campd.stopped (seq 2) \
+             lands after the final catch-up — the next start covers it"
+        );
+    }
+
+    /// PR #8 review finding 3: a client streaming a newline-less line must
+    /// be cut off with a clean error, not buffered without bound past the
+    /// idle-RSS budget (invariant 1 / spec §2.1).
+    #[test]
+    fn oversized_request_line_is_rejected_and_the_connection_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".camp");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        let camp = CampDir { root: root.clone() };
+        let handle = std::thread::spawn(move || run(&camp));
+
+        let sock = root.join("campd.sock");
+        let mut stream = connect_with_retry(&sock);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Exactly one byte over the cap, no newline, then stop writing: the
+        // daemon consumes everything before rejecting, so its close is a
+        // clean FIN and the error line is deterministically deliverable on
+        // every platform. (Writing MORE would leave unread bytes in the
+        // daemon's receive queue at close time, which resets the connection
+        // on Linux and clobbers the response — the in-the-wild firehose
+        // case, where the drop is the contract and the response is
+        // best-effort.)
+        let oversized = vec![b'x'; event_loop::MAX_REQUEST_BYTES + 1];
+        stream.write_all(&oversized).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("the daemon must answer an oversized line, not buffer it forever");
+        let resp: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(resp["ok"], false);
+        assert!(
+            resp["error"].as_str().unwrap().contains("exceeds"),
+            "error was: {resp}"
+        );
+        // the offending connection is closed…
+        line.clear();
+        let n = reader.read_line(&mut line).unwrap();
+        assert_eq!(n, 0, "daemon must close the oversized connection");
+
+        // …and campd is unharmed for the next client
+        let mut fresh = connect_with_retry(&sock);
+        let status = request(&mut fresh, r#"{"op":"status"}"#);
+        assert_eq!(status["ok"], true);
+        let stop = request(&mut fresh, r#"{"op":"stop"}"#);
+        assert_eq!(stop, serde_json::json!({"ok": true}));
+        handle.join().unwrap().unwrap();
+    }
+
+    /// PR #8 re-review finding 1: a client pipelining more than the 64 KB
+    /// cap of VALID newline-delimited requests in one burst must get every
+    /// one answered. The cap-break interacts with mio's edge-triggered
+    /// registration: if the daemon stops reading at the cap, answers the
+    /// complete lines, and returns to poll with data still in the kernel
+    /// receive buffer, no new readable event ever fires (the client is done
+    /// writing) — the connection wedges.
+    #[test]
+    fn pipelined_valid_requests_beyond_the_cap_are_all_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".camp");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        let camp = CampDir { root: root.clone() };
+        let handle = std::thread::spawn(move || run(&camp));
+
+        let sock = root.join("campd.sock");
+        let mut stream = connect_with_retry(&sock);
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Reader thread drains responses concurrently (a client that never
+        // reads would hit the decision-J write-backpressure drop instead —
+        // a different, intended behavior).
+        const N: usize = 3500;
+        let reader_stream = stream.try_clone().unwrap();
+        reader_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut reader = BufReader::new(reader_stream);
+            let mut answered = 0usize;
+            let mut line = String::new();
+            for _ in 0..N {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(n) if n > 0 && line.trim_end() == r#"{"ok":true}"# => answered += 1,
+                    _ => break, // EOF, timeout, or a wrong answer: stop counting
+                }
+            }
+            answered
+        });
+
+        // one burst of valid pokes, comfortably past the cap
+        let mut burst = String::new();
+        for i in 0..N {
+            burst.push_str(&format!("{{\"op\":\"poke\",\"seq\":{i}}}\n"));
+        }
+        assert!(
+            burst.len() > event_loop::MAX_REQUEST_BYTES,
+            "the burst must exceed the cap for this test to mean anything"
+        );
+        stream.write_all(burst.as_bytes()).unwrap();
+
+        let answered = reader.join().unwrap();
+        assert_eq!(answered, N, "every pipelined request must be answered");
+
+        // graceful shutdown
+        let mut fresh = connect_with_retry(&sock);
+        let stop = request(&mut fresh, r#"{"op":"stop"}"#);
+        assert_eq!(stop, serde_json::json!({"ok": true}));
+        handle.join().unwrap().unwrap();
+    }
+}

@@ -20,6 +20,7 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "bead.claimed",
     "campd.started",
     "campd.stopped",
+    "campd.autostarted",
     "rig.added",
 ];
 
