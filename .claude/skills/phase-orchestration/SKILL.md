@@ -48,12 +48,20 @@ never enters it.
    PR on the right branch; `gh pr checks` all green (run it yourself);
    exit criteria quoted with evidence; plan doc committed; rebased on
    current main. A teammate's "done" is a claim, not a fact.
-6. **Present to the operator** for review/merge; batch when several are
-   ready, never batching a blocked teammate behind a slow item.
-7. **Post-merge, immediately:** instruct every in-flight teammate to
+6. **Auto-review (operator standing order, 2026-07-07):** the moment
+   step 5 passes, dispatch an Opus 4.8 `code-reviewer` subagent against
+   the PR — isolated worktree, review-only, never posts to GitHub — with
+   the phase contract section, spec, and committed plan doc named as
+   context. Do not wait for the operator to ask. Review-fix rounds on the
+   same PR get a fresh reviewer pass on the fix commits.
+7. **Present to the operator** for review/merge — PR and review verdict
+   together; batch when several are ready, never batching a blocked
+   teammate behind a slow item. The operator decides which findings go
+   back to the teammate and when to merge.
+8. **Post-merge, immediately:** instruct every in-flight teammate to
    rebase onto main, resolve, and re-run the full gates. Then re-run the
    ready check — a merge usually opens the next window.
-8. Teammates stay idle-but-alive after finishing; send review feedback to
+9. Teammates stay idle-but-alive after finishing; send review feedback to
    the same teammate rather than respawning.
 
 ## Escalation — always operator-bound
@@ -79,3 +87,4 @@ kickoff prompts — branches, plan docs, and PRs carry all real state.
 | "Deps are green, close enough" | Merged is the gate. Green-but-unmerged is not merged. |
 | "I'll remember this decision" | You won't survive a restart (A3 finding). Write it to a PR comment. |
 | "I'll paraphrase the kickoff" | Blocks are verbatim. If a block is wrong, fix it via PR. |
+| "This PR is clean, skip the review" | Every phase PR gets the Opus 4.8 review before presentation. Standing order — the operator decides on findings, not you. |
