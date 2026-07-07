@@ -1,0 +1,6 @@
+formula = "compose"
+compose = true
+
+[[steps]]
+id = "a"
+title = "t"

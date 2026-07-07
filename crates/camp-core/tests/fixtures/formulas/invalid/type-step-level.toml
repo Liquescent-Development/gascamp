@@ -1,0 +1,6 @@
+formula = "type-step-level"
+
+[[steps]]
+id = "a"
+title = "t"
+type = "bug"

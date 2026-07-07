@@ -1,0 +1,6 @@
+formula = "tags"
+
+[[steps]]
+id = "a"
+title = "t"
+tags = true

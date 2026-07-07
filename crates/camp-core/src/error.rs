@@ -28,4 +28,9 @@ pub enum CoreError {
     InvalidPrefix(String),
     #[error("invalid search query {query:?}: {reason}")]
     InvalidSearchQuery { query: String, reason: String },
+    /// A formula cook failed before or around the ledger transaction
+    /// (bad cook input, run-dir filesystem trouble). NOT a ledger
+    /// integrity finding — that is `Corrupt`.
+    #[error("cook: {0}")]
+    Cook(String),
 }

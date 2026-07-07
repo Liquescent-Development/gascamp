@@ -1,0 +1,8 @@
+formula = "bad-semver"
+
+[requires]
+formula_compiler = "not-a-version"
+
+[[steps]]
+id = "a"
+title = "t"

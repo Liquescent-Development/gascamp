@@ -1,0 +1,16 @@
+formula = "nested-unknown-key"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "a"
+title = "t"
+
+[steps.check]
+max_attempts = 3
+retries = 2
+
+[steps.check.check]
+mode = "exec"
+path = "v.sh"

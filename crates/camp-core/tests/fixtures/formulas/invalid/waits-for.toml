@@ -1,0 +1,6 @@
+formula = "waits-for"
+
+[[steps]]
+id = "a"
+title = "t"
+waits_for = true

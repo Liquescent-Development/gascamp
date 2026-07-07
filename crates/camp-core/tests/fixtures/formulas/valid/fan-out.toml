@@ -1,0 +1,18 @@
+formula = "fan-out"
+description = "Runtime fan-out over structured step output"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "enumerate"
+title = "Enumerate the work items"
+
+[steps.on_complete]
+for_each = "output.items"
+bond = "minimal"
+sequential = true
+
+[steps.on_complete.vars]
+name = "{item.name}"
+position = "{index}"

@@ -22,6 +22,7 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "campd.stopped",
     "campd.autostarted",
     "rig.added",
+    "run.cooked",
 ];
 
 /// Values `bead.closed` accepts for `outcome` — a strict subset of gc's

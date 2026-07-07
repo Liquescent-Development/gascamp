@@ -1,0 +1,6 @@
+formula = "gate"
+
+[[steps]]
+id = "a"
+title = "t"
+gate = true

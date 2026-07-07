@@ -1,0 +1,25 @@
+formula = "diamond"
+description = "Fan out and join"
+
+[[steps]]
+id = "design"
+title = "Design the interface"
+assignee = "architect"
+
+[[steps]]
+id = "implement"
+title = "Implement the interface"
+needs = ["design"]
+assignee = "dev"
+
+[[steps]]
+id = "document"
+title = "Document the interface"
+needs = ["design"]
+assignee = "writer"
+
+[[steps]]
+id = "release"
+title = "Release it"
+needs = ["implement", "document"]
+assignee = "dev"

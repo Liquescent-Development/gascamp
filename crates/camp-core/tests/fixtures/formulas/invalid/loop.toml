@@ -1,0 +1,6 @@
+formula = "loop"
+
+[[steps]]
+id = "a"
+title = "t"
+loop = true
