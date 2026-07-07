@@ -23,16 +23,23 @@ A3 finding in `docs/design/2026-07-06-assumption-findings.md`).
   as amended by this directive). Operator involvement in plan approval is
   by escalation only: a plan proposing a spec edit, anything spending
   real API money, a reviewer/teammate deadlock after two reject rounds,
-  or the operator asking.*
+  or the operator asking.* *Amended 2026-07-07 (operator directive):
+  review findings are relayed to the teammate in full by default — the
+  lead sends every finding from every code-review pass (initial or
+  fix-pass) straight to the phase teammate, with no per-round operator
+  decision; the operator sees findings summarized when the PR is
+  presented and retains override and merge authority (may trim or waive
+  findings, or order a merge with findings open).*
 - **Lead (one session):** dispatcher only. Spawns one teammate per phase
   with a kickoff prompt composed from this guide, runs the plan gate
   (*amended 2026-07-07, operator directive:* dispatches an Opus 4.8
   plan-review subagent per its contract's step 3 and relays the verdict —
   decision 10 as amended by this directive), verifies completion
-  evidence, triggers rebases after merges, and batches what needs the
-  operator. The lead never edits code or docs deliverables, never reads
-  diffs, never debugs. Its behavioral contract is the
-  `phase-orchestration` skill.
+  evidence, relays code-review findings to the teammate in full per its
+  contract's step 6 (*amended 2026-07-07, operator directive*), triggers
+  rebases after merges, and batches what needs the operator. The lead
+  never edits code or docs deliverables, never reads diffs, never
+  debugs. Its behavioral contract is the `phase-orchestration` skill.
 - **Phase teammate (one session per phase):** does the actual work exactly
   as a solo session would — reads AGENTS.md, the spec, and its master-plan
   contract section; expands the phase into an execution-ready plan
@@ -152,6 +159,13 @@ plan decision 10 as amended by this directive) moved from the operator to
 the lead's dispatched Opus 4.8 plan reviewer; only the plan-gate
 escalation cases above reach the operator. The operator retains override
 authority at all times.*
+
+*Amended 2026-07-07 (operator directive): review findings are relayed to
+the teammate in full by default; the operator retains override and merge
+authority. Deciding which code-review findings go back to the teammate is
+no longer an operator escalation — the lead relays every finding from
+every pass immediately (skill step 6). The escalation list above is
+otherwise unchanged.*
 
 ## Recovery protocol (fresh lead after a lead-session loss)
 

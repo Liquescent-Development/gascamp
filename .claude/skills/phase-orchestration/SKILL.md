@@ -78,12 +78,21 @@ never enters it.
    step 5 passes, dispatch an Opus 4.8 `code-reviewer` subagent against
    the PR — isolated worktree, review-only, never posts to GitHub — with
    the phase contract section, spec, and committed plan doc named as
-   context. Do not wait for the operator to ask. Review-fix rounds on the
-   same PR get a fresh reviewer pass on the fix commits.
+   context. Do not wait for the operator to ask. **Fix-all (operator
+   standing order, 2026-07-07):** when any review pass — initial or
+   fix-pass — returns findings, relay ALL of them to the phase teammate
+   immediately for fixing. No per-round operator decision, no triage by
+   severity, no holding findings for presentation. Review-fix rounds on
+   the same PR get a fresh reviewer pass on the fix commits; the
+   revise → fresh-review loop continues until a pass returns clean or
+   the operator overrides.
 7. **Present to the operator** for review/merge — PR and review verdict
-   together; batch when several are ready, never batching a blocked
-   teammate behind a slow item. The operator decides which findings go
-   back to the teammate and when to merge.
+   together, findings summarized (what each pass found, what was relayed,
+   fix status); keep the ongoing narrative current on review rounds as
+   they happen. Batch when several are ready, never batching a blocked
+   teammate behind a slow item. The operator decides when to merge and
+   retains override authority at all times: they may trim or waive
+   findings, or order a merge with findings open.
 8. **Post-merge, immediately:** instruct every in-flight teammate to
    rebase onto main, resolve, and re-run the full gates. Then re-run the
    ready check — a merge usually opens the next window.
@@ -117,5 +126,6 @@ kickoff prompts — branches, plan docs, and PRs carry all real state.
 | "Deps are green, close enough" | Merged is the gate. Green-but-unmerged is not merged. |
 | "I'll remember this decision" | You won't survive a restart (A3 finding). Write it to a PR comment. |
 | "I'll paraphrase the kickoff" | Blocks are verbatim. If a block is wrong, fix it via PR. |
-| "This PR is clean, skip the review" | Every phase PR gets the Opus 4.8 review before presentation. Standing order — the operator decides on findings, not you. |
+| "This PR is clean, skip the review" | Every phase PR gets the Opus 4.8 review before presentation. Standing order — dispatch it, relay any findings. |
+| "These findings are minor, I'll present them and wait for the operator to decide" | That was the old flow. Fix-all standing order (2026-07-07): every finding from every pass goes to the teammate immediately; the operator sees the summary at presentation and may trim or waive at any time. |
 | "The plan looks fine, I'll approve it myself / skip the plan review" | Plan approval is the Opus 4.8 plan reviewer's verdict, never yours (decision 10 as amended 2026-07-07). Dispatch the review; relay the verdict. |
