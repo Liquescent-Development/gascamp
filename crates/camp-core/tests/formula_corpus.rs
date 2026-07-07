@@ -94,6 +94,7 @@ const REJECTIONS: &[(&str, &str)] = &[
     ("bad-semver", "requires.formula_compiler"),
     ("caret-requirement", "requires.formula_compiler"),
     ("bare-version-requirement", "requires.formula_compiler"),
+    ("spaced-requirement", "requires.formula_compiler"),
     ("unsatisfied-requirement", "requires.formula_compiler"),
     ("check-without-requires", "requires"),
     ("check-with-retry", "steps.a.check"),

@@ -3124,6 +3124,13 @@ Decision log:
   and fixturing every operator form — can widen the subset later without
   breaking any accepted formula. New rejection fixtures:
   `caret-requirement.toml`, `bare-version-requirement.toml`.
+  *Tightened after the fix-pass review (2026-07-07, operator-directed):*
+  the version must follow the operator IMMEDIATELY — the spaced form
+  `">= 2.0.0"` was an untested `trim_start` tolerance never verified
+  against gc's grammar, exactly the silent-divergence class this gate
+  exists to prevent, so camp rejects it (conservative default; can be
+  widened later if route (b) verifies gc accepts it). Fixture:
+  `spaced-requirement.toml`.
 - **Cook input validation (finding 1, MEDIUM).** `cook` resolves every
   `needs` edge before touching disk or the ledger; an unknown step id in a
   hand-built `Formula` is `CoreError::Cook`, never a silently dropped edge.

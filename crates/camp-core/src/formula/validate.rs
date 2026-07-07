@@ -246,28 +246,30 @@ fn check_comparator_capability(req: &str, out: &mut Vec<Violation>) {
 }
 
 /// Review finding 2, route (a): the comparator shape camp accepts — one
-/// explicit operator (>=, >, <=, <, =) followed by a full
-/// major.minor.patch version of plain digits. This is the subset verified
-/// to be syntactically valid AND semantically identical in Rust `semver`
-/// and gc's Go constraint grammar. Everything else (caret, tilde,
-/// wildcards, bare versions, partial versions, range lists, pre-release
-/// tags) is rejected: camp must never accept a requirement gc would
-/// reject or read differently (repo invariant 6).
+/// explicit operator (>=, >, <=, <, =) followed IMMEDIATELY by a full
+/// major.minor.patch version of plain digits (no whitespace: a spaced
+/// ">= 2.0.0" is an unverified tolerance, rejected per the fix-pass
+/// review). This is the subset verified to be syntactically valid AND
+/// semantically identical in Rust `semver` and gc's Go constraint
+/// grammar. Everything else (caret, tilde, wildcards, bare versions,
+/// partial versions, range lists, pre-release tags) is rejected: camp
+/// must never accept a requirement gc would reject or read differently
+/// (repo invariant 6).
 fn common_comparator_shape(req: &str) -> Result<(), String> {
     const OPS: &[&str] = &[">=", "<=", ">", "<", "="]; // two-char ops first
     let err = || {
         format!(
             "formula_compiler {req:?} is outside camp's comparator subset: use one \
-             explicit operator (>=, >, <=, <, =) and a full version, for example \
-             \">=2.0.0\" (camp accepts only the operator forms verified against \
-             Gas City's constraint grammar)"
+             explicit operator (>=, >, <=, <, =) immediately followed by a full \
+             version, for example \">=2.0.0\" (camp accepts only the operator \
+             forms verified against Gas City's constraint grammar)"
         )
     };
     let op = OPS
         .iter()
         .find(|op| req.starts_with(**op))
         .ok_or_else(err)?;
-    let version = req[op.len()..].trim_start();
+    let version = &req[op.len()..];
     let parts: Vec<&str> = version.split('.').collect();
     let three_plain_numbers = parts.len() == 3
         && parts
@@ -596,6 +598,8 @@ mod tests {
             "2.0.0",           // bare version: caret in Cargo, exact in Go
             ">=2.0",           // partial version
             ">=2.0.0, <3.0.0", // range list, unverified against gc
+            ">= 2.0.0",        // spaced form: tolerance unverified against gc
+            "< 3.0.0",         // spaced form
         ] {
             let v = violations_for(
                 &format!("{HEADER}[requires]\nformula_compiler = \"{bad}\"\n{body}"),
