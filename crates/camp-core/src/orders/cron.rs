@@ -158,6 +158,195 @@ impl CronExpr {
     }
 }
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
+use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
+
+use crate::error::CoreError;
+use crate::orders::{Order, Trigger};
+
+/// A fire within this much of its scheduled time is on-time (one cron
+/// granule); later than this it is *missed*, and the catch-up window rule
+/// (spec §9) decides whether it fires late — once, flagged — or is skipped.
+pub const ON_TIME_TOLERANCE: SignedDuration = SignedDuration::from_secs(60);
+
+/// A due fire popped by `fire_due` (plan Decision B): the order's name,
+/// the scheduled instant, and whether this is a late catch-up fire. The
+/// caller resolves the name back to its `Order`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fire {
+    pub order: String,
+    pub scheduled: Timestamp,
+    pub catch_up: bool,
+}
+
+/// A missed-while-not-watching fire recovered by `recompute` — always a
+/// catch-up (master-plan pinned shape).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchUp {
+    pub order: String,
+    pub scheduled: Timestamp,
+}
+
+/// Min-heap of (next fire, order index). The earliest deadline is campd's
+/// poll timeout; an empty heap means infinite wait (invariant 1 — a timer,
+/// never a tick).
+pub struct CronHeap {
+    tz: TimeZone,
+    orders: Vec<Order>,
+    entries: BinaryHeap<Reverse<(Timestamp, usize)>>,
+}
+
+impl CronHeap {
+    pub fn new(tz: TimeZone) -> Self {
+        CronHeap {
+            tz,
+            orders: Vec::new(),
+            entries: BinaryHeap::new(),
+        }
+    }
+
+    /// Arm a cron order. A non-cron order or an expression with no fire
+    /// inside the search horizon is an error naming the order (fail fast:
+    /// dead automation is config junk).
+    pub fn arm(&mut self, order: Order, now: Timestamp) -> Result<(), CoreError> {
+        let Trigger::Cron { expr } = &order.trigger else {
+            return Err(CoreError::Order {
+                order: order.name.clone(),
+                reason: "only cron orders arm the timer heap".into(),
+            });
+        };
+        let next = expr
+            .next_after(now, &self.tz)
+            .ok_or_else(|| CoreError::Order {
+                order: order.name.clone(),
+                reason: format!(
+                    "cron expression {:?} never fires within the {SEARCH_HORIZON_DAYS}-day search horizon",
+                    expr.source(),
+                ),
+            })?;
+        let idx = self.orders.len();
+        self.orders.push(order);
+        self.entries.push(Reverse((next, idx)));
+        Ok(())
+    }
+
+    /// The earliest armed deadline — campd's poll timeout source.
+    pub fn next_deadline(&self) -> Option<Timestamp> {
+        self.entries.peek().map(|Reverse((t, _))| *t)
+    }
+
+    /// Pop everything due at `now`, reschedule each from `now`, and return
+    /// the fires the caller must declare. Applies the catch-up rule (plan
+    /// Decision F), so a poll that overslept a system sleep behaves exactly
+    /// like a detected wall-clock jump.
+    pub fn fire_due(&mut self, now: Timestamp) -> Vec<Fire> {
+        let mut fires = Vec::new();
+        while let Some(Reverse((deadline, idx))) = self.entries.peek().copied() {
+            if deadline > now {
+                break;
+            }
+            self.entries.pop();
+            let order = &self.orders[idx];
+            let lateness = now.duration_since(deadline);
+            if lateness <= ON_TIME_TOLERANCE {
+                fires.push(Fire {
+                    order: order.name.clone(),
+                    scheduled: deadline,
+                    catch_up: false,
+                });
+            } else if window_allows(order.catch_up_window, lateness) {
+                fires.push(Fire {
+                    order: order.name.clone(),
+                    scheduled: deadline,
+                    catch_up: true,
+                });
+            } // else: missed outside the window — skip; reschedule only
+            if let Trigger::Cron { expr } = &self.orders[idx].trigger {
+                if let Some(next) = expr.next_after(now, &self.tz) {
+                    self.entries.push(Reverse((next, idx)));
+                }
+                // None: the expression ran off the horizon after years of
+                // service — the order goes quiet and `camp order ls` shows
+                // "never". Documented, not hidden.
+            }
+        }
+        fires
+    }
+
+    /// Wall-clock jump handling (spec §9): reschedule every order from
+    /// `now` and return one catch-up per order whose most recent missed
+    /// fire in `(last_seen, now]` is within its window ("fire once on
+    /// wake"). Scans only the window span, so a year-long gap costs
+    /// window-sized work. Backward jumps (`now ≤ last_seen`) reschedule
+    /// without catch-ups — wall-clock deadlines remain valid.
+    pub fn recompute(&mut self, now: Timestamp, last_seen: Timestamp) -> Vec<CatchUp> {
+        self.entries.clear();
+        let mut catch_ups = Vec::new();
+        for (idx, order) in self.orders.iter().enumerate() {
+            let Trigger::Cron { expr } = &order.trigger else {
+                continue;
+            };
+            if now > last_seen {
+                if let Some(scheduled) =
+                    most_recent_missed(expr, order.catch_up_window, now, last_seen, &self.tz)
+                {
+                    catch_ups.push(CatchUp {
+                        order: order.name.clone(),
+                        scheduled,
+                    });
+                }
+            }
+            if let Some(next) = expr.next_after(now, &self.tz) {
+                self.entries.push(Reverse((next, idx)));
+            }
+        }
+        catch_ups
+    }
+}
+
+/// The most recent fire of `expr` in `(last_seen, now]` that is still
+/// inside the catch-up window (or on-time tolerance), if any.
+fn most_recent_missed(
+    expr: &CronExpr,
+    window: std::time::Duration,
+    now: Timestamp,
+    last_seen: Timestamp,
+    tz: &TimeZone,
+) -> Option<Timestamp> {
+    let signed_window = SignedDuration::try_from(window).ok()?;
+    if signed_window <= SignedDuration::ZERO {
+        return None; // "0" disables catch-up
+    }
+    // Earliest instant that could still be in-window; never before last_seen.
+    let floor = now
+        .checked_sub(signed_window)
+        .and_then(|t| t.checked_sub(ON_TIME_TOLERANCE))
+        .unwrap_or(last_seen);
+    let mut cursor = if floor > last_seen { floor } else { last_seen };
+    let mut most_recent = None;
+    while let Some(fire) = expr.next_after(cursor, tz) {
+        if fire > now {
+            break;
+        }
+        let lateness = now.duration_since(fire);
+        if lateness <= ON_TIME_TOLERANCE || window_allows(window, lateness) {
+            most_recent = Some(fire);
+        }
+        cursor = fire;
+    }
+    most_recent
+}
+
+fn window_allows(window: std::time::Duration, lateness: SignedDuration) -> bool {
+    match SignedDuration::try_from(window) {
+        Ok(w) => w > SignedDuration::ZERO && lateness <= w,
+        Err(_) => false, // a window beyond SignedDuration range: treat as disabled
+    }
+}
+
 /// Parse one field: comma-separated items of `*[/step]` or `a[-b][/step]`.
 /// `wrap_seven`: the day-of-week field accepts 7 as an alias for 0 (Sunday);
 /// its `allowed` store is still indexed 0-6.
@@ -350,6 +539,177 @@ mod tests {
             next("0 0 30 2 *", "2026-01-01T00:00:00Z", &TimeZone::UTC),
             None
         );
+    }
+
+    use crate::orders::{Order, Trigger};
+    use std::time::Duration;
+
+    fn cron_order(name: &str, expr: &str, window: Duration) -> Order {
+        Order {
+            name: name.into(),
+            trigger: Trigger::Cron {
+                expr: CronExpr::parse(expr).unwrap(),
+            },
+            formula: "f".into(),
+            rig: None,
+            catch_up_window: window,
+        }
+    }
+
+    const TWO_HOURS: Duration = Duration::from_secs(2 * 60 * 60);
+
+    #[test]
+    fn empty_heap_has_no_deadline() {
+        assert_eq!(CronHeap::new(TimeZone::UTC).next_deadline(), None);
+    }
+
+    #[test]
+    fn interleaved_schedules_order_the_heap() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        let now = ts("2026-07-06T07:20:00Z");
+        heap.arm(cron_order("hourly", "0 * * * *", TWO_HOURS), now)
+            .unwrap();
+        heap.arm(cron_order("quarter", "*/15 * * * *", TWO_HOURS), now)
+            .unwrap();
+        // quarter fires 07:30, hourly 08:00
+        assert_eq!(heap.next_deadline(), Some(ts("2026-07-06T07:30:00Z")));
+        let fires = heap.fire_due(ts("2026-07-06T07:30:00Z"));
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].order, "quarter");
+        assert_eq!(fires[0].scheduled, ts("2026-07-06T07:30:00Z"));
+        assert!(!fires[0].catch_up);
+        // quarter rescheduled to 07:45, still ahead of hourly
+        assert_eq!(heap.next_deadline(), Some(ts("2026-07-06T07:45:00Z")));
+        // both due at 08:00 (quarter's 07:45 missed by 15 min → within window)
+        let fires = heap.fire_due(ts("2026-07-06T08:00:00Z"));
+        let names: Vec<&str> = fires.iter().map(|f| f.order.as_str()).collect();
+        assert!(names.contains(&"quarter") && names.contains(&"hourly"));
+    }
+
+    #[test]
+    fn fire_due_is_empty_before_the_deadline() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        heap.arm(
+            cron_order("h", "0 * * * *", TWO_HOURS),
+            ts("2026-07-06T07:20:00Z"),
+        )
+        .unwrap();
+        assert!(heap.fire_due(ts("2026-07-06T07:59:59Z")).is_empty());
+        assert_eq!(heap.next_deadline(), Some(ts("2026-07-06T08:00:00Z")));
+    }
+
+    #[test]
+    fn late_fire_within_window_is_a_catch_up_fire() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        heap.arm(
+            cron_order("h", "0 8 * * *", TWO_HOURS),
+            ts("2026-07-06T07:00:00Z"),
+        )
+        .unwrap();
+        // wakes 90 min late (poll timeout ticked through a sleep)
+        let fires = heap.fire_due(ts("2026-07-06T09:30:00Z"));
+        assert_eq!(fires.len(), 1);
+        assert!(fires[0].catch_up);
+        assert_eq!(fires[0].scheduled, ts("2026-07-06T08:00:00Z"));
+        // rescheduled from now: next fire tomorrow 08:00
+        assert_eq!(heap.next_deadline(), Some(ts("2026-07-07T08:00:00Z")));
+    }
+
+    #[test]
+    fn late_fire_outside_window_is_skipped_and_rescheduled() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        heap.arm(
+            cron_order("h", "0 8 * * *", TWO_HOURS),
+            ts("2026-07-06T07:00:00Z"),
+        )
+        .unwrap();
+        assert!(heap.fire_due(ts("2026-07-06T10:00:01Z")).is_empty()); // 2h1s late
+        assert_eq!(heap.next_deadline(), Some(ts("2026-07-07T08:00:00Z")));
+    }
+
+    #[test]
+    fn zero_window_disables_catch_up_but_not_on_time_fires() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        heap.arm(
+            cron_order("h", "0 8 * * *", Duration::ZERO),
+            ts("2026-07-06T07:00:00Z"),
+        )
+        .unwrap();
+        // 30 s late is within ON_TIME_TOLERANCE: a normal fire
+        let fires = heap.fire_due(ts("2026-07-06T08:00:30Z"));
+        assert_eq!(fires.len(), 1);
+        assert!(!fires[0].catch_up);
+        // next day, 10 min late: beyond tolerance, window disabled → skip
+        assert!(heap.fire_due(ts("2026-07-07T08:10:00Z")).is_empty());
+        assert_eq!(heap.next_deadline(), Some(ts("2026-07-08T08:00:00Z")));
+    }
+
+    #[test]
+    fn recompute_fires_once_with_the_most_recent_missed_fire() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        let armed = ts("2026-07-06T06:30:00Z");
+        heap.arm(cron_order("hourly", "0 * * * *", TWO_HOURS), armed)
+            .unwrap();
+        // slept 06:30 → 09:30: missed 07:00, 08:00, 09:00; 08:00+09:00 in window
+        let catch_ups = heap.recompute(ts("2026-07-06T09:30:00Z"), armed);
+        assert_eq!(catch_ups.len(), 1);
+        assert_eq!(catch_ups[0].order, "hourly");
+        assert_eq!(catch_ups[0].scheduled, ts("2026-07-06T09:00:00Z")); // most recent
+        assert_eq!(heap.next_deadline(), Some(ts("2026-07-06T10:00:00Z")));
+    }
+
+    #[test]
+    fn recompute_outside_window_and_zero_window_yield_no_catch_ups() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        let armed = ts("2026-07-06T06:30:00Z");
+        heap.arm(cron_order("daily", "0 7 * * *", TWO_HOURS), armed)
+            .unwrap();
+        heap.arm(cron_order("zeroed", "0 8 * * *", Duration::ZERO), armed)
+            .unwrap();
+        // woke at 12:00: 07:00 is 5h late (outside 2h), 08:00 window disabled
+        let catch_ups = heap.recompute(ts("2026-07-06T12:00:00Z"), armed);
+        assert!(catch_ups.is_empty());
+        assert_eq!(heap.next_deadline(), Some(ts("2026-07-07T07:00:00Z")));
+    }
+
+    #[test]
+    fn recompute_on_backward_jump_reschedules_without_catch_ups() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        let armed = ts("2026-07-06T07:30:00Z");
+        heap.arm(cron_order("h", "0 * * * *", TWO_HOURS), armed)
+            .unwrap();
+        let catch_ups = heap.recompute(ts("2026-07-06T06:00:00Z"), armed); // clock set back
+        assert!(catch_ups.is_empty());
+        assert_eq!(heap.next_deadline(), Some(ts("2026-07-06T07:00:00Z")));
+    }
+
+    #[test]
+    fn arming_a_never_firing_expression_is_an_error_naming_the_order() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        let err = heap
+            .arm(
+                cron_order("dead", "0 0 30 2 *", TWO_HOURS),
+                ts("2026-07-06T07:00:00Z"),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("dead"), "{err}");
+        assert!(err.to_string().contains("never fires"), "{err}");
+    }
+
+    #[test]
+    fn arming_an_event_order_is_an_error() {
+        let mut heap = CronHeap::new(TimeZone::UTC);
+        let order = Order {
+            name: "ev".into(),
+            trigger: Trigger::Event {
+                event_type: "bead.closed".into(),
+                label: None,
+            },
+            formula: "f".into(),
+            rig: None,
+            catch_up_window: TWO_HOURS,
+        };
+        assert!(heap.arm(order, ts("2026-07-06T07:00:00Z")).is_err());
     }
 
     #[test]
