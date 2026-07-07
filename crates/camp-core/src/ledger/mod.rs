@@ -45,6 +45,12 @@ impl Ledger {
         Ok(Self { conn, clock })
     }
 
+    /// The clock's current timestamp (RFC3339 UTC, whole seconds) — the same
+    /// source event timestamps use, so run ids are deterministic in tests.
+    pub fn now_utc(&self) -> String {
+        self.clock.now_utc()
+    }
+
     /// The single write path (spec §7.2): one WAL transaction inserts the
     /// event row and applies its state effect. Any fold error rolls back the
     /// event row — current state can never lag or outrun the history.

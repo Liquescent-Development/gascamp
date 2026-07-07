@@ -1,0 +1,161 @@
+//! Cook: materialize a validated formula into the ledger (spec §8.2).
+//! Files first (runs/<run-id>/ with the pinned copy + manifest), then ONE
+//! append_batch transaction for root + steps + run.cooked. Gas City's
+//! materialization property, kept: after cook the run is independent of
+//! the formula file.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::config::RigConfig;
+use crate::error::CoreError;
+use crate::event::{EventInput, EventType};
+use crate::formula::ast::Formula;
+use crate::ledger::Ledger;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CookedRun {
+    pub run_id: String,
+    pub root_bead: String,
+    pub step_beads: BTreeMap<String, String>,
+}
+
+pub fn cook(
+    ledger: &mut Ledger,
+    formula: &Formula,
+    run_dir: &Path,
+    rig: &RigConfig,
+    actor: &str,
+) -> Result<CookedRun, CoreError> {
+    if formula.steps.is_empty() {
+        // parse_and_validate guarantees this (rule S3); cook re-checks its
+        // own precondition rather than cooking an empty run.
+        return Err(CoreError::Corrupt(format!(
+            "cook: formula {:?} has no steps — cook requires parse_and_validate output",
+            formula.name
+        )));
+    }
+
+    let ts = ledger.now_utc();
+    let run_id = format!(
+        "{}-{:06x}",
+        ts.replace(['-', ':'], ""),
+        fastrand::u32(..) & 0xFF_FFFF
+    );
+
+    // ---- id block allocation (Phase 3 counter). A concurrent writer racing
+    // the same block makes the batch fail on the duplicate id and roll back
+    // everything — the same fail-fast race window `camp create` has.
+    let first = ledger.next_bead_id(&rig.prefix)?;
+    let (prefix, n) = crate::id::parse_bead_id(&first).ok_or_else(|| {
+        CoreError::Corrupt(format!("next_bead_id returned unparseable id {first:?}"))
+    })?;
+    let root_bead = format!("{prefix}-{n}");
+    let mut step_beads: BTreeMap<String, String> = BTreeMap::new();
+    for (offset, step) in formula.steps.iter().enumerate() {
+        step_beads.insert(
+            step.id.clone(),
+            format!("{prefix}-{}", n + 1 + offset as i64),
+        );
+    }
+
+    // ---- files first: runs/<run-id>/ with pinned copy + manifest
+    let dir = run_dir.join(&run_id);
+    std::fs::create_dir_all(run_dir).map_err(|e| {
+        CoreError::Corrupt(format!("cook: cannot create {}: {e}", run_dir.display()))
+    })?;
+    std::fs::create_dir(&dir)
+        .map_err(|e| CoreError::Corrupt(format!("cook: cannot create {}: {e}", dir.display())))?;
+    let write = |name: &str, bytes: &[u8]| -> Result<(), CoreError> {
+        std::fs::write(dir.join(name), bytes).map_err(|e| {
+            CoreError::Corrupt(format!("cook: cannot write {}/{name}: {e}", dir.display()))
+        })
+    };
+    write(&format!("{}.toml", formula.name), formula.source.as_bytes())?;
+    let manifest = serde_json::json!({
+        "run_id": run_id,
+        "formula": formula.name,
+        "rig": rig.name,
+        "actor": actor,
+        "cooked_ts": ts,
+        "root": root_bead,
+        "steps": step_beads,
+    });
+    write("manifest.json", format!("{manifest:#}").as_bytes())?;
+
+    // ---- one transaction: root, steps, run.cooked
+    let mut inputs = Vec::with_capacity(formula.steps.len() + 2);
+    let mut root_data = serde_json::json!({
+        "title": formula.name,
+        "needs": step_beads.values().collect::<Vec<_>>(),
+        "run_id": run_id,
+    });
+    if let Some(d) = &formula.description {
+        root_data["description"] = serde_json::json!(d);
+    }
+    inputs.push(EventInput {
+        kind: EventType::BeadCreated,
+        rig: Some(rig.name.clone()),
+        actor: actor.to_owned(),
+        bead: Some(root_bead.clone()),
+        data: root_data,
+    });
+    for step in &formula.steps {
+        let needs: Vec<&String> = step
+            .needs
+            .iter()
+            .filter_map(|id| step_beads.get(id))
+            .collect();
+        let mut data = serde_json::json!({
+            "title": step.title,
+            "run_id": run_id,
+            "step_id": step.id,
+        });
+        if let Some(d) = &step.description {
+            data["description"] = serde_json::json!(d);
+        }
+        if !needs.is_empty() {
+            data["needs"] = serde_json::json!(needs);
+        }
+        if let Some(a) = &step.assignee {
+            data["assignee"] = serde_json::json!(a);
+        }
+        inputs.push(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some(rig.name.clone()),
+            actor: actor.to_owned(),
+            bead: Some(step_beads[&step.id].clone()),
+            data,
+        });
+    }
+    inputs.push(EventInput {
+        kind: EventType::RunCooked,
+        rig: Some(rig.name.clone()),
+        actor: actor.to_owned(),
+        bead: Some(root_bead.clone()),
+        data: serde_json::json!({
+            "run_id": run_id,
+            "formula": formula.name,
+            "root": root_bead,
+            "steps": step_beads,
+        }),
+    });
+
+    if let Err(batch_err) = ledger.append_batch(inputs) {
+        // Roll the files back too; a cleanup failure is reported WITH the
+        // original error, never instead of it and never silently.
+        return Err(match std::fs::remove_dir_all(&dir) {
+            Ok(()) => batch_err,
+            Err(cleanup) => CoreError::Corrupt(format!(
+                "cook failed ({batch_err}) and the run dir {} could not be removed: {cleanup}",
+                dir.display()
+            )),
+        });
+    }
+
+    Ok(CookedRun {
+        run_id,
+        root_bead,
+        step_beads,
+    })
+}

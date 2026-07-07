@@ -5,12 +5,14 @@
 //! accepts no unknown keys, where gc silently ignores them.
 
 pub mod ast;
+mod cook;
 mod parse;
 mod validate;
 
 pub use ast::{
     Check, CheckMode, Disposition, Formula, FormulaError, OnComplete, Requires, Step, Violation,
 };
+pub use cook::{CookedRun, cook};
 pub use validate::FORMULA_COMPILER_CAPABILITY;
 
 use std::path::Path;

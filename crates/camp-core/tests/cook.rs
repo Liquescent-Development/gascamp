@@ -88,3 +88,180 @@ fn bead_created_accepts_run_and_step_ids_and_refolds_exactly() {
     let report = ledger.refold_check().unwrap();
     assert!(report.drift.is_empty(), "{:?}", report.drift);
 }
+
+use camp_core::config::RigConfig;
+use camp_core::formula::{cook, parse_and_validate};
+
+fn fixture(stem: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/formulas/valid")
+        .join(format!("{stem}.toml"))
+}
+
+fn rig() -> RigConfig {
+    RigConfig {
+        name: "gascity".into(),
+        path: "/code/gascity".into(),
+        prefix: "gc".into(),
+    }
+}
+
+#[test]
+fn cook_materializes_a_diamond_run_in_one_transaction() {
+    let (dir, mut ledger) = temp_ledger();
+    let formula = parse_and_validate(&fixture("diamond")).unwrap();
+    let runs = dir.path().join("runs");
+    let cooked = cook(&mut ledger, &formula, &runs, &rig(), "cli").unwrap();
+
+    // run_id shape: utc-compact from the FixedClock + 6 hex
+    assert!(
+        cooked.run_id.starts_with("20260705T211403Z-"),
+        "{}",
+        cooked.run_id
+    );
+    let suffix = cooked.run_id.rsplit('-').next().unwrap();
+    assert_eq!(suffix.len(), 6);
+    assert!(
+        suffix
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    );
+
+    // beads: root + 4 steps, contiguous rig-prefixed ids
+    assert_eq!(cooked.root_bead, "gc-1");
+    assert_eq!(cooked.step_beads.len(), 4);
+    assert_eq!(cooked.step_beads["design"], "gc-2");
+    assert_eq!(cooked.step_beads["release"], "gc-5");
+
+    // step bead carries assignee and the rig name; needs are bead ids
+    let release = ledger.get_bead("gc-5").unwrap().unwrap();
+    assert_eq!(release.assignee.as_deref(), Some("dev"));
+    assert_eq!(release.rig, "gascity");
+
+    // events: 5 creates + run.cooked, all in one batch
+    let events = ledger.events_range(1, None).unwrap();
+    assert_eq!(events.len(), 6);
+    assert_eq!(events[0].bead.as_deref(), Some("gc-1"));
+    assert_eq!(events[5].kind, EventType::RunCooked);
+    assert_eq!(events[5].bead.as_deref(), Some("gc-1"));
+    assert_eq!(events[5].data["steps"]["design"], "gc-2");
+
+    // refold property holds over a cooked ledger
+    assert!(ledger.refold_check().unwrap().drift.is_empty());
+}
+
+#[test]
+fn cooked_graphs_satisfy_phase_3_readiness_roots_ready_dependents_not() {
+    let (dir, mut ledger) = temp_ledger();
+    let formula = parse_and_validate(&fixture("diamond")).unwrap();
+    let cooked = cook(&mut ledger, &formula, &dir.path().join("runs"), &rig(), "cli").unwrap();
+
+    let ready: Vec<String> = ledger
+        .ready_beads(None)
+        .unwrap()
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    // Only the dag root step (design) is ready. Dependents are blocked, and
+    // the run root needs every step, so it is blocked too.
+    assert_eq!(ready, vec![cooked.step_beads["design"].clone()]);
+    assert!(!ledger.is_ready(&cooked.root_bead).unwrap());
+    assert!(!ledger.is_ready(&cooked.step_beads["implement"]).unwrap());
+    assert!(!ledger.is_ready(&cooked.step_beads["release"]).unwrap());
+}
+
+#[test]
+fn cook_pins_the_formula_verbatim_and_writes_the_manifest() {
+    let (dir, mut ledger) = temp_ledger();
+    let source_path = fixture("guarded-change");
+    let formula = parse_and_validate(&source_path).unwrap();
+    let runs = dir.path().join("runs");
+    let cooked = cook(&mut ledger, &formula, &runs, &rig(), "cli").unwrap();
+
+    let run_dir = runs.join(&cooked.run_id);
+    let pinned = std::fs::read_to_string(run_dir.join("guarded-change.toml")).unwrap();
+    assert_eq!(
+        pinned,
+        std::fs::read_to_string(&source_path).unwrap(),
+        "verbatim copy"
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["run_id"], cooked.run_id.as_str());
+    assert_eq!(manifest["formula"], "guarded-change");
+    assert_eq!(manifest["rig"], "gascity");
+    assert_eq!(manifest["actor"], "cli");
+    assert_eq!(manifest["cooked_ts"], "2026-07-05T21:14:03Z");
+    assert_eq!(manifest["root"], cooked.root_bead.as_str());
+    assert_eq!(
+        manifest["steps"]["implement"],
+        cooked.step_beads["implement"].as_str()
+    );
+}
+
+#[test]
+fn cook_is_file_independent_afterwards() {
+    let (dir, mut ledger) = temp_ledger();
+    // copy the fixture somewhere deletable, cook it, delete the original
+    let scratch = dir.path().join("minimal.toml");
+    std::fs::copy(fixture("minimal"), &scratch).unwrap();
+    let formula = parse_and_validate(&scratch).unwrap();
+    let cooked = cook(&mut ledger, &formula, &dir.path().join("runs"), &rig(), "cli").unwrap();
+    std::fs::remove_file(&scratch).unwrap();
+
+    // the run lives on: beads dispatchable, pinned copy present
+    assert!(ledger.is_ready(&cooked.step_beads["only"]).unwrap());
+    assert!(
+        dir.path()
+            .join("runs")
+            .join(&cooked.run_id)
+            .join("minimal.toml")
+            .exists()
+    );
+}
+
+#[test]
+fn cook_atomicity_fault_injection_leaves_nothing() {
+    let (dir, mut ledger) = temp_ledger();
+    // Occupy gc-2 through the public API (the counter advances to 2), then
+    // FAULT-INJECT by winding the counter back with a raw connection so
+    // cook allocates a block that collides with gc-2 mid-batch: root gc-1
+    // inserts fine, the first step create hits the gc-2 primary key, and
+    // the whole transaction must roll back.
+    ledger
+        .append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gascity".into()),
+            actor: "test".into(),
+            bead: Some("gc-2".into()),
+            data: serde_json::json!({"title": "squatter"}),
+        })
+        .unwrap();
+    let db = dir.path().join("camp.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE counters SET high = 0 WHERE prefix = 'gc'", [])
+            .unwrap();
+    }
+    let events_before = ledger.events_range(1, None).unwrap().len();
+
+    let formula = parse_and_validate(&fixture("diamond")).unwrap();
+    let runs = dir.path().join("runs");
+    let err = cook(&mut ledger, &formula, &runs, &rig(), "cli");
+    assert!(err.is_err(), "colliding id block must fail the whole cook");
+
+    // NOTHING landed: no new events, no beads beyond the squatter, no run dir
+    assert_eq!(ledger.events_range(1, None).unwrap().len(), events_before);
+    assert_eq!(ledger.list_beads(&Default::default()).unwrap().len(), 1);
+    let leftover = std::fs::read_dir(&runs).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(leftover, 0, "run dir must be removed on rollback");
+
+    // The injected counter tamper is exactly what doctor --refold repairs;
+    // after repair the ledger is drift-free and cooking works again.
+    ledger.refold_repair().unwrap();
+    assert!(ledger.refold_check().unwrap().drift.is_empty());
+    let cooked = cook(&mut ledger, &formula, &runs, &rig(), "cli").unwrap();
+    assert_eq!(cooked.root_bead, "gc-3");
+}
