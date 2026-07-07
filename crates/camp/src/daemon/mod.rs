@@ -5,8 +5,8 @@
 
 pub mod autostart;
 pub mod cursor;
-pub mod orders;
 pub mod event_loop;
+pub mod orders;
 pub mod socket;
 
 use std::io::Write;
@@ -25,6 +25,15 @@ pub const READY_PREFIX: &str = "campd listening on ";
 
 pub fn run(camp: &CampDir) -> Result<()> {
     let mut ledger = Ledger::open(&camp.db_path())?;
+    // "When did anyone last see the world" — read BEFORE campd.started
+    // lands, so cron fires missed while campd was down catch up under the
+    // window (spec §9; Phase 10 plan Decision F).
+    let last_seen0: jiff::Timestamp = match ledger.last_event_ts()? {
+        Some(ts) => ts
+            .parse()
+            .with_context(|| format!("parsing the ledger's last event ts {ts:?}"))?,
+        None => jiff::Timestamp::now(),
+    };
     let socket_path = camp.socket_path();
     let std_listener = socket::bind_or_replace(&socket_path)?;
     std_listener
@@ -40,20 +49,78 @@ pub fn run(camp: &CampDir) -> Result<()> {
         data: serde_json::json!({}),
     })?;
 
-    // Startup catch-up is fatal on error: a daemon that cannot process its
-    // backlog must not pretend to be up (fail fast).
+    // Declared automation must parse or campd refuses to start (fail
+    // fast); the lenient-but-evented path is hot reload only.
+    let clock = camp_core::clock::SystemClock;
+    let tz = jiff::tz::TimeZone::system();
+    let mut runtime = orders::OrdersRuntime::build(&camp.root, jiff::Timestamp::now(), tz)?;
+
+    // camp.toml watch: notify's callback (its own thread) signals the mio
+    // loop through a self-pipe. The camp ROOT is watched non-recursively —
+    // editors rename-replace, and a file watch dies with the inode.
+    let (sender, mut receiver) = mio::unix::pipe::new().context("creating the watch pipe")?;
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+        match result {
+            Ok(event)
+                if event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name() == Some(std::ffi::OsStr::new("camp.toml"))) =>
+            {
+                use std::io::Write as _;
+                // A full pipe (WouldBlock) is fine: the signal coalesces.
+                let _ = (&sender).write(&[1]);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("campd: camp.toml watch error: {e}"),
+        }
+    })
+    .context("creating the camp.toml watcher")?;
+    notify::Watcher::watch(&mut watcher, &camp.root, notify::RecursiveMode::NonRecursive)
+        .context("watching the camp directory")?;
+
+    // Startup settle is fatal on error: a daemon that cannot process its
+    // backlog must not pretend to be up (fail fast). Settle drains events
+    // past the cursor AND cooks any order.fired they declare.
     let mut processor = ReadinessProcessor::default();
-    cursor::catch_up(&mut ledger, &mut processor)?;
-    // Phase 8 dispatches the newly-ready set; until then the recompute is
-    // bookkeeping only, drained so it never accumulates in a long-lived
-    // daemon.
-    let _newly_ready = processor.take_pending();
+    orders::settle(&mut ledger, &mut processor, &mut runtime, &clock)?;
+    // Fires orphaned by a crash between order.fired and its cook (the
+    // cursor is already past them): queue them for the next settle —
+    // exactly once, execute_fire dedupes. Observation over state; kill -9
+    // self-heals.
+    for cook in camp_core::orders::unresponded_fires(&ledger)? {
+        runtime.queue_cook(cook);
+    }
+    // Cron fires missed while campd was down, under each order's window.
+    let now = jiff::Timestamp::now();
+    for c in runtime.recompute(now, last_seen0) {
+        ledger.append(camp_core::orders::fired_input(
+            &c.order,
+            &camp_core::orders::FireCause::Cron {
+                scheduled: c.scheduled,
+                catch_up: true,
+            },
+        ))?;
+    }
+    orders::settle(&mut ledger, &mut processor, &mut runtime, &clock)?;
 
     let mut stdout = std::io::stdout();
     writeln!(stdout, "{READY_PREFIX}{}", socket_path.display()).context("announcing readiness")?;
     stdout.flush().context("flushing the readiness line")?;
 
-    event_loop::run(listener, &socket_path, &mut ledger, &mut processor)
+    // `watcher` must live until the loop returns — dropping it kills the
+    // camp.toml watch.
+    let result = event_loop::run(
+        listener,
+        &socket_path,
+        &mut ledger,
+        &mut processor,
+        &mut runtime,
+        &clock,
+        &mut receiver,
+    );
+    drop(watcher);
+    result
 }
 
 #[cfg(test)]

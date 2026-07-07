@@ -1,23 +1,33 @@
-//! The campd event loop (spec §5, §15.1): mio poll over the listener and
-//! per-connection reads. The poll timeout is the earliest armed timer
-//! deadline; Phase 7 arms no timers, so it is always `None` — the idle
-//! daemon blocks in `poll` with zero wakeups (invariant 1).
+//! The campd event loop (spec §5, §15.1): mio poll over the listener,
+//! per-connection reads, the camp.toml watch pipe, and the cron heap. The
+//! poll timeout is the earliest armed timer deadline
+//! (`OrdersRuntime::poll_timeout` — the only timeout expression in campd);
+//! an idle heap means `None` and the idle daemon blocks in `poll` with
+//! zero wakeups (invariant 1).
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
+use camp_core::clock::Clock;
 use camp_core::event::{EventInput, EventType};
 use camp_core::ledger::Ledger;
+use camp_core::orders::FireCause;
+use camp_core::orders::cron::Fire;
+use jiff::{SignedDuration, Timestamp};
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
 
-use super::cursor::{self, ReadinessProcessor};
+use super::cursor::ReadinessProcessor;
+use super::orders::{self, OrdersRuntime};
 use super::socket::{Request, Response};
 
 const LISTENER: Token = Token(0);
+/// The notify→mio self-pipe (camp.toml watch). Phase 8 allocates its
+/// SIGCHLD token around this — coordinate before renumbering.
+const CONFIG_WATCH: Token = Token(1);
 
 /// Upper bound on a single request line (PR #8 review finding 3). Real
 /// requests are tens of bytes; the cap keeps a broken or hostile client
@@ -26,12 +36,10 @@ const LISTENER: Token = Token(0);
 /// clean error and dropped.
 pub(super) const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
-/// Earliest armed timer deadline → poll timeout. No timer armed = infinite
-/// wait. Phase 10 (cron heap) and Phase 11 (stall timers) plug in here;
-/// Phase 7 arms nothing. This is the only timeout expression in campd.
-fn poll_timeout() -> Option<Duration> {
-    None
-}
+/// Wall-vs-monotonic divergence beyond this is a wall-clock jump
+/// (sleep/wake, NTP step — spec §9): deadlines recompute and missed fires
+/// within each order's catch-up window fire once.
+const JUMP_TOLERANCE: SignedDuration = SignedDuration::from_secs(30);
 
 struct Conn {
     stream: UnixStream,
@@ -49,22 +57,68 @@ pub fn run(
     socket_path: &Path,
     ledger: &mut Ledger,
     processor: &mut ReadinessProcessor,
+    runtime: &mut OrdersRuntime,
+    clock: &dyn Clock,
+    config_rx: &mut mio::unix::pipe::Receiver,
 ) -> Result<()> {
     let mut poll = Poll::new().context("creating the poller")?;
     let mut events = Events::with_capacity(64);
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)
         .context("registering the listener")?;
+    poll.registry()
+        .register(config_rx, CONFIG_WATCH, Interest::READABLE)
+        .context("registering the config watch pipe")?;
     // The connection map is bounded by the process fd limit — the natural
     // cap for a single-user local socket. An artificial cap was considered
     // (PR #8 review finding 3) and rejected: it would reject legitimate
     // bursts, and per-connection memory is already bounded by
     // MAX_REQUEST_BYTES.
     let mut conns: HashMap<Token, Conn> = HashMap::new();
-    let mut next_token = 1usize;
+    let mut next_token = 2usize; // 0 = listener, 1 = config watch
 
+    let mut last_seen = Timestamp::now();
     loop {
-        poll.poll(&mut events, poll_timeout()).context("poll")?;
+        let timeout = runtime.poll_timeout(Timestamp::now());
+        let wall_before = Timestamp::now();
+        let mono_before = Instant::now();
+        poll.poll(&mut events, timeout).context("poll")?;
+        // Each wake compares expected vs actual wall time (spec §9): a
+        // jump recomputes every deadline; an honest wake pops due fires.
+        // Both paths apply the same catch-up window rule, so platforms
+        // whose poll timeout ticks through a system sleep behave
+        // identically to detected jumps.
+        let now = Timestamp::now();
+        let wall_delta = now.duration_since(wall_before);
+        let mono_delta =
+            SignedDuration::try_from(mono_before.elapsed()).unwrap_or(SignedDuration::MAX);
+        let fires: Vec<Fire> = if (wall_delta - mono_delta).abs() > JUMP_TOLERANCE {
+            runtime
+                .recompute(now, last_seen)
+                .into_iter()
+                .map(|c| Fire {
+                    order: c.order,
+                    scheduled: c.scheduled,
+                    catch_up: true,
+                })
+                .collect()
+        } else {
+            runtime.fire_due(now)
+        };
+        last_seen = now;
+        // Declare the fires (durable first); the settle below cooks them.
+        // A ledger that refuses the declaration is fatal — campd must not
+        // run automation it cannot record.
+        let mut wake_ledger_work = !fires.is_empty();
+        for fire in fires {
+            ledger.append(camp_core::orders::fired_input(
+                &fire.order,
+                &FireCause::Cron {
+                    scheduled: fire.scheduled,
+                    catch_up: fire.catch_up,
+                },
+            ))?;
+        }
         for event in events.iter() {
             match event.token() {
                 LISTENER => loop {
@@ -87,11 +141,27 @@ pub fn run(
                         Err(e) => return Err(e).context("accept"),
                     }
                 },
+                CONFIG_WATCH => {
+                    drain_pipe(config_rx)?;
+                    if let Some(input) = runtime.reload_if_changed(now)? {
+                        // spec §13.4: the config change is itself an event,
+                        // applied or rejected.
+                        ledger.append(input)?;
+                        wake_ledger_work = true;
+                    }
+                }
                 token => {
                     let Some(mut conn) = conns.remove(&token) else {
                         continue; // already dropped this cycle
                     };
-                    match serve_connection(&mut conn, ledger, processor, MAX_REQUEST_BYTES) {
+                    match serve_connection(
+                        &mut conn,
+                        ledger,
+                        processor,
+                        runtime,
+                        clock,
+                        MAX_REQUEST_BYTES,
+                    ) {
                         Ok(ConnState::Open) => {
                             conns.insert(token, conn);
                         }
@@ -114,6 +184,29 @@ pub fn run(
                     }
                 }
             }
+        }
+        if wake_ledger_work {
+            // Timer-path settle errors mirror Phase 7 decision H: surface
+            // to stderr, keep serving; the cursor holds position and the
+            // error re-surfaces on the next poke.
+            if let Err(e) = orders::settle(ledger, processor, runtime, clock) {
+                eprintln!("campd: settle failed: {e}");
+            }
+        }
+    }
+}
+
+/// Drain the watch pipe (the byte content is meaningless — the signal
+/// coalesces; `reload_if_changed` dedupes by file content).
+fn drain_pipe(rx: &mut mio::unix::pipe::Receiver) -> Result<()> {
+    let mut buf = [0u8; 64];
+    loop {
+        match rx.read(&mut buf) {
+            Ok(0) => return Ok(()), // watcher gone; campd keeps serving
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("draining the config watch pipe"),
         }
     }
 }
@@ -142,6 +235,8 @@ fn serve_connection(
     conn: &mut Conn,
     ledger: &mut Ledger,
     processor: &mut ReadinessProcessor,
+    runtime: &mut OrdersRuntime,
+    clock: &dyn Clock,
     max_request_bytes: usize,
 ) -> Result<ConnState> {
     let mut chunk = [0u8; 4096];
@@ -162,7 +257,7 @@ fn serve_connection(
                 Err(e) => return Err(e).context("reading a request"),
             }
         };
-        let drained = drain_lines(conn, ledger, processor)?;
+        let drained = drain_lines(conn, ledger, processor, runtime, clock)?;
         if let Some(terminal) = drained {
             return Ok(terminal);
         }
@@ -199,6 +294,8 @@ fn drain_lines(
     conn: &mut Conn,
     ledger: &mut Ledger,
     processor: &mut ReadinessProcessor,
+    runtime: &mut OrdersRuntime,
+    clock: &dyn Clock,
 ) -> Result<Option<ConnState>> {
     while let Some(newline) = conn.buf.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = conn.buf.drain(..=newline).collect();
@@ -212,15 +309,10 @@ fn drain_lines(
                 // The poked seq is advisory; catch-up reads past the cursor
                 // regardless. A processing error answers the poker, lands on
                 // stderr, and leaves the cursor before the failing event —
-                // surfaced, never skipped.
-                let response = match cursor::catch_up(ledger, processor) {
-                    Ok(_) => {
-                        // Phase 8 dispatches the newly-ready set; drained
-                        // here so the bookkeeping stays bounded in a
-                        // long-lived daemon.
-                        let _newly_ready = processor.take_pending();
-                        Response::Ok { ok: true }
-                    }
+                // surfaced, never skipped. (Phase 10: settle = catch-up +
+                // cook-to-fixpoint; readiness pending is drained inside it.)
+                let response = match orders::settle(ledger, processor, runtime, clock) {
+                    Ok(()) => Response::Ok { ok: true },
                     Err(e) => {
                         eprintln!("campd: catch-up failed: {e}");
                         Response::Error {
@@ -293,6 +385,7 @@ mod tests {
     use super::*;
     use crate::daemon::cursor::ReadinessProcessor;
     use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::time::Duration;
 
     /// PR #8 re-review finding 1, pinned at the unit level: one readable
     /// event must drain everything the kernel already holds. mio is
@@ -313,8 +406,16 @@ mod tests {
     fn one_readable_event_drains_a_pipelined_backlog_beyond_the_cap() {
         const TEST_CAP: usize = 1024;
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
         let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
         let mut processor = ReadinessProcessor::default();
+        let mut runtime = OrdersRuntime::build(
+            dir.path(),
+            Timestamp::now(),
+            jiff::tz::TimeZone::UTC,
+        )
+        .unwrap();
+        let clock = camp_core::clock::SystemClock;
 
         let (mut client, daemon_end) = StdUnixStream::pair().unwrap();
         daemon_end.set_nonblocking(true).unwrap();
@@ -355,7 +456,15 @@ mod tests {
         client.write_all(burst.as_bytes()).unwrap();
 
         // One event's worth of serving must answer every request.
-        let state = serve_connection(&mut conn, &mut ledger, &mut processor, TEST_CAP).unwrap();
+        let state = serve_connection(
+            &mut conn,
+            &mut ledger,
+            &mut processor,
+            &mut runtime,
+            &clock,
+            TEST_CAP,
+        )
+        .unwrap();
         assert!(matches!(state, ConnState::Open));
         let answered = reader.join().unwrap();
         assert_eq!(

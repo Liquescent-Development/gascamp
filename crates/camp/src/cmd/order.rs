@@ -6,7 +6,6 @@
 use anyhow::{Result, bail};
 use camp_core::config::CampConfig;
 use camp_core::ledger::Ledger;
-use camp_core::orders::cron::CronExpr;
 use camp_core::orders::parse::compile_orders;
 use camp_core::orders::{FireCause, Order, Trigger, fired_input};
 
