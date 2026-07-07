@@ -21,6 +21,15 @@ pub struct Ledger {
     clock: Box<dyn Clock>,
 }
 
+/// One `{"op":"status"}` snapshot (master plan Phase 7 protocol): computed
+/// from the state tables at request time — no cached copy to drift.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StatusSummary {
+    pub live_sessions: Vec<String>,
+    pub ready: u64,
+    pub open: u64,
+}
+
 impl Ledger {
     pub fn open(db_path: &Path) -> Result<Self, CoreError> {
         Self::open_with_clock(db_path, Box::new(SystemClock))
@@ -131,6 +140,31 @@ impl Ledger {
             events.push(row?);
         }
         Ok(events)
+    }
+
+    /// Live session names, ready-bead count, and open-bead count. `open`
+    /// counts `status='open'` beads (blocked ones included; claimed and
+    /// closed ones not).
+    pub fn status_summary(&self) -> Result<StatusSummary, CoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM sessions WHERE status = 'live' ORDER BY name")?;
+        let live_sessions: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let ready = crate::readiness::ready_beads(&self.conn, None)?.len() as u64;
+        let open: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM beads WHERE status = 'open'", [], |r| {
+                    r.get(0)
+                })?;
+        let open = u64::try_from(open)
+            .map_err(|_| CoreError::Corrupt(format!("negative open-bead count {open}")))?;
+        Ok(StatusSummary {
+            live_sessions,
+            ready,
+            open,
+        })
     }
 
     /// The named consumer cursor's position; 0 when the consumer has never
@@ -860,6 +894,58 @@ mod tests {
                 .is_err()
         );
         assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+    }
+
+    #[test]
+    fn status_summary_reports_live_sessions_ready_and_open() {
+        let (_dir, mut ledger) = temp_ledger();
+        // empty camp: all zeroes
+        assert_eq!(
+            ledger.status_summary().unwrap(),
+            StatusSummary {
+                live_sessions: vec![],
+                ready: 0,
+                open: 0
+            }
+        );
+
+        // gc-1 ready; gc-2 open but blocked on gc-1
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "one"})))
+            .unwrap();
+        ledger
+            .append(created(
+                "gc-2",
+                serde_json::json!({"title": "two", "needs": ["gc-1"]}),
+            ))
+            .unwrap();
+        // one live session, one stopped
+        ledger.append(woke("camp/dev/1")).unwrap();
+        ledger
+            .append(input(
+                EventType::SessionWoke,
+                Some("gc"),
+                None,
+                serde_json::json!({"name": "camp/dev/2", "agent": "dev"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::SessionStopped,
+                Some("gc"),
+                None,
+                serde_json::json!({"name": "camp/dev/2"}),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            ledger.status_summary().unwrap(),
+            StatusSummary {
+                live_sessions: vec!["camp/dev/1".to_owned()],
+                ready: 1,
+                open: 2
+            }
+        );
     }
 
     #[test]
