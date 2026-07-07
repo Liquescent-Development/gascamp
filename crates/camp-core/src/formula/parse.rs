@@ -96,9 +96,11 @@ fn city_only(key: &str) -> Violation {
     }
 }
 
-fn unknown(key: &str) -> Violation {
+/// `construct` is the full location (equal to `key` at top/step level,
+/// dotted inside nested tables — review finding 3).
+fn unknown(construct: &str, key: &str) -> Violation {
     Violation {
-        construct: key.to_owned(),
+        construct: construct.to_owned(),
         message: format!("unknown key `{key}`: camp formulas accept no unknown keys (spec §8.2)"),
     }
 }
@@ -229,7 +231,7 @@ pub(crate) fn walk(text: &str) -> (RawFormula, Vec<Violation>) {
         } else if CITY_ONLY_TOP.contains(&key) {
             out.push(city_only(key));
         } else {
-            out.push(unknown(key));
+            out.push(unknown(key, key));
         }
     }
 
@@ -319,7 +321,7 @@ fn walk_step(index: usize, step: &toml::Table, out: &mut Vec<Violation>) -> RawS
         } else if CITY_ONLY_STEP.contains(&key) {
             out.push(city_only(key));
         } else {
-            out.push(unknown(key));
+            out.push(unknown(key, key));
         }
     }
 
@@ -360,7 +362,7 @@ fn walk_check(step: &toml::Table, construct: &str, out: &mut Vec<Violation>) -> 
     };
     for key in sorted_keys(check) {
         if !["check", "max_attempts"].contains(&key) {
-            out.push(unknown(key));
+            out.push(unknown(&format!("{construct}.{key}"), key));
         }
     }
     let max_attempts = get_max_attempts(check, &format!("{construct}.max_attempts"), out);
@@ -378,7 +380,7 @@ fn walk_check(step: &toml::Table, construct: &str, out: &mut Vec<Violation>) -> 
     };
     for key in sorted_keys(inner) {
         if !["mode", "path", "timeout"].contains(&key) {
-            out.push(unknown(key));
+            out.push(unknown(&format!("{construct}.check.{key}"), key));
         }
     }
     let mode_construct = format!("{construct}.check.mode");
@@ -430,7 +432,7 @@ fn walk_retry(step: &toml::Table, construct: &str, out: &mut Vec<Violation>) -> 
     };
     for key in sorted_keys(retry) {
         if !["max_attempts", "on_exhausted"].contains(&key) {
-            out.push(unknown(key));
+            out.push(unknown(&format!("{construct}.{key}"), key));
         }
     }
     let max_attempts = get_max_attempts(retry, &format!("{construct}.max_attempts"), out);
@@ -461,7 +463,7 @@ fn walk_on_complete(
     };
     for key in sorted_keys(oc) {
         if !["bond", "for_each", "parallel", "sequential", "vars"].contains(&key) {
-            out.push(unknown(key));
+            out.push(unknown(&format!("{construct}.{key}"), key));
         }
     }
     let for_each = get_string(oc, "for_each", &format!("{construct}.for_each"), out);
@@ -595,6 +597,54 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn nested_unknown_keys_carry_their_location() {
+        // Review finding 3: an unknown key inside check/retry/on_complete
+        // must report its full location, like every other violation.
+        let text = r#"
+formula = "x"
+
+[[steps]]
+id = "a"
+title = "t"
+
+[steps.check]
+max_attempts = 1
+retries = 2
+
+[steps.check.check]
+mode = "exec"
+path = "v.sh"
+shell = "bash"
+
+[[steps]]
+id = "b"
+title = "t"
+
+[steps.retry]
+max_attempts = 1
+backoff = "1s"
+
+[[steps]]
+id = "c"
+title = "t"
+
+[steps.on_complete]
+for_each = "output.i"
+bond = "m"
+mode = "fanout"
+"#;
+        let c = constructs(text);
+        for expected in [
+            "steps.a.check.retries",
+            "steps.a.check.check.shell",
+            "steps.b.retry.backoff",
+            "steps.c.on_complete.mode",
+        ] {
+            assert!(c.contains(&expected.to_owned()), "missing {expected}: {c:?}");
+        }
+    }
 
     #[test]
     fn duration_grammar_is_a_strict_go_subset() {

@@ -86,6 +86,7 @@ const REJECTIONS: &[(&str, &str)] = &[
     ("notes", "notes"),
     // stricter-than-gc
     ("unknown-key", "dependson"),
+    ("nested-unknown-key", "steps.a.check.retries"),
     // semantic
     ("dup-step-id", "steps.a.id"),
     ("unknown-needs-id", "steps.a.needs"),
