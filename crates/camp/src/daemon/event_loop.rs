@@ -19,6 +19,13 @@ use super::socket::{Request, Response};
 
 const LISTENER: Token = Token(0);
 
+/// Upper bound on a single request line (PR #8 review finding 3). Real
+/// requests are tens of bytes; the cap keeps a broken or hostile client
+/// from ballooning campd's RSS past the idle budget (invariant 1). A
+/// connection whose buffered line fragment exceeds this is answered with a
+/// clean error and dropped.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
 /// Earliest armed timer deadline → poll timeout. No timer armed = infinite
 /// wait. Phase 10 (cron heap) and Phase 11 (stall timers) plug in here;
 /// Phase 7 arms nothing. This is the only timeout expression in campd.
@@ -48,6 +55,11 @@ pub fn run(
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)
         .context("registering the listener")?;
+    // The connection map is bounded by the process fd limit — the natural
+    // cap for a single-user local socket. An artificial cap was considered
+    // (PR #8 review finding 3) and rejected: it would reject legitimate
+    // bursts, and per-connection memory is already bounded by
+    // MAX_REQUEST_BYTES.
     let mut conns: HashMap<Token, Conn> = HashMap::new();
     let mut next_token = 1usize;
 
@@ -121,7 +133,14 @@ fn serve_connection(
                 eof = true;
                 break;
             }
-            Ok(n) => conn.buf.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                conn.buf.extend_from_slice(&chunk[..n]);
+                if conn.buf.len() > MAX_REQUEST_BYTES {
+                    // Stop inhaling a firehose; complete lines below still
+                    // get answered, and an oversized fragment is rejected.
+                    break;
+                }
+            }
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => return Err(e).context("reading a request"),
@@ -186,6 +205,18 @@ fn serve_connection(
                 return Ok(ConnState::Closed);
             }
         }
+    }
+    if conn.buf.len() > MAX_REQUEST_BYTES {
+        // A single line may not exceed the cap (finding 3): answer cleanly,
+        // then drop the connection. campd itself is unharmed.
+        respond(
+            &mut conn.stream,
+            &Response::Error {
+                ok: false,
+                error: format!("request line exceeds {MAX_REQUEST_BYTES} bytes"),
+            },
+        )?;
+        return Ok(ConnState::Closed);
     }
     Ok(if eof {
         ConnState::Closed

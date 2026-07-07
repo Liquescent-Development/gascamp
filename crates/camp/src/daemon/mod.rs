@@ -130,4 +130,58 @@ mod tests {
              lands after the final catch-up — the next start covers it"
         );
     }
+
+    /// PR #8 review finding 3: a client streaming a newline-less line must
+    /// be cut off with a clean error, not buffered without bound past the
+    /// idle-RSS budget (invariant 1 / spec §2.1).
+    #[test]
+    fn oversized_request_line_is_rejected_and_the_connection_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".camp");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        let camp = CampDir { root: root.clone() };
+        let handle = std::thread::spawn(move || run(&camp));
+
+        let sock = root.join("campd.sock");
+        let mut stream = connect_with_retry(&sock);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // 104 KB of 'x' with no newline (cap is 64 KB). Write failures past
+        // the cap are the daemon cutting us off — exactly the point.
+        let chunk = [b'x'; 8192];
+        for _ in 0..13 {
+            if stream.write_all(&chunk).is_err() {
+                break;
+            }
+        }
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("the daemon must answer an oversized line, not buffer it forever");
+        let resp: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(resp["ok"], false);
+        assert!(
+            resp["error"].as_str().unwrap().contains("exceeds"),
+            "error was: {resp}"
+        );
+        // the offending connection is closed…
+        line.clear();
+        let n = reader.read_line(&mut line).unwrap();
+        assert_eq!(n, 0, "daemon must close the oversized connection");
+
+        // …and campd is unharmed for the next client
+        let mut fresh = connect_with_retry(&sock);
+        let status = request(&mut fresh, r#"{"op":"status"}"#);
+        assert_eq!(status["ok"], true);
+        let stop = request(&mut fresh, r#"{"op":"stop"}"#);
+        assert_eq!(stop, serde_json::json!({"ok": true}));
+        handle.join().unwrap().unwrap();
+    }
 }
