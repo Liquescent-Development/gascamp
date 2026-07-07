@@ -24,7 +24,7 @@ const LISTENER: Token = Token(0);
 /// from ballooning campd's RSS past the idle budget (invariant 1). A
 /// connection whose buffered line fragment exceeds this is answered with a
 /// clean error and dropped.
-const MAX_REQUEST_BYTES: usize = 64 * 1024;
+pub(super) const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Earliest armed timer deadline → poll timeout. No timer armed = infinite
 /// wait. Phase 10 (cron heap) and Phase 11 (stall timers) plug in here;
@@ -207,8 +207,11 @@ fn serve_connection(
         }
     }
     if conn.buf.len() > MAX_REQUEST_BYTES {
-        // A single line may not exceed the cap (finding 3): answer cleanly,
-        // then drop the connection. campd itself is unharmed.
+        // A single line may not exceed the cap (finding 3): answer, then
+        // drop the connection. campd itself is unharmed. The response is
+        // best-effort courtesy: a client that still has data in flight may
+        // see a connection reset instead of the error line (closing with
+        // unread receive data resets on Linux) — the drop is the contract.
         respond(
             &mut conn.stream,
             &Response::Error {

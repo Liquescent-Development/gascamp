@@ -152,14 +152,16 @@ mod tests {
             .set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
 
-        // 104 KB of 'x' with no newline (cap is 64 KB). Write failures past
-        // the cap are the daemon cutting us off — exactly the point.
-        let chunk = [b'x'; 8192];
-        for _ in 0..13 {
-            if stream.write_all(&chunk).is_err() {
-                break;
-            }
-        }
+        // Exactly one byte over the cap, no newline, then stop writing: the
+        // daemon consumes everything before rejecting, so its close is a
+        // clean FIN and the error line is deterministically deliverable on
+        // every platform. (Writing MORE would leave unread bytes in the
+        // daemon's receive queue at close time, which resets the connection
+        // on Linux and clobbers the response — the in-the-wild firehose
+        // case, where the drop is the contract and the response is
+        // best-effort.)
+        let oversized = vec![b'x'; event_loop::MAX_REQUEST_BYTES + 1];
+        stream.write_all(&oversized).unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
         reader
