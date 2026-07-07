@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod campdir;
+mod daemon;
 mod cmd {
     pub mod claim;
     pub mod close;

@@ -18,6 +18,16 @@ impl CampDir {
         self.root.join("camp.toml")
     }
 
+    /// The daemon socket (spec §5: liveness IS this socket accepting).
+    pub fn socket_path(&self) -> PathBuf {
+        self.root.join("campd.sock")
+    }
+
+    /// Where a detached campd's stderr lands (never silenced, never hidden).
+    pub fn log_path(&self) -> PathBuf {
+        self.root.join("campd.log")
+    }
+
     pub fn resolve(flag: Option<&Path>) -> Result<CampDir> {
         if let Some(dir) = flag {
             return Self::at(dir);
