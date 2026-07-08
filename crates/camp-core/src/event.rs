@@ -32,6 +32,9 @@ pub enum EventType {
     WorktreeKept,
     BeadWorktreeReaped,
     DispatchFailed,
+    CheckPassed,
+    CheckFailed,
+    RunFinalized,
 }
 
 impl EventType {
@@ -56,6 +59,9 @@ impl EventType {
         EventType::WorktreeKept,
         EventType::BeadWorktreeReaped,
         EventType::DispatchFailed,
+        EventType::CheckPassed,
+        EventType::CheckFailed,
+        EventType::RunFinalized,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -80,6 +86,9 @@ impl EventType {
             EventType::WorktreeKept => "worktree.kept",
             EventType::BeadWorktreeReaped => "bead.worktree.reaped",
             EventType::DispatchFailed => "dispatch.failed",
+            EventType::CheckPassed => "check.passed",
+            EventType::CheckFailed => "check.failed",
+            EventType::RunFinalized => "run.finalized",
         }
     }
 

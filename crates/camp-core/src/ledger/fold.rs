@@ -32,6 +32,9 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::WorktreeKept => worktree_kept(conn, event),
         EventType::BeadWorktreeReaped => bead_worktree_reaped(conn, event),
         EventType::DispatchFailed => dispatch_failed(conn, event),
+        EventType::CheckPassed => check_passed(conn, event),
+        EventType::CheckFailed => check_failed(conn, event),
+        EventType::RunFinalized => run_finalized(conn, event),
         // Log-only events: no state effect.
         EventType::CampdStarted | EventType::CampdStopped => Ok(()),
     }
@@ -154,7 +157,7 @@ fn bead_created(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     Ok(())
 }
 
-use crate::vocab::CAMP_OUTCOMES;
+use crate::vocab::{CAMP_FINAL_DISPOSITIONS, CAMP_OUTCOMES, CAMP_RUN_DISPOSITIONS};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -230,19 +233,63 @@ struct BeadClosed {
     outcome: String,
     #[serde(default)]
     reason: Option<String>,
+    /// Phase 9 (spec §8.2 retry classification): only "transient", only on
+    /// a fail close.
+    #[serde(default)]
+    failure_class: Option<String>,
+    /// Phase 9: retry-exhaustion disposition on a looping-step anchor's
+    /// fail close. NEVER "pass" — the run-level pass disposition lives in
+    /// `run.finalized` only (plan Decision 3).
+    #[serde(default)]
+    final_disposition: Option<String>,
+    /// Phase 9: structured step output (`camp close --output-json`), read
+    /// back by `on_complete` fan-out. Audit content — any JSON.
+    #[serde(default)]
+    #[allow(dead_code)]
+    output: Option<serde_json::Value>,
 }
 
 fn bead_closed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     let id = required_bead(event)?;
     let p: BeadClosed = payload(event)?;
+    let bad = |reason: String| CoreError::InvalidEventData {
+        event_type: event.kind.as_str().to_owned(),
+        reason,
+    };
     if !CAMP_OUTCOMES.contains(&p.outcome.as_str()) {
-        return Err(CoreError::InvalidEventData {
-            event_type: event.kind.as_str().to_owned(),
-            reason: format!(
-                "outcome {:?} is not in camp's vocabulary {CAMP_OUTCOMES:?}",
+        return Err(bad(format!(
+            "outcome {:?} is not in camp's vocabulary {CAMP_OUTCOMES:?}",
+            p.outcome
+        )));
+    }
+    if let Some(class) = p.failure_class.as_deref() {
+        if !crate::vocab::CAMP_FAILURE_CLASSES.contains(&class) {
+            return Err(bad(format!(
+                "failure_class {class:?} is not in camp's vocabulary \
+                 {:?}",
+                crate::vocab::CAMP_FAILURE_CLASSES
+            )));
+        }
+        if p.outcome != "fail" {
+            return Err(bad(format!(
+                "failure_class requires outcome \"fail\", got {:?}",
                 p.outcome
-            ),
-        });
+            )));
+        }
+    }
+    if let Some(disposition) = p.final_disposition.as_deref() {
+        if !CAMP_FINAL_DISPOSITIONS.contains(&disposition) {
+            return Err(bad(format!(
+                "final_disposition {disposition:?} is not in camp's close vocabulary \
+                 {CAMP_FINAL_DISPOSITIONS:?} (the run-level \"pass\" lives in run.finalized only)"
+            )));
+        }
+        if p.outcome != "fail" {
+            return Err(bad(format!(
+                "final_disposition requires outcome \"fail\", got {:?}",
+                p.outcome
+            )));
+        }
     }
     match bead_status(conn, id)?.as_deref() {
         None => Err(CoreError::UnknownBead(id.to_owned())),
@@ -413,6 +460,137 @@ fn dispatch_failed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     known_bead(conn, bead)?;
     let p: DispatchFailed = payload(event)?;
     non_empty(event, "reason", &p.reason)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckPassed {
+    run_id: String,
+    step_id: String,
+    attempt: u32,
+}
+
+/// `check.passed` is log-only (Phase 9, spec §8.3): the check script for a
+/// looping step's Nth attempt exited 0. The anchor's pass close (same
+/// batch) is the state effect; event.bead is the verified attempt bead.
+fn check_passed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let bead = required_bead(event)?;
+    known_bead(conn, bead)?;
+    let p: CheckPassed = payload(event)?;
+    non_empty(event, "run_id", &p.run_id)?;
+    non_empty(event, "step_id", &p.step_id)?;
+    if p.attempt == 0 {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: "attempt numbers start at 1".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckFailed {
+    run_id: String,
+    step_id: String,
+    attempt: u32,
+    #[serde(default)]
+    exit_code: Option<i64>,
+    #[serde(default)]
+    signal: Option<i64>,
+    #[serde(default)]
+    timed_out: Option<bool>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    log: Option<String>,
+}
+
+/// `check.failed` is log-only (Phase 9): a check iteration failed — by
+/// exit code, signal, timeout, or a spawn error. At least one piece of
+/// evidence is required so the ledger always says WHY (invariant 5).
+fn check_failed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let bead = required_bead(event)?;
+    known_bead(conn, bead)?;
+    let p: CheckFailed = payload(event)?;
+    non_empty(event, "run_id", &p.run_id)?;
+    non_empty(event, "step_id", &p.step_id)?;
+    let bad = |reason: &str| CoreError::InvalidEventData {
+        event_type: event.kind.as_str().to_owned(),
+        reason: reason.to_owned(),
+    };
+    if p.attempt == 0 {
+        return Err(bad("attempt numbers start at 1"));
+    }
+    let timed_out = p.timed_out == Some(true);
+    if p.exit_code.is_none() && p.signal.is_none() && !timed_out && p.error.is_none() {
+        return Err(bad(
+            "check.failed requires evidence: exit_code, signal, timed_out, or error",
+        ));
+    }
+    if let Some(error) = p.error.as_deref()
+        && error.is_empty()
+    {
+        return Err(bad("empty error"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunFinalized {
+    run_id: String,
+    root: String,
+    outcome: String,
+    final_disposition: String,
+    /// The close event that made the run quiescent — the spec §13.3 cause
+    /// chain.
+    cause_seq: i64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    soft_failed: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    skipped: Vec<String>,
+}
+
+/// `run.finalized` is log-only (Phase 9, spec §8.3): the run's aggregated
+/// verdict with its cause. The root's close (same batch) is the state
+/// effect; the run-level disposition (including "pass") lives HERE, never
+/// on a bead.closed (plan Decision 3).
+fn run_finalized(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let bead = required_bead(event)?;
+    known_bead(conn, bead)?;
+    let p: RunFinalized = payload(event)?;
+    non_empty(event, "run_id", &p.run_id)?;
+    non_empty(event, "root", &p.root)?;
+    let bad = |reason: String| CoreError::InvalidEventData {
+        event_type: event.kind.as_str().to_owned(),
+        reason,
+    };
+    if bead != p.root {
+        return Err(bad(format!(
+            "run.finalized bead {bead:?} must be the root {:?}",
+            p.root
+        )));
+    }
+    if !CAMP_OUTCOMES.contains(&p.outcome.as_str()) {
+        return Err(bad(format!(
+            "outcome {:?} is not in camp's vocabulary {CAMP_OUTCOMES:?}",
+            p.outcome
+        )));
+    }
+    if !CAMP_RUN_DISPOSITIONS.contains(&p.final_disposition.as_str()) {
+        return Err(bad(format!(
+            "final_disposition {:?} is not in camp's run vocabulary {CAMP_RUN_DISPOSITIONS:?}",
+            p.final_disposition
+        )));
+    }
+    if p.cause_seq < 1 {
+        return Err(bad(format!("cause_seq {} is not a seq", p.cause_seq)));
+    }
     Ok(())
 }
 

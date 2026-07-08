@@ -1067,7 +1067,11 @@ mod tests {
     }
 
     #[test]
-    fn close_outcome_vocabulary_is_pass_or_fail_only() {
+    fn close_outcome_vocabulary_is_enforced() {
+        // Phase 9 (plan Decision 2, approved): "skipped" joined the close
+        // vocabulary — campd's finalization close for unreachable steps.
+        // The out-of-vocabulary counterexample is a value gc has but camp
+        // deliberately does not accept ("missing_root").
         let (_dir, mut ledger) = temp_ledger();
         ledger
             .append(created("gc-1", serde_json::json!({"title": "one"})))
@@ -1076,10 +1080,10 @@ mod tests {
             EventType::BeadClosed,
             Some("gc"),
             Some("gc-1"),
-            serde_json::json!({"outcome": "skipped"}),
+            serde_json::json!({"outcome": "missing_root"}),
         )) {
             Err(CoreError::InvalidEventData { reason, .. }) => {
-                assert!(reason.contains("skipped"), "reason was: {reason}");
+                assert!(reason.contains("missing_root"), "reason was: {reason}");
             }
             other => panic!("expected InvalidEventData, got {other:?}"),
         }
