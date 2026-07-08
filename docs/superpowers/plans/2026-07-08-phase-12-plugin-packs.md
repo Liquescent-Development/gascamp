@@ -18,7 +18,13 @@
 
 **Post-review fix pass (rev 3 — PR #23 Opus code review APPROVE, two LOW findings):**
 - LOW 1 (phantom-live attended sessions) — **document-only + follow-up** (my call, reviewer-sanctioned): a hard-killed TUI (no SessionEnd) leaves a `status="live"` row forever, since adopt keeps attended rows and patrol never tracks them. A correct reaper needs a grace threshold (transcript-creation race) and must not mark a live-but-idle session "stopped" (§10/UX tradeoffs) — dedicated design, not a LOW fix. Documented on `patrol::adopt`, `Ledger::live_sessions`, and `plugin/README.md`; follow-up requested from the lead.
-- LOW 2 (statusline settings-key mismatch) — **fixed**: docs verified (statusline.md §"Subagent status lines") that `subagentStatusLine` is valid but has a *different* stdin schema (`tasks` array, per-teammate row body), so wiring the fleet-badge script there is a semantic mismatch. Removed `plugin/.claude-plugin/settings.json`; the fleet badge is the operator-wired main `statusLine` only (D6 corrected). Script/README clarify the two keys.
+- LOW 2 (statusline settings-key mismatch) — **fixed**: docs verified (statusline.md §"Subagent status lines") that `subagentStatusLine` is valid but has a *different* stdin schema (`tasks` array, per-teammate row body), so wiring the fleet-badge script there is a semantic mismatch. Removed `plugin/.claude-plugin/settings.json`; the fleet badge is the operator-wired main `statusLine` only (D6 corrected). Script/README clarify the two keys. (Task 7's step-by-step below is marked SUPERSEDED accordingly.)
+
+**Rebase onto Phase 13 (rev 4 — origin/main moved to d96cefd, PR #24):**
+- The **sole *conflicting* file was `crates/camp/src/main.rs`** (Phase 13's `Backup` clap variant + dispatch vs. this phase's `Session`/`Top {statusline}` — resolved keeping all three, additively).
+- `crates/camp-core/src/ledger/mod.rs` was **also touched by both phases** (Phase 13 `backup_into`, Phase 12 `session_status` + `live_sessions` doc) but in **non-overlapping regions**, so it auto-merged with no conflict. Cargo.lock auto-merged cleanly. No other conflicts (patrol.rs/event_loop.rs/socket.rs untouched by Phase 13).
+- Full gates re-run green post-rebase (fmt, clippy, `cargo test --workspace` 0 failures with Phase 13's perf suites `#[ignore]`d); CI green on the rebased head.
+- Second-pass review found two doc-only consistency nits (this rev-4 note + the Task 7 SUPERSEDED markers); no code change.
 
 ## Global Constraints
 
@@ -653,11 +659,19 @@ git commit -m "feat(plugin): worker skill — the claim→work→emit→remember
 
 ## Task 7: Statusline snippet (opt-in) + wiring
 
-`plugin/statusline/statusline.sh` renders the fleet badge from `camp top --statusline` (Task 3), reading the harness statusline JSON to resolve the workspace cwd. Ships as an opt-in script (D6); documented wiring + optional `subagentStatusLine` registration.
+> **SUPERSEDED (rev 3, LOW 2) — see revision log lines 18-21 and D6:** the
+> `plugin/.claude-plugin/settings.json` / `subagentStatusLine` wiring below was
+> REMOVED. `subagentStatusLine` has a different per-teammate `tasks`-array
+> stdin schema, so wiring the fleet-badge script there is a semantic mismatch.
+> **The plugin ships NO `settings.json`;** the fleet badge is the operator-wired
+> **main `statusLine`** only. Ignore Step 4 and drop `settings.json` from Step 6.
+> Steps 1-3 and 5 (the script + its tests) stand.
+
+`plugin/statusline/statusline.sh` renders the fleet badge from `camp top --statusline` (Task 3), reading the harness statusline JSON to resolve the workspace cwd. Ships as an opt-in script (D6).
 
 **Files:**
 - Create: `plugin/statusline/statusline.sh`
-- Create/Modify: `plugin/.claude-plugin/settings.json` (register the script as `subagentStatusLine` — the one plugin-native slot)
+- ~~Create/Modify: `plugin/.claude-plugin/settings.json`~~ — SUPERSEDED (rev 3, LOW 2): no `settings.json` shipped.
 - Test: extend `crates/camp/tests/plugin_hooks.rs` (or a `plugin_statusline.rs`) driving the script with statusline fixture stdin.
 
 **Interfaces:**
@@ -672,18 +686,15 @@ git commit -m "feat(plugin): worker skill — the claim→work→emit→remember
 
 - [ ] **Step 3: Implement `plugin/statusline/statusline.sh`.** Read stdin JSON; `cd` into `workspace.current_dir`/`cwd` (so `camp` resolves the right `.camp`); `exec camp top --statusline`. (camp handles the badge + visible degradation; the script is a locator.) `chmod +x`.
 
-- [ ] **Step 4: Wire `plugin/.claude-plugin/settings.json`.**
-```json
-{ "subagentStatusLine": { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/statusline/statusline.sh" } }
-```
+- [ ] ~~**Step 4: Wire `plugin/.claude-plugin/settings.json`.**~~ **SUPERSEDED (rev 3, LOW 2) — skip.** No `settings.json` is shipped; the badge is the operator-wired main `statusLine`, documented in `plugin/README.md`. (The `subagentStatusLine` JSON that was here rendered the wrong schema — a per-teammate `tasks` array, not the single-session badge.)
 
 - [ ] **Step 5: Run, watch pass.** Run: `cargo test -p camp --test plugin_hooks`. Expected: PASS.
 
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add plugin/statusline plugin/.claude-plugin/settings.json crates/camp/tests/plugin_hooks.rs
-git commit -m "feat(plugin): fleet statusline snippet (opt-in) + subagentStatusLine wiring"
+git add plugin/statusline crates/camp/tests/plugin_hooks.rs
+git commit -m "feat(plugin): fleet statusline snippet (opt-in, operator-wired main statusLine)"
 ```
 
 ---
