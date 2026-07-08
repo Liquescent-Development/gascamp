@@ -44,8 +44,7 @@ fn fixture_camp(dir: &Path, orders_toml: &str) -> (PathBuf, Ledger, CampConfig) 
     std::fs::write(camp_root.join("agents/dev.md"), "# dev agent\n").unwrap();
 
     let mut ledger =
-        Ledger::open_with_clock(&camp_root.join("camp.db"), Box::new(FixedClock::new(TS)))
-            .unwrap();
+        Ledger::open_with_clock(&camp_root.join("camp.db"), Box::new(FixedClock::new(TS))).unwrap();
     for (bead, data) in [
         ("gc-1", serde_json::json!({"title": "implement widget"})),
         (

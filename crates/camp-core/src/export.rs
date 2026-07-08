@@ -109,8 +109,9 @@ pub struct BdIssue {
     pub description: String,
     pub status: String,
     /// bd priority 0 means P0/critical and the field carries no omitempty
-    /// in bd's export; absent priority is NOT defaulted at import — camp
-    /// has no priority, so every line says 2 (normal) explicitly.
+    /// in bd's own export. Camp has no priority concept, so every line
+    /// says 2 (normal) explicitly — correct under either reading of bd's
+    /// absent-field behavior.
     pub priority: i64,
     pub issue_type: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -273,8 +274,8 @@ pub fn translate_order(order: &Order, raw: &OrderConfig) -> OrderTranslation {
         return OrderTranslation::Untranslatable {
             name,
             reason: format!(
-                "rig {rig:?} cannot be expressed in gc order TOML (gc's scope key is city|rig \
-                 with no named-rig binding; pack placement picks the rig)"
+                "rig {rig:?} cannot be expressed in gc order TOML (no key binds an order to a \
+                 specific named rig; gc's scope key selects city-vs-rig instantiation)"
             ),
         };
     }
