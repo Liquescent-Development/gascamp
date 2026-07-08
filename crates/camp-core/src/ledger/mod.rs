@@ -9,7 +9,7 @@ pub use refold::{DriftEntry, RefoldReport};
 
 use std::path::Path;
 
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
 use crate::Seq;
 use crate::clock::{Clock, SystemClock};
@@ -553,6 +553,38 @@ impl Ledger {
     ) -> Result<Vec<crate::search::SearchHit>, CoreError> {
         crate::search::search(&self.conn, query, type_filter, limit)
     }
+
+    /// Write a consistent, defragmented copy of the ledger to `dest` via
+    /// SQLite `VACUUM INTO`, then verify the copy with `PRAGMA
+    /// integrity_check`. The copy is a single standalone db file with no
+    /// WAL sidecar — safe to archive or move. `dest` must not already
+    /// exist. Never modifies the source; safe on a read-only `Ledger`.
+    pub fn backup_into(&self, dest: &Path) -> Result<(), CoreError> {
+        if dest.exists() {
+            return Err(CoreError::Backup(format!(
+                "destination {} already exists",
+                dest.display()
+            )));
+        }
+        let dest_str = dest.to_str().ok_or_else(|| {
+            CoreError::Backup(format!("destination {} is not valid UTF-8", dest.display()))
+        })?;
+        // VACUUM INTO does not accept a bound parameter for the filename;
+        // inline it with single-quotes doubled to escape.
+        let escaped = dest_str.replace('\'', "''");
+        self.conn
+            .execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+
+        let verify = Connection::open_with_flags(dest, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let report: String = verify.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if report != "ok" {
+            return Err(CoreError::Backup(format!(
+                "integrity_check on backup {} reported: {report}",
+                dest.display()
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// The one write path shared by `append`/`append_batch`/`append_on`: insert
@@ -621,6 +653,41 @@ mod tests {
         )
         .unwrap();
         (dir, ledger)
+    }
+
+    #[test]
+    fn backup_into_copies_and_passes_integrity_check() {
+        let (dir, mut l) = temp_ledger();
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "title": "backup me" }),
+        })
+        .unwrap();
+
+        let dest = dir.path().join("backup.db");
+        l.backup_into(&dest).unwrap();
+        assert!(dest.exists());
+
+        // The copy is a standalone, valid ledger carrying the same event.
+        let copy = rusqlite::Connection::open(&dest).unwrap();
+        let ok: String = copy
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ok, "ok");
+        let n: i64 = copy
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // Fail fast: refuse to overwrite an existing destination.
+        let err = l.backup_into(&dest).unwrap_err();
+        assert!(
+            matches!(err, CoreError::Backup(msg) if msg.contains("already exists")),
+            "expected an already-exists Backup error"
+        );
     }
 
     // ---- Phase 8 events (worker.milestone, worktree.kept,
