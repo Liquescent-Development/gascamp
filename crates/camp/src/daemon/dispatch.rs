@@ -270,6 +270,71 @@ impl Dispatcher {
             .all(|a| matches!(a.child.try_wait(), Ok(Some(_))))
     }
 
+    /// Every pid campd owns (workers + aux children): the adoption/restart
+    /// probe excludes these — a live nudge-resume child carries the
+    /// worker's session uuid in its argv and must never be mistaken for
+    /// the worker itself (Phase 11 plan Task 11.11/11.12).
+    pub fn known_pids(&self) -> std::collections::HashSet<u32> {
+        self.children
+            .keys()
+            .chain(self.aux.keys())
+            .copied()
+            .collect()
+    }
+
+    /// Test scaffolding (patrol's executor tests live in a sibling
+    /// module): a live held-stdin `cat` worker registered under the given
+    /// session/bead, stdout captured to `<dir>/<bead>.out`.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    pub(crate) fn test_insert_held_cat(
+        &mut self,
+        dir: &std::path::Path,
+        session: &str,
+        bead: &str,
+    ) -> u32 {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let out = std::fs::File::create(dir.join(format!("{bead}.out"))).unwrap_or_else(|e| {
+            panic!("creating the capture file: {e}");
+        });
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(out))
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawning cat: {e}"));
+        let stdin = child.stdin.take();
+        let pid = child.id();
+        self.children.insert(
+            pid,
+            Worker {
+                child,
+                session: session.to_owned(),
+                bead: bead.to_owned(),
+                rig: "gc".into(),
+                rig_path: dir.to_path_buf(),
+                worktree: None,
+                end_recorded: false,
+                claude_session_id: "sid-test".into(),
+                stdin,
+                released: None,
+                patrol_kill: None,
+            },
+        );
+        pid
+    }
+
+    /// Test scaffolding: block until the given worker child exits.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    pub(crate) fn test_child_wait(&mut self, pid: u32) -> std::process::ExitStatus {
+        self.children
+            .get_mut(&pid)
+            .unwrap_or_else(|| panic!("no worker at pid {pid}"))
+            .child
+            .wait()
+            .unwrap_or_else(|e| panic!("waiting on {pid}: {e}"))
+    }
+
     /// Dispatch until the cap or the well runs dry. Re-queries after every
     /// spawn: the just-committed session.woke removes the bead from the
     /// dispatchable set, so the ledger is the only bookkeeping.

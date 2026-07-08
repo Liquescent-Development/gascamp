@@ -124,10 +124,16 @@ impl Ladder {
     }
 
     /// A nudge could not be DELIVERED: skip straight to restart next fire.
+    /// Creates the state when absent — a failed nudge implies a nudge was
+    /// attempted, so the bead is on the ladder by definition.
     pub fn nudge_failed(&mut self, bead: &str) {
-        if let Some(state) = self.states.get_mut(bead) {
-            state.next = Next::Restart;
-        }
+        self.states
+            .entry(bead.to_owned())
+            .or_insert(LadderState {
+                restarts: 0,
+                next: Next::Nudge,
+            })
+            .next = Next::Restart;
     }
 
     pub fn restarts(&self, bead: &str) -> u32 {

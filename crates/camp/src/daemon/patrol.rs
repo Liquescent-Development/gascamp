@@ -26,6 +26,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use camp_core::Seq;
+
+use super::dispatch::{Dispatcher, NudgeOutcome};
 use camp_core::config::CampConfig;
 use camp_core::event::{Event, EventInput, EventType};
 use camp_core::ledger::Ledger;
@@ -548,6 +550,391 @@ impl PatrolRuntime {
         let effective = self.ladder.effective_threshold(&tracked.bead, base);
         self.timers.arm(session, TimerKind::Stall, effective, at);
     }
+
+    /// Execute the queued ladder actions. Every action's declaration is
+    /// already durable (declare_stalls); failures here append their own
+    /// records (nudge_failed / patrol.degraded) — never silent, never
+    /// fatal to campd (only ledger errors surface).
+    pub fn execute_pending(
+        &mut self,
+        ledger: &mut Ledger,
+        dispatcher: &mut Dispatcher,
+        now: Timestamp,
+    ) -> Result<()> {
+        for action in std::mem::take(&mut self.pending) {
+            match action {
+                PendingAction::Nudge { session, cause_seq } => {
+                    self.do_nudge(ledger, dispatcher, &session, cause_seq)?;
+                }
+                PendingAction::Restart { session, cause_seq } => {
+                    self.do_restart(ledger, dispatcher, &session, cause_seq)?;
+                }
+                PendingAction::Release { bead } => {
+                    if let Some(session) =
+                        dispatcher.release_worker(&bead, "released after bead close")
+                    {
+                        // C2: the grace bounds the linger (P3: no exit on
+                        // EOF). The Release timer replaces the stall timer.
+                        self.timers.arm(
+                            &session,
+                            TimerKind::Release,
+                            self.config.release_grace,
+                            now,
+                        );
+                    } else if let Some(session) = self
+                        .tracked
+                        .iter()
+                        .find(|(_, t)| t.bead == bead && matches!(t.owned, Owned::AdoptedPid(_)))
+                        .map(|(name, _)| name.clone())
+                    {
+                        // A non-child (adopted) worker whose bead closed:
+                        // release it the observation way — probe, kill,
+                        // reasoned stop (the adopt() release rule).
+                        self.release_adopted(ledger, dispatcher, &session)?;
+                    }
+                }
+                PendingAction::KillReleased { session } => {
+                    dispatcher.kill_released(&session);
+                    // the reap turns the exit into the reasoned stop
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn do_nudge(
+        &mut self,
+        ledger: &mut Ledger,
+        dispatcher: &mut Dispatcher,
+        session: &str,
+        _cause_seq: Seq,
+    ) -> Result<()> {
+        let Some(tracked) = self.tracked.get(session).cloned() else {
+            return Ok(()); // untracked since the declaration
+        };
+        let base = tracked.base_threshold.unwrap_or(self.config.stall_after);
+        let text = nudge_text(
+            &tracked.bead,
+            session,
+            &threshold_string(self.ladder.effective_threshold(&tracked.bead, base)),
+        );
+        if dispatcher.is_child(session) {
+            match dispatcher.nudge_via_stdin(session, &text) {
+                NudgeOutcome::Delivered => return Ok(()),
+                NudgeOutcome::Failed(e) => {
+                    return self.nudge_failed(ledger, session, &tracked, "stdin", &e);
+                }
+                NudgeOutcome::NoPipe => {} // released or Null-mode: resume
+            }
+        }
+        // The resume path (spec §10 as amended: "otherwise via session
+        // resume"; A4-4 two-writers caution documented). The nudge child
+        // is an aux process: reaped by the dispatcher, failure evented as
+        // patrol.degraded.
+        let Some(sid) = tracked.claude_session_id.as_deref() else {
+            return self.nudge_failed(
+                ledger,
+                session,
+                &tracked,
+                "resume",
+                "the registry row has no claude session id to resume",
+            );
+        };
+        let cwd = match &tracked.worktree {
+            Some(wt) => wt.clone(),
+            None => match tracked
+                .rig
+                .as_deref()
+                .and_then(|r| self.camp_config.rig(r).ok())
+            {
+                Some(rig) => rig.path.clone(),
+                None => {
+                    return self.nudge_failed(
+                        ledger,
+                        session,
+                        &tracked,
+                        "resume",
+                        "no worktree and no configured rig to run the resume in",
+                    );
+                }
+            },
+        };
+        let log_path = self
+            .camp_config
+            .root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("sessions")
+            .join(format!(
+                "{}.nudge.log",
+                crate::daemon::spawn::munge(session)
+            ));
+        let spawn_result = (|| -> Result<std::process::Command> {
+            if let Some(parent) = log_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            let log = std::fs::File::create(&log_path)
+                .with_context(|| format!("creating {}", log_path.display()))?;
+            let log_err = log.try_clone().context("cloning the nudge log handle")?;
+            let mut cmd = std::process::Command::new(&self.camp_config.dispatch.command);
+            cmd.arg("-p")
+                .arg("--resume")
+                .arg(sid)
+                .arg(&text)
+                .arg("--output-format")
+                .arg("json")
+                .current_dir(&cwd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::from(log))
+                .stderr(std::process::Stdio::from(log_err));
+            Ok(cmd)
+        })();
+        let outcome =
+            spawn_result.and_then(|cmd| dispatcher.spawn_aux(session, "nudge-resume", cmd));
+        if let Err(e) = outcome {
+            return self.nudge_failed(ledger, session, &tracked, "resume", &format!("{e:#}"));
+        }
+        Ok(())
+    }
+
+    /// A nudge that could not be DELIVERED (plan Decision E): durable
+    /// nudge_failed record, ladder advances to restart, timer re-arms.
+    fn nudge_failed(
+        &mut self,
+        ledger: &mut Ledger,
+        session: &str,
+        tracked: &Tracked,
+        via: &str,
+        error: &str,
+    ) -> Result<()> {
+        let base = tracked.base_threshold.unwrap_or(self.config.stall_after);
+        ledger.append(EventInput {
+            kind: EventType::AgentStalled,
+            rig: tracked.rig.clone(),
+            actor: "campd".into(),
+            bead: Some(tracked.bead.clone()),
+            data: serde_json::json!({
+                "session": session,
+                "agent": tracked.agent,
+                "action": "nudge_failed",
+                "threshold": threshold_string(
+                    self.ladder.effective_threshold(&tracked.bead, base)
+                ),
+                "restarts": self.ladder.restarts(&tracked.bead),
+                "via": via,
+                "error": error,
+            }),
+        })?;
+        self.ladder.nudge_failed(&tracked.bead);
+        Ok(())
+    }
+
+    fn do_restart(
+        &mut self,
+        ledger: &mut Ledger,
+        dispatcher: &mut Dispatcher,
+        session: &str,
+        cause_seq: Seq,
+    ) -> Result<()> {
+        let Some(tracked) = self.tracked.get(session).cloned() else {
+            return Ok(());
+        };
+        match tracked.owned {
+            Owned::Child => {
+                // SIGCHLD does the rest: caused crash, fold release,
+                // converge respawn — each its own event.
+                dispatcher.kill_worker(session, cause_seq);
+                Ok(())
+            }
+            Owned::AdoptedPid(_) => {
+                // ROUND-1 BLOCKER 2: re-probe by uuid IMMEDIATELY before
+                // any kill, and kill the re-probed pid only. The pid
+                // observed at adopt time may be hours stale and REUSED by
+                // an innocent process (no SIGCHLD for non-children).
+                let probed = probe_alive(
+                    tracked.claude_session_id.as_deref(),
+                    None,
+                    &dispatcher.known_pids(),
+                )?;
+                match probed {
+                    None => {
+                        // already dead: record the caused crash, no kill
+                        ledger.append(EventInput {
+                            kind: EventType::SessionCrashed,
+                            rig: tracked.rig.clone(),
+                            actor: "campd".into(),
+                            bead: None,
+                            data: serde_json::json!({
+                                "name": session,
+                                "reason": "patrol restart: found dead at restart",
+                                "cause_seq": cause_seq,
+                            }),
+                        })?;
+                        Ok(())
+                    }
+                    Some(pid) => {
+                        kill_pid(pid)?;
+                        // verify the death by observation before recording
+                        if probe_alive(
+                            tracked.claude_session_id.as_deref(),
+                            None,
+                            &dispatcher.known_pids(),
+                        )?
+                        .is_some()
+                        {
+                            // Not confirmably dead: degraded, timer stays
+                            // armed (declare re-armed it), retry next fire.
+                            ledger.append(EventInput {
+                                kind: EventType::PatrolDegraded,
+                                rig: None,
+                                actor: "campd".into(),
+                                bead: None,
+                                data: serde_json::json!({
+                                    "error": format!(
+                                        "restart kill of pid {pid} did not take; retrying at the next fire"
+                                    ),
+                                    "session": session,
+                                }),
+                            })?;
+                            return Ok(());
+                        }
+                        ledger.append(EventInput {
+                            kind: EventType::SessionCrashed,
+                            rig: tracked.rig.clone(),
+                            actor: "campd".into(),
+                            bead: None,
+                            data: serde_json::json!({
+                                "name": session,
+                                "reason": "patrol restart",
+                                "cause_seq": cause_seq,
+                            }),
+                        })?;
+                        Ok(())
+                    }
+                }
+            }
+            Owned::Annotate => Ok(()), // declare never queues these
+        }
+    }
+
+    /// The adopt()/bead-closed release rule for NON-child workers: probe,
+    /// kill the re-probed pid, record the reasoned stop, untrack.
+    fn release_adopted(
+        &mut self,
+        ledger: &mut Ledger,
+        dispatcher: &mut Dispatcher,
+        session: &str,
+    ) -> Result<()> {
+        let Some(tracked) = self.tracked.get(session).cloned() else {
+            return Ok(());
+        };
+        if let Some(pid) = probe_alive(
+            tracked.claude_session_id.as_deref(),
+            None,
+            &dispatcher.known_pids(),
+        )? {
+            kill_pid(pid)?;
+        }
+        ledger.append(EventInput {
+            kind: EventType::SessionStopped,
+            rig: tracked.rig.clone(),
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "name": session,
+                "reason": "released after bead close",
+            }),
+        })?;
+        // the observation of that stop untracks on the next catch-up; the
+        // timer goes now so no fire lands in between
+        self.timers.disarm(session);
+        Ok(())
+    }
+}
+
+/// The mechanical status-request turn (machinery like WORKER_CONTRACT,
+/// zero role content).
+const NUDGE_PROMPT: &str = "Camp patrol status request: no activity has been observed for \
+{threshold}. Bead {bead} is still open. If you are mid-task, continue and record a milestone: \
+`camp event emit \"<one line>\" --bead {bead} --session {session}`. If the work is finished, \
+close it now with `camp close {bead} --outcome <pass|fail> --reason \"<one line>\"` and exit.";
+
+fn nudge_text(bead: &str, session: &str, threshold: &str) -> String {
+    NUDGE_PROMPT
+        .replace("{bead}", bead)
+        .replace("{session}", session)
+        .replace("{threshold}", threshold)
+}
+
+/// Probe whether the session's process is alive — OBSERVATION over state
+/// (spec §8.5): match the pre-assigned claude session uuid against the
+/// process table (`pgrep -f`, uuid-unique and pid-reuse-immune), excluding
+/// pids campd itself owns (a nudge-resume aux child carries the uuid in
+/// its argv). Falls back to `ps -p` for rows that recorded a pid but no
+/// uuid. Neither identity ⇒ unobservable ⇒ not observed alive. A missing
+/// probe binary is a hard error — fail fast, no fallback.
+pub(super) fn probe_alive(
+    claude_session_id: Option<&str>,
+    pid: Option<i64>,
+    exclude: &HashSet<u32>,
+) -> Result<Option<i64>> {
+    if let Some(uuid) = claude_session_id {
+        let out = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(uuid)
+            .output()
+            .context("running pgrep (required for adoption probes)")?;
+        return match out.status.code() {
+            Some(0) => {
+                let alive = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|l| l.trim().parse::<i64>().ok())
+                    .find(|p| {
+                        u32::try_from(*p)
+                            .map(|p| !exclude.contains(&p))
+                            .unwrap_or(true)
+                    });
+                Ok(alive)
+            }
+            Some(1) => Ok(None), // no match: not observed alive
+            _ => anyhow::bail!(
+                "pgrep failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        };
+    }
+    if let Some(pid) = pid {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "pid="])
+            .output()
+            .context("running ps (required for adoption probes)")?;
+        if out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+            return Ok(Some(pid));
+        }
+        return Ok(None);
+    }
+    Ok(None)
+}
+
+/// Terminate a NON-child process by pid, via /bin/kill (no unsafe, no new
+/// deps — the master plan's sanctioned `ps`/`kill` route).
+fn kill_pid(pid: i64) -> Result<()> {
+    let out = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .output()
+        .context("running kill")?;
+    if !out.status.success() {
+        // The process may have exited between probe and kill (the ms-scale
+        // window the plan accepts): "no such process" is success-shaped —
+        // the follow-up probe decides. Other failures surface.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.contains("No such process") {
+            anyhow::bail!("kill -9 {pid} failed: {}", stderr.trim());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -992,5 +1379,414 @@ mod tests {
                 "attended sessions annotate only, never nudge/restart"
             );
         }
+    }
+
+    // ---- Task 11.11: action execution (nudge / restart / release) --------
+
+    use crate::daemon::dispatch::Dispatcher;
+
+    fn dispatcher_for(dir: &std::path::Path, config: &CampConfig) -> Dispatcher {
+        Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.to_path_buf(),
+            },
+            config.clone(),
+        )
+    }
+
+    /// Track a session in patrol from a woke event and arm it.
+    fn track(patrol: &mut PatrolRuntime, ledger: &mut Ledger, event: &Event, now: &str) {
+        patrol.observe(event);
+        patrol.apply_tracking(ledger, ts(now)).unwrap();
+    }
+
+    #[test]
+    fn a_child_nudge_goes_over_stdin_and_a_pipeless_one_resumes() {
+        let (dir, mut ledger, mut config, _p) = fixture();
+        // a recording stand-in for the worker command (resume half): it
+        // writes argv+cwd RELATIVE to its cwd, which pins that the resume
+        // child runs in the worker's worktree.
+        let recorder = dir.path().join("recorder.sh");
+        std::fs::write(
+            &recorder,
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > resume-args.txt\npwd >> resume-args.txt\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &recorder,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        config.dispatch.command = recorder;
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let mut patrol = PatrolRuntime::new(patrol_config, &config);
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+
+        // CHILD half: a held cat under the tracked session name
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        track(&mut patrol, &mut ledger, &event, "2026-07-07T07:00:00Z");
+        let pid = dispatcher.test_insert_held_cat(dir.path(), "t/dev/1", "gc-1");
+        patrol.pending.push(PendingAction::Nudge {
+            session: "t/dev/1".into(),
+            cause_seq: 1,
+        });
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:10:00Z"))
+            .unwrap();
+        // read the delivered line: release the pipe so cat exits
+        dispatcher.release_worker("gc-1", "test readback");
+        dispatcher.test_child_wait(pid);
+        let delivered = std::fs::read_to_string(dir.path().join("gc-1.out")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(delivered.trim_end()).unwrap();
+        assert_eq!(v["type"], "user");
+        let text = v["message"]["content"].as_str().unwrap();
+        assert!(
+            text.contains("gc-1") && text.contains("t/dev/1") && text.contains("camp close"),
+            "the nudge text is the mechanical status request: {text}"
+        );
+        assert!(
+            stalled_events(&ledger).is_empty(),
+            "a delivered nudge appends nothing further"
+        );
+
+        // PIPELESS half: an adopted session resumes via the worker
+        // command, in the worker's worktree cwd.
+        let worktree = dir.path().join("wt-gc-2");
+        std::fs::create_dir_all(&worktree).unwrap();
+        seeded_bead(&mut ledger, "gc-2");
+        let seq = ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-2".into()),
+                data: serde_json::json!({
+                    "name": "t/dev/2", "agent": "dev",
+                    "claude_session_id": "11111111-2222-4333-8444-555555555555",
+                    "transcript_path": dir.path().join("projects/-p/sid2.jsonl"),
+                    "bead": "gc-2",
+                    "worktree": worktree,
+                }),
+            })
+            .unwrap();
+        let event2 = ledger.events_range(seq, Some(seq)).unwrap().remove(0);
+        track(&mut patrol, &mut ledger, &event2, "2026-07-07T07:00:00Z");
+        patrol.pending.push(PendingAction::Nudge {
+            session: "t/dev/2".into(),
+            cause_seq: 2,
+        });
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:10:00Z"))
+            .unwrap();
+        let record = worktree.join("resume-args.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !record.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resume child never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50)); // let it finish writing
+        let args = std::fs::read_to_string(&record).unwrap();
+        assert!(args.contains("--resume"), "args: {args}");
+        assert!(
+            args.contains("11111111-2222-4333-8444-555555555555"),
+            "the resume names the claude session id: {args}"
+        );
+        assert!(
+            args.contains("wt-gc-2"),
+            "the resume child runs in the worker's worktree: {args}"
+        );
+    }
+
+    #[test]
+    fn a_failed_nudge_is_evented_and_advances_the_ladder() {
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        // a campd-owned session with NO held child and NO claude session
+        // id: both nudge paths are impossible -> nudge_failed
+        seeded_bead(&mut ledger, "gc-3");
+        let seq = ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-3".into()),
+                data: serde_json::json!({
+                    "name": "t/dev/3", "agent": "dev",
+                    "transcript_path": dir.path().join("projects/-p/sid3.jsonl"),
+                    "bead": "gc-3",
+                }),
+            })
+            .unwrap();
+        let event = ledger.events_range(seq, Some(seq)).unwrap().remove(0);
+        track(&mut patrol, &mut ledger, &event, "2026-07-07T07:00:00Z");
+
+        patrol.pending.push(PendingAction::Nudge {
+            session: "t/dev/3".into(),
+            cause_seq: seq,
+        });
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:10:00Z"))
+            .unwrap();
+        let stalled = stalled_events(&ledger);
+        assert_eq!(stalled.len(), 1);
+        assert_eq!(stalled[0].data["action"], "nudge_failed");
+        assert_eq!(stalled[0].data["via"], "resume");
+        assert!(
+            stalled[0].data["error"]
+                .as_str()
+                .unwrap()
+                .contains("claude session id"),
+            "{}",
+            stalled[0].data
+        );
+        // the ladder advanced: the next fire is a restart
+        let fires = patrol.fire_due(ts("2026-07-07T07:30:00Z"));
+        assert_eq!(fires.len(), 1, "nudge_failed re-armed the timer");
+        patrol.declare_stalls(&mut ledger, &fires).unwrap();
+        assert_eq!(
+            stalled_events(&ledger).last().unwrap().data["action"],
+            "restart"
+        );
+    }
+
+    #[test]
+    fn restart_kills_the_child_and_the_crash_carries_the_cause() {
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        track(&mut patrol, &mut ledger, &event, "2026-07-07T07:00:00Z");
+        // claim it so the release-on-crash is observable
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClaimed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"session": "t/dev/1"}),
+            })
+            .unwrap();
+        let pid = dispatcher.test_insert_held_cat(dir.path(), "t/dev/1", "gc-1");
+
+        patrol.pending.push(PendingAction::Restart {
+            session: "t/dev/1".into(),
+            cause_seq: 77,
+        });
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:10:00Z"))
+            .unwrap();
+        dispatcher.test_child_wait(pid);
+        dispatcher.reap(&mut ledger).unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        let crashed = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.crashed")
+            .expect("the restart kill must reap as crashed");
+        assert_eq!(crashed.data["cause_seq"], 77);
+        assert_eq!(crashed.data["reason"], "patrol restart");
+        let bead = ledger.get_bead("gc-1").unwrap().unwrap();
+        assert_eq!(bead.status, "open", "the fold released the bead");
+    }
+
+    /// ROUND-1 BLOCKER 2 REGRESSION PIN: an AdoptedPid restart re-probes
+    /// the session uuid immediately before killing and kills the
+    /// re-probed pid only — a stale pid must never translate into a
+    /// SIGKILL of whatever innocent process now owns it.
+    #[test]
+    fn adopted_restart_reprobes_before_killing_and_never_kills_a_stale_pid() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+
+        // Case A: the worker is long dead; its stale pid now belongs to an
+        // INNOCENT process (a plain sleeper WITHOUT the uuid in argv).
+        let mut innocent = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let stale_pid = i64::from(innocent.id());
+        let dead_uuid = "99999999-9999-4999-8999-999999999999";
+        seeded_bead(&mut ledger, "gc-4");
+        let seq = ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-4".into()),
+                data: serde_json::json!({
+                    "name": "t/dev/4", "agent": "dev",
+                    "claude_session_id": dead_uuid,
+                    "transcript_path": dir.path().join("projects/-p/sid4.jsonl"),
+                    "bead": "gc-4",
+                }),
+            })
+            .unwrap();
+        let event = ledger.events_range(seq, Some(seq)).unwrap().remove(0);
+        patrol.observe(&event);
+        patrol
+            .apply_tracking(&mut ledger, ts("2026-07-07T07:00:00Z"))
+            .unwrap();
+        // adopt-shape ownership: the pid observed hours ago
+        patrol.tracked.get_mut("t/dev/4").unwrap().owned = Owned::AdoptedPid(stale_pid);
+
+        patrol.pending.push(PendingAction::Restart {
+            session: "t/dev/4".into(),
+            cause_seq: 88,
+        });
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:10:00Z"))
+            .unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        let crashed = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.crashed")
+            .expect("a dead adopted worker still gets its caused crash record");
+        assert!(
+            crashed.data["reason"]
+                .as_str()
+                .unwrap()
+                .contains("found dead"),
+            "{}",
+            crashed.data
+        );
+        assert_eq!(crashed.data["cause_seq"], 88);
+        assert!(
+            matches!(innocent.try_wait(), Ok(None)),
+            "the INNOCENT process at the stale pid must still be alive"
+        );
+        innocent.kill().unwrap();
+        innocent.wait().unwrap();
+
+        // Case B: the adopted worker IS alive (uuid in argv): the re-probed
+        // pid is killed and the caused crash recorded.
+        let live_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        // `|| true` keeps the command compound so bash stays resident
+        // (a simple command would be exec-replaced, losing the uuid from
+        // the process table).
+        let mut sleeper = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("sleep 30 || true # {live_uuid}"))
+            .spawn()
+            .unwrap();
+        seeded_bead(&mut ledger, "gc-5");
+        let seq = ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-5".into()),
+                data: serde_json::json!({
+                    "name": "t/dev/5", "agent": "dev",
+                    "claude_session_id": live_uuid,
+                    "transcript_path": dir.path().join("projects/-p/sid5.jsonl"),
+                    "bead": "gc-5",
+                }),
+            })
+            .unwrap();
+        let event = ledger.events_range(seq, Some(seq)).unwrap().remove(0);
+        patrol.observe(&event);
+        patrol
+            .apply_tracking(&mut ledger, ts("2026-07-07T07:00:00Z"))
+            .unwrap();
+        patrol.tracked.get_mut("t/dev/5").unwrap().owned =
+            Owned::AdoptedPid(i64::from(sleeper.id()));
+
+        patrol.pending.push(PendingAction::Restart {
+            session: "t/dev/5".into(),
+            cause_seq: 99,
+        });
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:10:00Z"))
+            .unwrap();
+        let status = sleeper.wait().unwrap();
+        assert!(!status.success(), "the live adopted worker was killed");
+        let events = ledger.events_range(1, None).unwrap();
+        let crashed: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind.as_str() == "session.crashed")
+            .collect();
+        assert_eq!(crashed.last().unwrap().data["reason"], "patrol restart");
+        assert_eq!(crashed.last().unwrap().data["cause_seq"], 99);
+    }
+
+    #[test]
+    fn release_arms_the_grace_and_kill_released_stops_with_reason() {
+        let (dir, mut ledger, config, _p) = fixture();
+        // a short grace so the test's timeline is explicit
+        let patrol_config = camp_core::patrol::PatrolConfig {
+            stall_after: jiff::SignedDuration::from_mins(10),
+            restart_budget: 2,
+            release_grace: jiff::SignedDuration::from_secs(30),
+        };
+        let mut patrol = PatrolRuntime::new(patrol_config, &config);
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        track(&mut patrol, &mut ledger, &event, "2026-07-07T07:00:00Z");
+        let pid = dispatcher.test_insert_held_cat(dir.path(), "t/dev/1", "gc-1");
+
+        // the bead closes: observe queues the release
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClaimed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"session": "t/dev/1"}),
+            })
+            .unwrap();
+        let seq = ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"outcome": "pass"}),
+            })
+            .unwrap();
+        let closed = ledger.events_range(seq, Some(seq)).unwrap().remove(0);
+        patrol.observe(&closed);
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:00Z"))
+            .unwrap();
+
+        // the release grace is armed and ignores activity resets
+        let fires = patrol.fire_due(ts("2026-07-07T07:20:29Z"));
+        assert!(fires.is_empty(), "not before the grace");
+        let fires = patrol.fire_due(ts("2026-07-07T07:20:30Z"));
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].kind, TimerKind::Release);
+
+        // the grace fires: kill_released -> reap -> stopped with reason
+        patrol.declare_stalls(&mut ledger, &fires).unwrap();
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:30Z"))
+            .unwrap();
+        dispatcher.test_child_wait(pid);
+        dispatcher.reap(&mut ledger).unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        let stopped = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.stopped")
+            .expect("a released worker stops, never crashes");
+        assert!(
+            stopped.data["reason"]
+                .as_str()
+                .unwrap()
+                .contains("released"),
+            "{}",
+            stopped.data
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind.as_str() == "session.crashed")
+                .count(),
+            0
+        );
     }
 }
