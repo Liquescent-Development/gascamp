@@ -151,6 +151,64 @@ impl Ledger {
         crate::readiness::newly_ready(&self.conn, closed_bead)
     }
 
+    // ---- Phase 9 graph-runtime reads (thin wrappers over the pure
+    // functions in formula::runtime, mirroring the readiness wrappers) ----
+
+    /// A bead's run membership (`None` for plain beads; `step_id: None`
+    /// marks a run root).
+    pub fn run_membership(
+        &self,
+        bead: &str,
+    ) -> Result<Option<crate::formula::runtime::RunMembership>, CoreError> {
+        crate::formula::runtime::run_membership(&self.conn, bead)
+    }
+
+    /// All beads of one run step (anchor + attempts), creation order.
+    pub fn run_step_beads(
+        &self,
+        run_id: &str,
+        step_id: &str,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::run_step_beads(&self.conn, run_id, step_id)
+    }
+
+    /// The attempts of a looping step (its beads minus the anchor),
+    /// creation order.
+    pub fn step_attempts(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        anchor: &str,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::attempts(&self.conn, run_id, step_id, anchor)
+    }
+
+    /// The retry budget already spent on a step's attempts.
+    pub fn transient_fails_used(
+        &self,
+        attempts: &[crate::readiness::BeadRow],
+    ) -> Result<u32, CoreError> {
+        crate::formula::runtime::transient_fails_used(&self.conn, attempts)
+    }
+
+    /// The data of a bead's close event, if closed.
+    pub fn close_event_data(&self, bead: &str) -> Result<Option<serde_json::Value>, CoreError> {
+        crate::formula::runtime::close_event_data(&self.conn, bead)
+    }
+
+    /// True when `bead`'s needs can never all pass.
+    pub fn unsatisfiable(&self, bead: &str) -> Result<bool, CoreError> {
+        crate::formula::runtime::unsatisfiable(&self.conn, bead)
+    }
+
+    /// The finalization verdict for a run (Phase 9 plan Decision 3).
+    pub fn finalization(
+        &self,
+        ctx: &crate::formula::runtime::RunContext,
+    ) -> Result<crate::formula::runtime::RunVerdict, CoreError> {
+        crate::formula::runtime::finalization(&self.conn, ctx)
+    }
+
     /// Beads matching `filter`, in creation order.
     pub fn list_beads(
         &self,

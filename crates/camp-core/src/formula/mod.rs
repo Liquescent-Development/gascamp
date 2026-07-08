@@ -7,6 +7,7 @@
 pub mod ast;
 mod cook;
 mod parse;
+pub mod runtime;
 mod validate;
 
 pub use ast::{
