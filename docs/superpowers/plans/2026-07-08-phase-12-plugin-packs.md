@@ -8,6 +8,12 @@
 
 **Tech Stack:** Rust (clap CLI, rusqlite ledger, existing `camp_core`/`camp` crates); POSIX shell for hooks/statusline; Claude Code plugin format (manifest JSON, hooks JSON, command markdown, SKILL.md); Gas City formula-v2 TOML subset. Tests are Rust integration tests under `crates/camp/tests/` (so they run under `cargo test --workspace`, gated by the existing CI `test` checks) driving the plugin scripts against recorded fixture stdin payloads under `plugin/tests/fixtures/`.
 
+**Revision log (rev 2 — addresses plan-review REJECT of rev 1):**
+- BLOCKER 1 (D2 `red` mechanism) — fixed: `red` is now backed by a genuinely-new bounded `stalled: HashSet<String>` on `PatrolRuntime`, SET when a stall is declared (nudge/restart/annotate) and CLEARED at every timer-reset/untrack site — because `fire_due` removes fired timers and `declare_stalls` immediately re-arms, so there is no persistent "currently fired" state to read. See revised D2 and Task 2.
+- BLOCKER 2 (SubagentStop unsound) — fixed: SubagentStop is **dropped** from the session-end wiring (its payload's `session_id` is the *parent*; ending it would kill the attended session, a §10 violation; and no subagent is registered under any SubagentStop-derivable name). Only the attended top-level session (SessionStart→SessionEnd) and campd-spawned workers (campd birth/SIGCHLD) get lifecycle events. See revised D5 and Task 5.
+- D5 correction — the spec/master-plan edits now cover ALL three occurrences (spec §11; master-plan Files line; master-plan content-contract line) and reflect the SubagentStop drop. See Task 10.
+- Non-blocking notes folded in: parity test extracts from the fenced `` ```! `` block only (Task 4); register idempotency edge acknowledged (Task 5); rebase reconciles the real daemon-file overlap with phase-13 in socket.rs/event_loop.rs/patrol.rs (Task 11).
+
 ## Global Constraints
 
 Copied verbatim from AGENTS.md invariants, CLAUDE.md, and the kickoff — every task's requirements implicitly include these:
@@ -29,8 +35,15 @@ Copied verbatim from AGENTS.md invariants, CLAUDE.md, and the kickoff — every 
 **D1 — Hook-facing session-lifecycle CLI verbs (additive core surface).**
 The plugin hooks must register an attended session and mark its end, but the CLI today only appends `worker.milestone` (via `camp event emit`). The event *types* `session.woke` / `session.stopped` already exist in `camp-core` (added by Phase 8/11) and the ledger already models a hook-registered attended session (`crates/camp-core/src/ledger/mod.rs` test: `woke_actor == "hook:session-start"`, comment "anything else is hook-registered (annotate-only)"). What is missing is the thin CLI verb a hook wraps. This plan adds a `camp session` subcommand group — `register` (appends `session.woke`) and `end` (appends `session.stopped`). No new event types, no vocab changes, no spec change: this is the CLI surface that realizes the already-designed hook-registration path. It reuses the exact `Ledger::append` + `poke_best_effort` pattern of `cmd/event_emit.rs`.
 
-**D2 — `red` on the status socket response (additive, for the fleet badge).**
-The statusline badge `▲live ●ready ✖red` is an explicit Phase 12 deliverable (master plan; spec §11) "fed by the campd socket," but the socket `Status` response (`Response::Status` in `daemon/socket.rs`, built from `StatusSummary`) carries only `live_sessions`, `ready`, `open` — no `red`. Spec §10 defines the red source: "patrol only annotates (`agent.stalled` event + **statusline badge**)". So `red` = the count of live sessions currently flagged **stalled** by patrol. campd is the natural place to compute it: the status handler in `daemon/event_loop.rs` already runs inside campd, which holds `PatrolRuntime` in memory (real-time-accurate stall state). This plan adds `red: u64` to `Response::Status`, populated from a new `PatrolRuntime::stalled_count()`, leaving `camp_core`'s `StatusSummary` (pure ledger derivation) untouched. Additive only; the pinned wire-format test is updated. *Alternative considered and rejected as hairier:* deriving "currently stalled" from the ledger via SQL ("live sessions whose latest patrol signal is `agent.stalled`") — there is no durable "un-stalled" event, so the in-memory patrol count is both simpler and more correct. **Plan review: confirm the `red` = stalled-live-sessions semantic and the socket extension.**
+**D2 — `red` on the status socket response (additive, for the fleet badge). [ACCEPTED semantic; MECHANISM revised per BLOCKER 1.]**
+The statusline badge `▲live ●ready ✖red` is an explicit Phase 12 deliverable (master plan; spec §11) "fed by the campd socket," but the socket `Status` response (`Response::Status` in `daemon/socket.rs`, built from `StatusSummary`) carries only `live_sessions`, `ready`, `open` — no `red`. Spec §10 defines the red source: "patrol only annotates (`agent.stalled` event + **statusline badge**)". So `red` = the count of sessions currently **stalled** by patrol. The semantic and placement are accepted: campd's status handler (`daemon/event_loop.rs:478`) runs single-threaded inside campd with `PatrolRuntime` already in scope.
+
+**Mechanism (revised — the rev-1 version was wrong).** There is NO persistent "currently fired" state to read: `StallTimers::fire_due` REMOVES fired sessions from the timer store, and `declare_stalls` (patrol.rs:554–633) immediately RE-ARMS a fresh future deadline for nudge/restart/annotate (or untracks on `exhausted`). `PatrolRuntime.activity` is a reset-*pending* set, not a stalled set. So a rev-1 `stalled_count()` reading "fired timers" would be ≈0 at every steady-state status query. Instead, introduce genuinely new bounded in-memory state: **`stalled: HashSet<String>` on `PatrolRuntime`** (initialized empty in `new`).
+- **SET** in `declare_stalls`, per action branch: `nudge`, `restart`, and `annotate` (the `_` arm) → `self.stalled.insert(fire.session.clone())`. `exhausted` → do NOT insert; it untracks, so also `self.stalled.remove(&fire.session)` there.
+- **CLEAR** at every timer-reset / untrack site: the `apply_tracking` activity loop (patrol.rs:433–435, after `timers.reset`), the `apply_tracking` `TrackOp::Untrack` arm (425–430, after `tracked.remove`), and `drain_touched` (526, after `timers.reset`). (Track/arm of a fresh session also `remove`s defensively against name reuse.)
+- **`stalled_count(&self) -> u64`** = `self.stalled.iter().filter(|s| self.tracked.contains_key(*s)).count() as u64` — intersect with `tracked` so a missed clear can never inflate the count (belt-and-suspenders; CLEAR-on-untrack already keeps it a subset).
+
+**Semantic note (state in the plan):** patrol only tracks sessions carrying a bead (workers), so `red` correctly counts stalled **workers**; an attended session registered with no `--bead` is never tracked and never contributes — the right meaning for a fleet badge. Additive only; `camp_core`'s `StatusSummary` (pure ledger derivation) is untouched; the pinned wire-format test is updated.
 
 **D3 — Starter formula is a symlink into the gc-validated corpus (single source of truth).**
 `packs/starter/formulas/guarded-change.toml` is a *relative symlink* to `crates/camp-core/tests/fixtures/formulas/valid/guarded-change.toml`. The gc-compat CI job (`.github/workflows/ci.yml` line 66) already validates that corpus directory against the real `gc` compiler, and `crates/camp-core/tests/formula_corpus.rs` pins it by name. The symlink means the starter pack ships *the* corpus file — "passes the Phase 6 gc gate" holds transitively with zero CI-workflow change and zero drift. A Phase 12 test (Task 9) asserts the symlink resolves to the corpus file and that `camp doctor --formula` accepts the pack path.
@@ -38,8 +51,12 @@ The statusline badge `▲live ●ready ✖red` is an explicit Phase 12 deliverab
 **D4 — Tests are Rust integration tests; fixtures live under `plugin/tests/fixtures/`.**
 The master plan says "hook tests under `plugin/tests/`." To gate them on the existing CI `test` checks (no new workflow job), the executable drivers are Rust integration tests under `crates/camp/tests/` that shell out to the `plugin/` scripts and read recorded stdin payloads from `plugin/tests/fixtures/`. This satisfies "tests under plugin/tests/" (the fixtures + a documented expectation table live there) while running under `cargo test --workspace`.
 
-**D5 — Session-end hook is `SessionEnd`, not `Stop` (spec-vs-reality correction — NEEDS LEAD SIGN-OFF).**
-Spec §11 and master plan Phase 12 say the plugin emits session-end events on "Stop and SubagentStop." Confirmed against current Claude Code docs (hooks.md lifecycle table; retrieved 2026-07-08): **`Stop` fires once per *turn* (after every assistant response), not at session termination** — using it for session-end would append N `session.stopped` events per session and the second one would hit the fold's "session already ended" error. The hook that fires exactly once at true session termination is **`SessionEnd`** (payload `{ session_id, cwd, hook_event_name, source }`, `source ∈ {clear, resume, logout, prompt_input_exit, bypass_permissions_disabled, other}`; exit codes/output ignored — fire-and-forget by design). Therefore this plan wires **SessionStart → register+adopt, SessionEnd → session end, SubagentStop → session end (for a registered worker/teammate)**, and does NOT register a `Stop` hook. Per AGENTS.md ("if implementation reality contradicts the spec, stop and update the spec via PR in the same change"), the fix is a one-line correction to spec §11 and master plan Phase 12 replacing "Stop" with "SessionEnd", landing in this same PR. **Plan review / lead: confirm the SessionEnd substitution and the in-PR spec edit before execution.**
+**D5 — Session-end hook is `SessionEnd`, not `Stop`; and SubagentStop is dropped from session-end wiring. [D5 VERIFIED CORRECT by lead; SubagentStop drop resolves BLOCKER 2.]**
+Spec §11 and master plan Phase 12 say the plugin emits session-end events on "Stop and SubagentStop." Both are wrong against current Claude Code docs (hooks.md lifecycle table; retrieved 2026-07-08):
+- **`Stop` fires once per *turn*** (after every assistant response), not at session termination — using it for session-end would append N `session.stopped` events per session and the second would hit the fold's "session already ended" error. The hook that fires exactly once at true termination is **`SessionEnd`** (payload `{ session_id, cwd, hook_event_name, source }`, `source ∈ {clear, resume, logout, prompt_input_exit, bypass_permissions_disabled, other}`; exit codes/output ignored — fire-and-forget by design).
+- **`SubagentStop` cannot soundly emit a session-end.** Its payload's `session_id` is the **parent** session; `agent_id`/`agent_type` identify the finished subagent. Deriving `attended/{session_id}` from it resolves to the *parent's* registered row — so `camp session end` would end the attended session (a §10 "never kill the attended session" violation), and there is no registration path that gives a subagent a SubagentStop-reconstructable name. So SubagentStop is **not wired** in v1. Attended Tier-0 teammates are visible directly in the agent panel (A1) and record their own ledger events (claim/milestone/close via `--session`, per the worker skill); campd-spawned workers get lifecycle from campd (birth in `dispatch.rs`, end via SIGCHLD §10). Neither needs a hook-driven `session.stopped`.
+
+Therefore the wiring is: **SessionStart → register + adopt (attended top-level session); SessionEnd → session end.** No `Stop`, no `SubagentStop`. Per AGENTS.md ("if implementation reality contradicts the spec, stop and update the spec via PR in the same change"), Task 10 corrects all three occurrences (spec §11; master-plan Files line; master-plan content-contract line) to match, in this same PR.
 
 **D6 — Statusline ships as an opt-in script, not a plugin-set `statusLine`.**
 A plugin's bundled `settings.json` supports only `agent` and `subagentStatusLine` (plugins-reference; retrieved 2026-07-08) — it cannot set the main `statusLine`. This matches spec §11's word "*optional* statusline snippet": the plugin ships `plugin/statusline/statusline.sh` and documents wiring it into the user's `~/.claude/settings.json` `statusLine.command`. Optionally, the plugin registers the same script as `subagentStatusLine` (the one plugin-native statusline slot) so teammates show a camp badge. The script's data path is `camp top --statusline` (Task 3).
@@ -54,10 +71,10 @@ A plugin's bundled `settings.json` supports only `agent` and `subagentStatusLine
 - `plugin/commands/status.md` — thin wrapper → `camp top`.
 - `plugin/commands/adopt.md` — thin wrapper → `camp adopt`.
 - `plugin/commands/events.md` — thin wrapper → `camp events`.
-- `plugin/hooks/hooks.json` — registers SessionStart, SessionEnd, SubagentStop (NOT Stop — per D5; PostToolUse breadcrumb present but NOT registered — off by default, §10).
-- `plugin/hooks/lib.sh` — shared helpers: locate the camp dir, `throttle` marker check, fire-and-forget wrapper, JSON field extraction (`jq`-free, portable).
-- `plugin/hooks/session-start.sh` — SessionStart: register this session (`camp session register`) + `camp adopt`; idempotent via a per-session marker; always exit 0.
-- `plugin/hooks/session-end.sh` — SessionEnd + SubagentStop end handler (`camp session end`, guarded by a registration check for SubagentStop); always exit 0.
+- `plugin/hooks/hooks.json` — registers SessionStart and SessionEnd only (NOT Stop, NOT SubagentStop — per D5/BLOCKER 2; PostToolUse breadcrumb present but NOT registered — off by default, §10).
+- `plugin/hooks/lib.sh` — shared helpers: locate the camp dir, `throttle` marker check, and a `camp_or_note` fire-and-forget wrapper (runs camp, notes to stderr on failure, always returns 0). JSON parsing happens in `camp --hook-stdin` (Rust), not in shell — no `jq` dependency.
+- `plugin/hooks/session-start.sh` — SessionStart: `camp session register --hook-stdin` (idempotent) + `camp adopt`; always exit 0.
+- `plugin/hooks/session-end.sh` — SessionEnd: `camp session end --hook-stdin --if-registered`; always exit 0.
 - `plugin/hooks/post-tool-use.sh` — OPTIONAL breadcrumb (`camp event emit`), time-window `throttle`d; shipped but unregistered; documented as off-by-default (§10 — patrol watches transcripts).
 - `plugin/skills/worker/SKILL.md` — the worker lifecycle contract.
 - `plugin/statusline/statusline.sh` — badge renderer → `camp top --statusline`.
@@ -92,7 +109,7 @@ A plugin's bundled `settings.json` supports only `agent` and `subagentStatusLine
 
 ## Task 1: Hook-facing session-lifecycle CLI verbs (`camp session register` / `camp session end`)
 
-Realizes Decision D1. The foundation the SessionStart/Stop/SubagentStop hooks wrap. No new event types — appends the existing `session.woke` / `session.stopped` via the `event_emit.rs` pattern.
+Realizes Decision D1. The foundation the SessionStart and SessionEnd hooks wrap. No new event types — appends the existing `session.woke` / `session.stopped` via the `event_emit.rs` pattern.
 
 **Files:**
 - Create: `crates/camp/src/cmd/session.rs`
@@ -195,11 +212,11 @@ Realizes Decision D2. Additive field so the statusline (Task 3) and `/status` ca
 
 **Interfaces:**
 - Consumes: `PatrolRuntime` (in `event_loop.rs`'s status handler at `crates/camp/src/daemon/event_loop.rs:478`); `camp_core::ledger::StatusSummary` (unchanged).
-- Produces: `Response::Status { ok, #[serde(flatten)] summary: StatusSummary, red: u64, campd_pid: u32 }`; `PatrolRuntime::stalled_count(&self) -> u64` returning the number of tracked sessions whose stall timer has currently fired (in-memory).
+- Produces: `Response::Status { ok, #[serde(flatten)] summary: StatusSummary, red: u64, campd_pid: u32 }`; a new field `stalled: HashSet<String>` on `PatrolRuntime`; `PatrolRuntime::stalled_count(&self) -> u64` = `self.stalled.iter().filter(|s| self.tracked.contains_key(*s)).count() as u64`.
 
 **Steps:**
 
-- [ ] **Step 1: Write the failing test.** In `socket.rs`'s `response_wire_format_is_pinned`, update the `Status` case to include `red` and assert the new canonical JSON (`red` positioned after `open`, before `campd_pid`):
+- [ ] **Step 1a: Write the failing wire-format test.** In `socket.rs`'s `response_wire_format_is_pinned`, update the `Status` case to include `red` (positioned after `open`, before `campd_pid`):
 
 ```rust
 let status = Response::Status {
@@ -213,13 +230,37 @@ assert_eq!(
     r#"{"ok":true,"live_sessions":["camp/dev/1"],"ready":1,"open":2,"red":1,"campd_pid":4242}"#
 );
 ```
-Also add a `patrol.rs` unit test asserting `stalled_count()` == number of fired timers for a fabricated runtime state (follow the existing patrol test fixtures).
 
-- [ ] **Step 2: Run, watch it fail.** Run: `cargo test -p camp --lib daemon::socket` and `cargo test -p camp --lib daemon::patrol`. Expected: FAIL (`red` not a field / `stalled_count` not defined).
+- [ ] **Step 1b: Write the failing `stalled_count` unit test in `patrol.rs`** — drive REAL state through the existing test harness (`fixture()`, `woke_event(...)`, `apply_tracking`, `fire_due`, `declare_stalls`; mirror `declare_stalls_appends_agent_stalled_with_the_ladder_action_and_cause` at patrol.rs:1613). Add a `milestone_event(...)` helper next to `woke_event` that appends a `worker.milestone` with `actor` = the session name (so `observe` counts it as activity):
 
-- [ ] **Step 3: Implement.** Add `red: u64` to `Response::Status`. Add `PatrolRuntime::stalled_count()` returning the count of currently-fired (stalled) tracked timers — read the same in-memory structure `fire_due`/`declare_stalls` use to know which timers have fired. In `event_loop.rs`, the status handler (currently `ledger.status_summary()`) sets `red: patrol.stalled_count()`. Update `top.rs::render` to accept and (optionally) show the red count without changing its existing text lines — the pinned `top` render tests must still pass, so add red on its own line, e.g. `"…\nred: {red}\n"`, and update those unit tests accordingly.
+```rust
+#[test]
+fn stalled_count_counts_stalled_workers_and_clears_on_activity() {
+    let (dir, mut ledger, _config, mut patrol) = fixture();
+    let transcript = dir.path().join("projects/-p/sid.jsonl");
+    let woke = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+    patrol.observe(&woke);
+    patrol.apply_tracking(&mut ledger, ts("2026-07-07T07:00:00Z")).unwrap();
+    assert_eq!(patrol.stalled_count(), 0, "a freshly tracked worker is not stalled");
 
-- [ ] **Step 4: Run all touched tests, watch pass.** Run: `cargo test -p camp --lib daemon`. Expected: PASS. Then `cargo test -p camp --test daemon_lifecycle` (status-over-socket integration) — update any status-response assertions to include `red`.
+    // stall timer fires (600s default) → nudge declared → worker is red
+    let fires = patrol.fire_due(ts("2026-07-07T07:10:00Z"));
+    patrol.declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:10:00Z")).unwrap();
+    assert_eq!(patrol.stalled_count(), 1, "a stalled worker counts red");
+
+    // a ledger event from the worker resets its timer → cleared
+    let beat = milestone_event(&mut ledger, "t/dev/1", "gc-1"); // actor = "t/dev/1"
+    patrol.observe(&beat);
+    patrol.apply_tracking(&mut ledger, ts("2026-07-07T07:11:00Z")).unwrap();
+    assert_eq!(patrol.stalled_count(), 0, "worker activity clears the stalled flag");
+}
+```
+
+- [ ] **Step 2: Run, watch both fail.** Run: `cargo test -p camp --lib daemon::socket::` then `cargo test -p camp --lib daemon::patrol::stalled_count`. Expected: FAIL (`red` not a field; `stalled_count`/`milestone_event` not defined).
+
+- [ ] **Step 3: Implement the `stalled` set + `red`.** Add `stalled: HashSet<String>` to `PatrolRuntime`, `stalled: HashSet::new()` in `new()`. Wire SET/CLEAR exactly per D2: in `declare_stalls` insert on `nudge`/`restart`/`_`(annotate), and `remove` on `exhausted`; in `apply_tracking` remove for each session in the `activity` reset loop (after `timers.reset`) and in the `TrackOp::Untrack` arm (after `tracked.remove`); in `drain_touched` remove after `timers.reset`. Add `pub fn stalled_count(&self) -> u64` (the intersect-with-`tracked` form from Interfaces). Add `red: u64` to `Response::Status`; in `event_loop.rs`'s status handler set `red: patrol.stalled_count()`. Update `top.rs::render` to append red on its own line (`"…\nred: {red}\n"`) and update the pinned `top` render unit tests to match.
+
+- [ ] **Step 4: Run all touched tests, watch pass.** Run: `cargo test -p camp --lib daemon`. Expected: PASS (socket wire, patrol stalled_count, top render). Then `cargo test -p camp --test daemon_lifecycle` (status-over-socket integration) — update any status-response assertions to include `red`.
 
 - [ ] **Step 5: Commit.**
 
@@ -315,13 +356,28 @@ fn help(sub: &str) -> String {
     let out = Command::cargo_bin("camp").unwrap().args([sub, "--help"]).output().unwrap();
     String::from_utf8(out.stdout).unwrap() + &String::from_utf8(out.stderr).unwrap()
 }
+// Note (a): scan ONLY the executable `!` fenced block + the argument-hint
+// frontmatter line — never free prose in the description (which may mention
+// another verb and mis-target).
+fn bang_block(md: &str) -> String {
+    let mut out = String::new();
+    let mut in_block = false;
+    for line in md.lines() {
+        if line.trim_start().starts_with("```!") { in_block = true; continue; }
+        if in_block && line.trim_start().starts_with("```") { in_block = false; continue; }
+        if in_block { out.push_str(line); out.push('\n'); }
+        if let Some(hint) = line.trim().strip_prefix("argument-hint:") { out.push_str(hint); out.push('\n'); }
+    }
+    out
+}
 fn wrapped(md: &str) -> (String, Vec<String>) {
-    let sub = md.split_whitespace()
+    let scan = bang_block(md);
+    let sub = scan.split_whitespace()
         .collect::<Vec<_>>().windows(2)
         .find(|w| w[0] == "camp")
         .map(|w| w[1].trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-        .expect("command md must invoke `camp <sub>`");
-    let flags = md.split_whitespace()
+        .expect("command md's `!` block must invoke `camp <sub>`");
+    let flags = scan.split_whitespace()
         .filter(|t| t.starts_with("--"))
         .map(|t| t.trim_matches(|c: char| !(c.is_alphanumeric() || c == '-')).to_string())
         .filter(|f| f.len() > 2)
@@ -391,50 +447,66 @@ git commit -m "feat(plugin): manifest + thin /sling /status /adopt /events wrapp
 
 ## Task 5: Lifecycle hooks + `--hook-stdin` + throttle (fixture-driven tests)
 
-SessionStart (register+adopt), SessionEnd + SubagentStop (session end), and an off-by-default PostToolUse breadcrumb. Hooks are trivial shell that always exit 0; JSON parsing + idempotency live in tested Rust via a `--hook-stdin` mode on `camp session`.
+SessionStart (register+adopt) and SessionEnd (session end), plus an off-by-default PostToolUse breadcrumb. Hooks are trivial shell that always exit 0; JSON parsing + idempotency live in tested Rust via a `--hook-stdin` mode on `camp session`.
 
 **Files:**
-- Modify: `crates/camp/src/cmd/session.rs` (add `--hook-stdin` to `register`/`end`; add a lenient `HookInput` parse)
+- Modify: `crates/camp/src/cmd/session.rs` (add `--hook-stdin`/`--if-registered` to `register`/`end`; lenient `HookInput` parse)
+- Modify: `crates/camp-core/src/ledger/mod.rs` (add `pub fn session_status(&self, name: &str) -> Result<Option<String>, CoreError>` if absent — the existence check for idempotent register)
 - Create: `plugin/hooks/hooks.json`, `plugin/hooks/lib.sh`, `plugin/hooks/session-start.sh`, `plugin/hooks/session-end.sh`, `plugin/hooks/post-tool-use.sh`
-- Create: `plugin/tests/fixtures/session-start.json`, `session-end.json`, `subagent-stop.json`, `post-tool-use.json`, and `plugin/tests/fixtures/README.md` (expectation table)
+- Create: `plugin/tests/fixtures/session-start.json`, `session-end.json`, `post-tool-use.json`, and `plugin/tests/fixtures/README.md` (expectation table). (No `subagent-stop.json` — SubagentStop is not wired, per D5/BLOCKER 2.)
 - Test: `crates/camp/tests/plugin_hooks.rs`, plus `--hook-stdin` cases in `crates/camp/tests/cli_session.rs`
 
 **Interfaces:**
-- Consumes: Task 1's `cmd::session::{register,end}`; the hook stdin schemas (SessionStart `{session_id, transcript_path, cwd, source, model?}`; SessionEnd `{session_id, source}`; SubagentStop `{session_id, agent_id, agent_type, agent_name?}`; PostToolUse `{session_id, tool_name, tool_input}`) — parsed leniently (ignore unknown harness fields).
-- Produces: name derivation `attended/<session_id>` (register and end derive it identically from stdin `session_id`); `register --hook-stdin` is idempotent (no-op success if the derived name is already a live session); `end --hook-stdin` is if-registered (no-op success if not live). `lib.sh`: `throttle <key> <window_secs>` (0 = proceed, 1 = skip), `camp_or_note` (runs camp, notes to stderr on failure, never non-zero).
+- Consumes: Task 1's `cmd::session::{register,end}`; the hook stdin schemas (SessionStart `{session_id, transcript_path, cwd, source, model?}`; SessionEnd `{session_id, source}`; PostToolUse `{session_id, tool_name, tool_input}`) — parsed leniently (ignore unknown harness fields).
+- Produces: name derivation `attended/<session_id>` (SessionStart register and SessionEnd end derive it identically from the SAME top-level `session_id` — both are the attended top-level session, so they always agree; SubagentStop, whose `session_id` is the parent, is not involved). `register --hook-stdin` is idempotent: it queries `session_status(name)` and no-ops with a note if a row for `name` exists in ANY status (covers repeat SessionStart and — see Step 3 note — a resumed session whose row already ended). `end --hook-stdin --if-registered` no-ops if `name` is not currently live, else appends `session.stopped` (fold enforces live→stopped). `lib.sh`: `throttle <key> <window_secs>` (0 = proceed, 1 = skip), `camp_or_note` (runs camp, notes to stderr on failure, never non-zero).
 
 **Steps:**
 
-- [ ] **Step 1: Write failing `--hook-stdin` tests** in `cli_session.rs`:
+- [ ] **Step 1: Write failing `--hook-stdin` tests** in `cli_session.rs`. Both use only the attended top-level session; there is NO SubagentStop-to-end case (dropped per BLOCKER 2):
 
 ```rust
 #[test]
-fn hook_stdin_register_is_idempotent_and_end_is_if_registered() {
+fn hook_stdin_register_is_idempotent_and_session_end_stops_the_registered_session() {
     let tmp = TempDir::new().unwrap();
     let d = tmp.path();
     init(d);
     let start = r#"{"session_id":"S-1","transcript_path":"/t/S-1.jsonl","cwd":"/x","source":"startup","hook_event_name":"SessionStart"}"#;
-    // first register → one session.woke
     camp(d).args(["session","register","--hook-stdin"]).write_stdin(start).assert().success();
-    // second identical SessionStart (resume/clear) → idempotent no-op, still success
+    // repeat SessionStart (resume/clear reuses the id) → idempotent no-op, still success
     camp(d).args(["session","register","--hook-stdin"]).write_stdin(start).assert().success();
     let text = String::from_utf8(camp(d).args(["events","--json"]).output().unwrap().stdout).unwrap();
     assert_eq!(text.lines().filter(|l| l.contains("\"session.woke\"") && l.contains("attended/S-1")).count(), 1,
         "SessionStart must register exactly once, got:\n{text}");
-    // SubagentStop for an unregistered subagent → if-registered no-op success (no event)
-    let sub = r#"{"session_id":"S-1","agent_id":"AG-9","agent_type":"Explore","hook_event_name":"SubagentStop"}"#;
-    camp(d).args(["session","end","--hook-stdin","--if-registered"]).write_stdin(sub).assert().success();
-    // SessionEnd for the registered attended session → one session.stopped
+
+    // SessionEnd for the SAME top-level session → exactly one session.stopped
     let end = r#"{"session_id":"S-1","source":"prompt_input_exit","hook_event_name":"SessionEnd"}"#;
-    camp(d).args(["session","end","--hook-stdin"]).write_stdin(end).assert().success();
+    camp(d).args(["session","end","--hook-stdin","--if-registered"]).write_stdin(end).assert().success();
+    // a second SessionEnd (already ended) → --if-registered no-op, still exactly one
+    camp(d).args(["session","end","--hook-stdin","--if-registered"]).write_stdin(end).assert().success();
     let text2 = String::from_utf8(camp(d).args(["events","--json"]).output().unwrap().stdout).unwrap();
     assert_eq!(text2.lines().filter(|l| l.contains("\"session.stopped\"") && l.contains("attended/S-1")).count(), 1);
+}
+
+#[test]
+fn if_registered_end_is_a_noop_for_a_never_registered_session() {
+    let tmp = TempDir::new().unwrap();
+    let d = tmp.path();
+    init(d);
+    let end = r#"{"session_id":"NEVER","source":"other","hook_event_name":"SessionEnd"}"#;
+    camp(d).args(["session","end","--hook-stdin","--if-registered"]).write_stdin(end).assert().success();
+    let text = String::from_utf8(camp(d).args(["events","--json"]).output().unwrap().stdout).unwrap();
+    assert_eq!(text.lines().filter(|l| l.contains("\"session.stopped\"")).count(), 0,
+        "no session.stopped for a name that was never registered");
 }
 ```
 
 - [ ] **Step 2: Run, watch it fail.** Run: `cargo test -p camp --test cli_session hook_stdin`. Expected: FAIL (`--hook-stdin` unknown).
 
-- [ ] **Step 3: Implement `--hook-stdin`.** Add `#[arg(long)] hook_stdin: bool` and `#[arg(long)] if_registered: bool` to `SessionCommand::{Register, End}`. In `cmd/session.rs`, when `hook_stdin`: read stdin, `serde_json::from_str` into a lenient `HookInput { session_id: String, transcript_path: Option<String>, cwd: Option<String>, source: Option<String>, agent_id: Option<String>, .. }` (NO `deny_unknown_fields` — this parses the harness payload, not a camp event). Derive `name = format!("attended/{session_id}")`, `agent = "attended"`. For `register`: query `ledger.live_sessions()`; if `name` already present, print a one-line note and return `Ok(())` (idempotent). Else append `session.woke`. For `end` with `if_registered`: if `name` not live, return `Ok(())`; else append `session.stopped` with `reason = source`.
+- [ ] **Step 3: Implement `--hook-stdin`.** Add `#[arg(long)] hook_stdin: bool` and `#[arg(long)] if_registered: bool` to `SessionCommand::{Register, End}`. In `cmd/session.rs`, when `hook_stdin`: read stdin, `serde_json::from_str` into a lenient `HookInput { session_id: String, transcript_path: Option<String>, cwd: Option<String>, source: Option<String>, .. }` (NO `deny_unknown_fields` — this parses the harness payload, not a camp event). Derive `name = format!("attended/{session_id}")`, `agent = "attended"`, no `--bead` (so patrol never tracks it — annotate-only, and it never contributes to `red`, per D2's note).
+  - `register --hook-stdin`: call `ledger.session_status(&name)?`; if `Some(_)` (a row exists in ANY status), print `note: session {name} already registered` and return `Ok(())` (idempotent — covers repeat SessionStart). Else append `session.woke` (actor `hook:session-start`) and poke.
+    - **Resume-after-end edge (non-blocking note b, acknowledged):** if the operator resumes a session whose row already `ended`, `session_status` returns `Some("ended"/"crashed")`, so register no-ops — the session is NOT re-registered. This is intentional and harmless: session names are fold-unique forever, attended registry rows are best-effort (the session still drives the camp fine, and `camp adopt` reconciles liveness). Documented in `plugin/README.md`.
+  - `end --hook-stdin --if-registered`: call `ledger.session_status(&name)?`; if not `Some("live")`, return `Ok(())` (no-op). Else append `session.stopped` (actor `hook:session-end`, `reason = source`) and poke.
+  - Add `Ledger::session_status(&self, name) -> Result<Option<String>, CoreError>` (SELECT status FROM sessions WHERE name=?1) if it does not already exist — mirrors the query the fold's `session_ended` already runs.
 
 - [ ] **Step 4: Run, watch pass.** Run: `cargo test -p camp --test cli_session`. Expected: PASS.
 
@@ -450,8 +522,21 @@ fn plugin() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../p
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(plugin().join("tests/fixtures").join(name)).unwrap()
 }
-// runs a hook script with CLAUDE_PLUGIN_ROOT + CAMP_DIR set, feeding stdin; returns exit status
-fn run_hook(script: &str, stdin: &str, camp_dir: &std::path::Path) -> std::process::Output { /* std::process::Command sh script, env CAMP_DIR, PATH to the built camp bin, write stdin */ unimplemented!() }
+// runs a hook script with CAMP_DIR set and the built `camp` on PATH, feeding stdin; returns the output
+fn run_hook(script: &str, stdin: &str, camp_dir: &std::path::Path) -> std::process::Output {
+    use std::io::Write;
+    let camp_bin_dir = assert_cmd::cargo::cargo_bin("camp");
+    let camp_bin_dir = camp_bin_dir.parent().unwrap();
+    let path = format!("{}:{}", camp_bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let mut child = std::process::Command::new("sh")
+        .arg(plugin().join("hooks").join(script))
+        .env("CAMP_DIR", camp_dir)
+        .env("PATH", path)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
 
 #[test]
 fn session_start_hook_registers_once_and_exits_zero() {
@@ -485,8 +570,8 @@ Fill `run_hook` with `std::process::Command::new("sh").arg(script)`, `.env("CAMP
 # throttle KEY WINDOW_SECS -> exit 0 to proceed, 1 to skip (touch a marker under $dir/hooks).
 # camp_or_note ARGS... -> run `camp ARGS`; on failure print "camp hook: <err>" to stderr; ALWAYS return 0.
 ```
-`plugin/hooks/session-start.sh`: `INPUT=$(cat); printf '%s' "$INPUT" | camp_or_note session register --hook-stdin; camp_or_note adopt; exit 0`.
-`plugin/hooks/session-end.sh`: reads `hook_event_name`; for `SubagentStop` runs `camp session end --hook-stdin --if-registered`, for `SessionEnd` runs `camp session end --hook-stdin`; always `exit 0`.
+`plugin/hooks/session-start.sh`: `INPUT=$(cat); printf '%s' "$INPUT" | camp_or_note session register --hook-stdin; camp_or_note adopt; exit 0` (`camp_or_note` forwards its stdin to `camp`).
+`plugin/hooks/session-end.sh`: `INPUT=$(cat); printf '%s' "$INPUT" | camp_or_note session end --hook-stdin --if-registered; exit 0` (SessionEnd only — no `hook_event_name` branching, since SubagentStop is not wired).
 `plugin/hooks/post-tool-use.sh`: `throttle breadcrumb 5 || exit 0; ... camp_or_note event emit "tool: $tool_name"; exit 0` (unregistered; off by default).
 
 `plugin/hooks/hooks.json`:
@@ -494,12 +579,11 @@ Fill `run_hook` with `std::process::Command::new("sh").arg(script)`, `.env("CAMP
 {
   "hooks": {
     "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/session-start.sh" }] }],
-    "SessionEnd":   [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/session-end.sh" }] }],
-    "SubagentStop": [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/session-end.sh" }] }]
+    "SessionEnd":   [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/session-end.sh" }] }]
   }
 }
 ```
-(NO `Stop`, NO `PostToolUse` — the breadcrumb ships unregistered.)
+(NO `Stop`, NO `SubagentStop`, NO `PostToolUse` — Stop fires per-turn (D5), SubagentStop can't soundly end a session (BLOCKER 2), and the breadcrumb ships unregistered.)
 
 Fixtures under `plugin/tests/fixtures/` are the confirmed payload shapes; `README.md` there is the expectation table (event appended, exit code, throttle) per fixture.
 
@@ -510,7 +594,7 @@ Fixtures under `plugin/tests/fixtures/` are the confirmed payload shapes; `READM
 ```bash
 git add crates/camp/src/cmd/session.rs plugin/hooks plugin/tests/fixtures \
         crates/camp/tests/plugin_hooks.rs crates/camp/tests/cli_session.rs
-git commit -m "feat(plugin): SessionStart/SessionEnd/SubagentStop hooks — fire-and-forget, --hook-stdin, throttle"
+git commit -m "feat(plugin): SessionStart/SessionEnd hooks — fire-and-forget, --hook-stdin, throttle"
 ```
 
 ---
@@ -714,13 +798,18 @@ git commit -m "test(plugin): repo-policy — plugin ships zero agent definitions
 ## Task 10: Plugin/pack docs + in-PR spec correction (D5)
 
 **Files:**
-- Create: `plugin/README.md`, `packs/starter/README.md` (if not already in Task 8)
-- Modify: `docs/design/2026-07-05-gas-camp-design.md` §11 (replace "Stop and SubagentStop" → "SessionEnd and SubagentStop"); `docs/superpowers/plans/2026-07-05-gas-camp-v1-implementation.md` Phase 12 (same one-word correction) — **only after the lead confirms D5.**
+- Create: `plugin/README.md` (`packs/starter/README.md` is created in Task 8)
+- Modify: `docs/design/2026-07-05-gas-camp-design.md` §11 AND `docs/superpowers/plans/2026-07-05-gas-camp-v1-implementation.md` Phase 12 — D5 is lead-confirmed, so apply now.
+
+**All three occurrences to correct (verbatim targets — the spec-never-diverges rule requires ALL of them):**
+1. Spec §11 (design doc, ~line 568): `SessionStart (register/adopt), Stop and SubagentStop (session end)` → `SessionStart (register/adopt), SessionEnd (session end)`.
+2. Master-plan Files line (~line 903): `hooks/` (SessionStart, Stop, SubagentStop, optional PostToolUse breadcrumb — off by default)` → `hooks/` (SessionStart, SessionEnd, optional PostToolUse breadcrumb — off by default)`.
+3. Master-plan content-contract line (~line 908): `Stop/SubagentStop append session-end events` → `SessionEnd appends the session-end event`.
 
 **Steps:**
 
-- [ ] **Step 1: Write `plugin/README.md`** — what the plugin is (machinery only, zero roles; the four commands; the three hooks; the worker skill; the opt-in statusline and how to wire it into `~/.claude/settings.json`).
-- [ ] **Step 2: Apply the D5 spec correction** in both docs (one line each), citing the hooks.md lifecycle finding and this plan's D5. Confirm the design-doc invariant (spec and code never diverge) holds.
+- [ ] **Step 1: Write `plugin/README.md`** — machinery only, zero roles; the four commands; the TWO lifecycle hooks (SessionStart register+adopt, SessionEnd end) and why Stop/SubagentStop are deliberately not wired (D5/BLOCKER 2); the resume-after-end registry caveat (Task 5 Step 3); the worker skill; the opt-in statusline and how to wire it into `~/.claude/settings.json`.
+- [ ] **Step 2: Apply the three corrections** above (grep to confirm no other `Stop`-as-session-end occurrence remains: `grep -n "Stop" docs/design/2026-07-05-gas-camp-design.md docs/superpowers/plans/2026-07-05-gas-camp-v1-implementation.md`). Cite the hooks.md lifecycle finding + this plan's D5. Confirm spec-and-code-never-diverge holds.
 - [ ] **Step 3: Commit.**
 ```bash
 git add plugin/README.md docs/design/2026-07-05-gas-camp-design.md docs/superpowers/plans/2026-07-05-gas-camp-v1-implementation.md
@@ -732,6 +821,8 @@ git commit -m "docs(plugin): README + spec §11 correction (session-end hook is 
 ## Task 11: Full gates, push, and CI
 
 **Steps:**
+
+- [ ] **Step 0: Rebase onto current origin/main and reconcile the real daemon overlap (note c).** When the lead says phase-13-perf-volume merged (or before final push regardless), `git fetch && git rebase origin/main`. phase-13 owns `Makefile`/`camp backup`/perf tests, but confirm whether it also touched the daemon files this phase edits — `git diff origin/main...HEAD -- crates/camp/src/daemon/socket.rs crates/camp/src/daemon/event_loop.rs crates/camp/src/daemon/patrol.rs crates/camp/src/main.rs` and inspect the corresponding origin/main changes — reconcile the `Response::Status`/`stalled`/status-handler edits and the `Command` enum (Session verb vs. phase-13's Backup verb) cleanly, then re-run all gates. Never push a branch not rebased on current main.
 
 - [ ] **Step 1: Run the full gate suite locally.**
 ```bash
@@ -761,15 +852,15 @@ Expected: five green (fmt, clippy, test ×2, gc-compat). Do NOT background this 
 
 ## Self-Review (spec coverage)
 
-- **Thin command wrappers over the CLI (§13.6):** Task 4 + parity test. ✓
-- **SessionStart (register/adopt), session-end, SubagentStop hooks (§10, §16):** Task 5; Stop→SessionEnd corrected per D5. ✓
-- **Fire-and-forget + throttle, verified by test (§16):** Task 5 (always exit 0 even with campd/db down; idempotent register; time-window breadcrumb throttle). ✓
+- **Thin command wrappers over the CLI (§13.6):** Task 4 + parity test (fenced-block scan, note a). ✓
+- **Session lifecycle hooks (§10, §16):** Task 5 — SessionStart (register+adopt), SessionEnd (end); Stop→SessionEnd corrected and SubagentStop dropped per D5/BLOCKER 2. ✓
+- **Fire-and-forget + throttle, verified by test (§16):** Task 5 (always exit 0 even with campd/db down; idempotent register via `session_status`; time-window breadcrumb throttle). ✓
 - **Optional PostToolUse breadcrumb OFF by default (§10):** Task 5 (shipped unregistered). ✓
 - **Worker skill = lifecycle contract:** Task 6 + verb-completeness test. ✓
-- **Statusline ▲live ●ready ✖red, visible degradation (§11):** Tasks 2, 3, 7. ✓
+- **Statusline ▲live ●ready ✖red, visible degradation (§11):** Tasks 2 (`stalled` set → `red`, BLOCKER 1 fix), 3, 7. ✓
 - **Starter pack content; formula passes doctor + gc gate (corpus symlink):** Task 8 (D3). ✓
 - **Zero shipped agent definitions (repo-policy test):** Task 9. ✓
 - **Attended Tier-0 as teammate per §8.4/A1, no headless+attach fallback:** Task 4 `/sling` note. ✓
 - **Exit criteria (drive a camp from a session end to end; zero agent defs; CI green):** Task 11. ✓
 
-**Open decisions for plan review:** D1 (session-lifecycle CLI verbs), D2 (`red` on the status socket = stalled sessions), D5 (Stop→SessionEnd + in-PR spec edit — **needs lead sign-off**). D3, D4, D6 are settled recommendations.
+**Decision status (rev 2):** D1 ACCEPTED; D2 semantic ACCEPTED, mechanism corrected (BLOCKER 1 — `stalled` HashSet); D5 VERIFIED (SessionEnd) with SubagentStop dropped (BLOCKER 2); D3/D4/D6 settled. Non-blocking notes a/b/c folded in (Tasks 4/5/11). No open decisions remain — resubmitting for a fresh plan-review pass.
