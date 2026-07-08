@@ -12,7 +12,10 @@ use camp_core::ledger::Ledger;
 use crate::campdir::CampDir;
 
 pub fn run(camp: &CampDir, city: &Path, skip_untranslatable: bool) -> anyhow::Result<()> {
-    let ledger = Ledger::open(&camp.db_path())?;
+    // Read-only by construction (SQLITE_OPEN_READ_ONLY), matching the
+    // export module's read-only claim — not just by discipline (PR #18
+    // review finding 4).
+    let ledger = Ledger::open_read_only(&camp.db_path())?;
     let config = CampConfig::load(&camp.config_path())?;
     let report = export_city(
         &ledger,
