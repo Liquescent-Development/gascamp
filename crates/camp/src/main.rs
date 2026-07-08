@@ -228,7 +228,13 @@ enum Command {
         command: SessionCommand,
     },
     /// One campd status snapshot as plain text (auto-starts the daemon)
-    Top,
+    Top {
+        /// Render the compact fleet badge (▲live ●ready ✖red) from a
+        /// read-only socket query. Never auto-starts campd; degrades to
+        /// empty output + a stderr note when campd is down (spec §11).
+        #[arg(long)]
+        statusline: bool,
+    },
     /// Write a consistent, integrity-checked copy of the ledger (VACUUM
     /// INTO). DEST must not already exist.
     Backup {
@@ -537,9 +543,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 } => cmd::session::end(&camp, name, reason, exit_code, signal, actor),
             }
         }
-        Command::Top => {
+        Command::Top { statusline } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
-            cmd::top::run(&camp)
+            if statusline {
+                cmd::top::statusline(&camp)
+            } else {
+                cmd::top::run(&camp)
+            }
         }
         Command::Backup { dest } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
