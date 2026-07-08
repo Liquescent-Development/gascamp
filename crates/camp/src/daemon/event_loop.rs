@@ -491,6 +491,32 @@ fn drain_lines(
                 };
                 respond(&mut conn.stream, &response)?;
             }
+            Ok(Request::Adopt) => {
+                // The startup routine, on demand (spec §8.5). Its events
+                // (session.crashed/stopped, sweep dispositions) settle in
+                // this same wake, after the summary is answered.
+                let response = match super::patrol::adopt(ledger, patrol, dispatcher) {
+                    Ok(s) => Response::Adopt {
+                        ok: true,
+                        crashed: s.crashed,
+                        rearmed: s.rearmed,
+                        released: s.released,
+                        swept: s.swept,
+                        kept: s.kept,
+                    },
+                    Err(e) => {
+                        eprintln!("campd: adopt failed: {e:#}");
+                        Response::Error {
+                            ok: false,
+                            error: format!("adopt failed: {e}"),
+                        }
+                    }
+                };
+                respond(&mut conn.stream, &response)?;
+                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, patrol) {
+                    eprintln!("campd: adopt settle failed: {e:#}");
+                }
+            }
             Err(e) => {
                 respond(
                     &mut conn.stream,

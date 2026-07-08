@@ -149,7 +149,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
     // against the process table — dead rows crash (beads release), living
     // workers re-arm, finished lingerers release, orphan worktrees sweep.
     // Its events drain in the settle below.
-    let adopted = patrol::adopt(&mut ledger, &mut patrol, &mut dispatcher, camp, &config)?;
+    let adopted = patrol::adopt(&mut ledger, &mut patrol, &mut dispatcher)?;
     if adopted != patrol::AdoptSummary::default() {
         eprintln!(
             "campd: adopted: {} crashed, {} re-armed, {} released, {} worktrees swept, {} kept",
@@ -271,6 +271,17 @@ mod tests {
 
         let poke = request(&mut stream, r#"{"op":"poke","seq":1}"#);
         assert_eq!(poke, serde_json::json!({"ok": true}));
+
+        // Phase 11: adopt on demand — a fresh camp reconciles to zeros
+        // and the daemon keeps serving.
+        let adopt = request(&mut stream, r#"{"op":"adopt"}"#);
+        assert_eq!(
+            adopt,
+            serde_json::json!({
+                "ok": true, "crashed": 0, "rearmed": 0, "released": 0,
+                "swept": 0, "kept": 0
+            })
+        );
 
         // an unknown op gets a clean error response on a fresh connection
         let mut bad = UnixStream::connect(&sock).unwrap();

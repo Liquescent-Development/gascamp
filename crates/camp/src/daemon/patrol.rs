@@ -898,9 +898,17 @@ pub fn adopt(
     ledger: &mut Ledger,
     patrol: &mut PatrolRuntime,
     dispatcher: &mut Dispatcher,
-    camp: &crate::campdir::CampDir,
-    config: &CampConfig,
 ) -> Result<AdoptSummary> {
+    // The camp root and config ride with the patrol runtime (loaded at
+    // campd start): a parse-only config has no root and cannot adopt.
+    let config = patrol.camp_config.clone();
+    let root = config
+        .root
+        .clone()
+        .context("adoption needs the camp root (config was parsed, not loaded)")?;
+    let camp = crate::campdir::CampDir { root };
+    let config = &config;
+    let camp = &camp;
     let mut summary = AdoptSummary::default();
     let now = Timestamp::now();
     for row in ledger.live_sessions()? {
@@ -1954,9 +1962,6 @@ mod tests {
         let _spawning = crate::daemon::spawn_probe_guard();
         let (dir, mut ledger, config, mut patrol) = fixture();
         let mut dispatcher = dispatcher_for(dir.path(), &config);
-        let camp = crate::campdir::CampDir {
-            root: dir.path().to_path_buf(),
-        };
         woke_row(
             &mut ledger,
             "t/dev/1",
@@ -1965,7 +1970,7 @@ mod tests {
             &dir.path().join("projects/-p/dead.jsonl"),
             true,
         );
-        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher).unwrap();
         assert_eq!(summary.crashed, 1);
         assert_eq!(summary.rearmed, 0);
         let events = ledger.events_range(1, None).unwrap();
@@ -1990,9 +1995,6 @@ mod tests {
         let _spawning = crate::daemon::spawn_probe_guard();
         let (dir, mut ledger, config, mut patrol) = fixture();
         let mut dispatcher = dispatcher_for(dir.path(), &config);
-        let camp = crate::campdir::CampDir {
-            root: dir.path().to_path_buf(),
-        };
         // live worker, OPEN bead → re-armed
         let live_uuid = "11ve0000-0000-4000-8000-00000000aaaa";
         let mut live = std::process::Command::new("bash")
@@ -2033,7 +2035,7 @@ mod tests {
             })
             .unwrap();
 
-        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher).unwrap();
         assert_eq!(summary.rearmed, 1, "{summary:?}");
         assert_eq!(summary.released, 1, "{summary:?}");
         assert_eq!(summary.crashed, 0, "{summary:?}");
@@ -2139,7 +2141,7 @@ mod tests {
         // gc-999: no such bead → never deleted, reported only
         std::fs::create_dir_all(worktrees.join("gc-999")).unwrap();
 
-        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher).unwrap();
         assert_eq!(summary.swept, 1, "{summary:?}");
         assert_eq!(summary.kept, 1, "{summary:?}");
         assert!(!worktrees.join("gc-20").exists(), "pass → removed");
@@ -2172,7 +2174,7 @@ mod tests {
         );
 
         // exact idempotency for the sweep half: dispositions recorded
-        let summary2 = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        let summary2 = adopt(&mut ledger, &mut patrol, &mut dispatcher).unwrap();
         assert_eq!(summary2, AdoptSummary::default(), "{summary2:?}");
     }
 
@@ -2183,9 +2185,6 @@ mod tests {
         let _spawning = crate::daemon::spawn_probe_guard();
         let (dir, mut ledger, config, mut patrol) = fixture();
         let mut dispatcher = dispatcher_for(dir.path(), &config);
-        let camp = crate::campdir::CampDir {
-            root: dir.path().to_path_buf(),
-        };
         let live_uuid = "1de40000-0000-4000-8000-00000000cccc";
         let mut live = std::process::Command::new("bash")
             .arg("-c")
@@ -2200,10 +2199,10 @@ mod tests {
             &dir.path().join("projects/-p/live.jsonl"),
             true,
         );
-        let first = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        let first = adopt(&mut ledger, &mut patrol, &mut dispatcher).unwrap();
         assert_eq!(first.rearmed, 1);
         let events_before = ledger.events_range(1, None).unwrap().len();
-        let second = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        let second = adopt(&mut ledger, &mut patrol, &mut dispatcher).unwrap();
         assert_eq!(second, AdoptSummary::default(), "{second:?}");
         assert_eq!(
             ledger.events_range(1, None).unwrap().len(),
