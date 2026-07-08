@@ -19,6 +19,7 @@ mod cmd {
     pub mod remember;
     pub mod rig;
     pub mod search;
+    pub mod session;
     pub mod show;
     pub mod sling;
     pub mod stop;
@@ -220,6 +221,12 @@ enum Command {
     Stop,
     /// Reconcile the session registry against reality (auto at campd start)
     Adopt,
+    /// Register or end an attended session (the plugin's SessionStart /
+    /// SessionEnd hooks wrap these; spec §8.4/§13.2)
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// One campd status snapshot as plain text (auto-starts the daemon)
     Top,
     /// Write a consistent, integrity-checked copy of the ledger (VACUUM
@@ -227,6 +234,58 @@ enum Command {
     Backup {
         /// Destination file for the backup copy.
         dest: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Register an attended session (appends session.woke)
+    Register {
+        /// Session registry name (unique)
+        #[arg(long)]
+        name: String,
+        /// Agent role name (e.g. "attended")
+        #[arg(long)]
+        agent: String,
+        /// Rig the session works in
+        #[arg(long)]
+        rig: Option<String>,
+        /// Claude Code session id
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
+        /// Transcript file path (patrol's stall-watch target)
+        #[arg(long)]
+        transcript: Option<String>,
+        /// OS process id
+        #[arg(long)]
+        pid: Option<i64>,
+        /// A bead this session has claimed
+        #[arg(long)]
+        bead: Option<String>,
+        /// Worktree the session runs in, when isolated
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Event actor / provenance (default: hook:session-start)
+        #[arg(long, default_value = "hook:session-start")]
+        actor: String,
+    },
+    /// End an attended session (appends session.stopped)
+    End {
+        /// Session registry name
+        #[arg(long)]
+        name: String,
+        /// How the session ended (searchable note)
+        #[arg(long)]
+        reason: Option<String>,
+        /// Process exit code (audit-only)
+        #[arg(long = "exit-code")]
+        exit_code: Option<i64>,
+        /// Terminating signal (audit-only)
+        #[arg(long)]
+        signal: Option<i64>,
+        /// Event actor / provenance (default: hook:session-end)
+        #[arg(long, default_value = "hook:session-end")]
+        actor: String,
     },
 }
 
@@ -452,6 +511,31 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Stop => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::stop::run(&camp)
+        }
+        Command::Session { command } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            match command {
+                SessionCommand::Register {
+                    name,
+                    agent,
+                    rig,
+                    session_id,
+                    transcript,
+                    pid,
+                    bead,
+                    worktree,
+                    actor,
+                } => cmd::session::register(
+                    &camp, name, agent, rig, session_id, transcript, pid, bead, worktree, actor,
+                ),
+                SessionCommand::End {
+                    name,
+                    reason,
+                    exit_code,
+                    signal,
+                    actor,
+                } => cmd::session::end(&camp, name, reason, exit_code, signal, actor),
+            }
         }
         Command::Top => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
