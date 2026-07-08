@@ -24,6 +24,10 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::RigAdded => rig_added(event),
         EventType::CampdAutostarted => campd_autostarted(event),
         EventType::RunCooked => run_cooked(event),
+        EventType::OrderFired => order_fired(event),
+        EventType::OrderCompleted => order_completed(event),
+        EventType::OrderFailed => order_failed(event),
+        EventType::ConfigChanged => config_changed(event),
         // Log-only events: no state effect.
         EventType::CampdStarted | EventType::CampdStopped => Ok(()),
     }
@@ -422,4 +426,187 @@ fn session_ended(conn: &Connection, event: &Event, new_status: &str) -> Result<(
             reason: format!("session already ended with status {s:?}"),
         }),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrderFired {
+    order: String,
+    trigger: String,
+    #[serde(default)]
+    scheduled_ts: Option<String>,
+    #[serde(default)]
+    catch_up: Option<bool>,
+    #[serde(default)]
+    cause_seq: Option<i64>,
+}
+
+/// `order.fired` is log-only: the durable declaration that a trigger
+/// tripped (spec §9). campd cooks the formula in response to *processing*
+/// this event, so a fire is never lost to a crash (Phase 10 plan
+/// Decision D). The fold validates the cause shape per trigger.
+fn order_fired(event: &Event) -> Result<(), CoreError> {
+    let p: OrderFired = payload(event)?;
+    let bad = |reason: String| CoreError::InvalidEventData {
+        event_type: event.kind.as_str().to_owned(),
+        reason,
+    };
+    if p.order.is_empty() {
+        return Err(bad("empty order".into()));
+    }
+    match p.trigger.as_str() {
+        "cron" => {
+            if p.scheduled_ts.is_none() {
+                return Err(bad("cron trigger requires scheduled_ts".into()));
+            }
+            if p.cause_seq.is_some() {
+                return Err(bad("cron trigger does not carry cause_seq".into()));
+            }
+        }
+        "event" => {
+            if p.cause_seq.is_none() {
+                return Err(bad("event trigger requires cause_seq".into()));
+            }
+            if p.scheduled_ts.is_some() || p.catch_up.is_some() {
+                return Err(bad("event trigger carries only cause_seq".into()));
+            }
+        }
+        "manual" => {
+            if p.scheduled_ts.is_some() || p.catch_up.is_some() || p.cause_seq.is_some() {
+                return Err(bad("manual trigger carries no schedule data".into()));
+            }
+        }
+        other => return Err(bad(format!("unknown trigger {other:?}"))),
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrderCompleted {
+    order: String,
+    #[allow(dead_code)] // audit content: validated for shape, not read back
+    fired_seq: i64,
+    root_bead: String,
+    run_id: String,
+    outcome: String,
+}
+
+/// `order.completed` is log-only: the run's truth lives in its beads; this
+/// event closes the order's cause chain (fired → cooked → root closed).
+fn order_completed(event: &Event) -> Result<(), CoreError> {
+    let p: OrderCompleted = payload(event)?;
+    let bad = |reason: String| CoreError::InvalidEventData {
+        event_type: event.kind.as_str().to_owned(),
+        reason,
+    };
+    for (field, value) in [
+        ("order", &p.order),
+        ("root_bead", &p.root_bead),
+        ("run_id", &p.run_id),
+    ] {
+        if value.is_empty() {
+            return Err(bad(format!("empty {field}")));
+        }
+    }
+    if p.outcome != "pass" {
+        return Err(bad(format!(
+            "order.completed outcome must be \"pass\", got {:?} (failures are order.failed)",
+            p.outcome
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrderFailed {
+    order: String,
+    #[allow(dead_code)] // audit content: validated for shape, not read back
+    fired_seq: i64,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    root_bead: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    outcome: Option<String>,
+}
+
+/// `order.failed` is log-only and has exactly two legal shapes: a
+/// fire-stage failure `{order, fired_seq, error}` or a run failure
+/// `{order, fired_seq, root_bead, run_id, outcome:"fail"}`.
+fn order_failed(event: &Event) -> Result<(), CoreError> {
+    let p: OrderFailed = payload(event)?;
+    let bad = |reason: String| CoreError::InvalidEventData {
+        event_type: event.kind.as_str().to_owned(),
+        reason,
+    };
+    if p.order.is_empty() {
+        return Err(bad("empty order".into()));
+    }
+    match (&p.error, &p.root_bead) {
+        (Some(error), None) => {
+            if error.is_empty() {
+                return Err(bad("empty error".into()));
+            }
+            if p.run_id.is_some() || p.outcome.is_some() {
+                return Err(bad("the error shape carries no run fields".into()));
+            }
+            Ok(())
+        }
+        (None, Some(root_bead)) => {
+            if root_bead.is_empty() {
+                return Err(bad("empty root_bead".into()));
+            }
+            if p.run_id.as_deref().is_none_or(str::is_empty) {
+                return Err(bad("the run shape requires run_id".into()));
+            }
+            if p.outcome.as_deref() != Some("fail") {
+                return Err(bad("the run shape requires outcome \"fail\"".into()));
+            }
+            Ok(())
+        }
+        _ => Err(bad(
+            "exactly one of error / root_bead must be present".into()
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigChanged {
+    path: String,
+    applied: bool,
+    #[serde(default)]
+    orders: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// `config.changed` is log-only (spec §13.4: config changes are themselves
+/// events; camp.toml stays the source of truth). `applied` decides the
+/// legal shape: applied changes report the order count, rejected ones the
+/// error.
+fn config_changed(event: &Event) -> Result<(), CoreError> {
+    let p: ConfigChanged = payload(event)?;
+    let bad = |reason: String| CoreError::InvalidEventData {
+        event_type: event.kind.as_str().to_owned(),
+        reason,
+    };
+    if p.path.is_empty() {
+        return Err(bad("empty path".into()));
+    }
+    if p.applied {
+        if p.error.is_some() {
+            return Err(bad("an applied change carries no error".into()));
+        }
+        if p.orders.is_none() {
+            return Err(bad("an applied change reports its order count".into()));
+        }
+    } else if p.error.as_deref().is_none_or(str::is_empty) {
+        return Err(bad("a rejected change requires the error".into()));
+    }
+    Ok(())
 }

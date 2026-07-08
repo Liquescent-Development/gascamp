@@ -8,6 +8,7 @@ pub mod event;
 pub mod formula;
 pub mod id;
 pub mod ledger;
+pub mod orders;
 pub mod readiness;
 pub mod search;
 pub mod vocab;

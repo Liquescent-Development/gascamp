@@ -13,6 +13,9 @@ pub const GC_MIRRORED_EVENTS: &[&str] = &[
     "session.woke",
     "session.stopped",
     "session.crashed",
+    "order.fired",
+    "order.completed",
+    "order.failed",
 ];
 
 /// Camp-specific names — additive; never redefinitions of gc names.
@@ -21,6 +24,7 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "campd.started",
     "campd.stopped",
     "campd.autostarted",
+    "config.changed",
     "rig.added",
     "run.cooked",
 ];
