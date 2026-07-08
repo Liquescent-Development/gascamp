@@ -51,7 +51,10 @@ impl Daemon {
         let stdout = child.stdout.take().unwrap();
         let mut line = String::new();
         BufReader::new(stdout).read_line(&mut line).unwrap();
-        assert!(line.starts_with(READY_PREFIX), "unexpected campd first line: {line:?}");
+        assert!(
+            line.starts_with(READY_PREFIX),
+            "unexpected campd first line: {line:?}"
+        );
         Daemon { child }
     }
 }
@@ -70,9 +73,15 @@ fn statusline_degrades_visibly_when_campd_is_down() {
     // campd is NOT running; --statusline must NOT auto-start it.
     let out = camp(&root, &["top", "--statusline"]);
     assert!(out.status.success(), "must exit 0 (fire-and-forget)");
-    assert!(out.stdout.is_empty(), "stdout must be empty when campd is down");
+    assert!(
+        out.stdout.is_empty(),
+        "stdout must be empty when campd is down"
+    );
     let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(stderr.contains("campd"), "must emit a visible stderr note, got: {stderr:?}");
+    assert!(
+        stderr.contains("campd"),
+        "must emit a visible stderr note, got: {stderr:?}"
+    );
 
     // and it must not have started a daemon
     let sock = root.join("campd.sock");
@@ -89,7 +98,11 @@ fn statusline_renders_the_badge_when_campd_is_up() {
     let _daemon = Daemon::spawn(&root);
 
     let out = camp(&root, &["top", "--statusline"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let badge = String::from_utf8(out.stdout).unwrap();
     let badge = badge.trim();
     // fresh camp: no live sessions, no ready beads, none stalled

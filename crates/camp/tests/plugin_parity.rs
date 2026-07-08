@@ -53,10 +53,7 @@ fn wrapped_subcommand(scan: &str) -> String {
     let toks: Vec<&str> = scan.split_whitespace().collect();
     toks.windows(2)
         .find(|w| w[0] == "camp")
-        .map(|w| {
-            w[1].trim_matches(|c: char| !c.is_alphanumeric())
-                .to_owned()
-        })
+        .map(|w| w[1].trim_matches(|c: char| !c.is_alphanumeric()).to_owned())
         .expect("a command wrapper's `!` block must invoke `camp <sub>`")
 }
 

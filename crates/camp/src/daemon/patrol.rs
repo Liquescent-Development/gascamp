@@ -1449,7 +1449,11 @@ mod tests {
         patrol
             .apply_tracking(&mut ledger, ts("2026-07-07T07:00:00Z"))
             .unwrap();
-        assert_eq!(patrol.stalled_count(), 0, "a freshly tracked worker is not stalled");
+        assert_eq!(
+            patrol.stalled_count(),
+            0,
+            "a freshly tracked worker is not stalled"
+        );
 
         // stall timer fires (600s default) → nudge declared → worker is red
         let fires = patrol.fire_due(ts("2026-07-07T07:10:00Z"));
@@ -1464,7 +1468,11 @@ mod tests {
         patrol
             .apply_tracking(&mut ledger, ts("2026-07-07T07:11:00Z"))
             .unwrap();
-        assert_eq!(patrol.stalled_count(), 0, "worker activity clears the stalled flag");
+        assert_eq!(
+            patrol.stalled_count(),
+            0,
+            "worker activity clears the stalled flag"
+        );
     }
 
     fn seeded_bead(ledger: &mut Ledger, id: &str) {

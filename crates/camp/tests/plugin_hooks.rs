@@ -41,8 +41,23 @@ fn init_camp(dir: &Path) -> PathBuf {
     let root = dir.join(".camp");
     let rig = dir.join("repo");
     std::fs::create_dir_all(&rig).unwrap();
-    let out = camp(&root, &["rig", "add", rig.to_str().unwrap(), "--prefix", "gc", "--name", "gc"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = camp(
+        &root,
+        &[
+            "rig",
+            "add",
+            rig.to_str().unwrap(),
+            "--prefix",
+            "gc",
+            "--name",
+            "gc",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     root
 }
 
@@ -80,7 +95,12 @@ fn run_script(
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
     child.wait_with_output().unwrap()
 }
 
@@ -114,7 +134,10 @@ impl Daemon {
         let stdout = child.stdout.take().unwrap();
         let mut line = String::new();
         BufReader::new(stdout).read_line(&mut line).unwrap();
-        assert!(line.starts_with(READY_PREFIX), "unexpected campd first line: {line:?}");
+        assert!(
+            line.starts_with(READY_PREFIX),
+            "unexpected campd first line: {line:?}"
+        );
         Daemon { child }
     }
 }
@@ -156,7 +179,12 @@ fn session_end_hook_stops_the_registered_session() {
     let root = init_camp(dir.path());
     let _daemon = Daemon::spawn(&root);
 
-    let out = run_hook("session-start.sh", &fixture("session-start.json"), &root, &[]);
+    let out = run_hook(
+        "session-start.sh",
+        &fixture("session-start.json"),
+        &root,
+        &[],
+    );
     assert!(out.status.success());
     let out = run_hook("session-end.sh", &fixture("session-end.json"), &root, &[]);
     assert!(out.status.success(), "session-end hook must exit 0");
@@ -171,7 +199,12 @@ fn breadcrumb_hook_throttles_repeats() {
 
     // large window: two rapid fires → exactly one milestone (2nd throttled)
     for _ in 0..2 {
-        let out = run_hook("post-tool-use.sh", &payload, &root, &[("CAMP_BREADCRUMB_THROTTLE", "3600")]);
+        let out = run_hook(
+            "post-tool-use.sh",
+            &payload,
+            &root,
+            &[("CAMP_BREADCRUMB_THROTTLE", "3600")],
+        );
         assert!(out.status.success());
     }
     let milestones = || {
@@ -180,10 +213,19 @@ fn breadcrumb_hook_throttles_repeats() {
             .filter(|e| e["type"] == "worker.milestone")
             .count()
     };
-    assert_eq!(milestones(), 1, "the second breadcrumb within the window is throttled");
+    assert_eq!(
+        milestones(),
+        1,
+        "the second breadcrumb within the window is throttled"
+    );
 
     // window 0 disables throttling → the next fire emits again
-    let out = run_hook("post-tool-use.sh", &payload, &root, &[("CAMP_BREADCRUMB_THROTTLE", "0")]);
+    let out = run_hook(
+        "post-tool-use.sh",
+        &payload,
+        &root,
+        &[("CAMP_BREADCRUMB_THROTTLE", "0")],
+    );
     assert!(out.status.success());
     assert_eq!(milestones(), 2, "window 0 bypasses the throttle");
 }
@@ -193,8 +235,17 @@ fn statusline_snippet_renders_the_badge_when_campd_is_up() {
     let dir = tempfile::tempdir().unwrap();
     let root = init_camp(dir.path());
     let _daemon = Daemon::spawn(&root);
-    let out = run_script("statusline/statusline.sh", &fixture("statusline.json"), &root, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_script(
+        "statusline/statusline.sh",
+        &fixture("statusline.json"),
+        &root,
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let badge = String::from_utf8(out.stdout).unwrap();
     assert_eq!(badge.trim(), "▲0 ●0 ✖0", "unexpected badge: {badge:?}");
 }
@@ -204,9 +255,17 @@ fn statusline_snippet_degrades_visibly_when_campd_is_down() {
     let dir = tempfile::tempdir().unwrap();
     let root = init_camp(dir.path());
     // no campd running; the snippet must not auto-start one
-    let out = run_script("statusline/statusline.sh", &fixture("statusline.json"), &root, &[]);
+    let out = run_script(
+        "statusline/statusline.sh",
+        &fixture("statusline.json"),
+        &root,
+        &[],
+    );
     assert!(out.status.success(), "statusline must exit 0");
-    assert!(out.stdout.is_empty(), "stdout must be empty when campd is down");
+    assert!(
+        out.stdout.is_empty(),
+        "stdout must be empty when campd is down"
+    );
     assert!(!out.stderr.is_empty(), "must emit a visible stderr note");
 }
 
@@ -221,7 +280,10 @@ fn hooks_exit_zero_even_when_camp_is_unavailable() {
         ("session-end.sh", "session-end.json"),
     ] {
         let out = run_hook(script, &fixture(fix), no_camp, &[]);
-        assert!(out.status.success(), "{script} must exit 0 even with no camp");
+        assert!(
+            out.status.success(),
+            "{script} must exit 0 even with no camp"
+        );
         assert!(
             !out.stderr.is_empty(),
             "{script} must emit a visible stderr note on failure"

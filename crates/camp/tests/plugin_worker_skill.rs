@@ -29,6 +29,12 @@ fn worker_skill_documents_every_lifecycle_verb() {
 fn worker_skill_has_skill_frontmatter() {
     let s = worker_skill();
     assert!(s.starts_with("---"), "must open with YAML frontmatter");
-    assert!(s.contains("name: worker"), "frontmatter must set name: worker");
-    assert!(s.contains("description:"), "frontmatter must have a description");
+    assert!(
+        s.contains("name: worker"),
+        "frontmatter must set name: worker"
+    );
+    assert!(
+        s.contains("description:"),
+        "frontmatter must have a description"
+    );
 }

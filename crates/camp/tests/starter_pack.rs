@@ -16,7 +16,8 @@ fn repo_root() -> PathBuf {
 #[test]
 fn starter_formula_is_the_corpus_file_and_doctor_accepts_it() {
     let pack_formula = repo_root().join("packs/starter/formulas/guarded-change.toml");
-    let corpus = repo_root().join("crates/camp-core/tests/fixtures/formulas/valid/guarded-change.toml");
+    let corpus =
+        repo_root().join("crates/camp-core/tests/fixtures/formulas/valid/guarded-change.toml");
 
     assert!(
         std::fs::symlink_metadata(&pack_formula)
@@ -59,5 +60,8 @@ fn starter_pack_ships_agent_definitions() {
 fn starter_pack_orders_example_exists() {
     let orders = repo_root().join("packs/starter/orders.toml");
     let s = std::fs::read_to_string(&orders).expect("packs/starter/orders.toml must exist");
-    assert!(s.contains("[[order]]"), "orders.toml must use the §9 [[order]] form");
+    assert!(
+        s.contains("[[order]]"),
+        "orders.toml must use the §9 [[order]] form"
+    );
 }

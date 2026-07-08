@@ -30,7 +30,12 @@ pub fn run(camp: &CampDir) -> Result<()> {
 pub fn statusline(camp: &CampDir) -> Result<()> {
     match socket::request(&camp.socket_path(), &Request::Status) {
         Ok(Response::Status { summary, red, .. }) => {
-            println!("▲{} ●{} ✖{}", summary.live_sessions.len(), summary.ready, red);
+            println!(
+                "▲{} ●{} ✖{}",
+                summary.live_sessions.len(),
+                summary.ready,
+                red
+            );
             Ok(())
         }
         Ok(other) => bail!("unexpected response to status: {other:?}"),

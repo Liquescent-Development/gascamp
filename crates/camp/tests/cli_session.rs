@@ -30,7 +30,12 @@ fn camp_stdin(root: &Path, args: &[&str], stdin: &str) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
     child.wait_with_output().unwrap()
 }
 
@@ -54,9 +59,21 @@ fn init_camp_with_rig(dir: &Path) -> PathBuf {
     std::fs::create_dir_all(&rig).unwrap();
     let out = camp(
         &root,
-        &["rig", "add", rig.to_str().unwrap(), "--prefix", "gc", "--name", "gc"],
+        &[
+            "rig",
+            "add",
+            rig.to_str().unwrap(),
+            "--prefix",
+            "gc",
+            "--name",
+            "gc",
+        ],
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     root
 }
 
@@ -90,7 +107,11 @@ fn register_appends_a_hook_registered_session_woke_then_end_stops_it() {
             "/tmp/S-1.jsonl",
         ],
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let events = events_json(&root);
     let woke = events
@@ -104,9 +125,20 @@ fn register_appends_a_hook_registered_session_woke_then_end_stops_it() {
 
     let out = camp(
         &root,
-        &["session", "end", "--name", "attended/S-1", "--reason", "user quit"],
+        &[
+            "session",
+            "end",
+            "--name",
+            "attended/S-1",
+            "--reason",
+            "user quit",
+        ],
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let events = events_json(&root);
     let stopped = events
@@ -123,7 +155,11 @@ fn hook_stdin_register_is_idempotent_and_session_end_stops_the_registered_sessio
 
     let start = r#"{"session_id":"S-1","transcript_path":"/t/S-1.jsonl","cwd":"/x","source":"startup","hook_event_name":"SessionStart"}"#;
     let out = camp_stdin(&root, &["session", "register", "--hook-stdin"], start);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     // repeat SessionStart (resume/clear reuses the id) → idempotent no-op, still success
     let out = camp_stdin(&root, &["session", "register", "--hook-stdin"], start);
     assert!(out.status.success(), "idempotent repeat must succeed");
@@ -135,11 +171,26 @@ fn hook_stdin_register_is_idempotent_and_session_end_stops_the_registered_sessio
 
     // SessionEnd for the SAME top-level session → exactly one session.stopped
     let end = r#"{"session_id":"S-1","source":"prompt_input_exit","hook_event_name":"SessionEnd"}"#;
-    let out = camp_stdin(&root, &["session", "end", "--hook-stdin", "--if-registered"], end);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = camp_stdin(
+        &root,
+        &["session", "end", "--hook-stdin", "--if-registered"],
+        end,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     // a second SessionEnd (already ended) → --if-registered no-op, still exactly one
-    let out = camp_stdin(&root, &["session", "end", "--hook-stdin", "--if-registered"], end);
-    assert!(out.status.success(), "if-registered end of an ended session must succeed");
+    let out = camp_stdin(
+        &root,
+        &["session", "end", "--hook-stdin", "--if-registered"],
+        end,
+    );
+    assert!(
+        out.status.success(),
+        "if-registered end of an ended session must succeed"
+    );
     assert_eq!(
         count_events(&root, "session.stopped", "attended/S-1"),
         1,
@@ -158,8 +209,16 @@ fn if_registered_end_is_a_noop_for_a_never_registered_session() {
     let dir = tempfile::tempdir().unwrap();
     let root = init_camp_with_rig(dir.path());
     let end = r#"{"session_id":"NEVER","source":"other","hook_event_name":"SessionEnd"}"#;
-    let out = camp_stdin(&root, &["session", "end", "--hook-stdin", "--if-registered"], end);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = camp_stdin(
+        &root,
+        &["session", "end", "--hook-stdin", "--if-registered"],
+        end,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(
         events_json(&root)
             .iter()
