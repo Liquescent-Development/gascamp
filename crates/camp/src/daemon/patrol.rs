@@ -296,13 +296,37 @@ impl PatrolRuntime {
     /// verified the process alive at `pid`; the timer starts fresh
     /// (restart grace) and later restarts go through the probe-first
     /// non-child path.
-    fn adopt_track(&mut self, session: &str, mut tracked: Tracked, pid: i64) {
-        if tracked.owned == Owned::Child {
-            tracked.owned = Owned::AdoptedPid(pid);
-        }
+    /// Whether patrol already tracks this session (adopt skips these —
+    /// round-1 minor 4).
+    pub fn is_tracked(&self, session: &str) -> bool {
+        self.tracked.contains_key(session)
+    }
+
+    /// Adopt a live registry row (Decision F): track at the probed pid,
+    /// annotate-only when the row was not campd-spawned.
+    fn adopt_from_row(&mut self, row: &camp_core::ledger::SessionRow, pid: i64) {
+        let (Some(transcript), Some(bead)) = (row.transcript_path.as_deref(), row.bead.as_deref())
+        else {
+            return; // callers check; belt-and-braces
+        };
+        let owned = if row.woke_actor == "campd" {
+            Owned::AdoptedPid(pid)
+        } else {
+            Owned::Annotate
+        };
         self.track_ops.push(TrackOp::Track {
-            session: session.to_owned(),
-            tracked,
+            session: row.name.clone(),
+            tracked: Tracked {
+                bead: bead.to_owned(),
+                agent: row.agent.clone(),
+                rig: row.rig.clone(),
+                claude_session_id: row.claude_session_id.clone(),
+                transcript_path: PathBuf::from(transcript),
+                worktree: row.worktree.as_deref().map(PathBuf::from),
+                owned,
+                base_threshold: None,
+                watch_registered: false,
+            },
         });
     }
 
@@ -851,6 +875,184 @@ impl PatrolRuntime {
         self.timers.disarm(session);
         Ok(())
     }
+}
+
+/// One `camp adopt` outcome (spec §8.5): what reconciliation observed and
+/// did. All-zero on a second run — adoption is idempotent (already-tracked
+/// sessions are skipped; dispositions are recorded once).
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AdoptSummary {
+    pub crashed: usize,
+    pub rearmed: usize,
+    pub released: usize,
+    pub swept: usize,
+    pub kept: usize,
+}
+
+/// Reconcile the session registry against reality (spec §8.5: run
+/// automatically at campd start, available as `camp adopt`). Observation
+/// over state: the process table (uuid probe) is the ground truth, never
+/// the registry row alone. Per live row not already tracked (campd's own
+/// children included — round-1 minor 4): dead → session.crashed (the fold
+/// releases beads, budgets intact); alive with an open bead → re-arm as
+/// AdoptedPid; alive with its bead closed/absent and campd-spawned →
+/// release (kill + reasoned stop; a finished stream worker lingers by P3).
+/// Then sweep <camp>/worktrees/ by the Decision G table.
+pub fn adopt(
+    ledger: &mut Ledger,
+    patrol: &mut PatrolRuntime,
+    dispatcher: &mut Dispatcher,
+    camp: &crate::campdir::CampDir,
+    config: &CampConfig,
+) -> Result<AdoptSummary> {
+    let mut summary = AdoptSummary::default();
+    let now = Timestamp::now();
+    for row in ledger.live_sessions()? {
+        if patrol.is_tracked(&row.name) || dispatcher.is_child(&row.name) {
+            continue; // already under patrol/parentage: nothing to reconcile
+        }
+        let alive = probe_alive(
+            row.claude_session_id.as_deref(),
+            row.pid,
+            &dispatcher.known_pids(),
+        )?;
+        match alive {
+            None => {
+                ledger.append(EventInput {
+                    kind: EventType::SessionCrashed,
+                    rig: row.rig.clone(),
+                    actor: "campd".into(),
+                    bead: None,
+                    data: serde_json::json!({
+                        "name": row.name,
+                        "reason": "adopt: process not found",
+                    }),
+                })?;
+                summary.crashed += 1;
+            }
+            Some(pid) => {
+                let bead_open = match row.bead.as_deref() {
+                    Some(bead) => ledger.get_bead(bead)?.is_some_and(|b| b.status != "closed"),
+                    None => false,
+                };
+                if bead_open && row.transcript_path.is_some() {
+                    patrol.adopt_from_row(&row, pid);
+                    summary.rearmed += 1;
+                } else if row.woke_actor == "campd" {
+                    // A finished-but-lingering stream worker (P3): the
+                    // release rule, non-child flavor. Never applied to
+                    // attended sessions (spec §10: never kill in the TUI).
+                    kill_pid(pid)?;
+                    ledger.append(EventInput {
+                        kind: EventType::SessionStopped,
+                        rig: row.rig.clone(),
+                        actor: "campd".into(),
+                        bead: None,
+                        data: serde_json::json!({
+                            "name": row.name,
+                            "reason": "released after bead close",
+                        }),
+                    })?;
+                    summary.released += 1;
+                }
+                // attended + no open bead: not patrol's business
+            }
+        }
+    }
+    patrol.apply_tracking(ledger, now)?;
+    sweep_worktrees(ledger, camp, config, &mut summary)?;
+    Ok(summary)
+}
+
+/// The Decision G sweep table: complete interrupted dispositions, never
+/// delete what camp cannot attribute, leave in-use/reusable worktrees be.
+fn sweep_worktrees(
+    ledger: &mut Ledger,
+    camp: &crate::campdir::CampDir,
+    config: &CampConfig,
+    summary: &mut AdoptSummary,
+) -> Result<()> {
+    let worktrees = camp.worktrees_path();
+    let entries = match std::fs::read_dir(&worktrees) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", worktrees.display()));
+        }
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", worktrees.display()))?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let bead_id = entry.file_name().to_string_lossy().into_owned();
+        let Some(bead) = ledger.get_bead(&bead_id)? else {
+            // Unattributable residue: report loudly, never delete.
+            eprintln!(
+                "campd adopt: worktree {} matches no bead; left in place",
+                entry.path().display()
+            );
+            continue;
+        };
+        if bead.status != "closed" {
+            continue; // in use, or awaiting re-dispatch (reused, Decision H)
+        }
+        // already disposed? (idempotency: one disposition per bead)
+        let disposed = ledger.events_for_bead(&bead_id)?.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventType::WorktreeKept | EventType::BeadWorktreeReaped
+            )
+        });
+        if disposed {
+            continue;
+        }
+        if bead.outcome.as_deref() == Some("pass") {
+            // complete the interrupted decision-H disposition: remove
+            let removal = match config.rig(&bead.rig) {
+                Ok(rig) => crate::daemon::spawn::remove_worktree(&rig.path, &entry.path()),
+                Err(e) => Err(anyhow::anyhow!("rig not configured: {e}")),
+            };
+            match removal {
+                Ok(()) => {
+                    ledger.append(EventInput {
+                        kind: EventType::BeadWorktreeReaped,
+                        rig: Some(bead.rig.clone()),
+                        actor: "campd".into(),
+                        bead: Some(bead_id.clone()),
+                        data: serde_json::json!({ "path": entry.path() }),
+                    })?;
+                    summary.swept += 1;
+                }
+                Err(e) => {
+                    ledger.append(EventInput {
+                        kind: EventType::WorktreeKept,
+                        rig: Some(bead.rig.clone()),
+                        actor: "campd".into(),
+                        bead: Some(bead_id.clone()),
+                        data: serde_json::json!({
+                            "path": entry.path(),
+                            "reason": format!("adopt: removal failed: {e:#}"),
+                        }),
+                    })?;
+                    summary.kept += 1;
+                }
+            }
+        } else {
+            ledger.append(EventInput {
+                kind: EventType::WorktreeKept,
+                rig: Some(bead.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(bead_id.clone()),
+                data: serde_json::json!({
+                    "path": entry.path(),
+                    "reason": "adopt: found after interrupted disposition; kept for forensics",
+                }),
+            })?;
+            summary.kept += 1;
+        }
+    }
+    Ok(())
 }
 
 /// The mechanical status-request turn (machinery like WORKER_CONTRACT,
@@ -1711,6 +1913,314 @@ mod tests {
             .collect();
         assert_eq!(crashed.last().unwrap().data["reason"], "patrol restart");
         assert_eq!(crashed.last().unwrap().data["cause_seq"], 99);
+    }
+
+    // ---- Task 11.12: adoption --------------------------------------------
+
+    fn append_and_get(ledger: &mut Ledger, input: EventInput) -> Event {
+        let seq = ledger.append(input).unwrap();
+        ledger.events_range(seq, Some(seq)).unwrap().remove(0)
+    }
+
+    fn woke_row(
+        ledger: &mut Ledger,
+        name: &str,
+        bead: &str,
+        uuid: &str,
+        transcript: &std::path::Path,
+        claim: bool,
+    ) {
+        seeded_bead(ledger, bead);
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some(bead.into()),
+                data: serde_json::json!({
+                    "name": name, "agent": "dev", "rig": "gc",
+                    "claude_session_id": uuid,
+                    "transcript_path": transcript,
+                    "bead": bead,
+                }),
+            })
+            .unwrap();
+        if claim {
+            ledger
+                .append(EventInput {
+                    kind: EventType::BeadClaimed,
+                    rig: Some("gc".into()),
+                    actor: "cli".into(),
+                    bead: Some(bead.into()),
+                    data: serde_json::json!({"session": name}),
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn adopt_marks_dead_sessions_crashed_and_releases_their_beads() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        woke_row(
+            &mut ledger,
+            "t/dev/1",
+            "gc-1",
+            "dead0000-0000-4000-8000-000000000000",
+            &dir.path().join("projects/-p/dead.jsonl"),
+            true,
+        );
+        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        assert_eq!(summary.crashed, 1);
+        assert_eq!(summary.rearmed, 0);
+        let events = ledger.events_range(1, None).unwrap();
+        let crashed = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.crashed")
+            .unwrap();
+        assert_eq!(crashed.data["name"], "t/dev/1");
+        assert!(
+            crashed.data["reason"]
+                .as_str()
+                .unwrap()
+                .contains("adopt: process not found")
+        );
+        let bead = ledger.get_bead("gc-1").unwrap().unwrap();
+        assert_eq!(bead.status, "open", "the fold released the claimed bead");
+        assert!(bead.claimed_by.is_none());
+    }
+
+    #[test]
+    fn adopt_rearms_living_sessions_and_releases_finished_ones() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        // live worker, OPEN bead → re-armed
+        let live_uuid = "11ve0000-0000-4000-8000-00000000aaaa";
+        let mut live = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("sleep 30 || true # {live_uuid}"))
+            .spawn()
+            .unwrap();
+        woke_row(
+            &mut ledger,
+            "t/dev/1",
+            "gc-1",
+            live_uuid,
+            &dir.path().join("projects/-p/live.jsonl"),
+            true,
+        );
+        // live worker, CLOSED bead → released (killed + reasoned stop)
+        let done_uuid = "d0ne0000-0000-4000-8000-00000000bbbb";
+        let mut done = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("sleep 30 || true # {done_uuid}"))
+            .spawn()
+            .unwrap();
+        woke_row(
+            &mut ledger,
+            "t/dev/2",
+            "gc-2",
+            done_uuid,
+            &dir.path().join("projects/-p/done.jsonl"),
+            true,
+        );
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-2".into()),
+                data: serde_json::json!({"outcome": "pass"}),
+            })
+            .unwrap();
+
+        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        assert_eq!(summary.rearmed, 1, "{summary:?}");
+        assert_eq!(summary.released, 1, "{summary:?}");
+        assert_eq!(summary.crashed, 0, "{summary:?}");
+        // the re-armed worker has a live timer
+        assert!(patrol.poll_timeout(ts("2026-07-07T07:00:00Z")).is_some());
+        assert!(patrol.is_tracked("t/dev/1"));
+        assert!(!patrol.is_tracked("t/dev/2"));
+        // the finished one was killed and stopped with the reason
+        let status = done.wait().unwrap();
+        assert!(!status.success(), "the finished lingerer was terminated");
+        let events = ledger.events_range(1, None).unwrap();
+        let stopped = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.stopped")
+            .unwrap();
+        assert_eq!(stopped.data["name"], "t/dev/2");
+        assert!(
+            stopped.data["reason"]
+                .as_str()
+                .unwrap()
+                .contains("released")
+        );
+        live.kill().unwrap();
+        live.wait().unwrap();
+    }
+
+    #[test]
+    fn adopt_sweeps_worktrees_by_the_decision_g_table() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        // a real git rig so worktree removal works
+        let rig = dir.path().join("rig");
+        std::fs::create_dir_all(&rig).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&rig)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        std::fs::write(
+            dir.path().join("camp.toml"),
+            format!(
+                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n",
+                rig.display()
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents/dev.md"),
+            "---\nname: dev\n---\nWork.\n",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open_with_clock(
+            &dir.path().join("camp.db"),
+            Box::new(FixedClock::new("2026-07-07T07:00:00Z")),
+        )
+        .unwrap();
+        let config = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let mut patrol = PatrolRuntime::new(patrol_config, &config);
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        let worktrees = camp.worktrees_path();
+
+        // gc-20: closed pass, interrupted disposition → removed + reaped
+        seeded_bead(&mut ledger, "gc-20");
+        crate::daemon::spawn::ensure_worktree(&rig, &worktrees, "gc-20").unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-20".into()),
+                data: serde_json::json!({"outcome": "pass"}),
+            })
+            .unwrap();
+        // gc-21: closed fail, undisposed → kept with the adopt reason
+        seeded_bead(&mut ledger, "gc-21");
+        crate::daemon::spawn::ensure_worktree(&rig, &worktrees, "gc-21").unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-21".into()),
+                data: serde_json::json!({"outcome": "fail"}),
+            })
+            .unwrap();
+        // gc-22: open → awaiting re-dispatch, untouched, no event
+        seeded_bead(&mut ledger, "gc-22");
+        crate::daemon::spawn::ensure_worktree(&rig, &worktrees, "gc-22").unwrap();
+        // gc-999: no such bead → never deleted, reported only
+        std::fs::create_dir_all(worktrees.join("gc-999")).unwrap();
+
+        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        assert_eq!(summary.swept, 1, "{summary:?}");
+        assert_eq!(summary.kept, 1, "{summary:?}");
+        assert!(!worktrees.join("gc-20").exists(), "pass → removed");
+        assert!(
+            worktrees.join("gc-21").exists(),
+            "fail → kept for forensics"
+        );
+        assert!(worktrees.join("gc-22").exists(), "open → reused later");
+        assert!(
+            worktrees.join("gc-999").exists(),
+            "unattributable → never deleted"
+        );
+        let events = ledger.events_range(1, None).unwrap();
+        let reaped: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind.as_str() == "bead.worktree.reaped")
+            .collect();
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].bead.as_deref(), Some("gc-20"));
+        let kept: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind.as_str() == "worktree.kept")
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].bead.as_deref(), Some("gc-21"));
+        assert!(
+            kept[0].data["reason"].as_str().unwrap().contains("adopt"),
+            "{}",
+            kept[0].data
+        );
+
+        // exact idempotency for the sweep half: dispositions recorded
+        let summary2 = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        assert_eq!(summary2, AdoptSummary::default(), "{summary2:?}");
+    }
+
+    /// ROUND-1 MINOR 4: a second adopt with a still-live ADOPTED worker in
+    /// play is exactly zero — already-tracked sessions are skipped.
+    #[test]
+    fn adopt_is_idempotent() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        let live_uuid = "1de40000-0000-4000-8000-00000000cccc";
+        let mut live = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("sleep 30 || true # {live_uuid}"))
+            .spawn()
+            .unwrap();
+        woke_row(
+            &mut ledger,
+            "t/dev/1",
+            "gc-1",
+            live_uuid,
+            &dir.path().join("projects/-p/live.jsonl"),
+            true,
+        );
+        let first = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        assert_eq!(first.rearmed, 1);
+        let events_before = ledger.events_range(1, None).unwrap().len();
+        let second = adopt(&mut ledger, &mut patrol, &mut dispatcher, &camp, &config).unwrap();
+        assert_eq!(second, AdoptSummary::default(), "{second:?}");
+        assert_eq!(
+            ledger.events_range(1, None).unwrap().len(),
+            events_before,
+            "a second adopt appends nothing"
+        );
+        live.kill().unwrap();
+        live.wait().unwrap();
     }
 
     #[test]
