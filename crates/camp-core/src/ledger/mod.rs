@@ -35,6 +35,23 @@ pub struct StatusSummary {
     pub open: u64,
 }
 
+/// One live `sessions` registry row with its `session.woke` provenance
+/// (Phase 11 adoption, spec §8.5). `woke_actor == "campd"` marks a
+/// campd-spawned worker; anything else is hook-registered (annotate-only).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionRow {
+    pub name: String,
+    pub agent: String,
+    pub rig: Option<String>,
+    pub claude_session_id: Option<String>,
+    pub transcript_path: Option<String>,
+    pub pid: Option<i64>,
+    pub bead: Option<String>,
+    pub spawned_ts: String,
+    pub woke_actor: String,
+    pub worktree: Option<String>,
+}
+
 impl Ledger {
     pub fn open(db_path: &Path) -> Result<Self, CoreError> {
         Self::open_with_clock(db_path, Box::new(SystemClock))
@@ -303,6 +320,58 @@ impl Ledger {
             ready,
             open,
         })
+    }
+
+    /// The live session registry rows, with each row's `session.woke`
+    /// provenance joined in (Phase 11, spec §8.5): `woke_actor` tells
+    /// adoption whether campd spawned the session (`"campd"`) or a hook
+    /// registered it (annotate-only patrol); `worktree` is the woke
+    /// payload's audit field (the sessions table deliberately has no
+    /// column — schema v1 is frozen). A live row without its woke event is
+    /// ledger corruption: the fold writes them in one transaction.
+    pub fn live_sessions(&self) -> Result<Vec<SessionRow>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.name, s.agent, s.rig, s.claude_session_id, s.transcript_path,
+                    s.pid, s.bead, s.spawned_ts,
+                    (SELECT e.actor FROM events e WHERE e.type = 'session.woke'
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
+                    (SELECT json_extract(e.data, '$.worktree') FROM events e
+                      WHERE e.type = 'session.woke'
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1)
+             FROM sessions s WHERE s.status = 'live' ORDER BY s.name",
+        )?;
+        let rows: Vec<(SessionRow, Option<String>)> = stmt
+            .query_map([], |r| {
+                let woke_actor: Option<String> = r.get(8)?;
+                Ok((
+                    SessionRow {
+                        name: r.get(0)?,
+                        agent: r.get(1)?,
+                        rig: r.get(2)?,
+                        claude_session_id: r.get(3)?,
+                        transcript_path: r.get(4)?,
+                        pid: r.get(5)?,
+                        bead: r.get(6)?,
+                        spawned_ts: r.get(7)?,
+                        woke_actor: String::new(), // filled below after the NULL check
+                        worktree: r.get(9)?,
+                    },
+                    woke_actor,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter()
+            .map(|(mut row, woke_actor)| match woke_actor {
+                Some(actor) => {
+                    row.woke_actor = actor;
+                    Ok(row)
+                }
+                None => Err(CoreError::Corrupt(format!(
+                    "live session {:?} has no session.woke event",
+                    row.name
+                ))),
+            })
+            .collect()
     }
 
     /// The named consumer cursor's position; 0 when the consumer has never
@@ -644,6 +713,80 @@ mod tests {
         });
         assert!(err.is_err());
         assert_eq!(l.events_range(1, None).unwrap().len(), before);
+    }
+
+    // ---- Phase 11: the adoption registry query ---------------------------
+
+    #[test]
+    fn live_sessions_returns_registry_rows_with_their_woke_provenance() {
+        let (_dir, mut l) = temp_ledger();
+        seeded_bead(&mut l, "gc-1");
+        // w1: a fully populated campd-spawned worker
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({
+                "name": "t/dev/1", "agent": "dev", "rig": "gc",
+                "claude_session_id": "7bd2befc-b018-4080-8738-429d541b3646",
+                "transcript_path": "/home/u/.claude/projects/-code-gc/x.jsonl",
+                "bead": "gc-1", "worktree": "/camps/t/worktrees/gc-1",
+            }),
+        })
+        .unwrap();
+        // a1: a minimal hook-registered attended session
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: None,
+            actor: "hook:session-start".into(),
+            bead: None,
+            data: serde_json::json!({"name": "a1", "agent": "operator"}),
+        })
+        .unwrap();
+        // w2: woke then stopped — must not appear
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "t/dev/2", "agent": "dev"}),
+        })
+        .unwrap();
+        l.append(EventInput {
+            kind: EventType::SessionStopped,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "t/dev/2", "exit_code": 0}),
+        })
+        .unwrap();
+
+        let rows = l.live_sessions().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        // name-ordered: a1 then t/dev/1
+        assert_eq!(rows[0].name, "a1");
+        assert_eq!(rows[0].agent, "operator");
+        assert_eq!(rows[0].woke_actor, "hook:session-start");
+        assert!(rows[0].claude_session_id.is_none());
+        assert!(rows[0].worktree.is_none());
+        let w1 = &rows[1];
+        assert_eq!(w1.name, "t/dev/1");
+        assert_eq!(w1.agent, "dev");
+        assert_eq!(w1.rig.as_deref(), Some("gc"));
+        assert_eq!(
+            w1.claude_session_id.as_deref(),
+            Some("7bd2befc-b018-4080-8738-429d541b3646")
+        );
+        assert_eq!(
+            w1.transcript_path.as_deref(),
+            Some("/home/u/.claude/projects/-code-gc/x.jsonl")
+        );
+        assert_eq!(w1.bead.as_deref(), Some("gc-1"));
+        assert_eq!(w1.woke_actor, "campd");
+        assert_eq!(w1.worktree.as_deref(), Some("/camps/t/worktrees/gc-1"));
+        assert!(w1.pid.is_none());
+        assert_eq!(w1.spawned_ts, "2026-07-05T21:14:03Z");
     }
 
     // ---- Phase 11 events (agent.stalled, patrol.degraded) + crash cause --
