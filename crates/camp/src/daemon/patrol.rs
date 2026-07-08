@@ -378,6 +378,17 @@ impl PatrolRuntime {
                     session,
                     mut tracked,
                 } => {
+                    // HIGH 1 (fix-2 guard): a Track for an ALREADY-tracked
+                    // session is a stale replay by construction — session
+                    // names are fold-unique, so a second woke for the same
+                    // name is the SAME row re-observed (e.g. a woke row
+                    // past the cursor replayed by the startup settle).
+                    // Skipping it keeps the first arming (and its Owned
+                    // classification) authoritative — a re-Track would
+                    // overwrite and re-arm from a duplicate.
+                    if self.tracked.contains_key(&session) {
+                        continue;
+                    }
                     // Threshold: agent stall_after override, else camp
                     // default. A resolution failure on a campd-owned
                     // worker is an anomaly worth a durable event; for
@@ -667,12 +678,16 @@ impl PatrolRuntime {
                     } else if let Some(session) = self
                         .tracked
                         .iter()
-                        .find(|(_, t)| t.bead == bead && matches!(t.owned, Owned::AdoptedPid(_)))
+                        .find(|(_, t)| t.bead == bead && t.owned != Owned::Annotate)
                         .map(|(name, _)| name.clone())
                     {
-                        // A non-child (adopted) worker whose bead closed:
-                        // release it the observation way — probe, kill,
-                        // reasoned stop (the adopt() release rule).
+                        // HIGH 1: a non-child worker whose bead closed — an
+                        // adopted worker OR one mislabeled Owned::Child
+                        // after a campd-crash orphaning (release_worker
+                        // already declined it, so this dispatcher does not
+                        // hold it). NEVER an attended session (spec §10:
+                        // t.owned != Annotate). Release the observation
+                        // way: probe, kill, reasoned stop.
                         self.release_adopted(ledger, dispatcher, &session)?;
                     }
                 }
@@ -823,84 +838,104 @@ impl PatrolRuntime {
         let Some(tracked) = self.tracked.get(session).cloned() else {
             return Ok(());
         };
-        match tracked.owned {
-            Owned::Child => {
-                // SIGCHLD does the rest: caused crash, fold release,
-                // converge respawn — each its own event.
-                dispatcher.kill_worker(session, cause_seq);
-                Ok(())
-            }
-            Owned::AdoptedPid(_) => {
-                // ROUND-1 BLOCKER 2: re-probe by uuid IMMEDIATELY before
-                // any kill, and kill the re-probed pid only. The pid
-                // observed at adopt time may be hours stale and REUSED by
-                // an innocent process (no SIGCHLD for non-children).
-                let probed = probe_alive(
-                    tracked.claude_session_id.as_deref(),
-                    None,
-                    &dispatcher.known_pids(),
-                    &self.camp_config.dispatch.command,
-                )?;
-                match probed {
-                    None => {
-                        // already dead: record the caused crash, no kill
-                        ledger.append(EventInput {
-                            kind: EventType::SessionCrashed,
-                            rig: tracked.rig.clone(),
-                            actor: "campd".into(),
-                            bead: None,
-                            data: serde_json::json!({
-                                "name": session,
-                                "reason": "patrol restart: found dead at restart",
-                                "cause_seq": cause_seq,
-                            }),
-                        })?;
-                        Ok(())
-                    }
-                    Some(pid) => {
-                        kill_pid(pid)?;
-                        // verify the death by observation before recording
-                        if probe_alive(
-                            tracked.claude_session_id.as_deref(),
-                            None,
-                            &dispatcher.known_pids(),
-                            &self.camp_config.dispatch.command,
-                        )?
-                        .is_some()
-                        {
-                            // Not confirmably dead: degraded, timer stays
-                            // armed (declare re-armed it), retry next fire.
-                            ledger.append(EventInput {
-                                kind: EventType::PatrolDegraded,
-                                rig: None,
-                                actor: "campd".into(),
-                                bead: None,
-                                data: serde_json::json!({
-                                    "error": format!(
-                                        "restart kill of pid {pid} did not take; retrying at the next fire"
-                                    ),
-                                    "session": session,
-                                }),
-                            })?;
-                            return Ok(());
-                        }
-                        ledger.append(EventInput {
-                            kind: EventType::SessionCrashed,
-                            rig: tracked.rig.clone(),
-                            actor: "campd".into(),
-                            bead: None,
-                            data: serde_json::json!({
-                                "name": session,
-                                "reason": "patrol restart",
-                                "cause_seq": cause_seq,
-                            }),
-                        })?;
-                        Ok(())
-                    }
-                }
-            }
-            Owned::Annotate => Ok(()), // declare never queues these
+        // Never restart an attended session (spec §10: never kill a
+        // session in the user's TUI). declare never queues these; the
+        // guard is belt-and-braces before any kill path.
+        if tracked.owned == Owned::Annotate {
+            return Ok(());
         }
+        // HIGH 1: trust the LIVE dispatcher, not the Owned label. A worker
+        // orphaned across a campd crash (its session.woke row past the
+        // cursor) is re-tracked as Owned::Child by the startup settle
+        // (actor=="campd") even though THIS dispatcher never held it —
+        // `kill_worker` then returns false. The old code discarded that
+        // bool: no kill, no session.crashed, no bead release, while a
+        // false agent.stalled{restart} recorded a restart that never
+        // happened (invariants 3/5). Only a kill_worker that RETURNS TRUE
+        // (a genuine child of this campd) takes the SIGCHLD path; every
+        // other case falls through to the probe-verified non-child kill.
+        if tracked.owned == Owned::Child && dispatcher.kill_worker(session, cause_seq) {
+            // SIGCHLD does the rest: caused crash, fold release, converge
+            // respawn — each its own event.
+            return Ok(());
+        }
+        self.restart_non_child(ledger, dispatcher, session, &tracked, cause_seq)
+    }
+
+    /// Kill a NON-child worker (adopted, or a genuine-looking Child this
+    /// dispatcher does not hold) by probe-verified pid, recording the
+    /// caused crash. ROUND-1 BLOCKER 2: re-probe by uuid IMMEDIATELY
+    /// before the kill and kill the re-probed pid only — the pid observed
+    /// earlier may be stale and REUSED by an innocent process (no SIGCHLD
+    /// for non-children).
+    fn restart_non_child(
+        &mut self,
+        ledger: &mut Ledger,
+        dispatcher: &mut Dispatcher,
+        session: &str,
+        tracked: &Tracked,
+        cause_seq: Seq,
+    ) -> Result<()> {
+        let probed = probe_alive(
+            tracked.claude_session_id.as_deref(),
+            None,
+            &dispatcher.known_pids(),
+            &self.camp_config.dispatch.command,
+        )?;
+        let Some(pid) = probed else {
+            // already dead: record the caused crash, no kill
+            ledger.append(EventInput {
+                kind: EventType::SessionCrashed,
+                rig: tracked.rig.clone(),
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "name": session,
+                    "reason": "patrol restart: found dead at restart",
+                    "cause_seq": cause_seq,
+                }),
+            })?;
+            return Ok(());
+        };
+        kill_pid(pid)?;
+        // verify the death by observation before recording (LOW 4: never
+        // by kill's exit chatter)
+        if probe_alive(
+            tracked.claude_session_id.as_deref(),
+            None,
+            &dispatcher.known_pids(),
+            &self.camp_config.dispatch.command,
+        )?
+        .is_some()
+        {
+            // Not confirmably dead: degraded, timer stays armed (declare
+            // re-armed it), retry next fire.
+            ledger.append(EventInput {
+                kind: EventType::PatrolDegraded,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "error": format!(
+                        "restart kill of pid {pid} did not take; retrying at the next fire"
+                    ),
+                    "session": session,
+                }),
+            })?;
+            return Ok(());
+        }
+        ledger.append(EventInput {
+            kind: EventType::SessionCrashed,
+            rig: tracked.rig.clone(),
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "name": session,
+                "reason": "patrol restart",
+                "cause_seq": cause_seq,
+            }),
+        })?;
+        Ok(())
     }
 
     /// The adopt()/bead-closed release rule for NON-child workers: probe,
@@ -2098,6 +2133,131 @@ mod tests {
             .collect();
         assert_eq!(crashed.last().unwrap().data["reason"], "patrol restart");
         assert_eq!(crashed.last().unwrap().data["cause_seq"], 99);
+    }
+
+    /// ROUND-2 HIGH 1: a worker orphaned across a campd crash — its
+    /// session.woke row sits past the cursor and is replayed by the
+    /// STARTUP settle, which re-tracks it Owned::Child (actor=="campd")
+    /// even though the fresh dispatcher never held it — must STILL be
+    /// killed on restart and released on bead-close. The action verifies
+    /// against the LIVE dispatcher, never the label. Both processes are
+    /// alive MID-WINDOW (the fresh campd does not hold them), which is why
+    /// the existing kill-9 test — waiting for both claims before killing —
+    /// misses this.
+    #[test]
+    fn an_orphan_retracked_as_child_is_still_restarted_and_released() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        use std::os::unix::process::CommandExt as _;
+
+        let spawn_orphan = |uuid: &str| {
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg0("claude") // worker-shaped for the LOW-3 command filter
+                .arg("-c")
+                .arg(format!("sleep 30 || true # {uuid}"));
+            cmd.spawn().unwrap()
+        };
+        // R: driven through Restart. C: driven through bead-close Release.
+        let uuid_r = "00000000-dead-4000-8000-0000000000aa";
+        let uuid_c = "00000000-dead-4000-8000-0000000000bb";
+        let mut orphan_r = spawn_orphan(uuid_r);
+        let mut orphan_c = spawn_orphan(uuid_c);
+
+        // The startup settle replays their campd-actor woke rows →
+        // Track{Owned::Child}, even though this fresh dispatcher holds
+        // neither. Claim each bead so a crash release is observable.
+        for (name, uuid, bead) in [("t/dev/R", uuid_r, "gc-1"), ("t/dev/C", uuid_c, "gc-2")] {
+            seeded_bead(&mut ledger, bead);
+            let seq = ledger
+                .append(EventInput {
+                    kind: EventType::SessionWoke,
+                    rig: Some("gc".into()),
+                    actor: "campd".into(),
+                    bead: Some(bead.into()),
+                    data: serde_json::json!({
+                        "name": name, "agent": "dev",
+                        "claude_session_id": uuid,
+                        "transcript_path": dir.path().join(format!("projects/-p/{bead}.jsonl")),
+                        "bead": bead,
+                    }),
+                })
+                .unwrap();
+            let event = ledger.events_range(seq, Some(seq)).unwrap().remove(0);
+            patrol.observe(&event);
+            ledger
+                .append(EventInput {
+                    kind: EventType::BeadClaimed,
+                    rig: Some("gc".into()),
+                    actor: "cli".into(),
+                    bead: Some(bead.into()),
+                    data: serde_json::json!({"session": name}),
+                })
+                .unwrap();
+        }
+        patrol
+            .apply_tracking(&mut ledger, ts("2026-07-07T07:00:00Z"))
+            .unwrap();
+        // the misclassification the bug rests on: both labelled Child
+        assert!(matches!(
+            patrol.tracked.get("t/dev/R").unwrap().owned,
+            Owned::Child
+        ));
+        assert!(
+            !dispatcher.is_child("t/dev/R"),
+            "the fresh campd holds neither"
+        );
+
+        // drive Restart on R and BeadClosed on C in the same wake
+        patrol.pending.push(PendingAction::Restart {
+            session: "t/dev/R".into(),
+            cause_seq: 50,
+        });
+        let close_seq = ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-2".into()),
+                data: serde_json::json!({"outcome": "pass"}),
+            })
+            .unwrap();
+        let closed = ledger
+            .events_range(close_seq, Some(close_seq))
+            .unwrap()
+            .remove(0);
+        patrol.observe(&closed); // queues Release{gc-2}
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:10:00Z"))
+            .unwrap();
+
+        // R: actually killed, caused crash recorded (not a fiction)
+        assert!(
+            !orphan_r.wait().unwrap().success(),
+            "the orphaned 'Child' R must actually be killed on restart"
+        );
+        let events = ledger.events_range(1, None).unwrap();
+        let r_crash = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.crashed" && e.data["name"] == "t/dev/R")
+            .expect("R's caused crash must land (not a false agent.stalled trail)");
+        assert_eq!(r_crash.data["reason"], "patrol restart");
+        assert_eq!(r_crash.data["cause_seq"], 50);
+
+        // C: actually killed, reasoned stop recorded (the spec §10 release)
+        assert!(
+            !orphan_c.wait().unwrap().success(),
+            "the orphaned 'Child' C must be released on bead close"
+        );
+        let c_stop = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.stopped" && e.data["name"] == "t/dev/C")
+            .expect("C's reasoned stop must land (spec §10 release rule)");
+        assert!(
+            c_stop.data["reason"].as_str().unwrap().contains("released"),
+            "{}",
+            c_stop.data
+        );
     }
 
     // ---- Task 11.12: adoption --------------------------------------------

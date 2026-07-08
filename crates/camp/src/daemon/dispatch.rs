@@ -33,6 +33,13 @@ pub struct Dispatcher {
     /// Beads that failed to dispatch this campd lifetime (plan decision
     /// F): one dispatch.failed each, retried once per restart (crash-only).
     failed: HashSet<String>,
+    /// Patrol respawns deferred because the worker cap was full (Phase 11,
+    /// round-2 LOW 2): retried on every `converge`, so a reap-freed slot
+    /// re-hooks the bead — never stranded, never silently dropped
+    /// (invariant 3). Insertion order preserved so the oldest deferral
+    /// re-hooks first. (Phase 9's retry machinery will subsume budget and
+    /// backoff for these — the hand-off seam.)
+    pending_respawns: Vec<String>,
 }
 
 struct Worker {
@@ -146,6 +153,7 @@ impl Dispatcher {
             children: HashMap::new(),
             aux: HashMap::new(),
             failed: HashSet::new(),
+            pending_respawns: Vec::new(),
         }
     }
 
@@ -318,8 +326,11 @@ impl Dispatcher {
 
     /// Dispatch until the cap or the well runs dry. Re-queries after every
     /// spawn: the just-committed session.woke removes the bead from the
-    /// dispatchable set, so the ledger is the only bookkeeping.
+    /// dispatchable set, so the ledger is the only bookkeeping. Deferred
+    /// patrol respawns (round-2 LOW 2) get first crack at freed slots —
+    /// they represent in-flight work patrol is recovering.
     pub fn converge(&mut self, ledger: &mut Ledger) -> Result<()> {
+        self.retry_pending_respawns(ledger)?;
         loop {
             if self.children.len() >= self.config.dispatch.max_workers {
                 return Ok(());
@@ -333,13 +344,25 @@ impl Dispatcher {
         }
     }
 
+    /// Re-attempt every cap-deferred patrol respawn (round-2 LOW 2). Runs
+    /// at the top of `converge`, so a reap-freed slot re-hooks the oldest
+    /// deferral first; a still-full cap re-queues it (idempotent, no
+    /// duplicate event). Bounded by the queue, which only shrinks here.
+    fn retry_pending_respawns(&mut self, ledger: &mut Ledger) -> Result<()> {
+        for bead_id in std::mem::take(&mut self.pending_respawns) {
+            self.dispatch_bead(ledger, &bead_id)?;
+        }
+        Ok(())
+    }
+
     /// Targeted respawn for a patrol restart (Phase 11, spec §10.2): the
     /// general dispatchable set deliberately excludes ever-sessioned beads
     /// (Phase 8 decision C — organic crashes must not hot-loop until the
     /// Phase 9 retry machinery routes them); a PATROL-caused crash is
     /// budget-bounded by the ladder, so its bead re-hooks through this
-    /// explicit path instead. A cap-full dispatcher records the deferral
-    /// as dispatch.failed — evented, never silent (invariant 5).
+    /// explicit path instead. A cap-full dispatcher QUEUES the respawn and
+    /// events the deferral once — retried on the next `converge` when a
+    /// slot frees, never stranded (round-2 LOW 2; invariants 3/5).
     pub fn dispatch_bead(&mut self, ledger: &mut Ledger, bead_id: &str) -> Result<()> {
         let Some(bead) = ledger.get_bead(bead_id)? else {
             return Ok(()); // gone from the ledger: nothing to re-hook
@@ -348,15 +371,22 @@ impl Dispatcher {
             return Ok(()); // closed or re-claimed since the kill
         }
         if self.children.len() >= self.config.dispatch.max_workers {
-            ledger.append(EventInput {
-                kind: EventType::DispatchFailed,
-                rig: Some(bead.rig.clone()),
-                actor: "campd".into(),
-                bead: Some(bead.id.clone()),
-                data: serde_json::json!({
-                    "reason": "patrol respawn deferred: worker cap reached",
-                }),
-            })?;
+            // Queue for retry on the next freed slot. Event ONCE per
+            // deferral episode — a retry that is still capped re-queues
+            // silently (no dispatch.failed spam).
+            if !self.pending_respawns.iter().any(|b| b == bead_id) {
+                self.pending_respawns.push(bead_id.to_owned());
+                ledger.append(EventInput {
+                    kind: EventType::DispatchFailed,
+                    rig: Some(bead.rig.clone()),
+                    actor: "campd".into(),
+                    bead: Some(bead.id.clone()),
+                    data: serde_json::json!({
+                        "reason": "patrol respawn deferred: worker cap reached; \
+                                   will retry when a slot frees",
+                    }),
+                })?;
+            }
             return Ok(());
         }
         // a patrol respawn supersedes an earlier same-life dispatch failure
@@ -3253,6 +3283,123 @@ mod tests {
             released: None,
             patrol_kill: None,
         }
+    }
+
+    /// ROUND-2 LOW 2: a cap-full patrol respawn must QUEUE and retry when
+    /// a worker slot frees — never strand the bead with a false "deferred"
+    /// event that nothing acts on. Reachable from the AdoptedPid restart
+    /// path, whose non-child kill frees no slot in `children`.
+    #[test]
+    fn a_cap_full_patrol_respawn_queues_and_retries_when_a_slot_frees() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("rig")).unwrap();
+        std::fs::create_dir_all(root.join("agents")).unwrap();
+        std::fs::write(root.join("agents/dev.md"), "---\nname: dev\n---\nWork.\n").unwrap();
+        std::fs::write(
+            root.join("camp.toml"),
+            format!(
+                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+                 [dispatch]\nmax_workers = 1\ncommand = \"/bin/echo\"\ndefault_agent = \"dev\"\n",
+                root.join("rig").display()
+            ),
+        )
+        .unwrap();
+        let config = CampConfig::load(&root.join("camp.toml")).unwrap();
+        let mut ledger = Ledger::open(&root.join("camp.db")).unwrap();
+        // gc-9: created, then EVER-SESSIONED (a patrol-killed worker) so
+        // `dispatchable_beads` excludes it — only the respawn queue can
+        // re-hook it. The crash releases it back to open.
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-9".into()),
+                data: serde_json::json!({"title": "respawn me"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-9".into()),
+                data: serde_json::json!({"name": "t/dev/1", "agent": "dev", "bead": "gc-9"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClaimed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-9".into()),
+                data: serde_json::json!({"session": "t/dev/1"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionCrashed,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({"name": "t/dev/1", "reason": "patrol restart"}),
+            })
+            .unwrap();
+
+        let gc9_wokes = |l: &Ledger| -> usize {
+            l.events_of_type(EventType::SessionWoke)
+                .unwrap()
+                .iter()
+                .filter(|e| e.data["bead"] == "gc-9")
+                .count()
+        };
+        assert_eq!(gc9_wokes(&ledger), 1, "just the setup woke so far");
+
+        let mut dispatcher = Dispatcher::new(
+            CampDir {
+                root: root.to_path_buf(),
+            },
+            config,
+        );
+        // an ADOPTED restart frees no slot, so children stays full while
+        // the respawn is attempted — the exact cap-full path.
+        let occupant = held_cat_worker(root, "t/dev/occ", "gc-other");
+        let occupant_pid = occupant.child.id();
+        dispatcher.children.insert(occupant_pid, occupant);
+
+        // cap full → queued and evented ONCE, truthfully (will retry)
+        dispatcher.dispatch_bead(&mut ledger, "gc-9").unwrap();
+        assert_eq!(gc9_wokes(&ledger), 1, "no dispatch while capped");
+        assert_eq!(count(&ledger, "dispatch.failed"), 1);
+        let failed = ledger.events_of_type(EventType::DispatchFailed).unwrap();
+        assert!(
+            failed[0].data["reason"].as_str().unwrap().contains("retry"),
+            "the deferral must be truthful: {}",
+            failed[0].data["reason"]
+        );
+        // a second attempt while still capped must NOT re-event
+        dispatcher.dispatch_bead(&mut ledger, "gc-9").unwrap();
+        assert_eq!(
+            count(&ledger, "dispatch.failed"),
+            1,
+            "no duplicate deferral event"
+        );
+
+        // free the slot (as a reap would) and converge: the queue drains
+        {
+            let w = dispatcher.children.get_mut(&occupant_pid).unwrap();
+            let _ = w.child.kill();
+            let _ = w.child.wait();
+        }
+        dispatcher.children.remove(&occupant_pid);
+        dispatcher.converge(&mut ledger).unwrap();
+        assert_eq!(
+            gc9_wokes(&ledger),
+            2,
+            "the freed slot re-hooks the queued respawn"
+        );
     }
 
     #[test]
