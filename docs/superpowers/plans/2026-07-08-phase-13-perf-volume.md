@@ -740,6 +740,8 @@ fn volume_suite() {
 }
 ```
 
+> **SUPERSEDED (operator ruling 2026-07-08).** Block 6 above was the pre-ruling single-pass write bench. The first 1M run showed the raw `append()` p99 (~1.1 ms) is dominated by periodic WAL autocheckpoint (~every 66 appends), which is deferred maintenance, not "one WAL transaction" cost (§14's metric; `synchronous=NORMAL` commits do not fsync). The **shipped** block 6 (`crates/camp-core/tests/perf_volume.rs`, authoritative) runs two passes — a RAW pass (autocheckpoint on, reported) and a TRANSACTION pass (a background checkpointer drains the WAL out-of-band, asserted p50 AND p99 < 1 ms) — and prints both p99s. The `< 1 ms` target is unchanged.
+
 - [ ] **Step 4: Verify the ignored test compiles and is listed as ignored**
 
 Run: `cargo test -p camp-core --test perf_volume -- --list`

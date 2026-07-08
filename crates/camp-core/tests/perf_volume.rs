@@ -312,14 +312,6 @@ fn percentile_is_nearest_rank() {
 
 #[test]
 fn fixture_generation_is_deterministic() {
-    let d1 = tempfile::tempdir().unwrap();
-    let d2 = tempfile::tempdir().unwrap();
-    let db1 = d1.path().join("camp.db");
-    let db2 = d2.path().join("camp.db");
-    let a = build_fixture(&db1, 50, 0);
-    let b = build_fixture(&db2, 50, 0);
-    assert_eq!(a, b);
-
     let dump = |db: &Path| -> Vec<(String, Option<String>, String, String)> {
         let conn = rusqlite::Connection::open(db).unwrap();
         let mut stmt = conn
@@ -337,11 +329,32 @@ fn fixture_generation_is_deterministic() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
     };
-    assert_eq!(
-        dump(&db1),
-        dump(&db2),
-        "the seeded corpus must be identical"
-    );
+
+    // Two builds with the same seed must be byte-identical. Cover both the
+    // lifecycle path (floor 0 → no top-up) AND the top-up milestone loop
+    // (floor 500 > lifecycle events for 50 beads), which produces ~90% of
+    // events at 1M scale but would otherwise never run under the CI guard.
+    for (bead_target, event_floor) in [(50usize, 0usize), (50, 500)] {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let db1 = d1.path().join("camp.db");
+        let db2 = d2.path().join("camp.db");
+        let a = build_fixture(&db1, bead_target, event_floor);
+        let b = build_fixture(&db2, bead_target, event_floor);
+        assert_eq!(a, b, "counts differ for floor {event_floor}");
+        if event_floor > 0 {
+            assert!(
+                a.0 >= event_floor as u64,
+                "top-up must reach the floor: {} < {event_floor}",
+                a.0
+            );
+        }
+        assert_eq!(
+            dump(&db1),
+            dump(&db2),
+            "the seeded corpus must be identical for floor {event_floor}"
+        );
+    }
 }
 
 /// The spec §14 volume + throughput budget as one orchestrated assertion.
