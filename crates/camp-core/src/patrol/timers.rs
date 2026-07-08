@@ -53,7 +53,13 @@ impl StallTimers {
     }
 
     /// Arm (or re-arm) a session's timer: deadline = now + threshold.
-    pub fn arm(&mut self, session: &str, kind: TimerKind, threshold: SignedDuration, now: Timestamp) {
+    pub fn arm(
+        &mut self,
+        session: &str,
+        kind: TimerKind,
+        threshold: SignedDuration,
+        now: Timestamp,
+    ) {
         self.entries.insert(
             session.to_owned(),
             Entry {

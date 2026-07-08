@@ -157,8 +157,14 @@ mod tests {
 
     #[test]
     fn parse_duration_accepts_friendly_forms() {
-        assert_eq!(parse_duration("10m").unwrap(), SignedDuration::from_mins(10));
-        assert_eq!(parse_duration("90s").unwrap(), SignedDuration::from_secs(90));
+        assert_eq!(
+            parse_duration("10m").unwrap(),
+            SignedDuration::from_mins(10)
+        );
+        assert_eq!(
+            parse_duration("90s").unwrap(),
+            SignedDuration::from_secs(90)
+        );
         assert_eq!(
             parse_duration("300ms").unwrap(),
             SignedDuration::from_millis(300)
