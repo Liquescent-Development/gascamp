@@ -192,6 +192,7 @@ impl Dispatcher {
             &session_id,
             &transcript,
             &cwd,
+            spawn::StdinMode::Null, // Task 11.9 moves dispatch to HeldStream
         );
         Ok(Prep {
             spec,
