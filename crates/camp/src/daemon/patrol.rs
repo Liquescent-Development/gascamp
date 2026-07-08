@@ -136,6 +136,14 @@ pub struct PatrolRuntime {
     /// Sessions with ledger-observed activity awaiting a timer reset
     /// (applied with an explicit `now` at apply_tracking).
     activity: HashSet<String>,
+    /// Sessions currently in a declared-stalled state — SET when a stall
+    /// is declared (nudge/restart/annotate; NOT exhausted, which untracks)
+    /// and CLEARED at every timer-reset / untrack site. Backs the status
+    /// socket's `red` count (Phase 12 Decision D2). There is no durable
+    /// "un-stalled" event, so this in-memory set — not the timer store,
+    /// which `fire_due` empties and `declare_stalls` re-arms — is the
+    /// source of truth for "currently stalled".
+    stalled: HashSet<String>,
 }
 
 /// A poisoned mutex still yields its data (the orders-watch precedent):
@@ -206,7 +214,18 @@ impl PatrolRuntime {
             track_ops: Vec::new(),
             pending: Vec::new(),
             activity: HashSet::new(),
+            stalled: HashSet::new(),
         }
+    }
+
+    /// The number of currently-stalled tracked sessions — the `✖red` of
+    /// the fleet badge (Decision D2). Intersected with `tracked` so a
+    /// missed clear can never inflate the count.
+    pub fn stalled_count(&self) -> u64 {
+        self.stalled
+            .iter()
+            .filter(|s| self.tracked.contains_key(*s))
+            .count() as u64
     }
 
     /// The slot the notify callback closure captures.
@@ -420,6 +439,7 @@ impl PatrolRuntime {
                     self.watch_transcript(ledger, &session, &mut tracked)?;
                     let effective = self.ladder.effective_threshold(&tracked.bead, base);
                     self.timers.arm(&session, TimerKind::Stall, effective, now);
+                    self.stalled.remove(&session); // fresh arm: never stalled (name-reuse guard)
                     self.tracked.insert(session, *tracked);
                 }
                 TrackOp::Untrack { session } => {
@@ -427,11 +447,13 @@ impl PatrolRuntime {
                     if let Some(tracked) = self.tracked.remove(&session) {
                         self.unwatch_transcript(&tracked);
                     }
+                    self.stalled.remove(&session); // ended/closed/crashed → not stalled
                 }
             }
         }
         for session in std::mem::take(&mut self.activity) {
             self.timers.reset(&session, now);
+            self.stalled.remove(&session); // worker activity revives it
         }
         Ok(())
     }
@@ -524,6 +546,7 @@ impl PatrolRuntime {
                     self.ladder.on_activity(&t.bead.clone());
                 }
                 self.timers.reset(&session, now);
+                self.stalled.remove(&session); // transcript heartbeat revives it
             }
         }
     }
@@ -605,12 +628,14 @@ impl PatrolRuntime {
                     if let Some(t) = self.tracked.remove(&fire.session) {
                         self.unwatch_transcript(&t);
                     }
+                    self.stalled.remove(&fire.session); // untracked → drop the red flag
                 }
                 "nudge" => {
                     self.pending.push(PendingAction::Nudge {
                         session: fire.session.clone(),
                         cause_seq: seq,
                     });
+                    self.stalled.insert(fire.session.clone());
                     self.rearm(&fire.session, &tracked, fire.deadline.max(now));
                 }
                 "restart" => {
@@ -618,6 +643,7 @@ impl PatrolRuntime {
                         session: fire.session.clone(),
                         cause_seq: seq,
                     });
+                    self.stalled.insert(fire.session.clone());
                     // Re-armed at the (now doubled) effective threshold: a
                     // successful kill untracks via the crash observation; a
                     // failed non-child kill retries at the next fire.
@@ -625,6 +651,7 @@ impl PatrolRuntime {
                 }
                 _ => {
                     // annotate: re-arm, nothing mechanical beyond the event
+                    self.stalled.insert(fire.session.clone());
                     self.rearm(&fire.session, &tracked, fire.deadline.max(now));
                 }
             }
@@ -1387,6 +1414,48 @@ mod tests {
             })
             .unwrap();
         ledger.events_range(seq, Some(seq)).unwrap().remove(0)
+    }
+
+    /// A worker.milestone attributed to `session` (actor = the session
+    /// name) — `observe` counts it as worker activity, resetting the timer.
+    fn milestone_event(ledger: &mut Ledger, session: &str, bead: &str) -> Event {
+        let seq = ledger
+            .append(EventInput {
+                kind: EventType::WorkerMilestone,
+                rig: Some("gc".into()),
+                actor: session.into(),
+                bead: Some(bead.into()),
+                data: serde_json::json!({ "text": "progress" }),
+            })
+            .unwrap();
+        ledger.events_range(seq, Some(seq)).unwrap().remove(0)
+    }
+
+    #[test]
+    fn stalled_count_counts_stalled_workers_and_clears_on_activity() {
+        let (dir, mut ledger, _config, mut patrol) = fixture();
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let woke = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        patrol.observe(&woke);
+        patrol
+            .apply_tracking(&mut ledger, ts("2026-07-07T07:00:00Z"))
+            .unwrap();
+        assert_eq!(patrol.stalled_count(), 0, "a freshly tracked worker is not stalled");
+
+        // stall timer fires (600s default) → nudge declared → worker is red
+        let fires = patrol.fire_due(ts("2026-07-07T07:10:00Z"));
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:10:00Z"))
+            .unwrap();
+        assert_eq!(patrol.stalled_count(), 1, "a stalled worker counts red");
+
+        // a ledger event from the worker resets its timer → cleared
+        let beat = milestone_event(&mut ledger, "t/dev/1", "gc-1");
+        patrol.observe(&beat);
+        patrol
+            .apply_tracking(&mut ledger, ts("2026-07-07T07:11:00Z"))
+            .unwrap();
+        assert_eq!(patrol.stalled_count(), 0, "worker activity clears the stalled flag");
     }
 
     fn seeded_bead(ledger: &mut Ledger, id: &str) {
