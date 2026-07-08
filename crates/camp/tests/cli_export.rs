@@ -193,6 +193,53 @@ fn skip_untranslatable_is_the_explicit_opt_out() {
     assert!(!city.join("pack/orders/ci-red.toml").exists());
 }
 
+/// Local-only (not in CI): prove a real `bd import` accepts the export.
+/// Run: cargo test -p camp --test cli_export -- --ignored
+#[test]
+#[ignore = "requires a bd binary on PATH; local-only by contract"]
+fn bd_import_accepts_the_exported_jsonl() {
+    let bd_available = Command::new("bd")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(
+        bd_available,
+        "this ignored test was invoked explicitly but no working `bd` binary is on PATH"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_camp(dir.path());
+    add_orders(&root, TRANSLATABLE);
+    let city = dir.path().join("city");
+    run_ok(&root, &["export", "--city", city.to_str().unwrap()]);
+
+    let bd_home = dir.path().join("bdws");
+    std::fs::create_dir_all(&bd_home).unwrap();
+    let init = Command::new("bd")
+        .current_dir(&bd_home)
+        .args(["init"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "bd init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let import = Command::new("bd")
+        .current_dir(&bd_home)
+        .arg("import")
+        .arg(city.join("beads.jsonl"))
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "bd import failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&import.stdout),
+        String::from_utf8_lossy(&import.stderr)
+    );
+}
+
 #[test]
 fn a_non_empty_target_directory_is_refused() {
     let dir = tempfile::tempdir().unwrap();
