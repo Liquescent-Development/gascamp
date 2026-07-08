@@ -13,7 +13,7 @@ mod validate;
 pub use ast::{
     Check, CheckMode, Disposition, Formula, FormulaError, OnComplete, Requires, Step, Violation,
 };
-pub use cook::{CookedRun, cook};
+pub use cook::{CookOptions, CookedRun, cook, cook_with};
 pub use validate::FORMULA_COMPILER_CAPABILITY;
 
 use std::path::Path;

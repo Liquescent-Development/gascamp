@@ -30,12 +30,54 @@ pub struct CookedRun {
     pub step_beads: BTreeMap<String, String>,
 }
 
+/// Cook-time options for bond fan-out (Phase 9, spec §8.2 on_complete).
+/// The default cooks exactly as before.
+#[derive(Debug, Clone, Default)]
+pub struct CookOptions {
+    /// Substituted into step titles/descriptions (`{key}` -> value) on the
+    /// cooked BEADS only — the pinned file stays byte-verbatim. Recorded
+    /// in manifest.json under "vars".
+    pub vars: BTreeMap<String, String>,
+    /// Extra `needs` on the root bead (sequential bond chaining edge).
+    pub extra_root_needs: Vec<String>,
+    /// Labels on the root bead (`bond:<anchor>:<index>` linkage).
+    pub extra_root_labels: Vec<String>,
+}
+
+/// Replace every `{key}` from `vars` in `text`. Plain string replacement —
+/// authored text, not a template language; unknown tokens stay verbatim.
+fn substitute(text: &str, vars: &BTreeMap<String, String>) -> String {
+    let mut out = text.to_owned();
+    for (key, value) in vars {
+        out = out.replace(&format!("{{{key}}}"), value);
+    }
+    out
+}
+
 pub fn cook(
     ledger: &mut Ledger,
     formula: &Formula,
     run_dir: &Path,
     rig: &RigConfig,
     actor: &str,
+) -> Result<CookedRun, CoreError> {
+    cook_with(
+        ledger,
+        formula,
+        run_dir,
+        rig,
+        actor,
+        &CookOptions::default(),
+    )
+}
+
+pub fn cook_with(
+    ledger: &mut Ledger,
+    formula: &Formula,
+    run_dir: &Path,
+    rig: &RigConfig,
+    actor: &str,
+    opts: &CookOptions,
 ) -> Result<CookedRun, CoreError> {
     if formula.steps.is_empty() {
         // parse_and_validate guarantees this (rule S3); cook re-checks its
@@ -114,7 +156,7 @@ pub fn cook(
             .map_err(|e| CoreError::Cook(format!("cannot write {}/{name}: {e}", dir.display())))
     };
     write(&format!("{}.toml", formula.name), formula.source.as_bytes())?;
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "run_id": run_id,
         "formula": formula.name,
         "rig": rig.name,
@@ -123,17 +165,25 @@ pub fn cook(
         "root": root_bead,
         "steps": step_beads,
     });
+    if !opts.vars.is_empty() {
+        manifest["vars"] = serde_json::json!(opts.vars);
+    }
     write("manifest.json", format!("{manifest:#}").as_bytes())?;
 
     // ---- one transaction: root, steps, run.cooked
     let mut inputs = Vec::with_capacity(formula.steps.len() + 2);
+    let mut root_needs: Vec<&str> = step_beads.values().map(String::as_str).collect();
+    root_needs.extend(opts.extra_root_needs.iter().map(String::as_str));
     let mut root_data = serde_json::json!({
         "title": formula.name,
-        "needs": step_beads.values().collect::<Vec<_>>(),
+        "needs": root_needs,
         "run_id": run_id,
     });
     if let Some(d) = &formula.description {
         root_data["description"] = serde_json::json!(d);
+    }
+    if !opts.extra_root_labels.is_empty() {
+        root_data["labels"] = serde_json::json!(opts.extra_root_labels);
     }
     inputs.push(EventInput {
         kind: EventType::BeadCreated,
@@ -145,12 +195,12 @@ pub fn cook(
     for step in &formula.steps {
         let needs = &step_needs[step.id.as_str()];
         let mut data = serde_json::json!({
-            "title": step.title,
+            "title": substitute(&step.title, &opts.vars),
             "run_id": run_id,
             "step_id": step.id,
         });
         if let Some(d) = &step.description {
-            data["description"] = serde_json::json!(d);
+            data["description"] = serde_json::json!(substitute(d, &opts.vars));
         }
         if !needs.is_empty() {
             data["needs"] = serde_json::json!(needs);
