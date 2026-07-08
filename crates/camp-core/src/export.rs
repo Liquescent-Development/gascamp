@@ -4,11 +4,14 @@
 //! appends nothing to camp's own ledger. Field-level mapping tables:
 //! docs/reference/export.md.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::config::CampConfig;
 use crate::error::CoreError;
+use crate::ledger::Ledger;
 use crate::orders::parse::OrderConfig;
 use crate::orders::{Order, Trigger};
 
@@ -312,6 +315,335 @@ pub fn translate_order(order: &Order, raw: &OrderConfig) -> OrderTranslation {
             ),
         },
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportOptions {
+    /// The contract's explicit opt-out: skip untranslatable orders (each
+    /// one reported) instead of failing the export.
+    pub skip_untranslatable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkippedOrder {
+    pub name: String,
+    pub reason: String,
+}
+
+/// What an export produced — the CLI renders this; camp-core prints
+/// nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExportReport {
+    pub issues: usize,
+    pub memories: usize,
+    pub archive_formulas: usize,
+    pub pack_formulas: usize,
+    pub agents: usize,
+    pub orders: usize,
+    pub skipped_orders: Vec<SkippedOrder>,
+    pub notes: Vec<String>,
+}
+
+/// `camp export --city <dir>` (spec §15.3). Read-only over the ledger and
+/// the camp directory; refuses a non-empty output directory; translates
+/// every order BEFORE writing anything, so the untranslatable-order
+/// failure leaves no partial output. Output layout and mapping tables:
+/// docs/reference/export.md.
+pub fn export_city(
+    ledger: &Ledger,
+    config: &CampConfig,
+    camp_root: &Path,
+    out_dir: &Path,
+    options: &ExportOptions,
+) -> Result<ExportReport, CoreError> {
+    ensure_empty_dir(out_dir)?;
+    let mut report = ExportReport::default();
+    let translated = translate_all_orders(config, options, &mut report)?;
+    write_beads_jsonl(ledger, out_dir, &mut report)?;
+    write_archive_formulas(camp_root, out_dir, &mut report)?;
+    write_pack(config, camp_root, out_dir, &translated, &mut report)?;
+    Ok(report)
+}
+
+fn export_io(action: &str, path: &Path, err: &std::io::Error) -> CoreError {
+    CoreError::Export(format!("cannot {action} {}: {err}", path.display()))
+}
+
+fn ensure_empty_dir(dir: &Path) -> Result<(), CoreError> {
+    if dir.exists() {
+        let mut entries = std::fs::read_dir(dir).map_err(|e| export_io("read", dir, &e))?;
+        if entries.next().is_some() {
+            return Err(CoreError::Export(format!(
+                "refusing to export into non-empty directory {}",
+                dir.display()
+            )));
+        }
+    } else {
+        std::fs::create_dir_all(dir).map_err(|e| export_io("create", dir, &e))?;
+    }
+    Ok(())
+}
+
+fn create_dir(dir: &Path) -> Result<(), CoreError> {
+    std::fs::create_dir_all(dir).map_err(|e| export_io("create", dir, &e))
+}
+
+fn write_file(path: &Path, content: impl AsRef<[u8]>) -> Result<(), CoreError> {
+    std::fs::write(path, content).map_err(|e| export_io("write", path, &e))
+}
+
+/// Translate every `[[order]]`; any untranslatable order fails the whole
+/// export (before a single byte is written) unless the caller opted out.
+fn translate_all_orders(
+    config: &CampConfig,
+    options: &ExportOptions,
+    report: &mut ExportReport,
+) -> Result<Vec<(String, GcOrderFile)>, CoreError> {
+    let compiled = crate::orders::parse::compile_orders(config)?;
+    let mut translated = Vec::new();
+    let mut skipped = Vec::new();
+    for (order, raw) in compiled.iter().zip(&config.orders) {
+        if order.name != raw.name {
+            return Err(CoreError::Corrupt(format!(
+                "compiled order {:?} does not line up with config order {:?}",
+                order.name, raw.name
+            )));
+        }
+        match translate_order(order, raw) {
+            OrderTranslation::Translated { name, file } => translated.push((name, file)),
+            OrderTranslation::Untranslatable { name, reason } => {
+                skipped.push(SkippedOrder { name, reason });
+            }
+        }
+    }
+    if !skipped.is_empty() && !options.skip_untranslatable {
+        let details = skipped
+            .iter()
+            .map(|s| format!("  {}: {}", s.name, s.reason))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(CoreError::UntranslatableOrders {
+            count: skipped.len(),
+            details,
+        });
+    }
+    report.skipped_orders = skipped;
+    Ok(translated)
+}
+
+fn write_beads_jsonl(
+    ledger: &Ledger,
+    out_dir: &Path,
+    report: &mut ExportReport,
+) -> Result<(), CoreError> {
+    let mut lines = String::new();
+    for bead in ledger.export_beads()? {
+        let record = bd_record(&bead)?;
+        match &record {
+            BdRecord::Issue(_) => report.issues += 1,
+            BdRecord::Memory(_) => report.memories += 1,
+        }
+        lines.push_str(&jsonl_line(&record)?);
+        lines.push('\n');
+    }
+    write_file(&out_dir.join("beads.jsonl"), lines)
+}
+
+/// `formulas/` = the pinned formula copies from `runs/` (master plan Phase
+/// 14; Phase 5 pins byte-fidelity copies precisely for this export). The
+/// newest run's copy of each name takes `<name>.toml`; an older run whose
+/// copy differs is archived as `<name>.<run-id>.toml` — nothing dropped,
+/// nothing flattened silently (invariant 3, plan decision D5).
+fn write_archive_formulas(
+    camp_root: &Path,
+    out_dir: &Path,
+    report: &mut ExportReport,
+) -> Result<(), CoreError> {
+    let dest = out_dir.join("formulas");
+    create_dir(&dest)?;
+    let runs_dir = camp_root.join("runs");
+    if !runs_dir.exists() {
+        return Ok(());
+    }
+    let mut run_dirs = Vec::new();
+    for entry in std::fs::read_dir(&runs_dir).map_err(|e| export_io("read", &runs_dir, &e))? {
+        let entry = entry.map_err(|e| export_io("read", &runs_dir, &e))?;
+        if entry
+            .file_type()
+            .map_err(|e| export_io("stat", &entry.path(), &e))?
+            .is_dir()
+        {
+            run_dirs.push(entry.path());
+        }
+    }
+    // Run ids start with the compact cook timestamp: lexicographically
+    // descending is newest-first.
+    run_dirs.sort();
+    run_dirs.reverse();
+
+    let mut bare: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for run_dir in &run_dirs {
+        let run_id = run_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                CoreError::Export(format!(
+                    "run dir {} has a non-UTF-8 name",
+                    run_dir.display()
+                ))
+            })?
+            .to_owned();
+        let mut pinned = Vec::new();
+        for entry in std::fs::read_dir(run_dir).map_err(|e| export_io("read", run_dir, &e))? {
+            let entry = entry.map_err(|e| export_io("read", run_dir, &e))?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "toml") {
+                pinned.push(path);
+            }
+        }
+        if pinned.is_empty() {
+            return Err(CoreError::Export(format!(
+                "run dir {} has no pinned formula (*.toml)",
+                run_dir.display()
+            )));
+        }
+        pinned.sort();
+        for path in pinned {
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    CoreError::Export(format!("{} has a non-UTF-8 name", path.display()))
+                })?
+                .to_owned();
+            let content = std::fs::read(&path).map_err(|e| export_io("read", &path, &e))?;
+            match bare.get(&file_name) {
+                None => {
+                    write_file(&dest.join(&file_name), &content)?;
+                    bare.insert(file_name, content);
+                    report.archive_formulas += 1;
+                }
+                Some(existing) if *existing == content => {}
+                Some(_) => {
+                    let stem = file_name.trim_end_matches(".toml");
+                    let alt = format!("{stem}.{run_id}.toml");
+                    write_file(&dest.join(&alt), &content)?;
+                    report.archive_formulas += 1;
+                    report.notes.push(format!(
+                        "formula {file_name} from run {run_id} differs from the newest pinned \
+                         copy; archived as formulas/{alt}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `pack/`: generated pack.toml wrapper, agent definitions verbatim,
+/// translated orders as gc `orders/<name>.toml` files, and the authored
+/// formulas those orders reference (plan decision D4).
+fn write_pack(
+    config: &CampConfig,
+    camp_root: &Path,
+    out_dir: &Path,
+    translated: &[(String, GcOrderFile)],
+    report: &mut ExportReport,
+) -> Result<(), CoreError> {
+    #[derive(serde::Serialize)]
+    struct PackToml<'a> {
+        pack: PackMeta<'a>,
+    }
+    #[derive(serde::Serialize)]
+    struct PackMeta<'a> {
+        name: &'a str,
+        schema: i64,
+        description: String,
+    }
+
+    let pack_dir = out_dir.join("pack");
+    let agents_dest = pack_dir.join("agents");
+    let formulas_dest = pack_dir.join("formulas");
+    let orders_dest = pack_dir.join("orders");
+    for dir in [&pack_dir, &agents_dest, &formulas_dest, &orders_dest] {
+        create_dir(dir)?;
+    }
+
+    let manifest = PackToml {
+        pack: PackMeta {
+            name: &config.camp.name,
+            schema: 2,
+            description: format!("Exported from gas-camp camp {}", config.camp.name),
+        },
+    };
+    let manifest_text = toml::to_string(&manifest)
+        .map_err(|e| CoreError::Export(format!("cannot serialize pack.toml: {e}")))?;
+    write_file(&pack_dir.join("pack.toml"), manifest_text)?;
+
+    let agents_src = camp_root.join("agents");
+    if agents_src.is_dir() {
+        report.agents = copy_tree(&agents_src, &agents_dest)?;
+    }
+    if report.agents == 0 {
+        report.notes.push(format!(
+            "no agent definitions found under {} — pack exported without agents",
+            agents_src.display()
+        ));
+    }
+
+    let mut formula_refs = BTreeSet::new();
+    for (name, file) in translated {
+        let text = toml::to_string(file)
+            .map_err(|e| CoreError::Export(format!("cannot serialize order {name:?}: {e}")))?;
+        write_file(&orders_dest.join(format!("{name}.toml")), text)?;
+        formula_refs.insert((file.order.formula.clone(), name.clone()));
+    }
+    report.orders = translated.len();
+
+    let mut copied = BTreeSet::new();
+    for (formula, order_name) in formula_refs {
+        if !copied.insert(formula.clone()) {
+            continue;
+        }
+        let src = crate::orders::formula_path(camp_root, &formula);
+        let content = std::fs::read(&src).map_err(|e| {
+            CoreError::Export(format!(
+                "exported order {order_name:?} references formula {formula:?} but {} cannot \
+                 be read: {e}",
+                src.display()
+            ))
+        })?;
+        write_file(&formulas_dest.join(format!("{formula}.toml")), content)?;
+        report.pack_formulas += 1;
+    }
+    Ok(())
+}
+
+/// Verbatim recursive copy (agent definitions are opaque to camp —
+/// invariant 4 leaves zero role knowledge in code). Returns files copied.
+fn copy_tree(src: &Path, dest: &Path) -> Result<usize, CoreError> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(src).map_err(|e| export_io("read", src, &e))? {
+        let entry = entry.map_err(|e| export_io("read", src, &e))?;
+        let path = entry.path();
+        let ty = entry
+            .file_type()
+            .map_err(|e| export_io("stat", &path, &e))?;
+        let to = dest.join(entry.file_name());
+        if ty.is_dir() {
+            create_dir(&to)?;
+            count += copy_tree(&path, &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(&path, &to).map_err(|e| export_io("copy", &path, &e))?;
+            count += 1;
+        } else {
+            return Err(CoreError::Export(format!(
+                "{} is neither a file nor a directory",
+                path.display()
+            )));
+        }
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
