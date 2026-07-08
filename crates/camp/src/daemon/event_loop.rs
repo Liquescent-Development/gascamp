@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use camp_core::clock::Clock;
