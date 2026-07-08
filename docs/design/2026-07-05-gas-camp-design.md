@@ -565,8 +565,8 @@ mypack/
   local definitions highest — Gas City's layering, simplified.
 - **The camp plugin is machinery only:** `/sling`, `/status`, `/adopt`,
   `/events` slash commands (thin wrappers over the `camp` CLI); lifecycle
-  hooks — SessionStart (register/adopt), Stop and SubagentStop (session
-  end), plus an optional PostToolUse breadcrumb hook (off by default:
+  hooks — SessionStart (register/adopt) and SessionEnd (session end),
+  plus an optional PostToolUse breadcrumb hook (off by default:
   patrol watches transcripts instead, §10); the worker skill; an optional
   statusline snippet showing
   a fleet badge (`▲3 ●2 ✖1` — live, ready, red) fed by the `campd` socket.

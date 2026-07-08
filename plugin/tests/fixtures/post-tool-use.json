@@ -1,0 +1,1 @@
+{"session_id":"S-1","cwd":"/project","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cargo test"}}

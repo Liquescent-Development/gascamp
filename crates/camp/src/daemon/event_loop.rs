@@ -479,6 +479,7 @@ fn drain_lines(
                     Ok(summary) => Response::Status {
                         ok: true,
                         summary,
+                        red: patrol.stalled_count(),
                         campd_pid: std::process::id(),
                     },
                     Err(e) => {

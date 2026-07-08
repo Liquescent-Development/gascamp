@@ -900,12 +900,12 @@ impl CronHeap {
 
 **Goal:** Spec §11: the Claude Code session becomes the control plane; machinery only, zero shipped roles.
 
-**Files:** `plugin/` (plugin manifest, `commands/{sling,status,adopt,events}.md`, `hooks/` (SessionStart, Stop, SubagentStop, optional PostToolUse breadcrumb — off by default), `skills/worker/SKILL.md`, `statusline/`); `packs/starter/` (example `agents/dev.md`, `agents/reviewer.md`, `formulas/guarded-change.toml` = the corpus file, `orders.toml` example); hook tests under `plugin/tests/` driven by fixture stdin payloads.
+**Files:** `plugin/` (plugin manifest, `commands/{sling,status,adopt,events}.md`, `hooks/` (SessionStart, SessionEnd, optional PostToolUse breadcrumb — off by default), `skills/worker/SKILL.md`, `statusline/`); `packs/starter/` (example `agents/dev.md`, `agents/reviewer.md`, `formulas/guarded-change.toml` = the corpus file, `orders.toml` example); hook tests under `plugin/tests/` driven by fixture stdin payloads.
 
 **Content contracts:**
 - Slash commands are thin wrappers over the `camp` CLI (identical scripting surface, spec §13.6).
 - Worker skill text = the lifecycle contract: `recall` → `claim` → work → `event emit` milestones → `remember` non-obvious findings → `close` with outcome → exit.
-- Hooks: SessionStart registers/adopts; Stop/SubagentStop append session-end events; all hooks are fire-and-forget appends with throttling (spec §16 requires this verified).
+- Hooks: SessionStart registers/adopts; SessionEnd appends the session-end event (NOT Stop, which fires per turn, and NOT SubagentStop, whose session_id is the parent — see the Phase 12 plan's D5); all hooks are fire-and-forget appends with throttling (spec §16 requires this verified).
 - Statusline snippet: one `status` socket query rendering `▲live ●ready ✖red`; degrades to empty output (with stderr note) when campd is down — visible degradation, not silence.
 - Attended Tier-0 sling spawns a teammate per A1 findings; if A1 resolved weaker, `/sling` prints the instant-attach line instead (the decided fallback).
 
