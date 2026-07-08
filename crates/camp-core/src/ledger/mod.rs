@@ -196,6 +196,11 @@ impl Ledger {
         crate::formula::runtime::close_event_data(&self.conn, bead)
     }
 
+    /// The data of a bead's creation event (authored title/description).
+    pub fn created_event_data(&self, bead: &str) -> Result<Option<serde_json::Value>, CoreError> {
+        crate::formula::runtime::created_event_data(&self.conn, bead)
+    }
+
     /// True when `bead`'s needs can never all pass.
     pub fn unsatisfiable(&self, bead: &str) -> Result<bool, CoreError> {
         crate::formula::runtime::unsatisfiable(&self.conn, bead)

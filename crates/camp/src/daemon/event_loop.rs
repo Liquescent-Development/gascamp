@@ -114,7 +114,14 @@ pub fn run(
 
     let mut last_seen = Timestamp::now();
     loop {
-        let timeout = runtime.poll_timeout(Timestamp::now());
+        // Decision 11c: THE poll-timeout composition point. Each deadline
+        // source converts its own deadline to a Duration-from-now (cron is
+        // wall-anchored, checks are monotonic); phase-11's stall timers
+        // join this same combinator at rebase.
+        let timeout = min_deadline(
+            runtime.poll_timeout(Timestamp::now()),
+            graph.poll_timeout(Instant::now()),
+        );
         let wall_before = Timestamp::now();
         let mono_before = Instant::now();
         if let Err(e) = poll.poll(&mut events, timeout) {
@@ -147,6 +154,10 @@ pub fn run(
             runtime.fire_due(now)
         };
         last_seen = now;
+        // Decision 11d: enforce check deadlines on every wake (a
+        // deadline-only wake has no other trigger). Kills convert to
+        // SIGCHLD -> reap_checks -> timed-out check.failed verdicts.
+        graph.kill_expired(Instant::now());
         // Declare the fires (durable first); the settle below cooks them.
         // A ledger that refuses the declaration is fatal — campd must not
         // run automation it cannot record.
@@ -485,6 +496,9 @@ fn reap_and_refill(
     graph: &mut GraphRuntime,
 ) -> Result<(), ReapFailure> {
     dispatcher.reap(ledger)?;
+    // Decision 11e: check-script children ride the same SIGCHLD pipe;
+    // their verdict batches land before the settle that acts on them.
+    graph.reap_checks(ledger)?;
     // settle failures are ledger-side: retry-worthy, like the appends
     settle(ledger, processor, runtime, clock, dispatcher, graph).map_err(|error| ReapFailure {
         retryable: true,
@@ -521,6 +535,21 @@ pub(super) fn settle(
         if !ledger.has_events_past(cursor)? {
             return Ok(());
         }
+    }
+}
+
+/// The poll-timeout combinator (Decision 11c, review note 1): None = no
+/// deadline from that source; the earliest wins. Deliberately THE single
+/// composition point — new deadline sources (phase-11 stall timers) join
+/// here.
+fn min_deadline(
+    a: Option<std::time::Duration>,
+    b: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    match (a, b) {
+        (None, x) => x,
+        (x, None) => x,
+        (Some(a), Some(b)) => Some(a.min(b)),
     }
 }
 

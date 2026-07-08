@@ -423,7 +423,9 @@ impl Dispatcher {
 // outcomes/classifications) and user-supplied check scripts.
 // ---------------------------------------------------------------------------
 
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use camp_core::error::CoreError;
 use camp_core::event::Event;
@@ -462,6 +464,23 @@ pub struct GraphRuntime {
     runs: HashMap<String, Option<Arc<RunContext>>>,
     pending_checks: Vec<PendingCheck>,
     pending_fanouts: Vec<PendingFanout>,
+    /// Live check-script children by pid, reaped on SIGCHLD like workers.
+    check_children: HashMap<u32, CheckChild>,
+}
+
+/// One running check script (spec §8.3): campd runs `check.path` with
+/// cwd = rig, `min(check.timeout, step.timeout)` enforced via the poll
+/// timeout, output captured to a per-attempt log under the run dir.
+struct CheckChild {
+    child: std::process::Child,
+    run_id: String,
+    step_id: String,
+    anchor: String,
+    attempt_bead: String,
+    attempt_no: u32,
+    deadline: Option<std::time::Instant>,
+    log_path: PathBuf,
+    timed_out: bool,
 }
 
 impl GraphRuntime {
@@ -476,6 +495,7 @@ impl GraphRuntime {
             runs: HashMap::new(),
             pending_checks: Vec::new(),
             pending_fanouts: Vec::new(),
+            check_children: HashMap::new(),
         }
     }
 
@@ -497,11 +517,381 @@ impl GraphRuntime {
     }
 
     /// The side-effect executor, called from event_loop::settle between
-    /// orders::settle and dispatcher.converge. Check spawning (Task 6)
-    /// and bond cooking (Task 7) drain the queues; until then queued work
-    /// waits (dedupe keeps re-queues harmless).
-    pub fn execute(&mut self, _ledger: &mut Ledger) -> Result<()> {
+    /// orders::settle and dispatcher.converge: spawn due check scripts
+    /// (verdicts arrive via SIGCHLD -> reap_checks) and cook due bond
+    /// children (Task 7). On an infrastructure error the unexecuted work
+    /// is requeued and the error surfaces — the next settle retries (the
+    /// Phase 10 pending-cook pattern).
+    pub fn execute(&mut self, ledger: &mut Ledger) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending_checks);
+        for (i, check) in pending.iter().enumerate() {
+            let live = self.check_children.values().any(|c| {
+                c.run_id == check.run_id
+                    && c.step_id == check.step_id
+                    && c.attempt_no == check.attempt_no
+            });
+            if live {
+                continue; // already running (defensive dedupe)
+            }
+            if let Err(error) = self.spawn_check(ledger, check) {
+                for survivor in &pending[i..] {
+                    self.pending_checks.push(survivor.clone());
+                }
+                return Err(error);
+            }
+        }
         Ok(())
+    }
+
+    /// Spawn one check script (non-blocking; the SIGCHLD reap classifies).
+    /// A script that cannot START is structural, not flaky: the anchor
+    /// hard-fails immediately without burning the budget (plan Decision
+    /// 10). Only ledger errors surface as Err.
+    fn spawn_check(&mut self, ledger: &mut Ledger, pending: &PendingCheck) -> Result<()> {
+        let Some(ctx) = self.ctx(&pending.run_id) else {
+            return Ok(()); // dead-ended elsewhere
+        };
+        let Some(step_ref) = ctx.step_ref(&pending.step_id) else {
+            return Ok(());
+        };
+        let Some(check) = &step_ref.step.check else {
+            return Ok(());
+        };
+        // the anchor must still be campd's loop (idempotent re-execution)
+        let Some(anchor_row) = ledger.get_bead(&pending.anchor)? else {
+            return Ok(());
+        };
+        if anchor_row.status != "in_progress" || anchor_row.claimed_by.as_deref() != Some("campd") {
+            return Ok(());
+        }
+        let Some(rig_path) = self.rig_paths.get(&ctx.rig).cloned() else {
+            return self.check_spawn_failure(
+                ledger,
+                pending,
+                &anchor_row,
+                &format!("rig {:?} is not configured", ctx.rig),
+            );
+        };
+        let script = if check.path.is_absolute() {
+            check.path.clone()
+        } else {
+            rig_path.join(&check.path)
+        };
+        let log_dir = flow::runs_dir(&self.camp_root)
+            .join(&pending.run_id)
+            .join("checks");
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            return self.check_spawn_failure(
+                ledger,
+                pending,
+                &anchor_row,
+                &format!("cannot create {}: {e}", log_dir.display()),
+            );
+        }
+        let log_path = log_dir.join(format!(
+            "{}-attempt-{}.log",
+            pending.step_id, pending.attempt_no
+        ));
+        let open_log = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+        };
+        let (stdout, stderr) = match (open_log(), open_log()) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(e), _) | (_, Err(e)) => {
+                return self.check_spawn_failure(
+                    ledger,
+                    pending,
+                    &anchor_row,
+                    &format!("cannot open {}: {e}", log_path.display()),
+                );
+            }
+        };
+        let deadline = match (check.timeout, step_ref.step.timeout) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+        .map(|d| std::time::Instant::now() + d);
+        let spawned = std::process::Command::new(&script)
+            .current_dir(&rig_path)
+            .env("CAMP_DIR", &self.camp_root)
+            .env("CAMP_BEAD", &pending.anchor)
+            .env("CAMP_RUN_ID", &pending.run_id)
+            .env("CAMP_STEP_ID", &pending.step_id)
+            .env("CAMP_ATTEMPT", pending.attempt_no.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn();
+        match spawned {
+            Ok(child) => {
+                self.check_children.insert(
+                    child.id(),
+                    CheckChild {
+                        child,
+                        run_id: pending.run_id.clone(),
+                        step_id: pending.step_id.clone(),
+                        anchor: pending.anchor.clone(),
+                        attempt_bead: pending.attempt_bead.clone(),
+                        attempt_no: pending.attempt_no,
+                        deadline,
+                        log_path,
+                        timed_out: false,
+                    },
+                );
+                Ok(())
+            }
+            Err(e) => self.check_spawn_failure(
+                ledger,
+                pending,
+                &anchor_row,
+                &format!("check script {} failed to start: {e}", script.display()),
+            ),
+        }
+    }
+
+    /// Decision 10: a check that cannot start closes the anchor hard,
+    /// evidence in one atomic batch — no budget loop over a structural
+    /// problem.
+    fn check_spawn_failure(
+        &mut self,
+        ledger: &mut Ledger,
+        pending: &PendingCheck,
+        anchor_row: &BeadRow,
+        error: &str,
+    ) -> Result<()> {
+        ledger.append_batch(vec![
+            EventInput {
+                kind: EventType::CheckFailed,
+                rig: Some(anchor_row.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(pending.attempt_bead.clone()),
+                data: serde_json::json!({
+                    "run_id": pending.run_id,
+                    "step_id": pending.step_id,
+                    "attempt": pending.attempt_no,
+                    "error": error,
+                }),
+            },
+            EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some(anchor_row.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(anchor_row.id.clone()),
+                data: serde_json::json!({
+                    "outcome": "fail",
+                    "final_disposition": "hard_fail",
+                    "reason": error,
+                }),
+            },
+        ])?;
+        Ok(())
+    }
+
+    /// The earliest live check deadline as a poll timeout contribution
+    /// (monotonic; combined with the cron heap via min_deadline —
+    /// Decision 11c).
+    pub fn poll_timeout(&self, now: std::time::Instant) -> Option<Duration> {
+        self.check_children
+            .values()
+            .filter(|c| !c.timed_out)
+            .filter_map(|c| c.deadline)
+            .min()
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+
+    /// Kill checks past their declared deadline (SIGKILL; the reap
+    /// classifies them as timed-out failed iterations — Decision 12).
+    /// `now` is a parameter for testability.
+    pub fn kill_expired(&mut self, now: std::time::Instant) {
+        for check in self.check_children.values_mut() {
+            if check.timed_out {
+                continue;
+            }
+            if let Some(deadline) = check.deadline
+                && deadline <= now
+            {
+                check.timed_out = true;
+                // a child that already exited is fine — the reap classifies
+                let _ = check.child.kill();
+            }
+        }
+    }
+
+    /// Reap exited check scripts (SIGCHLD service, alongside the worker
+    /// reap): each verdict is ONE atomic batch. Durable-then-forget: a
+    /// failed batch keeps the child mapped and surfaces retryable; the
+    /// next wake retries (try_wait re-returns the cached status).
+    pub fn reap_checks(&mut self, ledger: &mut Ledger) -> Result<(), ReapFailure> {
+        let mut exited: Vec<(u32, ExitStatus)> = Vec::new();
+        for (pid, check) in &mut self.check_children {
+            match check.child.try_wait() {
+                Ok(Some(status)) => exited.push((*pid, status)),
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(ReapFailure {
+                        retryable: false,
+                        error: anyhow::Error::new(e).context("try_wait on a check script"),
+                    });
+                }
+            }
+        }
+        for (pid, status) in exited {
+            let Some(check) = self.check_children.get(&pid) else {
+                continue;
+            };
+            let verdict =
+                self.check_verdict(ledger, check, status)
+                    .map_err(|error| ReapFailure {
+                        retryable: true,
+                        error: anyhow::anyhow!("{error}").context("recording a check verdict"),
+                    })?;
+            if let Some(inputs) = verdict {
+                ledger.append_batch(inputs).map_err(|error| ReapFailure {
+                    retryable: true,
+                    error: anyhow::Error::new(error).context("recording a check verdict"),
+                })?;
+            }
+            self.check_children.remove(&pid);
+        }
+        Ok(())
+    }
+
+    /// Build the verdict batch for one exited check (pure over ledger
+    /// reads; None = the anchor is no longer campd's — drop silently, the
+    /// ledger already tells that story).
+    fn check_verdict(
+        &self,
+        ledger: &Ledger,
+        check: &CheckChild,
+        status: ExitStatus,
+    ) -> Result<Option<Vec<EventInput>>, CoreError> {
+        use std::os::unix::process::ExitStatusExt;
+        let Some(ctx) = self.runs.get(&check.run_id).and_then(Clone::clone) else {
+            return Ok(None);
+        };
+        let Some(step_ref) = ctx.step_ref(&check.step_id) else {
+            return Ok(None);
+        };
+        let Some(max_attempts) = step_ref.step.check.as_ref().map(|c| c.max_attempts) else {
+            return Ok(None);
+        };
+        let Some(anchor_row) = ledger.get_bead(&check.anchor)? else {
+            return Ok(None);
+        };
+        if anchor_row.status != "in_progress" || anchor_row.claimed_by.as_deref() != Some("campd") {
+            return Ok(None);
+        }
+        let passed = status.success() && !check.timed_out;
+        if passed {
+            let output = ledger
+                .close_event_data(&check.attempt_bead)?
+                .and_then(|d| d.get("output").cloned());
+            let mut close = serde_json::json!({
+                "outcome": "pass",
+                "reason": format!("check passed on attempt {}", check.attempt_no),
+            });
+            if let Some(output) = output {
+                close["output"] = output;
+            }
+            return Ok(Some(vec![
+                EventInput {
+                    kind: EventType::CheckPassed,
+                    rig: Some(anchor_row.rig.clone()),
+                    actor: "campd".into(),
+                    bead: Some(check.attempt_bead.clone()),
+                    data: serde_json::json!({
+                        "run_id": check.run_id,
+                        "step_id": check.step_id,
+                        "attempt": check.attempt_no,
+                    }),
+                },
+                EventInput {
+                    kind: EventType::BeadClosed,
+                    rig: Some(anchor_row.rig.clone()),
+                    actor: "campd".into(),
+                    bead: Some(check.anchor.clone()),
+                    data: close,
+                },
+            ]));
+        }
+        // failed (exit code, signal, or timeout): one check iteration spent
+        let mut failed_data = serde_json::json!({
+            "run_id": check.run_id,
+            "step_id": check.step_id,
+            "attempt": check.attempt_no,
+            "log": check.log_path.display().to_string(),
+        });
+        if check.timed_out {
+            failed_data["timed_out"] = serde_json::json!(true);
+        }
+        if let Some(code) = status.code() {
+            failed_data["exit_code"] = serde_json::json!(code);
+        } else if let Some(signal) = status.signal() {
+            failed_data["signal"] = serde_json::json!(signal);
+        }
+        let failed = EventInput {
+            kind: EventType::CheckFailed,
+            rig: Some(anchor_row.rig.clone()),
+            actor: "campd".into(),
+            bead: Some(check.attempt_bead.clone()),
+            data: failed_data,
+        };
+        if check.attempt_no < max_attempts {
+            // next iteration bead: the worker redoes the work with the
+            // check evidence in front of it (mechanical copying)
+            let evidence = format!(
+                "check failed (attempt {}): {}; log: {}\n{}",
+                check.attempt_no,
+                if check.timed_out {
+                    "timed out".to_owned()
+                } else {
+                    format!("exit {:?}", status.code().unwrap_or(-1))
+                },
+                check.log_path.display(),
+                log_tail(&check.log_path),
+            );
+            let base_description = ledger
+                .created_event_data(&anchor_row.id)?
+                .as_ref()
+                .and_then(|d| d.get("description"))
+                .and_then(|d| d.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let id = ledger.next_bead_id(prefix_of(&anchor_row.id)?)?;
+            let attempts_so_far = ledger
+                .step_attempts(&check.run_id, &check.step_id, &anchor_row.id)?
+                .len();
+            let created = attempt_bead_input(
+                id,
+                &anchor_row.rig,
+                &check.run_id,
+                step_ref.step,
+                &anchor_row.title,
+                &base_description,
+                attempts_so_far + 1,
+                Some(&evidence),
+            );
+            return Ok(Some(vec![failed, created]));
+        }
+        Ok(Some(vec![
+            failed,
+            EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some(anchor_row.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(check.anchor.clone()),
+                data: serde_json::json!({
+                    "outcome": "fail",
+                    "final_disposition": "hard_fail",
+                    "reason": format!("check budget ({max_attempts}) exhausted"),
+                }),
+            },
+        ]))
     }
 
     fn ctx(&mut self, run_id: &str) -> Option<Arc<RunContext>> {
@@ -683,43 +1073,24 @@ impl GraphRuntime {
         attempt_no: usize,
         evidence: Option<String>,
     ) -> Result<(), CoreError> {
-        let (prefix, _) = camp_core::id::parse_bead_id(&anchor_row.id).ok_or_else(|| {
-            CoreError::Corrupt(format!("anchor id {:?} is not a bead id", anchor_row.id))
-        })?;
-        let id = camp_core::id::next_bead_id(conn, prefix)?;
+        let id = camp_core::id::next_bead_id(conn, prefix_of(&anchor_row.id)?)?;
         let base_description = flow::created_event_data(conn, &anchor_row.id)?
             .as_ref()
             .and_then(|d| d.get("description"))
             .and_then(|d| d.as_str())
             .unwrap_or_default()
             .to_owned();
-        let description = match evidence {
-            Some(evidence) if base_description.is_empty() => evidence,
-            Some(evidence) => format!("{base_description}\n\n{evidence}"),
-            None => base_description,
-        };
-        let mut data = serde_json::json!({
-            "title": format!("{} (attempt {attempt_no})", anchor_row.title),
-            "run_id": ctx.run_id,
-            "step_id": step.id,
-        });
-        if !description.is_empty() {
-            data["description"] = serde_json::json!(description);
-        }
-        if let Some(assignee) = &step.assignee {
-            data["assignee"] = serde_json::json!(assignee);
-        }
-        Ledger::append_on(
-            conn,
-            now,
-            EventInput {
-                kind: EventType::BeadCreated,
-                rig: Some(anchor_row.rig.clone()),
-                actor: "campd".into(),
-                bead: Some(id),
-                data,
-            },
-        )?;
+        let input = attempt_bead_input(
+            id,
+            &anchor_row.rig,
+            &ctx.run_id,
+            step,
+            &anchor_row.title,
+            &base_description,
+            attempt_no,
+            evidence.as_deref(),
+        );
+        Ledger::append_on(conn, now, input)?;
         Ok(())
     }
 
@@ -1010,6 +1381,69 @@ impl GraphRuntime {
     #[allow(dead_code)] // consumed by the Task 7 fan-out tests
     pub fn pending_fanout_queue(&self) -> &[PendingFanout] {
         &self.pending_fanouts
+    }
+}
+
+/// The bead id prefix of an existing bead id (attempt beads share their
+/// anchor's rig prefix).
+fn prefix_of(bead_id: &str) -> Result<&str, CoreError> {
+    camp_core::id::parse_bead_id(bead_id)
+        .map(|(prefix, _)| prefix)
+        .ok_or_else(|| CoreError::Corrupt(format!("{bead_id:?} is not a bead id")))
+}
+
+/// The bead.created input for a looping-step attempt (shared by the
+/// cursor-atomic processor path and the check-reap batch path).
+#[allow(clippy::too_many_arguments)]
+fn attempt_bead_input(
+    id: String,
+    rig: &str,
+    run_id: &str,
+    step: &Step,
+    anchor_title: &str,
+    base_description: &str,
+    attempt_no: usize,
+    evidence: Option<&str>,
+) -> EventInput {
+    let description = match evidence {
+        Some(evidence) if base_description.is_empty() => evidence.to_owned(),
+        Some(evidence) => format!("{base_description}\n\n{evidence}"),
+        None => base_description.to_owned(),
+    };
+    let mut data = serde_json::json!({
+        "title": format!("{anchor_title} (attempt {attempt_no})"),
+        "run_id": run_id,
+        "step_id": step.id,
+    });
+    if !description.is_empty() {
+        data["description"] = serde_json::json!(description);
+    }
+    if let Some(assignee) = &step.assignee {
+        data["assignee"] = serde_json::json!(assignee);
+    }
+    EventInput {
+        kind: EventType::BeadCreated,
+        rig: Some(rig.to_owned()),
+        actor: "campd".into(),
+        bead: Some(id),
+        data,
+    }
+}
+
+/// The last ~2 KB of a check log — the mechanical evidence copied into the
+/// next iteration's description (nothing hidden; the worker needs it).
+fn log_tail(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let tail_start = text.len().saturating_sub(2048);
+            // don't split a UTF-8 char
+            let mut start = tail_start;
+            while start < text.len() && !text.is_char_boundary(start) {
+                start += 1;
+            }
+            text[start..].to_owned()
+        }
+        Err(_) => String::new(), // the log path is already in the event
     }
 }
 
@@ -1632,6 +2066,237 @@ mod tests {
         assert_eq!(queue[0].attempt_no, 1);
         assert_eq!(queue[0].anchor, anchor_id);
         assert_eq!(queue[0].attempt_bead, attempt);
+    }
+
+    // ---- Phase 9 Task 6: check execution --------------------------------
+
+    /// Test-only: block until every live check child exits, then reap.
+    fn wait_and_reap_checks(graph: &mut GraphRuntime, ledger: &mut Ledger) {
+        for check in graph.check_children.values_mut() {
+            let _ = check.child.wait();
+        }
+        graph.reap_checks(ledger).unwrap();
+    }
+
+    /// Cook a checked run, close attempt 1 pass, and settle so the check
+    /// is queued. Returns (anchor, attempt) bead ids.
+    fn checked_run_with_queued_check(
+        dir: &tempfile::TempDir,
+        ledger: &mut Ledger,
+        rt: &mut super::super::orders::OrdersRuntime,
+        graph: &mut GraphRuntime,
+        script: &str,
+        toml: &str,
+    ) -> (String, String, CookedRun) {
+        let script_path = dir.path().join("repo/verify.sh");
+        std::fs::write(&script_path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cooked = cook_into(dir, ledger, "checked", toml);
+        settle_graph(ledger, rt, graph);
+        let anchor_id = cooked.step_beads["impl"].clone();
+        let attempt = ledger
+            .step_attempts(&cooked.run_id, "impl", &anchor_id)
+            .unwrap()[0]
+            .id
+            .clone();
+        append_close(
+            ledger,
+            &attempt,
+            serde_json::json!({"outcome":"pass","output":{"n":1}}),
+        );
+        settle_graph(ledger, rt, graph);
+        (anchor_id, attempt, cooked)
+    }
+
+    #[test]
+    fn a_passing_check_closes_the_anchor_with_output() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let (anchor_id, attempt, cooked) = checked_run_with_queued_check(
+            &dir,
+            &mut ledger,
+            &mut rt,
+            &mut graph,
+            "#!/bin/sh\necho verifying\nexit 0\n",
+            CHECKED,
+        );
+        graph.execute(&mut ledger).unwrap();
+        wait_and_reap_checks(&mut graph, &mut ledger);
+        let passed = events_named(&ledger, "check.passed");
+        assert_eq!(passed.len(), 1);
+        assert_eq!(passed[0].data["attempt"], 1);
+        assert_eq!(passed[0].bead.as_deref(), Some(attempt.as_str()));
+        let close = ledger.close_event_data(&anchor_id).unwrap().unwrap();
+        assert_eq!(close["outcome"], "pass");
+        assert_eq!(close["output"]["n"], 1, "attempt output copied to the step");
+        // the settle that follows the reap finalizes the run
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        assert_eq!(events_named(&ledger, "run.finalized").len(), 1);
+        assert_eq!(
+            ledger
+                .get_bead(&cooked.root_bead)
+                .unwrap()
+                .unwrap()
+                .outcome
+                .as_deref(),
+            Some("pass")
+        );
+        assert!(ledger.refold_check().unwrap().drift.is_empty());
+    }
+
+    #[test]
+    fn a_failing_check_with_budget_creates_the_next_attempt_with_evidence() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let (anchor_id, _attempt, cooked) = checked_run_with_queued_check(
+            &dir,
+            &mut ledger,
+            &mut rt,
+            &mut graph,
+            "#!/bin/sh\necho boom goes the check\nexit 1\n",
+            CHECKED,
+        );
+        graph.execute(&mut ledger).unwrap();
+        wait_and_reap_checks(&mut graph, &mut ledger);
+        let failed = events_named(&ledger, "check.failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].data["attempt"], 1);
+        assert_eq!(failed[0].data["exit_code"], 1);
+        assert!(
+            failed[0].data["log"]
+                .as_str()
+                .unwrap()
+                .contains("impl-attempt-1.log")
+        );
+        let attempts = ledger
+            .step_attempts(&cooked.run_id, "impl", &anchor_id)
+            .unwrap();
+        assert_eq!(attempts.len(), 2, "the next iteration bead exists");
+        let created = ledger.created_event_data(&attempts[1].id).unwrap().unwrap();
+        let description = created["description"].as_str().unwrap();
+        assert!(
+            description.contains("check failed (attempt 1)"),
+            "{description}"
+        );
+        assert!(
+            description.contains("boom goes the check"),
+            "log tail copied: {description}"
+        );
+        assert_eq!(
+            ledger.get_bead(&anchor_id).unwrap().unwrap().status,
+            "in_progress",
+            "the loop continues"
+        );
+    }
+
+    #[test]
+    fn check_budget_exhaustion_fails_the_anchor() {
+        const CHECKED_ONE: &str = "formula = \"checked\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[steps]]\nid = \"impl\"\ntitle = \"Implement\"\n\n[steps.check]\nmax_attempts = 1\n\n[steps.check.check]\nmode = \"exec\"\npath = \"verify.sh\"\ntimeout = \"1m\"\n";
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let (anchor_id, _attempt, _cooked) = checked_run_with_queued_check(
+            &dir,
+            &mut ledger,
+            &mut rt,
+            &mut graph,
+            "#!/bin/sh\nexit 1\n",
+            CHECKED_ONE,
+        );
+        graph.execute(&mut ledger).unwrap();
+        wait_and_reap_checks(&mut graph, &mut ledger);
+        let close = ledger.close_event_data(&anchor_id).unwrap().unwrap();
+        assert_eq!(close["outcome"], "fail");
+        assert_eq!(close["final_disposition"], "hard_fail");
+        assert!(
+            close["reason"]
+                .as_str()
+                .unwrap()
+                .contains("check budget (1) exhausted"),
+            "{close}"
+        );
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let finalized = events_named(&ledger, "run.finalized");
+        assert_eq!(finalized.len(), 1, "check exhaustion fails the run");
+        assert_eq!(finalized[0].data["outcome"], "fail");
+        assert!(ledger.refold_check().unwrap().drift.is_empty());
+    }
+
+    #[test]
+    fn an_expired_check_is_killed_and_counts_as_a_failed_iteration() {
+        const CHECKED_FAST: &str = "formula = \"checked\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[steps]]\nid = \"impl\"\ntitle = \"Implement\"\n\n[steps.check]\nmax_attempts = 3\n\n[steps.check.check]\nmode = \"exec\"\npath = \"verify.sh\"\ntimeout = \"200ms\"\n";
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let (anchor_id, _attempt, cooked) = checked_run_with_queued_check(
+            &dir,
+            &mut ledger,
+            &mut rt,
+            &mut graph,
+            "#!/bin/sh\nsleep 60\n",
+            CHECKED_FAST,
+        );
+        graph.execute(&mut ledger).unwrap();
+        // the deadline contributes to the poll timeout (<= 200ms)
+        let timeout = graph.poll_timeout(std::time::Instant::now()).unwrap();
+        assert!(
+            timeout <= std::time::Duration::from_millis(200),
+            "{timeout:?}"
+        );
+        // a wake past the deadline kills; `now` is injectable
+        graph.kill_expired(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        wait_and_reap_checks(&mut graph, &mut ledger);
+        let failed = events_named(&ledger, "check.failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].data["timed_out"], true);
+        // a timeout is a spent iteration, not a hard stop: attempt 2 exists
+        assert_eq!(
+            ledger
+                .step_attempts(&cooked.run_id, "impl", &anchor_id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            ledger.get_bead(&anchor_id).unwrap().unwrap().status,
+            "in_progress"
+        );
+    }
+
+    #[test]
+    fn a_missing_check_script_hard_fails_the_anchor_without_burning_budget() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        // CHECKED names verify.sh but we never create it
+        let cooked = cook_into(&dir, &mut ledger, "checked", CHECKED);
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let anchor_id = cooked.step_beads["impl"].clone();
+        let attempt = ledger
+            .step_attempts(&cooked.run_id, "impl", &anchor_id)
+            .unwrap()[0]
+            .id
+            .clone();
+        append_close(&mut ledger, &attempt, serde_json::json!({"outcome":"pass"}));
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        graph.execute(&mut ledger).unwrap();
+        let failed = events_named(&ledger, "check.failed");
+        assert_eq!(failed.len(), 1, "exactly one check.failed (Decision 10)");
+        assert!(
+            failed[0].data["error"]
+                .as_str()
+                .unwrap()
+                .contains("failed to start")
+        );
+        let close = ledger.close_event_data(&anchor_id).unwrap().unwrap();
+        assert_eq!(close["outcome"], "fail");
+        assert_eq!(close["final_disposition"], "hard_fail");
+        assert_eq!(
+            ledger
+                .step_attempts(&cooked.run_id, "impl", &anchor_id)
+                .unwrap()
+                .len(),
+            1,
+            "no budget loop over a structural problem"
+        );
     }
 
     #[test]
