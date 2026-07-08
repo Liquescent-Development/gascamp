@@ -4,6 +4,8 @@
 //! read at campd start; hot reload does not re-arm patrol (Phase 11 plan
 //! Decision L).
 
+pub mod timers;
+
 use jiff::SignedDuration;
 
 use crate::config::PatrolSection;
