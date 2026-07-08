@@ -101,6 +101,11 @@ mod tests {
     /// child's EOF is a won race, not "campd failed to start".
     #[test]
     fn start_detached_recognizes_a_lost_race() {
+        // start_detached forks a child: serialized against the socket
+        // probe tests (round-2 review finding; see spawn_probe_guard) so
+        // the fork cannot land inside another test's socket()/FD_CLOEXEC
+        // window on macOS.
+        let _spawning = crate::daemon::spawn_probe_guard();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".camp");
         std::fs::create_dir_all(&root).unwrap();

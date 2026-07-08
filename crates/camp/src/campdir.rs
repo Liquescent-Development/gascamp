@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+#[derive(Clone)]
 pub struct CampDir {
     pub root: PathBuf,
 }
@@ -26,6 +27,11 @@ impl CampDir {
     /// Where a detached campd's stderr lands (never silenced, never hidden).
     pub fn log_path(&self) -> PathBuf {
         self.root.join("campd.log")
+    }
+
+    /// Camp-managed worktrees (spec §12), one per isolated bead.
+    pub fn worktrees_path(&self) -> PathBuf {
+        self.root.join("worktrees")
     }
 
     pub fn resolve(flag: Option<&Path>) -> Result<CampDir> {

@@ -198,6 +198,8 @@ camp/                      # ~/camps/<name>/ (multi-rig) or <repo>/.camp/ (singl
                            #   canonical JSONL for any range (7.2)
   runs/<run-id>/           # one dir per formula run: pinned formula copy,
                            #   cook manifest, step status snapshot
+  sessions/                # per-worker stdout capture (the claude result
+                           #   envelope JSON) + stderr log, one pair per session
   formulas/                # camp-local formula definitions, resolved by
                            #   name (§9; packs layer beneath, §11)
   worktrees/               # camp-managed worktrees (per agent isolation flag)

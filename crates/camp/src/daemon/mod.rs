@@ -5,9 +5,11 @@
 
 pub mod autostart;
 pub mod cursor;
+pub mod dispatch;
 pub mod event_loop;
 pub mod orders;
 pub mod socket;
+pub mod spawn;
 
 use std::io::Write;
 
@@ -23,7 +25,29 @@ use cursor::ReadinessProcessor;
 /// sleep/retry loop. stdout is never written again after this line.
 pub const READY_PREFIX: &str = "campd listening on ";
 
+/// Test-only serialization of child-spawning tests against socket-probe
+/// tests. macOS lacks SOCK_CLOEXEC, so std sets FD_CLOEXEC in a second
+/// syscall after socket(); a test that forks a child (git, /usr/bin/true)
+/// in that window inherits another test's listener fd and keeps a
+/// "dropped" socket accepting — the stale-socket probes then flake.
+/// Production campd is immune: it binds single-threaded, before any
+/// worker exists. Tests that spawn processes and tests that probe dead
+/// sockets both hold this lock (a poisoned lock is fine — the dead
+/// holder's window is over).
+#[cfg(test)]
+pub(crate) static SPAWN_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn spawn_probe_guard() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_PROBE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub fn run(camp: &CampDir) -> Result<()> {
+    // A daemon that cannot read its own config must not pretend to be up.
+    let config = camp_core::config::CampConfig::load(&camp.config_path())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut ledger = Ledger::open(&camp.db_path())?;
     // "When did campd last OBSERVE the world" — the cursor-position ts,
     // read BEFORE the startup settle advances the cursor, so cron fires
@@ -37,6 +61,17 @@ pub fn run(camp: &CampDir) -> Result<()> {
         .set_nonblocking(true)
         .context("setting the listener non-blocking")?;
     let listener = mio::net::UnixListener::from_std(std_listener);
+
+    // SIGCHLD self-pipe (Phase 8 plan decision I), registered before any
+    // child can exist so no exit can be missed. signal-hook's handler
+    // writes a byte; the poll loop drains it. No unsafe anywhere.
+    let (sigchld_read, sigchld_write) =
+        std::os::unix::net::UnixStream::pair().context("creating the SIGCHLD pipe")?;
+    signal_hook::low_level::pipe::register(signal_hook::consts::SIGCHLD, sigchld_write)
+        .context("registering the SIGCHLD handler")?;
+    sigchld_read
+        .set_nonblocking(true)
+        .context("setting the SIGCHLD pipe non-blocking")?;
 
     ledger.append(EventInput {
         kind: EventType::CampdStarted,
@@ -73,9 +108,19 @@ pub fn run(camp: &CampDir) -> Result<()> {
 
     // Startup settle is fatal on error: a daemon that cannot process its
     // backlog must not pretend to be up (fail fast). Settle drains events
-    // past the cursor AND cooks any order.fired they declare.
+    // past the cursor, cooks any order.fired they declare, AND dispatches
+    // whatever is ready (the Phase 8 + Phase 10 joint fixpoint). Per-bead
+    // dispatch problems are dispatch.failed events, not errors — only a
+    // broken ledger stops the daemon.
     let mut processor = ReadinessProcessor::default();
-    orders::settle(&mut ledger, &mut processor, &mut runtime, &clock)?;
+    let mut dispatcher = dispatch::Dispatcher::new(camp.clone(), config);
+    event_loop::settle(
+        &mut ledger,
+        &mut processor,
+        &mut runtime,
+        &clock,
+        &mut dispatcher,
+    )?;
     // Fires orphaned by a crash between order.fired and its cook (the
     // cursor is already past them): queue them for the next settle —
     // exactly once, execute_fire dedupes. Observation over state; kill -9
@@ -91,7 +136,13 @@ pub fn run(camp: &CampDir) -> Result<()> {
         .map(|c| c.into_fire(now))
         .collect();
     orders::declare_cron_fires(&mut ledger, &fires)?;
-    orders::settle(&mut ledger, &mut processor, &mut runtime, &clock)?;
+    event_loop::settle(
+        &mut ledger,
+        &mut processor,
+        &mut runtime,
+        &clock,
+        &mut dispatcher,
+    )?;
 
     let mut stdout = std::io::stdout();
     writeln!(stdout, "{READY_PREFIX}{}", socket_path.display()).context("announcing readiness")?;
@@ -101,12 +152,14 @@ pub fn run(camp: &CampDir) -> Result<()> {
     // camp.toml watch.
     let result = event_loop::run(
         listener,
+        sigchld_read,
         &socket_path,
         &mut ledger,
         &mut processor,
         &mut runtime,
         &clock,
         &mut receiver,
+        &mut dispatcher,
     );
     drop(watcher);
     result
@@ -140,6 +193,17 @@ mod tests {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         reader.read_line(&mut resp).unwrap();
         serde_json::from_str(resp.trim_end()).expect("campd response is JSON")
+    }
+
+    #[test]
+    fn daemon_with_a_broken_config_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".camp");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname = \"t\"\nbogus = 1\n").unwrap();
+        let camp = CampDir { root };
+        let err = run(&camp).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "got {err:#}");
     }
 
     #[test]
