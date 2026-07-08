@@ -33,4 +33,9 @@ pub enum CoreError {
     /// integrity finding — that is `Corrupt`.
     #[error("cook: {0}")]
     Cook(String),
+    /// An order is misconfigured or failed at the order level; the reason
+    /// names the offending field where one exists (spec §9: parse errors
+    /// name the order and the field).
+    #[error("order {order:?}: {reason}")]
+    Order { order: String, reason: String },
 }

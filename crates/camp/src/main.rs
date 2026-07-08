@@ -10,6 +10,7 @@ mod cmd {
     pub mod events;
     pub mod init;
     pub mod ls;
+    pub mod order;
     pub mod recall;
     pub mod remember;
     pub mod rig;
@@ -165,12 +166,32 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Manage orders (scheduled and event-triggered formulas)
+    Order {
+        #[command(subcommand)]
+        command: OrderCommand,
+    },
     /// Run the daemon in the foreground (also reachable via a campd symlink)
     Daemon,
     /// Stop the running daemon gracefully
     Stop,
     /// One campd status snapshot as plain text (auto-starts the daemon)
     Top,
+}
+
+#[derive(Subcommand)]
+enum OrderCommand {
+    /// List configured orders with their next fire times
+    Ls {
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fire an order now (manual trigger; campd cooks it)
+    Run {
+        /// Order name from camp.toml
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -321,6 +342,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Recall { query, limit } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::recall::run(&camp, &query, limit)
+        }
+        Command::Order { command } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            match command {
+                OrderCommand::Ls { json } => cmd::order::ls(&camp, json),
+                OrderCommand::Run { name } => cmd::order::run_order(&camp, &name),
+            }
         }
         Command::Daemon => run_daemon(cli.camp.as_deref()),
         Command::Stop => {

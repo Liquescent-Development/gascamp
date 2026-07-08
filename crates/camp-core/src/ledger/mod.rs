@@ -73,33 +73,20 @@ impl Ledger {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut seqs = Vec::with_capacity(inputs.len());
         for input in inputs {
-            let EventInput {
-                kind,
-                rig,
-                actor,
-                bead,
-                data,
-            } = input;
-            tx.execute(
-                "INSERT INTO events (ts, type, rig, actor, bead, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![ts, kind.as_str(), rig, actor, bead, data.to_string()],
-            )?;
-            let seq = tx.last_insert_rowid();
-            let event = Event {
-                seq,
-                ts: ts.clone(),
-                kind,
-                rig,
-                actor,
-                bead,
-                data,
-            };
-            fold::apply(&tx, &event)?;
-            seqs.push(seq);
+            seqs.push(insert_and_fold(&tx, &ts, input)?);
         }
         tx.commit()?;
         Ok(seqs)
+    }
+
+    /// The single write path (insert the event row + fold its state effect)
+    /// on a caller-provided connection. MUST run inside a transaction the
+    /// caller commits — the sanctioned caller is a `process_past_cursor`
+    /// processor (spec §7.3), whose appends then commit atomically with the
+    /// cursor advance (exactly-once even across kill -9). Same fold, same
+    /// validation, same refold story as `append`.
+    pub fn append_on(conn: &Connection, ts: &str, input: EventInput) -> Result<Seq, CoreError> {
+        insert_and_fold(conn, ts, input)
     }
 
     /// The next unused bead id for `prefix` (spec §12). See `camp_core::id`.
@@ -264,6 +251,89 @@ impl Ledger {
         Ok(events)
     }
 
+    /// Every event of one type, in seq order (via the `events_type` index).
+    /// Order counts are small; this backs fire reconciliation, not user
+    /// queries (spec §7.2: state reads go to the state tables).
+    pub fn events_of_type(&self, kind: crate::event::EventType) -> Result<Vec<Event>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, ts, type, rig, actor, bead, data FROM events
+             WHERE type = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([kind.as_str()], row_to_event)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    /// Is there any event of `kind` with exactly this actor? A targeted
+    /// existence probe bounded by the `events_type` index (PR #13 review
+    /// LOW 5) — the fire-dedupe hot path must not scan the ledger.
+    pub fn has_event_with_actor(
+        &self,
+        kind: crate::event::EventType,
+        actor: &str,
+    ) -> Result<bool, CoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM events WHERE type = ?1 AND actor = ?2 LIMIT 1",
+                params![kind.as_str(), actor],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Is there any event of `kind` whose `data.<field>` equals this
+    /// integer? `json_extract` over the type-indexed subset (PR #13 review
+    /// LOW 5).
+    pub fn has_event_with_data_i64(
+        &self,
+        kind: crate::event::EventType,
+        field: &str,
+        value: i64,
+    ) -> Result<bool, CoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE type = ?1 AND json_extract(data, '$.' || ?2) = ?3 LIMIT 1",
+                params![kind.as_str(), field, value],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Is there any event of `kind` whose `data.<f1>` and `data.<f2>`
+    /// equal these strings? Targeted existence probe over the type-indexed
+    /// subset (PR #13 fix-pass review: idempotent cron-fire declaration).
+    pub fn has_event_with_data_strs(
+        &self,
+        kind: crate::event::EventType,
+        (f1, v1): (&str, &str),
+        (f2, v2): (&str, &str),
+    ) -> Result<bool, CoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE type = ?1
+                   AND json_extract(data, '$.' || ?2) = ?3
+                   AND json_extract(data, '$.' || ?4) = ?5
+                 LIMIT 1",
+                params![kind.as_str(), f1, v1, f2, v2],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Ranked full-text search over titles, descriptions, close notes, and
     /// memory (spec §7.4), best match first. See [`crate::search::search`].
     pub fn search(
@@ -274,6 +344,36 @@ impl Ledger {
     ) -> Result<Vec<crate::search::SearchHit>, CoreError> {
         crate::search::search(&self.conn, query, type_filter, limit)
     }
+}
+
+/// The one write path shared by `append`/`append_batch`/`append_on`: insert
+/// the event row (monotonic seq) and apply its fold in the caller's open
+/// transaction (spec §7.2 — a write is one transaction).
+fn insert_and_fold(conn: &Connection, ts: &str, input: EventInput) -> Result<Seq, CoreError> {
+    let EventInput {
+        kind,
+        rig,
+        actor,
+        bead,
+        data,
+    } = input;
+    conn.execute(
+        "INSERT INTO events (ts, type, rig, actor, bead, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![ts, kind.as_str(), rig, actor, bead, data.to_string()],
+    )?;
+    let seq = conn.last_insert_rowid();
+    let event = Event {
+        seq,
+        ts: ts.to_owned(),
+        kind,
+        rig,
+        actor,
+        bead,
+        data,
+    };
+    fold::apply(conn, &event)?;
+    Ok(seq)
 }
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
@@ -1160,6 +1260,307 @@ mod tests {
             })
             .unwrap();
         assert_eq!(tail, (poison..=total).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn append_on_writes_through_a_processor_transaction_atomically() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(input(
+                EventType::CampdStarted,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        // A processor that appends a config.changed for the event it sees:
+        let end = ledger
+            .process_past_cursor("t", &mut |conn, event| {
+                if event.kind == EventType::CampdStarted {
+                    Ledger::append_on(
+                        conn,
+                        "2026-07-06T07:00:00Z",
+                        EventInput {
+                            kind: EventType::ConfigChanged,
+                            rig: None,
+                            actor: "campd".into(),
+                            bead: None,
+                            data: serde_json::json!({"path":"camp.toml","applied":true,"orders":0}),
+                        },
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        // process_past_cursor drains pages until empty WITHIN one call: the
+        // config.changed appended while processing seq 1 lands at seq 2 and
+        // is processed by the same call.
+        assert_eq!(
+            end, 2,
+            "the same call drains events appended mid-processing"
+        );
+        let events = ledger.events_range(1, None).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, EventType::ConfigChanged);
+        assert_eq!(ledger.cursor("t").unwrap(), 2);
+    }
+
+    #[test]
+    fn append_on_rejects_invalid_payloads_like_append() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(input(
+                EventType::CampdStarted,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        let err = ledger.process_past_cursor("t", &mut |conn, _event| {
+            Ledger::append_on(
+                conn,
+                "2026-07-06T07:00:00Z",
+                EventInput {
+                    kind: EventType::ConfigChanged,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: None,
+                    data: serde_json::json!({"applied": true}), // missing path/orders
+                },
+            )?;
+            Ok(())
+        });
+        assert!(err.is_err());
+        // the failed processor transaction rolled back: no event, no cursor move
+        assert_eq!(ledger.events_range(1, None).unwrap().len(), 1);
+        assert_eq!(ledger.cursor("t").unwrap(), 0);
+    }
+
+    #[test]
+    fn targeted_event_existence_queries() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(input(
+                EventType::OrderFailed,
+                None,
+                None,
+                serde_json::json!({"order":"t","fired_seq":41,"error":"e"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::ConfigChanged,
+                None,
+                None,
+                serde_json::json!({"path":"p","applied":true,"orders":0}),
+            ))
+            .unwrap();
+        assert!(
+            ledger
+                .has_event_with_data_i64(EventType::OrderFailed, "fired_seq", 41)
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .has_event_with_data_i64(EventType::OrderFailed, "fired_seq", 42)
+                .unwrap()
+        );
+        // actor equality, bounded by the type index
+        assert!(
+            ledger
+                .has_event_with_actor(EventType::ConfigChanged, "test")
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .has_event_with_actor(EventType::ConfigChanged, "order:t:41")
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .has_event_with_actor(EventType::RunCooked, "test")
+                .unwrap()
+        );
+        // two-string-field probe (idempotent cron-fire declaration)
+        ledger
+            .append(input(
+                EventType::OrderFired,
+                None,
+                None,
+                serde_json::json!({"order":"t","trigger":"cron","scheduled_ts":"2026-07-06T07:00:00Z"}),
+            ))
+            .unwrap();
+        assert!(
+            ledger
+                .has_event_with_data_strs(
+                    EventType::OrderFired,
+                    ("order", "t"),
+                    ("scheduled_ts", "2026-07-06T07:00:00Z"),
+                )
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .has_event_with_data_strs(
+                    EventType::OrderFired,
+                    ("order", "t"),
+                    ("scheduled_ts", "2026-07-06T08:00:00Z"),
+                )
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .has_event_with_data_strs(
+                    EventType::OrderFired,
+                    ("order", "u"),
+                    ("scheduled_ts", "2026-07-06T07:00:00Z"),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn events_of_type_lists_exactly_that_kind() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(input(
+                EventType::CampdStarted,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::CampdStopped,
+                None,
+                None,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::CampdStarted)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            ledger.events_of_type(EventType::OrderFired).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn order_events_are_validated_and_log_only() {
+        let (_dir, mut ledger) = temp_ledger();
+        for data in [
+            serde_json::json!({"order":"t","trigger":"cron","scheduled_ts":"2026-07-06T07:00:00Z"}),
+            serde_json::json!({"order":"t","trigger":"cron","scheduled_ts":"2026-07-06T07:00:00Z","catch_up":true}),
+            serde_json::json!({"order":"t","trigger":"event","cause_seq":4}),
+            serde_json::json!({"order":"t","trigger":"manual"}),
+        ] {
+            ledger
+                .append(input(EventType::OrderFired, None, None, data))
+                .unwrap();
+        }
+        ledger
+            .append(input(
+                EventType::OrderCompleted,
+                None,
+                None,
+                serde_json::json!({"order":"t","fired_seq":1,"root_bead":"gc-1","run_id":"r","outcome":"pass"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::OrderFailed,
+                None,
+                None,
+                serde_json::json!({"order":"t","fired_seq":1,"error":"formula not found"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::OrderFailed,
+                None,
+                None,
+                serde_json::json!({"order":"t","fired_seq":1,"root_bead":"gc-1","run_id":"r","outcome":"fail"}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::ConfigChanged,
+                None,
+                None,
+                serde_json::json!({"path":"camp.toml","applied":true,"orders":2}),
+            ))
+            .unwrap();
+        ledger
+            .append(input(
+                EventType::ConfigChanged,
+                None,
+                None,
+                serde_json::json!({"path":"camp.toml","applied":false,"error":"unknown field"}),
+            ))
+            .unwrap();
+        // all log-only: no state effect
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 9);
+        assert_eq!(count(&ledger, "SELECT count(*) FROM beads"), 0);
+    }
+
+    #[test]
+    fn malformed_order_events_are_rejected() {
+        let (_dir, mut ledger) = temp_ledger();
+        for (kind, data) in [
+            (
+                EventType::OrderFired,
+                serde_json::json!({"order":"t","trigger":"vibes"}),
+            ),
+            (
+                EventType::OrderFired,
+                serde_json::json!({"order":"t","trigger":"cron"}), // no scheduled_ts
+            ),
+            (
+                EventType::OrderFired,
+                serde_json::json!({"order":"t","trigger":"event"}), // no cause_seq
+            ),
+            (
+                EventType::OrderFired,
+                serde_json::json!({"order":"t","trigger":"manual","catch_up":true}),
+            ),
+            (
+                EventType::OrderCompleted,
+                serde_json::json!({"order":"t","fired_seq":1,"root_bead":"gc-1","run_id":"r","outcome":"fail"}),
+            ),
+            (
+                EventType::OrderFailed,
+                serde_json::json!({"order":"t","fired_seq":1}), // neither shape
+            ),
+            (
+                EventType::OrderFailed,
+                serde_json::json!({"order":"t","fired_seq":1,"error":"e","root_bead":"gc-1"}), // both
+            ),
+            (
+                EventType::ConfigChanged,
+                serde_json::json!({"path":"p","applied":true,"error":"e"}),
+            ),
+            (
+                EventType::ConfigChanged,
+                serde_json::json!({"path":"p","applied":false}),
+            ),
+            (
+                EventType::OrderFired,
+                serde_json::json!({"order":"t","trigger":"manual","bogus":1}),
+            ),
+        ] {
+            assert!(
+                ledger
+                    .append(input(kind, None, None, data.clone()))
+                    .is_err(),
+                "{kind:?} {data}"
+            );
+        }
     }
 
     #[test]

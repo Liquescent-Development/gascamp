@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Gas Camp: OPTIONAL fire-at-login agent (spec §5, §9).
+       Edit the two paths below, then see README.md alongside this file.
+       Without this agent, campd auto-starts on first `camp` use and orders
+       fire only while it runs; that default is fine for most setups. -->
+  <key>Label</key>
+  <string>com.gascamp.campd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/camp</string>
+    <string>daemon</string>
+    <string>--camp</string>
+    <string>/Users/YOU/camps/dev/.camp</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Deliberately NO KeepAlive: `camp stop` must stay stopped. A campd
+       that exits is restarted on demand by the next camp verb (spec §5). -->
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/camps/dev/.camp/campd.log</string>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+</dict>
+</plist>
