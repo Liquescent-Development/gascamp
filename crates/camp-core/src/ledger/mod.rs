@@ -45,6 +45,18 @@ impl Ledger {
         Ok(Self { conn, clock })
     }
 
+    /// Open an existing ledger read-only (`SQLITE_OPEN_READ_ONLY`) — the
+    /// `camp export` path (spec §15.3): read-only by construction, not by
+    /// discipline (PR #18 review finding 4). Appends fail; a missing
+    /// database is a hard error, never created.
+    pub fn open_read_only(db_path: &Path) -> Result<Self, CoreError> {
+        let conn = schema::open_db_read_only(db_path)?;
+        Ok(Self {
+            conn,
+            clock: Box::new(SystemClock),
+        })
+    }
+
     /// The clock's current timestamp (RFC3339 UTC, whole seconds) — the same
     /// source event timestamps use, so run ids are deterministic in tests.
     pub fn now_utc(&self) -> String {
@@ -145,6 +157,12 @@ impl Ledger {
         filter: &crate::readiness::ListFilter,
     ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
         crate::readiness::list_beads(&self.conn, filter)
+    }
+
+    /// Full-fidelity bead rows for `camp export` (spec §15.3): every
+    /// `beads` column plus the `needs` edges, in creation order.
+    pub fn export_beads(&self) -> Result<Vec<crate::export::ExportBead>, CoreError> {
+        crate::export::export_beads(&self.conn)
     }
 
     /// One bead's current state, or `None`.
@@ -1062,6 +1080,41 @@ mod tests {
         )) {
             Err(CoreError::InvalidEventData { reason, .. }) => {
                 assert!(reason.contains("skipped"), "reason was: {reason}");
+            }
+            other => panic!("expected InvalidEventData, got {other:?}"),
+        }
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+    }
+
+    /// PR #18 review finding 1: bd v1.0.4 silently SKIPS memory records
+    /// with an empty value and REJECTS a whole import over an empty-title
+    /// issue line — so an empty title must never enter the ledger at all
+    /// (fail fast at the creation boundary, fixing every consumer).
+    #[test]
+    fn bead_titles_must_be_non_empty() {
+        let (_dir, mut ledger) = temp_ledger();
+        for bad in ["", "   "] {
+            match ledger.append(created("gc-1", serde_json::json!({"title": bad}))) {
+                Err(CoreError::InvalidEventData { reason, .. }) => {
+                    assert!(reason.contains("title"), "reason was: {reason}");
+                }
+                other => panic!("expected InvalidEventData, got {other:?}"),
+            }
+        }
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 0);
+
+        // an update cannot blank a title either
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "ok"})))
+            .unwrap();
+        match ledger.append(input(
+            EventType::BeadUpdated,
+            Some("gc"),
+            Some("gc-1"),
+            serde_json::json!({"title": "  "}),
+        )) {
+            Err(CoreError::InvalidEventData { reason, .. }) => {
+                assert!(reason.contains("title"), "reason was: {reason}");
             }
             other => panic!("expected InvalidEventData, got {other:?}"),
         }
@@ -2079,6 +2132,31 @@ mod tests {
         drop(Ledger::open(&path).unwrap());
         // second open must not re-run migration or error
         drop(Ledger::open(&path).unwrap());
+    }
+
+    /// PR #18 review finding 4: `camp export` opens the ledger read-only
+    /// by construction — reads work, appends fail, and a missing database
+    /// is never created.
+    #[test]
+    fn read_only_open_reads_but_never_writes_or_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("camp.db");
+        {
+            let mut rw = Ledger::open(&path).unwrap();
+            rw.append(created("gc-1", serde_json::json!({"title": "one"})))
+                .unwrap();
+        }
+        let mut ro = Ledger::open_read_only(&path).unwrap();
+        assert_eq!(ro.export_beads().unwrap().len(), 1);
+        assert!(
+            ro.append(created("gc-2", serde_json::json!({"title": "two"})))
+                .is_err(),
+            "appends must fail on a read-only ledger"
+        );
+
+        let missing = dir.path().join("nope.db");
+        assert!(Ledger::open_read_only(&missing).is_err());
+        assert!(!missing.exists(), "read-only open must never create a db");
     }
 
     #[test]

@@ -101,6 +101,16 @@ fn bead_created(conn: &Connection, event: &Event) -> Result<(), CoreError> {
             reason: format!("unknown bead type {:?}", p.bead_type),
         });
     }
+    // An empty title is unusable everywhere downstream (bd import rejects
+    // empty-title issues and silently drops empty-value memories — spec
+    // §15.3 export bridge, PR #18 review finding 1). Fail fast at the
+    // creation boundary so no consumer ever sees one.
+    if p.title.trim().is_empty() {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: "title must be non-empty".to_owned(),
+        });
+    }
     if bead_status(conn, id)?.is_some() {
         return Err(CoreError::InvalidTransition {
             bead: id.to_owned(),
@@ -188,6 +198,16 @@ fn bead_updated(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         return Err(CoreError::InvalidEventData {
             event_type: event.kind.as_str().to_owned(),
             reason: "update must set title and/or description".to_owned(),
+        });
+    }
+    // Same rule as creation (PR #18 review finding 1): a patch must not
+    // blank a title.
+    if let Some(title) = &p.title
+        && title.trim().is_empty()
+    {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: "title, when set, must be non-empty".to_owned(),
         });
     }
     if bead_status(conn, id)?.is_none() {

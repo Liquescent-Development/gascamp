@@ -44,4 +44,15 @@ pub enum CoreError {
     /// name the order and the field).
     #[error("order {order:?}: {reason}")]
     Order { order: String, reason: String },
+    /// A `camp export` failure that is not an order-translation finding:
+    /// bad output directory, unreadable inputs, malformed run dirs.
+    #[error("export: {0}")]
+    Export(String),
+    /// Orders that cannot be expressed as gc order TOML (spec §15.3, plan
+    /// decision 8). Listed in full; the flag named here is the contract's
+    /// explicit opt-out.
+    #[error(
+        "export: {count} order(s) cannot be translated to gc order TOML:\n{details}\npass --skip-untranslatable to export without them"
+    )]
+    UntranslatableOrders { count: usize, details: String },
 }

@@ -1,0 +1,4 @@
+[order]
+formula = "one-step"
+trigger = "cron"
+schedule = "0 7 * * 1-5"
