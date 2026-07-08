@@ -294,6 +294,28 @@ fn a_missing_agents_dir_is_noted_not_fatal() {
     );
 }
 
+/// PR #18 review finding 3: a symlinked agent definition must fail with
+/// an actionable message, not "neither a file nor a directory".
+#[cfg(unix)]
+#[test]
+fn a_symlinked_agent_definition_fails_with_an_actionable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (camp_root, ledger, config) = fixture_camp(dir.path(), "");
+    std::os::unix::fs::symlink(
+        camp_root.join("agents/dev.md"),
+        camp_root.join("agents/link.md"),
+    )
+    .unwrap();
+    let out = dir.path().join("city");
+    match export_city(&ledger, &config, &camp_root, &out, &NO_SKIP) {
+        Err(CoreError::Export(msg)) => assert!(
+            msg.contains("symlink") && msg.contains("link.md"),
+            "{msg}"
+        ),
+        other => panic!("expected Export error, got {other:?}"),
+    }
+}
+
 /// D10: export is read-only — it appends nothing to the ledger.
 #[test]
 fn export_appends_no_events() {

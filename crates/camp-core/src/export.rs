@@ -634,7 +634,17 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<usize, CoreError> {
             .file_type()
             .map_err(|e| export_io("stat", &path, &e))?;
         let to = dest.join(entry.file_name());
-        if ty.is_dir() {
+        if ty.is_symlink() {
+            // DirEntry::file_type never follows symlinks, so without this
+            // arm a symlinked agent definition would read like filesystem
+            // corruption (PR #18 review finding 3). Verbatim copy means
+            // copying bytes camp can vouch for — a link's target can
+            // change after export, so links are refused, actionably.
+            return Err(CoreError::Export(format!(
+                "symlinks are not supported in agents/: {}",
+                path.display()
+            )));
+        } else if ty.is_dir() {
             create_dir(&to)?;
             count += copy_tree(&path, &to)?;
         } else if ty.is_file() {
