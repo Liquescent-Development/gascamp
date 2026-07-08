@@ -275,20 +275,50 @@ pub fn transient_fails_used(conn: &Connection, attempts: &[BeadRow]) -> Result<u
 /// reference closed into a loop) — a revisit is a Corrupt error naming
 /// the cycle, never unbounded recursion (review LOW 5).
 pub fn unsatisfiable(conn: &Connection, bead: &str) -> Result<bool, CoreError> {
-    let mut visited = std::collections::HashSet::new();
-    unsatisfiable_walk(conn, bead, &mut visited)
+    let mut gray = std::collections::HashSet::new();
+    let mut black = std::collections::HashMap::new();
+    unsatisfiable_walk(conn, bead, &mut gray, &mut black)
 }
 
+/// DFS with proper three-color bookkeeping (fix-pass HIGH). `gray` is the
+/// CURRENT recursion path only — a need already gray is a genuine cycle;
+/// it is removed before every return, so a diamond's shared ancestor,
+/// reached again on a second path, is not mistaken for one. `black`
+/// memoizes fully-computed beads so a dense DAG stays O(V+E) rather than
+/// exponential (only completed results are memoized — never a partial
+/// answer for a bead still on the path).
 fn unsatisfiable_walk(
     conn: &Connection,
     bead: &str,
-    visited: &mut std::collections::HashSet<String>,
+    gray: &mut std::collections::HashSet<String>,
+    black: &mut std::collections::HashMap<String, bool>,
 ) -> Result<bool, CoreError> {
-    if !visited.insert(bead.to_owned()) {
+    if let Some(&known) = black.get(bead) {
+        return Ok(known);
+    }
+    if !gray.insert(bead.to_owned()) {
         return Err(CoreError::Corrupt(format!(
             "needs cycle involving bead {bead:?} — the dependency graph must be acyclic"
         )));
     }
+    // compute with the bead gray, then ALWAYS ungray before propagating
+    let result = unsatisfiable_needs(conn, bead, gray, black);
+    gray.remove(bead);
+    let result = result?;
+    black.insert(bead.to_owned(), result);
+    Ok(result)
+}
+
+/// The needs iteration for `unsatisfiable_walk` (a separate fn so its
+/// several early returns all funnel back through the caller's
+/// `gray.remove`). A missing or closed-non-pass need is terminal; an open
+/// need recurses.
+fn unsatisfiable_needs(
+    conn: &Connection,
+    bead: &str,
+    gray: &mut std::collections::HashSet<String>,
+    black: &mut std::collections::HashMap<String, bool>,
+) -> Result<bool, CoreError> {
     let mut stmt = conn.prepare("SELECT needs_id FROM deps WHERE bead_id = ?1")?;
     let needs: Vec<String> = stmt
         .query_map([bead], |r| r.get::<_, String>(0))?
@@ -301,7 +331,7 @@ fn unsatisfiable_walk(
                     if row.outcome.as_deref() != Some("pass") {
                         return Ok(true);
                     }
-                } else if unsatisfiable_walk(conn, &need, visited)? {
+                } else if unsatisfiable_walk(conn, &need, gray, black)? {
                     return Ok(true);
                 }
             }
@@ -729,6 +759,60 @@ mod tests {
         assert!(l.unsatisfiable("gc-3").unwrap(), "walks through open beads");
         assert!(!l.unsatisfiable("gc-5").unwrap(), "open dep can still pass");
         assert!(l.unsatisfiable("gc-6").unwrap(), "missing dep never passes");
+    }
+
+    /// Fix-pass HIGH: a diamond DAG revisits its shared ancestor on a
+    /// SECOND path — that is not a cycle. "Ever seen" tracking
+    /// misclassified it; only the current recursion path (gray set) may
+    /// trigger the cycle error.
+    #[test]
+    fn a_diamond_dag_with_a_shared_open_ancestor_is_not_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = ledger(&dir);
+        let create = |l: &mut Ledger, id: &str, needs: &[&str]| {
+            l.append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some(id.into()),
+                data: serde_json::json!({"title": id, "needs": needs}),
+            })
+            .unwrap();
+        };
+        create(&mut l, "gc-1", &[]); // A: open, healthy
+        create(&mut l, "gc-2", &["gc-1"]); // B
+        create(&mut l, "gc-3", &["gc-1"]); // C
+        create(&mut l, "gc-4", &["gc-2", "gc-3"]); // D: both paths reach A
+        assert!(
+            !l.unsatisfiable("gc-4").unwrap(),
+            "an acyclic diamond with an open ancestor is satisfiable"
+        );
+        // and the memo returns the RESULT, not a false negative: fail A
+        // and both paths must report unsatisfiable
+        close(&mut l, "gc-1", serde_json::json!({"outcome":"fail"}));
+        assert!(l.unsatisfiable("gc-4").unwrap());
+    }
+
+    /// Fix-pass HIGH, end to end: a sink-first diamond formula (valid per
+    /// S6/S7 — forward references are legal) cooks fine, and finalization
+    /// of the fresh all-open run is NotQuiescent — never Corrupt. On the
+    /// broken head this errored on EVERY settle of the run, wedging it.
+    #[test]
+    fn finalization_of_a_sink_first_diamond_is_not_a_false_cycle() {
+        const SINK_FIRST: &str = "formula = \"sink-first\"\n\n\
+            [[steps]]\nid = \"release\"\ntitle = \"R\"\nneeds = [\"implement\", \"document\"]\n\n\
+            [[steps]]\nid = \"implement\"\ntitle = \"I\"\nneeds = [\"design\"]\n\n\
+            [[steps]]\nid = \"document\"\ntitle = \"D\"\nneeds = [\"design\"]\n\n\
+            [[steps]]\nid = \"design\"\ntitle = \"Des\"\n";
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = ledger(&dir);
+        let cooked = cook_formula(&dir, &mut l, "sink-first", SINK_FIRST);
+        let ctx = load(&dir, &cooked.run_id);
+        assert_eq!(
+            l.finalization(&ctx).unwrap(),
+            RunVerdict::NotQuiescent,
+            "a fresh valid diamond run is simply not quiescent"
+        );
     }
 
     /// Review LOW 5: a needs cycle IS constructible through the normal
