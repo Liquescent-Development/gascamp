@@ -27,6 +27,9 @@ pub enum Request {
     },
     Status,
     Stop,
+    /// Reconcile the session registry against reality (spec §8.5) — the
+    /// same routine campd runs at startup, on demand (Phase 11).
+    Adopt,
 }
 
 /// One response line. Untagged: variant order matters for deserialization
@@ -39,6 +42,14 @@ pub enum Response {
         #[serde(flatten)]
         summary: StatusSummary,
         campd_pid: u32,
+    },
+    Adopt {
+        ok: bool,
+        crashed: usize,
+        rearmed: usize,
+        released: usize,
+        swept: usize,
+        kept: usize,
     },
     Error {
         ok: bool,
@@ -154,6 +165,14 @@ mod tests {
             r#"{"op":"stop"}"#
         );
         assert_eq!(
+            serde_json::to_string(&Request::Adopt).unwrap(),
+            r#"{"op":"adopt"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"op":"adopt"}"#).unwrap(),
+            Request::Adopt
+        );
+        assert_eq!(
             serde_json::from_str::<Request>(r#"{"op":"poke","seq":412}"#).unwrap(),
             Request::Poke { seq: 412 }
         );
@@ -191,6 +210,25 @@ mod tests {
             .unwrap(),
             r#"{"ok":false,"error":"bad request"}"#
         );
+        let adopt = Response::Adopt {
+            ok: true,
+            crashed: 1,
+            rearmed: 2,
+            released: 3,
+            swept: 4,
+            kept: 5,
+        };
+        assert_eq!(
+            serde_json::to_string(&adopt).unwrap(),
+            r#"{"ok":true,"crashed":1,"rearmed":2,"released":3,"swept":4,"kept":5}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Response>(
+                r#"{"ok":true,"crashed":0,"rearmed":0,"released":0,"swept":0,"kept":0}"#
+            )
+            .unwrap(),
+            Response::Adopt { .. }
+        ));
         // client-side parse resolves the right variants
         assert!(matches!(
             serde_json::from_str::<Response>(r#"{"ok":true}"#).unwrap(),

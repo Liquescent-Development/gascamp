@@ -23,17 +23,22 @@ use mio::{Events, Interest, Poll, Token};
 use super::cursor::{self, ReadinessProcessor};
 use super::dispatch::{Dispatcher, GraphRuntime, ReapFailure};
 use super::orders::{self, OrdersRuntime};
+use super::patrol::PatrolRuntime;
 use super::socket::{Request, Response};
 
 const LISTENER: Token = Token(0);
 /// The notify→mio self-pipe (camp.toml watch). Authoritative campd token
-/// layout (lead ruling, PR #13 review MEDIUM 4): 0 = listener, 1 = config
-/// watch, 2 = Phase 8's SIGCHLD self-pipe, 3+ = connections. Coordinate
-/// with the lead before renumbering.
+/// layout (lead ruling, PR #13 review MEDIUM 4; Phase 11 plan Decision I,
+/// approved): 0 = listener, 1 = config watch, 2 = Phase 8's SIGCHLD
+/// self-pipe, 3 = Phase 11's patrol transcript-watch self-pipe, 4+ =
+/// connections. Coordinate with the lead before renumbering.
 const CONFIG_WATCH: Token = Token(1);
 /// Phase 8's SIGCHLD self-pipe (worker death detection, spec §10.1), per
 /// the shared token layout above.
 const SIGCHLD: Token = Token(2);
+/// Phase 11's patrol transcript-watch self-pipe (spec §10.2), per the
+/// shared token layout above.
+const PATROL_WATCH: Token = Token(3);
 
 /// Upper bound on a single request line (PR #8 review finding 3). Real
 /// requests are tens of bytes; the cap keeps a broken or hostile client
@@ -88,6 +93,8 @@ pub fn run(
     config_rx: &mut mio::unix::pipe::Receiver,
     dispatcher: &mut Dispatcher,
     graph: &mut GraphRuntime,
+    patrol: &mut PatrolRuntime,
+    patrol_rx: &mut mio::unix::pipe::Receiver,
 ) -> Result<()> {
     let mut poll = Poll::new().context("creating the poller")?;
     let mut events = Events::with_capacity(64);
@@ -101,26 +108,34 @@ pub fn run(
     poll.registry()
         .register(&mut sigchld, SIGCHLD, Interest::READABLE)
         .context("registering the SIGCHLD pipe")?;
+    poll.registry()
+        .register(patrol_rx, PATROL_WATCH, Interest::READABLE)
+        .context("registering the patrol watch pipe")?;
     // The connection map is bounded by the process fd limit — the natural
     // cap for a single-user local socket. An artificial cap was considered
     // (PR #8 review finding 3) and rejected: it would reject legitimate
     // bursts, and per-connection memory is already bounded by
     // MAX_REQUEST_BYTES.
     let mut conns: HashMap<Token, Conn> = HashMap::new();
-    // Token(2) is RESERVED for Phase 8's SIGCHLD self-pipe (the layout
-    // above); connections start at 3.
-    let mut next_token = 3usize;
+    // Tokens 2 and 3 are RESERVED (SIGCHLD, patrol watch — the layout
+    // above); connections start at 4.
+    let mut next_token = 4usize;
     let mut self_raise_budget = SELF_RAISE_BUDGET;
 
     let mut last_seen = Timestamp::now();
     loop {
         // Decision 11c: THE poll-timeout composition point. Each deadline
         // source converts its own deadline to a Duration-from-now (cron is
-        // wall-anchored, checks are monotonic); phase-11's stall timers
-        // join this same combinator at rebase.
+        // wall-anchored, checks are monotonic, patrol stall timers are
+        // wall-anchored). Phase 11's stall timers join this same
+        // combinator (Decision I) — THREE sources, earliest wins.
+        let poll_now = Timestamp::now();
         let timeout = min_deadline(
-            runtime.poll_timeout(Timestamp::now()),
-            graph.poll_timeout(Instant::now()),
+            min_deadline(
+                runtime.poll_timeout(poll_now),
+                graph.poll_timeout(Instant::now()),
+            ),
+            patrol.poll_timeout(poll_now),
         );
         let wall_before = Timestamp::now();
         let mono_before = Instant::now();
@@ -162,6 +177,11 @@ pub fn run(
         // A ledger that refuses the declaration is fatal — campd must not
         // run automation it cannot record.
         let mut wake_ledger_work = orders::declare_cron_fires(ledger, &fires)?;
+        // Patrol stall fires: same declare-then-act shape (Phase 11).
+        // agent.stalled lands durably here; the settle executes the
+        // queued ladder actions.
+        let stall_fires = patrol.fire_due(now);
+        wake_ledger_work |= patrol.declare_stalls(ledger, &stall_fires, now)?;
         for event in events.iter() {
             match event.token() {
                 LISTENER => loop {
@@ -191,7 +211,9 @@ pub fn run(
                     // child must not take campd down, and unrecorded exits
                     // are retried next wake (try_wait re-returns the
                     // status).
-                    match reap_and_refill(ledger, processor, runtime, clock, dispatcher, graph) {
+                    match reap_and_refill(
+                        ledger, processor, runtime, clock, dispatcher, graph, patrol,
+                    ) {
                         Ok(()) => self_raise_budget = SELF_RAISE_BUDGET,
                         Err(failure) => {
                             eprintln!("campd: reap failed: {failure}");
@@ -223,6 +245,17 @@ pub fn run(
                         }
                     }
                 }
+                PATROL_WATCH => {
+                    drain_pipe(patrol_rx)?;
+                    // Transcript activity → timer resets (the watch IS the
+                    // heartbeat, spec §10.2); watcher errors → durable
+                    // patrol.degraded (the LOW-8 mold).
+                    patrol.drain_touched(now);
+                    for input in patrol.take_watch_error_events() {
+                        ledger.append(input)?;
+                        wake_ledger_work = true;
+                    }
+                }
                 CONFIG_WATCH => {
                     drain_pipe(config_rx)?;
                     // A dead watcher is a durable, rejected config.changed —
@@ -251,6 +284,7 @@ pub fn run(
                         clock,
                         dispatcher,
                         graph,
+                        patrol,
                         MAX_REQUEST_BYTES,
                     ) {
                         Ok(ConnState::Open) => {
@@ -282,7 +316,7 @@ pub fn run(
             // error re-surfaces on the next poke. The joint settle also
             // dispatches whatever the cooks made ready (Phase 8), in this
             // same wake.
-            if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph) {
+            if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol) {
                 eprintln!("campd: settle failed: {e:#}");
             }
         }
@@ -333,6 +367,7 @@ fn serve_connection(
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
     graph: &mut GraphRuntime,
+    patrol: &mut PatrolRuntime,
     max_request_bytes: usize,
 ) -> Result<ConnState> {
     let mut chunk = [0u8; 4096];
@@ -353,7 +388,9 @@ fn serve_connection(
                 Err(e) => return Err(e).context("reading a request"),
             }
         };
-        let drained = drain_lines(conn, ledger, processor, runtime, clock, dispatcher, graph)?;
+        let drained = drain_lines(
+            conn, ledger, processor, runtime, clock, dispatcher, graph, patrol,
+        )?;
         if let Some(terminal) = drained {
             return Ok(terminal);
         }
@@ -395,6 +432,7 @@ fn drain_lines(
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
     graph: &mut GraphRuntime,
+    patrol: &mut PatrolRuntime,
 ) -> Result<Option<ConnState>> {
     while let Some(newline) = conn.buf.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = conn.buf.drain(..=newline).collect();
@@ -419,7 +457,8 @@ fn drain_lines(
                 // leaves the cursor before the failing event — surfaced,
                 // never skipped; the next wake retries.
                 let ack = respond(&mut conn.stream, &Response::Ok { ok: true });
-                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph) {
+                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol)
+                {
                     eprintln!("campd: poke processing failed: {e:#}");
                 }
                 if let Err(e) = ack {
@@ -451,6 +490,33 @@ fn drain_lines(
                     }
                 };
                 respond(&mut conn.stream, &response)?;
+            }
+            Ok(Request::Adopt) => {
+                // The startup routine, on demand (spec §8.5). Its events
+                // (session.crashed/stopped, sweep dispositions) settle in
+                // this same wake, after the summary is answered.
+                let response = match super::patrol::adopt(ledger, patrol, dispatcher) {
+                    Ok(s) => Response::Adopt {
+                        ok: true,
+                        crashed: s.crashed,
+                        rearmed: s.rearmed,
+                        released: s.released,
+                        swept: s.swept,
+                        kept: s.kept,
+                    },
+                    Err(e) => {
+                        eprintln!("campd: adopt failed: {e:#}");
+                        Response::Error {
+                            ok: false,
+                            error: format!("adopt failed: {e}"),
+                        }
+                    }
+                };
+                respond(&mut conn.stream, &response)?;
+                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol)
+                {
+                    eprintln!("campd: adopt settle failed: {e:#}");
+                }
             }
             Err(e) => {
                 respond(
@@ -494,28 +560,32 @@ fn reap_and_refill(
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
     graph: &mut GraphRuntime,
+    patrol: &mut PatrolRuntime,
 ) -> Result<(), ReapFailure> {
     dispatcher.reap(ledger)?;
     // Decision 11e: check-script children ride the same SIGCHLD pipe;
     // their verdict batches land before the settle that acts on them.
     graph.reap_checks(ledger)?;
     // settle failures are ledger-side: retry-worthy, like the appends
-    settle(ledger, processor, runtime, clock, dispatcher, graph).map_err(|error| ReapFailure {
-        retryable: true,
-        error,
+    settle(ledger, processor, runtime, clock, dispatcher, graph, patrol).map_err(|error| {
+        ReapFailure {
+            retryable: true,
+            error,
+        }
     })
 }
 
 /// One wake's processing, to a joint fixpoint (spec §7.3 append → fold →
-/// dispatch): orders::settle catches up past the cursor and cooks fired
-/// orders to ITS fixpoint (draining the readiness hints — bounded
-/// bookkeeping; the dispatcher converges from ledger truth, Phase 8 plan
-/// decision B), then the dispatcher spawns workers up to the cap, and the
-/// loop repeats until dispatch appends nothing new — so the campd cursor
-/// always settles on the ledger head with every dispatch and cook event
-/// processed, and a cooked run's ready steps dispatch in the same wake.
-/// Bounded by the shrinking cook queue and dispatchable set: convergence,
-/// not polling.
+/// dispatch): orders::settle catches up past the cursor (patrol observing
+/// every event on the same pass — Phase 11) and cooks fired orders to ITS
+/// fixpoint, patrol applies tracking (watches + timers) and executes the
+/// queued ladder actions (nudge/restart/release — their records land as
+/// events), then the dispatcher spawns workers up to the cap, and the
+/// loop repeats until nothing appends — so the campd cursor always
+/// settles on the ledger head with every dispatch, cook, and patrol
+/// event processed, and a patrol-released bead's respawn dispatches in
+/// the same wake. Bounded by the shrinking queues: convergence, not
+/// polling.
 pub(super) fn settle(
     ledger: &mut Ledger,
     processor: &mut ReadinessProcessor,
@@ -523,17 +593,24 @@ pub(super) fn settle(
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
     graph: &mut GraphRuntime,
+    patrol: &mut PatrolRuntime,
 ) -> Result<()> {
     // Decision 11f / issue #17: the fire budget spans this WHOLE
     // invocation (every orders::settle / converge round below) — resetting
     // any deeper lets through-converge regeneration escape the budget.
     runtime.reset_fire_budget();
     loop {
-        orders::settle(ledger, processor, runtime, clock, graph)?;
+        orders::settle(ledger, processor, runtime, clock, graph, patrol)?;
         // Phase 9: drain the graph work the processor queued — spawn due
         // check scripts, cook due bond children. Cooks append events, so
         // the fixpoint below re-settles them in this same invocation.
         graph.execute(ledger)?;
+        // Phase 11: apply queued patrol tracking (watches + timers) and
+        // execute the queued ladder actions (nudge/restart/release) — all
+        // in this same wake, before converge respawns released beads.
+        let now = Timestamp::now();
+        patrol.apply_tracking(ledger, now)?;
+        patrol.execute_pending(ledger, dispatcher, now)?;
         dispatcher.converge(ledger)?;
         let cursor = ledger.cursor(cursor::CAMPD_CURSOR)?;
         if !ledger.has_events_past(cursor)? {
@@ -588,6 +665,139 @@ mod tests {
     use crate::daemon::cursor::ReadinessProcessor;
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::time::Duration;
+
+    /// A patrol runtime for settle threading (Phase 11): unwatched, empty.
+    fn test_patrol() -> crate::daemon::patrol::PatrolRuntime {
+        let config = camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap();
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config)
+    }
+
+    /// Phase 11: the poll timeout composes THREE deadline sources through
+    /// `min_deadline` (orders, graph checks, patrol stall timers); both
+    /// idle = infinite wait (invariant 1 stays intact).
+    #[test]
+    fn min_deadline_takes_the_earliest_deadline_and_none_means_idle() {
+        let a = Some(Duration::from_secs(5));
+        let b = Some(Duration::from_secs(9));
+        assert_eq!(min_deadline(None, None), None);
+        assert_eq!(min_deadline(a, None), a);
+        assert_eq!(min_deadline(None, b), b);
+        assert_eq!(min_deadline(a, b), a);
+        assert_eq!(min_deadline(b, a), a);
+        // the three-source composition: earliest of all three
+        assert_eq!(
+            min_deadline(min_deadline(a, b), Some(Duration::from_secs(2))),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    /// Phase 11 wiring pin: a due stall declares agent.stalled on the wake
+    /// path, and the settle EXECUTES the queued action — here the nudge
+    /// fails loudly (no held child, no resumable session id) and the
+    /// evented nudge_failed proves declare → settle → execute end to end.
+    #[test]
+    fn a_due_stall_declares_and_the_settle_executes_the_action() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents/dev.md"),
+            "---\nname: dev\n---\nWork.\n",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "t"}),
+            })
+            .unwrap();
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "name": "t/dev/1", "agent": "dev",
+                    "transcript_path": dir.path().join("projects/-p/sid.jsonl"),
+                    "bead": "gc-1",
+                }),
+            })
+            .unwrap();
+        let mut processor = ReadinessProcessor::default();
+        let mut runtime =
+            OrdersRuntime::build(dir.path(), Timestamp::now(), jiff::tz::TimeZone::UTC).unwrap();
+        let clock = camp_core::clock::SystemClock;
+        let config = camp_core::config::CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let mut dispatcher = Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            config.clone(),
+        );
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config);
+        let mut graph = GraphRuntime::new(dir.path().to_path_buf(), &config);
+
+        // first settle: observe the woke row, arm the timer
+        settle(
+            &mut ledger,
+            &mut processor,
+            &mut runtime,
+            &clock,
+            &mut dispatcher,
+            &mut graph,
+            &mut patrol,
+        )
+        .unwrap();
+        assert!(
+            patrol.poll_timeout(Timestamp::now()).is_some(),
+            "the wake's poll timeout is now patrol-sourced"
+        );
+
+        // the wake path, replayed at a synthetic future instant: fire, declare, settle
+        let later = Timestamp::now()
+            .checked_add(jiff::SignedDuration::from_mins(11))
+            .unwrap();
+        let stall_fires = patrol.fire_due(later);
+        assert_eq!(stall_fires.len(), 1, "the 10m default threshold fired");
+        assert!(
+            patrol
+                .declare_stalls(&mut ledger, &stall_fires, later)
+                .unwrap()
+        );
+        settle(
+            &mut ledger,
+            &mut processor,
+            &mut runtime,
+            &clock,
+            &mut dispatcher,
+            &mut graph,
+            &mut patrol,
+        )
+        .unwrap();
+
+        let events = ledger.events_range(1, None).unwrap();
+        let stalled: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind.as_str() == "agent.stalled")
+            .collect();
+        assert_eq!(stalled[0].data["action"], "nudge", "the declaration");
+        assert_eq!(
+            stalled[1].data["action"], "nudge_failed",
+            "the settle executed the action and its failure is evented"
+        );
+        assert_eq!(
+            ledger.cursor(cursor::CAMPD_CURSOR).unwrap() as usize,
+            events.len(),
+            "the settle fixpoint consumed every patrol event"
+        );
+    }
 
     /// PR #14 fix-pass NEW MEDIUM: the self-raise retry budget must bound
     /// — non-retryable failures never self-raise, and a persistent
@@ -663,6 +873,7 @@ mod tests {
             &clock,
             &mut dispatcher,
             &mut graph,
+            &mut test_patrol(),
             1024,
         )
         .expect("a dead poker must not error the connection loop");
@@ -722,6 +933,8 @@ mod tests {
         )
         .unwrap();
         let mut graph = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config);
         let mut dispatcher = Dispatcher::new(
             crate::campdir::CampDir {
                 root: dir.path().to_path_buf(),
@@ -736,6 +949,7 @@ mod tests {
             &clock,
             &mut dispatcher,
             &mut graph,
+            &mut patrol,
         )
         .expect("settle must return despite the regenerative order");
 
@@ -771,6 +985,7 @@ mod tests {
             &clock,
             &mut dispatcher,
             &mut graph,
+            &mut patrol,
         )
         .unwrap();
         assert_eq!(
@@ -863,6 +1078,7 @@ mod tests {
             &clock,
             &mut dispatcher,
             &mut graph,
+            &mut test_patrol(),
             TEST_CAP,
         )
         .unwrap();

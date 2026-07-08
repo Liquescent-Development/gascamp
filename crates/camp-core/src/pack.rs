@@ -29,6 +29,10 @@ pub struct AgentDef {
     pub tools: Option<Vec<String>>,
     pub permission_mode: Option<String>,
     pub isolation: Isolation,
+    /// Per-agent stall threshold override (Phase 11, spec §10): a friendly
+    /// duration string ("5m"), validated at parse. `None` uses the camp
+    /// `[patrol] stall_after` default.
+    pub stall_after: Option<String>,
     pub prompt: String,
 }
 
@@ -111,6 +115,12 @@ pub fn parse_agent_file(path: &Path) -> Result<AgentDef, CoreError> {
         }
     };
 
+    let stall_after = get_str("stall_after")?;
+    if let Some(s) = &stall_after {
+        crate::patrol::parse_duration(s)
+            .map_err(|e| pack_err(path, format!("frontmatter key \"stall_after\": {e}")))?;
+    }
+
     let prompt = body.trim().to_owned();
     if prompt.is_empty() {
         return Err(pack_err(
@@ -125,6 +135,7 @@ pub fn parse_agent_file(path: &Path) -> Result<AgentDef, CoreError> {
         tools,
         permission_mode: get_str("permissionMode")?,
         isolation,
+        stall_after,
         prompt,
     })
 }
@@ -238,6 +249,34 @@ mod tests {
         assert_eq!(def.permission_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(def.isolation, Isolation::None);
         assert_eq!(def.prompt, "Implement the change with TDD.");
+    }
+
+    #[test]
+    fn stall_after_frontmatter_parses_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(
+            dir.path(),
+            "s.md",
+            "---\nname: dev\nstall_after: 5m\n---\nWork.\n",
+        );
+        let def = parse_agent_file(&dir.path().join("s.md")).unwrap();
+        assert_eq!(def.stall_after.as_deref(), Some("5m"));
+
+        write_agent(dir.path(), "none.md", "---\nname: dev\n---\nWork.\n");
+        let def = parse_agent_file(&dir.path().join("none.md")).unwrap();
+        assert_eq!(def.stall_after, None);
+
+        write_agent(
+            dir.path(),
+            "bad.md",
+            "---\nname: dev\nstall_after: banana\n---\nWork.\n",
+        );
+        let err = parse_agent_file(&dir.path().join("bad.md")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stall_after") && msg.contains("bad.md"),
+            "error must name the key and the file: {msg}"
+        );
     }
 
     #[test]

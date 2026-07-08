@@ -530,7 +530,12 @@ Three mechanisms, all push, all mechanical:
    input mode, per the A4 resolution in §17, otherwise via session
    resume), then `restart` (kill, respawn, re-hook the bead)
    with exponential backoff and a bounded budget. Safe because the bead is
-   the work; the session is disposable.
+   the work; the session is disposable. campd-spawned workers run in
+   stream-json input mode with campd holding the stdin pipe (the live
+   nudge path); when a worker's bead closes, campd releases it — stdin
+   EOF, a bounded grace, then termination recorded as `session.stopped`
+   with the reason — because an idle stream worker does not exit on its
+   own (probe-verified, claude 2.1.204).
 3. **Escalation to judgment is pack content, not Rust:** an order matching
    `event:agent.stalled` can sling an investigator formula. `campd`
    notices; it never diagnoses.

@@ -107,8 +107,10 @@ pub fn ready_beads(conn: &Connection, rig: Option<&str>) -> Result<Vec<BeadRow>,
 /// Beads campd may dispatch a worker for (Phase 8, plan decision C): open,
 /// ready (decision-6 rule), plain work (`type='task'`), not a run root
 /// (roots are finalized by campd, Phase 9), and never dispatched before
-/// (no sessions row bound — respawn-after-crash arrives with retry
-/// budgets, Phase 9/11). Oldest first, like `ready_beads`.
+/// (no sessions row bound — organic crash respawns arrive with retry
+/// budgets, Phase 9). Phase 11's patrol restarts respawn through the
+/// TARGETED `Dispatcher::dispatch_bead`, bounded by the ladder budget —
+/// deliberately not through this set. Oldest first, like `ready_beads`.
 pub fn dispatchable_beads(conn: &Connection) -> Result<Vec<BeadRow>, CoreError> {
     let sql = format!(
         "SELECT {BEAD_COLS} FROM beads b

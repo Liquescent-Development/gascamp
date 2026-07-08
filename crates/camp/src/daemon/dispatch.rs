@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use camp_core::Seq;
 use camp_core::config::CampConfig;
 use camp_core::event::{EventInput, EventType};
 use camp_core::ledger::Ledger;
@@ -25,9 +26,20 @@ pub struct Dispatcher {
     /// Live children by pid. campd is the parent (spec §10.1) — SIGCHLD
     /// lands here and try_wait reaps.
     children: HashMap<u32, Worker>,
+    /// Auxiliary children (patrol nudge-resume spawns, Phase 11): reaped
+    /// in the same try_wait sweep; failures land as patrol.degraded, never
+    /// as session events.
+    aux: HashMap<u32, AuxChild>,
     /// Beads that failed to dispatch this campd lifetime (plan decision
     /// F): one dispatch.failed each, retried once per restart (crash-only).
     failed: HashSet<String>,
+    /// Patrol respawns deferred because the worker cap was full (Phase 11,
+    /// round-2 LOW 2): retried on every `converge`, so a reap-freed slot
+    /// re-hooks the bead — never stranded, never silently dropped
+    /// (invariant 3). Insertion order preserved so the oldest deferral
+    /// re-hooks first. (Phase 9's retry machinery will subsume budget and
+    /// backoff for these — the hand-off seam.)
+    pending_respawns: Vec<String>,
 }
 
 struct Worker {
@@ -41,6 +53,34 @@ struct Worker {
     /// disposition retry must skip the end-append or the fold's
     /// already-ended rejection would wedge the pid forever.
     end_recorded: bool,
+    /// The held stream-json stdin (Decision C). Dropping it is the release
+    /// EOF; `None` after release (or for Null-mode spawns).
+    stdin: Option<std::process::ChildStdin>,
+    /// Set when campd released this worker (bead closed, stdin dropped):
+    /// its exit reaps as session.stopped with this reason — campd
+    /// initiated the termination of a worker whose work was done (C2).
+    released: Option<String>,
+    /// Set when patrol killed this worker: its exit reaps as
+    /// session.crashed carrying this cause_seq (the agent.stalled event).
+    patrol_kill: Option<Seq>,
+}
+
+struct AuxChild {
+    child: std::process::Child,
+    session: String,
+    purpose: String,
+}
+
+/// How a nudge write went (Phase 11 plan Task 11.9).
+#[derive(Debug)]
+pub enum NudgeOutcome {
+    /// The status-request turn is in the worker's stdin pipe.
+    Delivered,
+    /// No held pipe for that session (released, Null-mode, or not our
+    /// child) — the caller falls back to the resume path.
+    NoPipe,
+    /// The pipe is broken: evented as nudge_failed by the caller.
+    Failed(String),
 }
 
 /// A reap failure, typed for the caller's retry decision (PR #14 fix-pass
@@ -111,14 +151,186 @@ impl Dispatcher {
             camp,
             config,
             children: HashMap::new(),
+            aux: HashMap::new(),
             failed: HashSet::new(),
+            pending_respawns: Vec::new(),
         }
+    }
+
+    /// Whether campd holds this session as a live child of its own.
+    pub fn is_child(&self, session: &str) -> bool {
+        self.children.values().any(|w| w.session == session)
+    }
+
+    /// Write one status-request turn into the session's held stdin
+    /// (Decision C: the live nudge path).
+    pub fn nudge_via_stdin(&mut self, session: &str, text: &str) -> NudgeOutcome {
+        use std::io::Write as _;
+        let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
+            return NudgeOutcome::NoPipe;
+        };
+        let Some(stdin) = worker.stdin.as_mut() else {
+            return NudgeOutcome::NoPipe;
+        };
+        let line = spawn::user_message(text);
+        match stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.flush())
+        {
+            Ok(()) => NudgeOutcome::Delivered,
+            Err(e) => NudgeOutcome::Failed(format!("stdin write failed: {e}")),
+        }
+    }
+
+    /// Patrol restart, child half: SIGKILL our own worker and mark the
+    /// cause. The SIGCHLD reap then appends the caused session.crashed,
+    /// the fold releases the bead, and converge respawns — each step its
+    /// own event. Returns false when the session is not our child (the
+    /// AdoptedPid path handles those).
+    pub fn kill_worker(&mut self, session: &str, cause_seq: Seq) -> bool {
+        let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
+            return false;
+        };
+        worker.patrol_kill = Some(cause_seq);
+        worker.stdin = None; // no more turns for a condemned worker
+        if let Err(e) = worker.child.kill() {
+            // Already exiting: the reap classifies it with the marked
+            // cause regardless.
+            eprintln!("campd: patrol kill of {session}: {e}");
+        }
+        true
+    }
+
+    /// The release rule (Decision C2): the bead closed, so drop the held
+    /// stdin (EOF) and mark the worker released — its exit reaps as
+    /// session.stopped with the reason. Returns the session name when a
+    /// live un-released worker held that bead (the caller arms the release
+    /// grace timer); None otherwise (idempotent).
+    pub fn release_worker(&mut self, bead: &str, reason: &str) -> Option<String> {
+        let worker = self
+            .children
+            .values_mut()
+            .find(|w| w.bead == bead && w.released.is_none())?;
+        worker.stdin = None;
+        worker.released = Some(reason.to_owned());
+        Some(worker.session.clone())
+    }
+
+    /// The release grace expired and the worker is still ours: terminate
+    /// it (P3: an idle stream worker does not exit on EOF alone).
+    pub fn kill_released(&mut self, session: &str) -> bool {
+        let Some(worker) = self
+            .children
+            .values_mut()
+            .find(|w| w.session == session && w.released.is_some())
+        else {
+            return false;
+        };
+        if let Err(e) = worker.child.kill() {
+            eprintln!("campd: release kill of {session}: {e}");
+        }
+        true
+    }
+
+    /// Spawn an auxiliary patrol child (nudge-resume). Reaped in the
+    /// normal SIGCHLD sweep; a nonzero exit lands as patrol.degraded.
+    pub fn spawn_aux(
+        &mut self,
+        session: &str,
+        purpose: &str,
+        mut cmd: std::process::Command,
+    ) -> Result<()> {
+        let child = cmd.spawn().with_context(|| format!("spawning {purpose}"))?;
+        self.aux.insert(
+            child.id(),
+            AuxChild {
+                child,
+                session: session.to_owned(),
+                purpose: purpose.to_owned(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Test observability: whether every aux child has exited.
+    #[cfg(test)]
+    pub fn aux_done(&mut self) -> bool {
+        self.aux
+            .values_mut()
+            .all(|a| matches!(a.child.try_wait(), Ok(Some(_))))
+    }
+
+    /// Every pid campd owns (workers + aux children): the adoption/restart
+    /// probe excludes these — a live nudge-resume child carries the
+    /// worker's session uuid in its argv and must never be mistaken for
+    /// the worker itself (Phase 11 plan Task 11.11/11.12).
+    pub fn known_pids(&self) -> std::collections::HashSet<u32> {
+        self.children
+            .keys()
+            .chain(self.aux.keys())
+            .copied()
+            .collect()
+    }
+
+    /// Test scaffolding (patrol's executor tests live in a sibling
+    /// module): a live held-stdin `cat` worker registered under the given
+    /// session/bead, stdout captured to `<dir>/<bead>.out`.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    pub(crate) fn test_insert_held_cat(
+        &mut self,
+        dir: &std::path::Path,
+        session: &str,
+        bead: &str,
+    ) -> u32 {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let out = std::fs::File::create(dir.join(format!("{bead}.out"))).unwrap_or_else(|e| {
+            panic!("creating the capture file: {e}");
+        });
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(out))
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawning cat: {e}"));
+        let stdin = child.stdin.take();
+        let pid = child.id();
+        self.children.insert(
+            pid,
+            Worker {
+                child,
+                session: session.to_owned(),
+                bead: bead.to_owned(),
+                rig: "gc".into(),
+                rig_path: dir.to_path_buf(),
+                worktree: None,
+                end_recorded: false,
+                stdin,
+                released: None,
+                patrol_kill: None,
+            },
+        );
+        pid
+    }
+
+    /// Test scaffolding: block until the given worker child exits.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    pub(crate) fn test_child_wait(&mut self, pid: u32) -> std::process::ExitStatus {
+        self.children
+            .get_mut(&pid)
+            .unwrap_or_else(|| panic!("no worker at pid {pid}"))
+            .child
+            .wait()
+            .unwrap_or_else(|e| panic!("waiting on {pid}: {e}"))
     }
 
     /// Dispatch until the cap or the well runs dry. Re-queries after every
     /// spawn: the just-committed session.woke removes the bead from the
-    /// dispatchable set, so the ledger is the only bookkeeping.
+    /// dispatchable set, so the ledger is the only bookkeeping. Deferred
+    /// patrol respawns (round-2 LOW 2) get first crack at freed slots —
+    /// they represent in-flight work patrol is recovering.
     pub fn converge(&mut self, ledger: &mut Ledger) -> Result<()> {
+        self.retry_pending_respawns(ledger)?;
         loop {
             if self.children.len() >= self.config.dispatch.max_workers {
                 return Ok(());
@@ -130,6 +342,56 @@ impl Dispatcher {
             let Some(bead) = next else { return Ok(()) };
             self.dispatch_one(ledger, &bead)?;
         }
+    }
+
+    /// Re-attempt every cap-deferred patrol respawn (round-2 LOW 2). Runs
+    /// at the top of `converge`, so a reap-freed slot re-hooks the oldest
+    /// deferral first; a still-full cap re-queues it (idempotent, no
+    /// duplicate event). Bounded by the queue, which only shrinks here.
+    fn retry_pending_respawns(&mut self, ledger: &mut Ledger) -> Result<()> {
+        for bead_id in std::mem::take(&mut self.pending_respawns) {
+            self.dispatch_bead(ledger, &bead_id)?;
+        }
+        Ok(())
+    }
+
+    /// Targeted respawn for a patrol restart (Phase 11, spec §10.2): the
+    /// general dispatchable set deliberately excludes ever-sessioned beads
+    /// (Phase 8 decision C — organic crashes must not hot-loop until the
+    /// Phase 9 retry machinery routes them); a PATROL-caused crash is
+    /// budget-bounded by the ladder, so its bead re-hooks through this
+    /// explicit path instead. A cap-full dispatcher QUEUES the respawn and
+    /// events the deferral once — retried on the next `converge` when a
+    /// slot frees, never stranded (round-2 LOW 2; invariants 3/5).
+    pub fn dispatch_bead(&mut self, ledger: &mut Ledger, bead_id: &str) -> Result<()> {
+        let Some(bead) = ledger.get_bead(bead_id)? else {
+            return Ok(()); // gone from the ledger: nothing to re-hook
+        };
+        if bead.status != "open" {
+            return Ok(()); // closed or re-claimed since the kill
+        }
+        if self.children.len() >= self.config.dispatch.max_workers {
+            // Queue for retry on the next freed slot. Event ONCE per
+            // deferral episode — a retry that is still capped re-queues
+            // silently (no dispatch.failed spam).
+            if !self.pending_respawns.iter().any(|b| b == bead_id) {
+                self.pending_respawns.push(bead_id.to_owned());
+                ledger.append(EventInput {
+                    kind: EventType::DispatchFailed,
+                    rig: Some(bead.rig.clone()),
+                    actor: "campd".into(),
+                    bead: Some(bead.id.clone()),
+                    data: serde_json::json!({
+                        "reason": "patrol respawn deferred: worker cap reached; \
+                                   will retry when a slot frees",
+                    }),
+                })?;
+            }
+            return Ok(());
+        }
+        // a patrol respawn supersedes an earlier same-life dispatch failure
+        self.failed.remove(bead_id);
+        self.dispatch_one(ledger, &bead)
     }
 
     /// One bead → one worker. Per-bead failures append dispatch.failed and
@@ -192,6 +454,10 @@ impl Dispatcher {
             &session_id,
             &transcript,
             &cwd,
+            // Decision C: ALL campd dispatch spawns hold the stream stdin
+            // (the live nudge path; fake agents tolerate it, C3). NOT
+            // command-sniffed — a mode fallback would be a hidden branch.
+            spawn::StdinMode::HeldStream,
         );
         Ok(Prep {
             spec,
@@ -206,7 +472,9 @@ impl Dispatcher {
     /// must never dangle live (plan decision F).
     fn launch(&mut self, ledger: &mut Ledger, bead: &BeadRow, prep: Prep) -> Result<()> {
         let worktree = if prep.make_worktree {
-            match spawn::create_worktree(&prep.rig_path, &self.camp.worktrees_path(), &bead.id) {
+            // ensure_worktree (Phase 11 Decision H): a patrol respawn
+            // reuses the bead's own worktree; residue still fails fast.
+            match spawn::ensure_worktree(&prep.rig_path, &self.camp.worktrees_path(), &bead.id) {
                 Ok(dir) => Some(dir),
                 Err(e) => {
                     self.failed.insert(bead.id.clone());
@@ -244,7 +512,43 @@ impl Dispatcher {
         })?;
 
         match spawn::spawn(&prep.spec) {
-            Ok(child) => {
+            Ok(mut child) => {
+                // HeldStream: the task is the FIRST user_message on the
+                // held pipe (P2). A write failure means the worker never
+                // got its task — kill it and land the failure in the
+                // ledger like any other spawn failure (decision F).
+                let mut stdin = child.stdin.take();
+                if let Some(pipe) = stdin.as_mut() {
+                    use std::io::Write as _;
+                    let task = spawn::task_message(&bead.id, &prep.spec.session_name);
+                    if let Err(e) = pipe.write_all(task.as_bytes()).and_then(|()| pipe.flush()) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        ledger.append(EventInput {
+                            kind: EventType::SessionCrashed,
+                            rig: Some(bead.rig.clone()),
+                            actor: "campd".into(),
+                            bead: None,
+                            data: serde_json::json!({
+                                "name": prep.spec.session_name,
+                                "reason": format!("task write failed: {e}"),
+                            }),
+                        })?;
+                        if let Some(wt) = worktree {
+                            ledger.append(EventInput {
+                                kind: EventType::WorktreeKept,
+                                rig: Some(bead.rig.clone()),
+                                actor: "campd".into(),
+                                bead: Some(bead.id.clone()),
+                                data: serde_json::json!({
+                                    "path": wt,
+                                    "reason": "task write failed before the worker ran",
+                                }),
+                            })?;
+                        }
+                        return Ok(());
+                    }
+                }
                 self.children.insert(
                     child.id(),
                     Worker {
@@ -255,6 +559,9 @@ impl Dispatcher {
                         rig_path: prep.rig_path,
                         worktree,
                         end_recorded: false,
+                        stdin,
+                        released: None,
+                        patrol_kill: None,
                     },
                 );
                 Ok(())
@@ -294,7 +601,53 @@ impl Dispatcher {
     /// next wake retries — try_wait re-returns the exit status, and
     /// `end_recorded` makes the retry skip the already-committed session
     /// end so the fold never sees a double end.
+    /// Reap auxiliary patrol children (nudge-resume spawns): exit 0 is
+    /// forgotten; a nonzero exit lands as patrol.degraded naming the
+    /// session — never a session event (the aux child is not the worker).
+    /// Durable-then-forget like the worker half: a failed append keeps the
+    /// aux entry so the next wake retries.
+    fn reap_aux(&mut self, ledger: &mut Ledger) -> Result<(), ReapFailure> {
+        let mut exited: Vec<(u32, ExitStatus)> = Vec::new();
+        for (pid, aux) in &mut self.aux {
+            match aux.child.try_wait() {
+                Ok(Some(status)) => exited.push((*pid, status)),
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(ReapFailure {
+                        retryable: false,
+                        error: anyhow::Error::new(e).context("try_wait on an aux child"),
+                    });
+                }
+            }
+        }
+        for (pid, status) in exited {
+            let Some(aux) = self.aux.get(&pid) else {
+                continue;
+            };
+            if !status.success() {
+                ledger
+                    .append(EventInput {
+                        kind: EventType::PatrolDegraded,
+                        rig: None,
+                        actor: "campd".into(),
+                        bead: None,
+                        data: serde_json::json!({
+                            "error": format!("{} child exited {status}", aux.purpose),
+                            "session": aux.session,
+                        }),
+                    })
+                    .map_err(|e| ReapFailure {
+                        retryable: true,
+                        error: anyhow::Error::new(e).context("recording an aux failure"),
+                    })?;
+            }
+            self.aux.remove(&pid);
+        }
+        Ok(())
+    }
+
     pub fn reap(&mut self, ledger: &mut Ledger) -> Result<(), ReapFailure> {
+        self.reap_aux(ledger)?;
         let mut exited: Vec<(u32, ExitStatus)> = Vec::new();
         for (pid, worker) in &mut self.children {
             match worker.child.try_wait() {
@@ -315,6 +668,11 @@ impl Dispatcher {
                 continue;
             };
             if !worker.end_recorded {
+                // Phase 11 classification order: a campd-initiated end
+                // overrides F4 — released ⇒ stopped-with-reason (C2: the
+                // work was done; the exit code is noise), patrol kill ⇒
+                // crashed-with-cause (the agent.stalled seq). Otherwise
+                // the plain F4 mapping.
                 let (kind, exit_code, signal) = classify(status);
                 let mut data = serde_json::json!({ "name": worker.session });
                 if let Some(code) = exit_code {
@@ -323,6 +681,16 @@ impl Dispatcher {
                 if let Some(sig) = signal {
                     data["signal"] = serde_json::json!(sig);
                 }
+                let kind = if let Some(reason) = &worker.released {
+                    data["reason"] = serde_json::json!(reason);
+                    EventType::SessionStopped
+                } else if let Some(cause_seq) = worker.patrol_kill {
+                    data["reason"] = serde_json::json!("patrol restart");
+                    data["cause_seq"] = serde_json::json!(cause_seq);
+                    EventType::SessionCrashed
+                } else {
+                    kind
+                };
                 ledger
                     .append(EventInput {
                         kind,
@@ -1849,6 +2217,9 @@ mod tests {
                 rig_path: dir.path().to_path_buf(),
                 worktree: Some(worktree.clone()),
                 end_recorded: false,
+                stdin: None,
+                released: None,
+                patrol_kill: None,
             },
         );
 
@@ -1931,6 +2302,9 @@ mod tests {
                 rig_path: dir.path().to_path_buf(), // not a git repo
                 worktree: Some(worktree.clone()),
                 end_recorded: false,
+                stdin: None,
+                released: None,
+                patrol_kill: None,
             },
         );
         {
@@ -2038,7 +2412,12 @@ mod tests {
     ) {
         let mut readiness = crate::daemon::cursor::ReadinessProcessor::default();
         let clock = FixedClock::new("2026-07-07T12:00:01Z");
-        super::super::orders::settle(ledger, &mut readiness, rt, &clock, graph).unwrap();
+        // Phase 11: settle threads a patrol runtime too (unwatched/empty here).
+        let cfg = CampConfig::parse("[camp]\nname = \"t\"\n").unwrap();
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&cfg.patrol).unwrap();
+        let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &cfg);
+        super::super::orders::settle(ledger, &mut readiness, rt, &clock, graph, &mut patrol)
+            .unwrap();
     }
 
     fn append_close(l: &mut Ledger, bead: &str, data: serde_json::Value) -> i64 {
@@ -2872,6 +3251,384 @@ mod tests {
             ledger.events_range(1, None).unwrap().len(),
             before,
             "re-settling an already-settled ledger appends nothing"
+        );
+    }
+
+    // ---- Phase 11: held-stdin worker lifecycle ---------------------------
+
+    fn test_dispatcher(dir: &std::path::Path) -> Dispatcher {
+        Dispatcher::new(
+            CampDir {
+                root: dir.to_path_buf(),
+            },
+            CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
+        )
+    }
+
+    /// A live `cat` worker with a held stdin pipe and stdout captured to a
+    /// file — the stream-worker stand-in.
+    fn held_cat_worker(dir: &std::path::Path, session: &str, bead: &str) -> Worker {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let out = std::fs::File::create(dir.join(format!("{}.out", bead))).unwrap();
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(out))
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        Worker {
+            child,
+            session: session.to_owned(),
+            bead: bead.to_owned(),
+            rig: "gc".into(),
+            rig_path: dir.to_path_buf(),
+            worktree: None,
+            end_recorded: false,
+            stdin,
+            released: None,
+            patrol_kill: None,
+        }
+    }
+
+    /// ROUND-2 LOW 2: a cap-full patrol respawn must QUEUE and retry when
+    /// a worker slot frees — never strand the bead with a false "deferred"
+    /// event that nothing acts on. Reachable from the AdoptedPid restart
+    /// path, whose non-child kill frees no slot in `children`.
+    #[test]
+    fn a_cap_full_patrol_respawn_queues_and_retries_when_a_slot_frees() {
+        // NOTE: do NOT hold spawn_probe_guard here — `held_cat_worker`
+        // acquires it per call, and the guard mutex is non-reentrant, so a
+        // test-level hold would self-deadlock. The one fork this test does
+        // outside held_cat_worker (converge → /bin/echo) is guarded inline.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("rig")).unwrap();
+        std::fs::create_dir_all(root.join("agents")).unwrap();
+        std::fs::write(root.join("agents/dev.md"), "---\nname: dev\n---\nWork.\n").unwrap();
+        std::fs::write(
+            root.join("camp.toml"),
+            format!(
+                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+                 [dispatch]\nmax_workers = 1\ncommand = \"/bin/echo\"\ndefault_agent = \"dev\"\n",
+                root.join("rig").display()
+            ),
+        )
+        .unwrap();
+        let config = CampConfig::load(&root.join("camp.toml")).unwrap();
+        let mut ledger = Ledger::open(&root.join("camp.db")).unwrap();
+        // gc-9: created, then EVER-SESSIONED (a patrol-killed worker) so
+        // `dispatchable_beads` excludes it — only the respawn queue can
+        // re-hook it. The crash releases it back to open.
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-9".into()),
+                data: serde_json::json!({"title": "respawn me"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-9".into()),
+                data: serde_json::json!({"name": "t/dev/1", "agent": "dev", "bead": "gc-9"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClaimed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-9".into()),
+                data: serde_json::json!({"session": "t/dev/1"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionCrashed,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({"name": "t/dev/1", "reason": "patrol restart"}),
+            })
+            .unwrap();
+
+        let gc9_wokes = |l: &Ledger| -> usize {
+            l.events_of_type(EventType::SessionWoke)
+                .unwrap()
+                .iter()
+                .filter(|e| e.data["bead"] == "gc-9")
+                .count()
+        };
+        assert_eq!(gc9_wokes(&ledger), 1, "just the setup woke so far");
+
+        let mut dispatcher = Dispatcher::new(
+            CampDir {
+                root: root.to_path_buf(),
+            },
+            config,
+        );
+        // an ADOPTED restart frees no slot, so children stays full while
+        // the respawn is attempted — the exact cap-full path.
+        let occupant = held_cat_worker(root, "t/dev/occ", "gc-other");
+        let occupant_pid = occupant.child.id();
+        dispatcher.children.insert(occupant_pid, occupant);
+
+        // cap full → queued and evented ONCE, truthfully (will retry)
+        dispatcher.dispatch_bead(&mut ledger, "gc-9").unwrap();
+        assert_eq!(gc9_wokes(&ledger), 1, "no dispatch while capped");
+        assert_eq!(count(&ledger, "dispatch.failed"), 1);
+        let failed = ledger.events_of_type(EventType::DispatchFailed).unwrap();
+        assert!(
+            failed[0].data["reason"].as_str().unwrap().contains("retry"),
+            "the deferral must be truthful: {}",
+            failed[0].data["reason"]
+        );
+        // a second attempt while still capped must NOT re-event
+        dispatcher.dispatch_bead(&mut ledger, "gc-9").unwrap();
+        assert_eq!(
+            count(&ledger, "dispatch.failed"),
+            1,
+            "no duplicate deferral event"
+        );
+
+        // free the slot (as a reap would) and converge: the queue drains
+        {
+            let w = dispatcher.children.get_mut(&occupant_pid).unwrap();
+            let _ = w.child.kill();
+            let _ = w.child.wait();
+        }
+        dispatcher.children.remove(&occupant_pid);
+        {
+            // converge forks /bin/echo for the respawn — serialize it
+            // against the socket-probe tests (the guard is released before
+            // any nested held_cat call, so no re-entrancy).
+            let _spawning = crate::daemon::spawn_probe_guard();
+            dispatcher.converge(&mut ledger).unwrap();
+        }
+        assert_eq!(
+            gc9_wokes(&ledger),
+            2,
+            "the freed slot re-hooks the queued respawn"
+        );
+    }
+
+    #[test]
+    fn released_worker_reaps_as_stopped_with_the_reason() {
+        let (dir, mut ledger) = temp_ledger();
+        wake_session(&mut ledger, "t/dev/1");
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "t"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClaimed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"session": "t/dev/1"}),
+            })
+            .unwrap();
+
+        let mut dispatcher = test_dispatcher(dir.path());
+        let mut worker = held_cat_worker(dir.path(), "t/dev/1", "gc-1");
+        worker.stdin = None; // released: pipe already dropped
+        worker.released = Some("released after bead close".into());
+        worker.child.kill().unwrap();
+        worker.child.wait().unwrap(); // try_wait re-returns the status
+        dispatcher.children.insert(worker.child.id(), worker);
+
+        dispatcher.reap(&mut ledger).unwrap();
+        assert_eq!(count(&ledger, "session.stopped"), 1);
+        assert_eq!(count(&ledger, "session.crashed"), 0, "released ≠ crashed");
+        let events = ledger.events_range(1, None).unwrap();
+        let stopped = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.stopped")
+            .unwrap();
+        assert!(
+            stopped.data["reason"]
+                .as_str()
+                .unwrap()
+                .contains("released"),
+            "{}",
+            stopped.data
+        );
+        // stopped (not crashed) leaves the claim in place
+        let bead = ledger.get_bead("gc-1").unwrap().unwrap();
+        assert_eq!(bead.status, "in_progress");
+    }
+
+    #[test]
+    fn patrol_killed_worker_reaps_as_crashed_with_cause_seq() {
+        let (dir, mut ledger) = temp_ledger();
+        wake_session(&mut ledger, "t/dev/1");
+        let mut dispatcher = test_dispatcher(dir.path());
+        let worker = held_cat_worker(dir.path(), "t/dev/1", "gc-1");
+        let pid = worker.child.id();
+        dispatcher.children.insert(pid, worker);
+
+        assert!(dispatcher.kill_worker("t/dev/1", 41));
+        assert!(!dispatcher.kill_worker("ghost", 41), "unknown session");
+        // the kill lands as SIGKILL; wait for the exit so try_wait sees it
+        loop {
+            if dispatcher
+                .children
+                .get_mut(&pid)
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        dispatcher.reap(&mut ledger).unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        let crashed = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.crashed")
+            .expect("patrol kill must reap as crashed");
+        assert_eq!(crashed.data["signal"], 9);
+        assert_eq!(crashed.data["reason"], "patrol restart");
+        assert_eq!(crashed.data["cause_seq"], 41);
+        assert!(dispatcher.children.is_empty());
+    }
+
+    #[test]
+    fn nudge_via_stdin_writes_one_message_line_or_reports_no_pipe() {
+        let (dir, mut ledger) = temp_ledger();
+        wake_session(&mut ledger, "t/dev/1");
+        let mut dispatcher = test_dispatcher(dir.path());
+        let worker = held_cat_worker(dir.path(), "t/dev/1", "gc-1");
+        let pid = worker.child.id();
+        dispatcher.children.insert(pid, worker);
+
+        assert!(dispatcher.is_child("t/dev/1"));
+        assert!(!dispatcher.is_child("ghost"));
+        assert!(matches!(
+            dispatcher.nudge_via_stdin("t/dev/1", "status?"),
+            NudgeOutcome::Delivered
+        ));
+        // drop the pipe (release) so cat exits and we can read the capture
+        assert_eq!(
+            dispatcher.release_worker("gc-1", "done"),
+            Some("t/dev/1".to_owned())
+        );
+        let worker = dispatcher.children.get_mut(&pid).unwrap();
+        worker.child.wait().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("gc-1.out")).unwrap(),
+            crate::daemon::spawn::user_message("status?"),
+            "the wire carries exactly one user_message line"
+        );
+
+        // released pipe: no pipe to nudge
+        assert!(matches!(
+            dispatcher.nudge_via_stdin("t/dev/1", "again?"),
+            NudgeOutcome::NoPipe
+        ));
+        // unknown session: NoPipe as well (the resume path takes over)
+        assert!(matches!(
+            dispatcher.nudge_via_stdin("ghost", "x"),
+            NudgeOutcome::NoPipe
+        ));
+    }
+
+    #[test]
+    fn a_dead_reader_nudge_fails_loudly() {
+        let (dir, _ledger) = temp_ledger();
+        let mut dispatcher = test_dispatcher(dir.path());
+        let mut worker = held_cat_worker(dir.path(), "t/dev/1", "gc-1");
+        // kill the reader while campd still holds the write end
+        worker.child.kill().unwrap();
+        worker.child.wait().unwrap();
+        dispatcher.children.insert(worker.child.id(), worker);
+        // one write may land in the pipe buffer; the second hits EPIPE
+        let first = dispatcher.nudge_via_stdin("t/dev/1", "status?");
+        let second = dispatcher.nudge_via_stdin("t/dev/1", "status?");
+        assert!(
+            matches!(second, NudgeOutcome::Failed(_)) || matches!(first, NudgeOutcome::Failed(_)),
+            "a broken pipe must surface as Failed: {first:?} then {second:?}"
+        );
+    }
+
+    #[test]
+    fn release_worker_drops_stdin_and_names_the_session() {
+        let (dir, _ledger) = temp_ledger();
+        let mut dispatcher = test_dispatcher(dir.path());
+        let worker = held_cat_worker(dir.path(), "t/dev/1", "gc-1");
+        let pid = worker.child.id();
+        dispatcher.children.insert(pid, worker);
+
+        assert_eq!(
+            dispatcher.release_worker("gc-1", "released after bead close"),
+            Some("t/dev/1".to_owned())
+        );
+        {
+            let worker = dispatcher.children.get_mut(&pid).unwrap();
+            assert!(worker.stdin.is_none(), "the pipe is dropped (EOF)");
+            assert_eq!(
+                worker.released.as_deref(),
+                Some("released after bead close")
+            );
+            // cat exits on EOF
+            assert!(worker.child.wait().unwrap().success());
+        }
+        // idempotent: a second release finds nothing to do
+        assert_eq!(dispatcher.release_worker("gc-1", "again"), None);
+        assert_eq!(dispatcher.release_worker("gc-999", "x"), None);
+    }
+
+    #[test]
+    fn aux_children_reap_without_session_events_and_event_failures() {
+        let (dir, mut ledger) = temp_ledger();
+        let mut dispatcher = test_dispatcher(dir.path());
+        {
+            let _spawning = crate::daemon::spawn_probe_guard();
+            let mut ok = std::process::Command::new("true");
+            ok.stdin(std::process::Stdio::null());
+            dispatcher.spawn_aux("t/dev/1", "nudge-resume", ok).unwrap();
+            let mut bad = std::process::Command::new("false");
+            bad.stdin(std::process::Stdio::null());
+            dispatcher
+                .spawn_aux("t/dev/2", "nudge-resume", bad)
+                .unwrap();
+        }
+        // wait for both to exit so one reap sees them
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !dispatcher.aux_done() {
+            assert!(std::time::Instant::now() < deadline, "aux children hung");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        dispatcher.reap(&mut ledger).unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        assert_eq!(count(&ledger, "session.stopped"), 0, "aux ≠ session end");
+        assert_eq!(count(&ledger, "session.crashed"), 0);
+        let degraded: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind.as_str() == "patrol.degraded")
+            .collect();
+        assert_eq!(degraded.len(), 1, "only the failing aux child events");
+        assert_eq!(degraded[0].data["session"], "t/dev/2");
+        assert!(
+            degraded[0].data["error"]
+                .as_str()
+                .unwrap()
+                .contains("nudge-resume"),
+            "{}",
+            degraded[0].data
         );
     }
 }

@@ -3,6 +3,7 @@
 mod campdir;
 mod daemon;
 mod cmd {
+    pub mod adopt;
     pub mod claim;
     pub mod close;
     pub mod create;
@@ -216,6 +217,8 @@ enum Command {
     Daemon,
     /// Stop the running daemon gracefully
     Stop,
+    /// Reconcile the session registry against reality (auto at campd start)
+    Adopt,
     /// One campd status snapshot as plain text (auto-starts the daemon)
     Top,
 }
@@ -435,6 +438,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Command::Daemon => run_daemon(cli.camp.as_deref()),
+        Command::Adopt => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::adopt::run(&camp)
+        }
         Command::Stop => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::stop::run(&camp)
