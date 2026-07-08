@@ -247,12 +247,12 @@ enum Command {
 enum SessionCommand {
     /// Register an attended session (appends session.woke)
     Register {
-        /// Session registry name (unique)
-        #[arg(long)]
-        name: String,
-        /// Agent role name (e.g. "attended")
-        #[arg(long)]
-        agent: String,
+        /// Session registry name (unique); derived from stdin with --hook-stdin
+        #[arg(long, required_unless_present = "hook_stdin")]
+        name: Option<String>,
+        /// Agent role name (e.g. "attended"); derived with --hook-stdin
+        #[arg(long, required_unless_present = "hook_stdin")]
+        agent: Option<String>,
         /// Rig the session works in
         #[arg(long)]
         rig: Option<String>,
@@ -274,12 +274,16 @@ enum SessionCommand {
         /// Event actor / provenance (default: hook:session-start)
         #[arg(long, default_value = "hook:session-start")]
         actor: String,
+        /// Read a Claude Code SessionStart hook payload from stdin; derive
+        /// name=attended/<session_id>, agent=attended. Idempotent.
+        #[arg(long)]
+        hook_stdin: bool,
     },
     /// End an attended session (appends session.stopped)
     End {
-        /// Session registry name
-        #[arg(long)]
-        name: String,
+        /// Session registry name; derived from stdin with --hook-stdin
+        #[arg(long, required_unless_present = "hook_stdin")]
+        name: Option<String>,
         /// How the session ended (searchable note)
         #[arg(long)]
         reason: Option<String>,
@@ -292,6 +296,14 @@ enum SessionCommand {
         /// Event actor / provenance (default: hook:session-end)
         #[arg(long, default_value = "hook:session-end")]
         actor: String,
+        /// Read a Claude Code SessionEnd hook payload from stdin; derive
+        /// name=attended/<session_id>, reason=<source>.
+        #[arg(long)]
+        hook_stdin: bool,
+        /// No-op (success) unless the session is currently live — for
+        /// fire-and-forget hooks that must not error on an unknown session.
+        #[arg(long)]
+        if_registered: bool,
     },
 }
 
@@ -531,8 +543,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     bead,
                     worktree,
                     actor,
+                    hook_stdin,
                 } => cmd::session::register(
                     &camp, name, agent, rig, session_id, transcript, pid, bead, worktree, actor,
+                    hook_stdin,
                 ),
                 SessionCommand::End {
                     name,
@@ -540,7 +554,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     exit_code,
                     signal,
                     actor,
-                } => cmd::session::end(&camp, name, reason, exit_code, signal, actor),
+                    hook_stdin,
+                    if_registered,
+                } => cmd::session::end(
+                    &camp,
+                    name,
+                    reason,
+                    exit_code,
+                    signal,
+                    actor,
+                    hook_stdin,
+                    if_registered,
+                ),
             }
         }
         Command::Top { statusline } => {

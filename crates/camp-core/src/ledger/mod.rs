@@ -322,6 +322,22 @@ impl Ledger {
         })
     }
 
+    /// The current status of a registered session (`live`/`stopped`/
+    /// `crashed`), or `None` if the name was never registered. Session
+    /// names are fold-unique forever, so this is the existence check the
+    /// plugin's hook-facing `register` (idempotent — a repeat SessionStart
+    /// or a resumed-after-end session must not attempt a duplicate
+    /// `session.woke`) and `end --if-registered` rely on.
+    pub fn session_status(&self, name: &str) -> Result<Option<String>, CoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row("SELECT status FROM sessions WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
     /// The live session registry rows, with each row's `session.woke`
     /// provenance joined in (Phase 11, spec §8.5): `woke_actor` tells
     /// adoption whether campd spawned the session (`"campd"`) or a hook

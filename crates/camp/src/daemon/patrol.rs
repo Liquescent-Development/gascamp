@@ -1067,6 +1067,15 @@ pub fn adopt(
         if patrol.is_tracked(&row.name) || dispatcher.is_child(&row.name) {
             continue; // already under patrol/parentage: nothing to reconcile
         }
+        // A hook-registered attended session (the operator's own control
+        // session: woke_actor is a hook, not "campd", and there is no pid)
+        // cannot be probed by the worker-command model — and spec §10
+        // forbids campd crashing/killing a session in the user's TUI. Keep
+        // it live; its SessionEnd hook reconciles it. Only campd-owned
+        // workers and pid-bearing rows are probed for liveness.
+        if row.woke_actor != "campd" && row.pid.is_none() {
+            continue;
+        }
         let alive = probe_alive(
             row.claude_session_id.as_deref(),
             row.pid,
@@ -2342,6 +2351,38 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn adopt_keeps_hook_registered_attended_sessions_never_crashes_them() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        // a hook-registered attended session: non-campd actor, no bead, no
+        // pid, and a transcript path that need not exist. probe_alive would
+        // find no process — but spec §10 forbids crashing it.
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: None,
+                actor: "hook:session-start".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "name": "attended/S-1", "agent": "attended",
+                    "claude_session_id": "S-1", "transcript_path": "/tmp/S-1.jsonl",
+                }),
+            })
+            .unwrap();
+        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher).unwrap();
+        assert_eq!(
+            summary.crashed, 0,
+            "adopt must never crash an attended session (spec §10)"
+        );
+        assert_eq!(
+            ledger.session_status("attended/S-1").unwrap().as_deref(),
+            Some("live"),
+            "the attended session stays live across adopt"
+        );
     }
 
     #[test]
