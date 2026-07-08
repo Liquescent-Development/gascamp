@@ -196,6 +196,13 @@ plan doc path, await approval — so only the word "operator" was dropped
 from the block below. This note stays outside the fenced block: kickoffs
 are composed from the block verbatim.*
 
+*Amended 2026-07-08 (operator directive): added the subagent-hygiene
+pointer to Method and rules — sessions spawning helper agents kept
+hitting stranded completion callbacks and misrouted reports (six
+incidents this project); the skill (.claude/skills/subagent-hygiene) is
+the durable fix. This note stays outside the fenced block: kickoffs are
+composed from the block verbatim.*
+
 ```
 Work in the gascamp repository (private repo richardkiene/gascamp, default
 branch main — NEVER commit to main; all work lands via PR branches). Read
@@ -240,6 +247,10 @@ CI is green (gh pr checks --watch).
 master-plan exit criteria quoted line by line with the evidence for each.
 - If you hit a genuine spec/contract ambiguity, stop and ask the lead
 rather than guessing.
+- If you spawn helper agents, follow the subagent-hygiene skill
+(.claude/skills/): poll for results — completion callbacks don't wake
+stopped sessions; use file handoffs; no helper task may need a
+permission escalation.
 
 House rules: never add co-authors or mention yourself in commits; never
 silence errors; fail fast, no fallbacks; no panics in library code; never
