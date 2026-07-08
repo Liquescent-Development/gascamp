@@ -269,10 +269,26 @@ pub fn transient_fails_used(conn: &Connection, attempts: &[BeadRow]) -> Result<u
 
 /// True when `bead`'s needs can NEVER all pass: some need is missing,
 /// closed non-pass, or (recursively) itself unsatisfiable. Open needs
-/// whose own needs can still pass keep the bead satisfiable. Cycles are
-/// impossible (validate rejects same-run cycles; cross-run edges point at
-/// closed roots).
+/// whose own needs can still pass keep the bead satisfiable. Formula
+/// cooking cannot produce cycles (validate rejects them; cross-run edges
+/// point at closed roots), but the general append path CAN (a forward
+/// reference closed into a loop) — a revisit is a Corrupt error naming
+/// the cycle, never unbounded recursion (review LOW 5).
 pub fn unsatisfiable(conn: &Connection, bead: &str) -> Result<bool, CoreError> {
+    let mut visited = std::collections::HashSet::new();
+    unsatisfiable_walk(conn, bead, &mut visited)
+}
+
+fn unsatisfiable_walk(
+    conn: &Connection,
+    bead: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<bool, CoreError> {
+    if !visited.insert(bead.to_owned()) {
+        return Err(CoreError::Corrupt(format!(
+            "needs cycle involving bead {bead:?} — the dependency graph must be acyclic"
+        )));
+    }
     let mut stmt = conn.prepare("SELECT needs_id FROM deps WHERE bead_id = ?1")?;
     let needs: Vec<String> = stmt
         .query_map([bead], |r| r.get::<_, String>(0))?
@@ -285,7 +301,7 @@ pub fn unsatisfiable(conn: &Connection, bead: &str) -> Result<bool, CoreError> {
                     if row.outcome.as_deref() != Some("pass") {
                         return Ok(true);
                     }
-                } else if unsatisfiable(conn, &need)? {
+                } else if unsatisfiable_walk(conn, &need, visited)? {
                     return Ok(true);
                 }
             }
@@ -459,6 +475,49 @@ pub fn bond_label(anchor: &str, index: usize) -> String {
     format!("bond:{anchor}:{index}")
 }
 
+/// The bond children already cooked for an anchor, by index: run ROOT
+/// beads whose labels parse as `bond:<anchor>:<i>`. One beads-table query
+/// narrowed by a LIKE prefilter on the folded labels column (review
+/// LOW 4 — the events-scan predecessor cost O(total runs) per chain
+/// link); the Rust-side `parse_bond_label` re-check keeps correctness
+/// independent of the prefilter (decoy substrings cannot slip through).
+pub fn bond_children(
+    conn: &Connection,
+    anchor: &str,
+) -> Result<std::collections::BTreeMap<usize, BeadRow>, CoreError> {
+    // labels serialize as a JSON array of strings, so a real bond label
+    // appears as `"bond:<anchor>:` — escape LIKE metacharacters in the id
+    let escaped = anchor
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%\"bond:{escaped}:%");
+    let mut stmt = conn.prepare(
+        "SELECT id, labels FROM beads
+         WHERE run_id IS NOT NULL AND step_id IS NULL
+           AND labels LIKE ?1 ESCAPE '\\'",
+    )?;
+    let candidates: Vec<(String, String)> = stmt
+        .query_map([pattern], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut children = std::collections::BTreeMap::new();
+    for (id, labels_json) in candidates {
+        let labels: Vec<String> = serde_json::from_str(&labels_json)
+            .map_err(|e| CoreError::Corrupt(format!("bead {id} labels are not JSON: {e}")))?;
+        for label in &labels {
+            if let Some((parent, index)) = parse_bond_label(label)
+                && parent == anchor
+            {
+                let row = crate::readiness::get_bead(conn, &id)?
+                    .ok_or_else(|| CoreError::Corrupt(format!("bead {id} vanished mid-query")))?;
+                children.insert(index, row);
+                break;
+            }
+        }
+    }
+    Ok(children)
+}
+
 pub fn parse_bond_label(label: &str) -> Option<(&str, usize)> {
     let rest = label.strip_prefix("bond:")?;
     let (anchor, index) = rest.rsplit_once(':')?;
@@ -471,6 +530,74 @@ pub fn parse_bond_label(label: &str) -> Option<(&str, usize)> {
 /// PathBuf helper: the runs dir under a camp root.
 pub fn runs_dir(camp_root: &Path) -> PathBuf {
     camp_root.join(RUNS_SUBDIR)
+}
+
+/// The dead-end batch for a run that can never advance (its pinned dir is
+/// unreadable, so campd has no structure to execute): close every open
+/// run bead `skipped`, the root `fail`, and finalize hard — evented,
+/// never silent. Empty when the root is already closed (idempotent) or
+/// the run has no beads. Pure input construction; the caller appends
+/// (cursor-atomically in the processor, or as one batch from reconcile).
+pub fn dead_end_inputs(
+    conn: &Connection,
+    run_id: &str,
+    cause_seq: i64,
+    reason: &str,
+) -> Result<Vec<crate::event::EventInput>, CoreError> {
+    use crate::event::{EventInput, EventType};
+    let beads = run_bead_ids(conn, run_id)?;
+    let Some((root_id, _)) = beads.iter().find(|(_, step)| step.is_none()) else {
+        return Ok(Vec::new());
+    };
+    let Some(root_row) = crate::readiness::get_bead(conn, root_id)? else {
+        return Ok(Vec::new());
+    };
+    if root_row.status == "closed" {
+        return Ok(Vec::new());
+    }
+    let mut inputs = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for (id, step_id) in &beads {
+        let Some(step_id) = step_id else { continue };
+        let Some(row) = crate::readiness::get_bead(conn, id)? else {
+            continue;
+        };
+        if row.status != "closed" {
+            inputs.push(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some(row.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(id.clone()),
+                data: serde_json::json!({ "outcome": "skipped", "reason": reason }),
+            });
+            if !skipped.contains(step_id) {
+                skipped.push(step_id.clone());
+            }
+        }
+    }
+    inputs.push(EventInput {
+        kind: EventType::BeadClosed,
+        rig: Some(root_row.rig.clone()),
+        actor: "campd".into(),
+        bead: Some(root_id.clone()),
+        data: serde_json::json!({ "outcome": "fail", "reason": reason }),
+    });
+    inputs.push(EventInput {
+        kind: EventType::RunFinalized,
+        rig: Some(root_row.rig.clone()),
+        actor: "campd".into(),
+        bead: Some(root_id.clone()),
+        data: serde_json::json!({
+            "run_id": run_id,
+            "root": root_id,
+            "outcome": "fail",
+            "final_disposition": "hard_fail",
+            "cause_seq": cause_seq,
+            "soft_failed": [],
+            "skipped": skipped,
+        }),
+    });
+    Ok(inputs)
 }
 
 #[cfg(test)]
@@ -602,6 +729,37 @@ mod tests {
         assert!(l.unsatisfiable("gc-3").unwrap(), "walks through open beads");
         assert!(!l.unsatisfiable("gc-5").unwrap(), "open dep can still pass");
         assert!(l.unsatisfiable("gc-6").unwrap(), "missing dep never passes");
+    }
+
+    /// Review LOW 5: a needs cycle IS constructible through the normal
+    /// append path (A needs B before B exists, then B needs A) — the walk
+    /// must fail fast naming the cycle, never recurse unboundedly inside
+    /// the cursor transaction.
+    #[test]
+    fn a_needs_cycle_is_a_corrupt_error_not_a_stack_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = ledger(&dir);
+        let create = |l: &mut Ledger, id: &str, needs: &[&str]| {
+            l.append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some(id.into()),
+                data: serde_json::json!({"title": id, "needs": needs}),
+            })
+            .unwrap();
+        };
+        create(&mut l, "gc-1", &["gc-2"]); // forward reference
+        create(&mut l, "gc-2", &["gc-1"]); // closes the cycle
+        create(&mut l, "gc-3", &["gc-1"]); // hangs off the cycle
+        for bead in ["gc-1", "gc-2", "gc-3"] {
+            match l.unsatisfiable(bead) {
+                Err(crate::error::CoreError::Corrupt(message)) => {
+                    assert!(message.contains("cycle"), "{message}");
+                }
+                other => panic!("{bead}: expected Corrupt(cycle), got {other:?}"),
+            }
+        }
     }
 
     const TWO_STEP: &str = "formula = \"two-step\"\n\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n\n\
@@ -813,6 +971,83 @@ mod tests {
         vars.insert("obj".to_owned(), "{item.inner}".to_owned());
         let err = substitute_vars(&vars, &serde_json::json!({"inner":{"a":1}}), 0).unwrap_err();
         assert!(err.contains("not a scalar"), "{err}");
+    }
+
+    /// Review LOW 4: bond-children lookup is a beads-table label query,
+    /// and decoys cannot slip through — a similar label on a STEP bead, a
+    /// label whose anchor merely shares a prefix, and a non-bond label
+    /// containing the substring are all excluded by the Rust re-parse.
+    #[test]
+    fn bond_children_finds_roots_by_label_and_rejects_decoys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = ledger(&dir);
+        let create_labeled = |l: &mut Ledger,
+                              id: &str,
+                              labels: serde_json::Value,
+                              run_id: Option<&str>,
+                              step_id: Option<&str>| {
+            let mut data = serde_json::json!({"title": id, "labels": labels});
+            if let Some(r) = run_id {
+                data["run_id"] = serde_json::json!(r);
+            }
+            if let Some(st) = step_id {
+                data["step_id"] = serde_json::json!(st);
+            }
+            l.append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some(id.into()),
+                data,
+            })
+            .unwrap();
+        };
+        // real children of gc-7 (run roots)
+        create_labeled(
+            &mut l,
+            "gc-10",
+            serde_json::json!(["bond:gc-7:0"]),
+            Some("r1"),
+            None,
+        );
+        create_labeled(
+            &mut l,
+            "gc-11",
+            serde_json::json!(["bond:gc-7:1"]),
+            Some("r2"),
+            None,
+        );
+        // decoy: same label on a STEP bead (not a root)
+        create_labeled(
+            &mut l,
+            "gc-12",
+            serde_json::json!(["bond:gc-7:2"]),
+            Some("r3"),
+            Some("s"),
+        );
+        // decoy: a DIFFERENT anchor sharing the prefix
+        create_labeled(
+            &mut l,
+            "gc-13",
+            serde_json::json!(["bond:gc-70:0"]),
+            Some("r4"),
+            None,
+        );
+        // decoy: a non-bond label containing the substring mid-text
+        create_labeled(
+            &mut l,
+            "gc-14",
+            serde_json::json!(["notes about \"bond:gc-7:9\" elsewhere"]),
+            Some("r5"),
+            None,
+        );
+        let children = l.bond_children("gc-7").unwrap();
+        let got: Vec<(usize, String)> = children.into_iter().map(|(i, row)| (i, row.id)).collect();
+        assert_eq!(
+            got,
+            vec![(0, "gc-10".to_owned()), (1, "gc-11".to_owned())],
+            "exactly the real root children, in index order"
+        );
     }
 
     #[test]

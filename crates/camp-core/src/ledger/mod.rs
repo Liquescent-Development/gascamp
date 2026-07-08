@@ -201,6 +201,24 @@ impl Ledger {
         crate::formula::runtime::created_event_data(&self.conn, bead)
     }
 
+    /// The bond children already cooked for an anchor, by index (Phase 9).
+    pub fn bond_children(
+        &self,
+        anchor: &str,
+    ) -> Result<std::collections::BTreeMap<usize, crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::bond_children(&self.conn, anchor)
+    }
+
+    /// The dead-end batch for a run that can never advance (Phase 9).
+    pub fn dead_end_inputs(
+        &self,
+        run_id: &str,
+        cause_seq: Seq,
+        reason: &str,
+    ) -> Result<Vec<EventInput>, CoreError> {
+        crate::formula::runtime::dead_end_inputs(&self.conn, run_id, cause_seq, reason)
+    }
+
     /// True when `bead`'s needs can never all pass.
     pub fn unsatisfiable(&self, bead: &str) -> Result<bool, CoreError> {
         crate::formula::runtime::unsatisfiable(&self.conn, bead)

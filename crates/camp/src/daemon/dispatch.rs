@@ -834,8 +834,15 @@ impl GraphRuntime {
             if let Some(deadline) = check.deadline
                 && deadline <= now
             {
+                // Review MEDIUM 1: a child that ALREADY EXITED met its
+                // deadline — the wake being late (busy settle) must not
+                // rewrite an on-time verdict. Only a still-running child
+                // is timed out and killed; the reap classifies exited
+                // ones by their real status.
+                if matches!(check.child.try_wait(), Ok(Some(_))) {
+                    continue;
+                }
                 check.timed_out = true;
-                // a child that already exited is fine — the reap classifies
                 let _ = check.child.kill();
             }
         }
@@ -1114,6 +1121,17 @@ impl GraphRuntime {
             };
             let run_id = run_id.to_owned();
             let Some(ctx) = self.ctx(&run_id) else {
+                // Review LOW 3: a dir that vanished while campd was down
+                // gets no further events to trigger the processor's
+                // dead-end — reconcile must event it, never skip silently.
+                let inputs = ledger.dead_end_inputs(
+                    &run_id,
+                    event.seq,
+                    "run dir unreadable; the run cannot advance",
+                )?;
+                if !inputs.is_empty() {
+                    ledger.append_batch(inputs)?;
+                }
                 continue;
             };
             let ctx = Arc::clone(&ctx);
@@ -1522,6 +1540,7 @@ impl GraphRuntime {
     /// A run whose pinned dir is unreadable can never advance: close every
     /// open run bead `skipped`, the root `fail`, and finalize — the honest
     /// mechanical dead-end, evented, never silent (plan Task 5 ruling).
+    /// Cursor-atomic here; reconcile uses the same builder as one batch.
     fn dead_end_run(
         &mut self,
         conn: &Connection,
@@ -1529,76 +1548,14 @@ impl GraphRuntime {
         run_id: &str,
         cause_seq: i64,
     ) -> Result<(), CoreError> {
-        let beads = flow::run_bead_ids(conn, run_id)?;
-        let root = beads.iter().find(|(_, step)| step.is_none());
-        let Some((root_id, _)) = root else {
-            return Ok(()); // no root: nothing to finalize
-        };
-        let Some(root_row) = camp_core::readiness::get_bead(conn, root_id)? else {
-            return Ok(());
-        };
-        if root_row.status == "closed" {
-            return Ok(()); // already dead-ended
-        }
-        let mut skipped: Vec<String> = Vec::new();
-        for (id, step_id) in &beads {
-            let Some(step_id) = step_id else { continue };
-            let Some(row) = camp_core::readiness::get_bead(conn, id)? else {
-                continue;
-            };
-            if row.status != "closed" {
-                Ledger::append_on(
-                    conn,
-                    now,
-                    EventInput {
-                        kind: EventType::BeadClosed,
-                        rig: Some(row.rig.clone()),
-                        actor: "campd".into(),
-                        bead: Some(id.clone()),
-                        data: serde_json::json!({
-                            "outcome": "skipped",
-                            "reason": "run dir unreadable; the run cannot advance",
-                        }),
-                    },
-                )?;
-                if !skipped.contains(step_id) {
-                    skipped.push(step_id.clone());
-                }
-            }
-        }
-        Ledger::append_on(
+        for input in flow::dead_end_inputs(
             conn,
-            now,
-            EventInput {
-                kind: EventType::BeadClosed,
-                rig: Some(root_row.rig.clone()),
-                actor: "campd".into(),
-                bead: Some(root_id.clone()),
-                data: serde_json::json!({
-                    "outcome": "fail",
-                    "reason": "run dir unreadable; the run cannot advance",
-                }),
-            },
-        )?;
-        Ledger::append_on(
-            conn,
-            now,
-            EventInput {
-                kind: EventType::RunFinalized,
-                rig: Some(root_row.rig.clone()),
-                actor: "campd".into(),
-                bead: Some(root_id.clone()),
-                data: serde_json::json!({
-                    "run_id": run_id,
-                    "root": root_id,
-                    "outcome": "fail",
-                    "final_disposition": "hard_fail",
-                    "cause_seq": cause_seq,
-                    "soft_failed": [],
-                    "skipped": skipped,
-                }),
-            },
-        )?;
+            run_id,
+            cause_seq,
+            "run dir unreadable; the run cannot advance",
+        )? {
+            Ledger::append_on(conn, now, input)?;
+        }
         Ok(())
     }
 
@@ -1673,31 +1630,14 @@ fn attempt_bead_input(
     }
 }
 
-/// The bond children already cooked for an anchor, by index: root beads
-/// whose labels parse as `bond:<anchor>:<i>` (pure beads/events state, so
-/// crash recovery and re-execution converge on the same answer).
+/// The bond children already cooked for an anchor, by index — one
+/// beads-table label query (review LOW 4; the events-scan predecessor
+/// cost O(total runs) per chain link).
 fn existing_bond_children(
     ledger: &Ledger,
     anchor: &str,
 ) -> Result<std::collections::BTreeMap<usize, BeadRow>, CoreError> {
-    let mut children = std::collections::BTreeMap::new();
-    for event in ledger.events_of_type(EventType::RunCooked)? {
-        let Some(root) = event.data["root"].as_str() else {
-            continue;
-        };
-        let Some(row) = ledger.get_bead(root)? else {
-            continue;
-        };
-        for label in &row.labels {
-            if let Some((parent, index)) = flow::parse_bond_label(label)
-                && parent == anchor
-            {
-                children.insert(index, row.clone());
-                break;
-            }
-        }
-    }
-    Ok(children)
+    ledger.bond_children(anchor)
 }
 
 /// A fan-out-level failure: evented on the anchor (invariant 5 — campd
@@ -2764,6 +2704,42 @@ mod tests {
         assert!(bond_children(&ledger, &anchor).is_empty());
     }
 
+    /// Review MEDIUM 1: a check that EXITED 0 before its deadline must be
+    /// classified by its real exit status, not misrecorded as timed out
+    /// just because the wake arrived late (busy-camp settle). kill_expired
+    /// must try_wait before marking/killing.
+    #[test]
+    fn an_on_time_pass_reaped_after_the_deadline_is_still_a_pass() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let (anchor_id, attempt, _cooked) = checked_run_with_queued_check(
+            &dir,
+            &mut ledger,
+            &mut rt,
+            &mut graph,
+            "#!/bin/sh\nexit 0\n",
+            CHECKED,
+        );
+        graph.execute(&mut ledger).unwrap();
+        // the check exits 0 well within its declared timeout...
+        for check in graph.check_children.values_mut() {
+            let _ = check.child.wait();
+        }
+        // ...but campd is busy and the deadline-enforcement wake arrives
+        // AFTER the deadline passed
+        graph.kill_expired(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        graph.reap_checks(&mut ledger).unwrap();
+        assert_eq!(
+            events_named(&ledger, "check.passed").len(),
+            1,
+            "an on-time exit 0 is a pass, whatever the wake latency"
+        );
+        assert_eq!(events_named(&ledger, "check.failed").len(), 0);
+        let close = ledger.close_event_data(&anchor_id).unwrap().unwrap();
+        assert_eq!(close["outcome"], "pass");
+        let _ = attempt;
+    }
+
     // ---- Phase 9 Task 8: startup reconciliation ---------------------------
 
     #[test]
@@ -2835,6 +2811,53 @@ mod tests {
         let before = ledger.events_range(1, None).unwrap().len();
         later.execute(&mut ledger).unwrap();
         assert_eq!(ledger.events_range(1, None).unwrap().len(), before);
+    }
+
+    /// Review LOW 3: a run whose pinned dir vanished while campd was down
+    /// (and with no further ledger events coming) must be dead-ended BY
+    /// RECONCILE — evented, never a silent eprintln + NotQuiescent-forever.
+    #[test]
+    fn reconcile_dead_ends_a_run_whose_dir_vanished() {
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = cook_into(&dir, &mut ledger, "two-step", TWO_STEP);
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        // the dir vanishes while campd is down
+        std::fs::remove_dir_all(
+            camp_core::formula::runtime::runs_dir(dir.path()).join(&cooked.run_id),
+        )
+        .unwrap();
+        let config =
+            CampConfig::parse(&std::fs::read_to_string(dir.path().join("camp.toml")).unwrap())
+                .unwrap();
+        let mut fresh = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        fresh.reconcile(&mut ledger).unwrap();
+        let root = ledger.get_bead(&cooked.root_bead).unwrap().unwrap();
+        assert_eq!(
+            root.status, "closed",
+            "the run must be dead-ended, not skipped"
+        );
+        assert_eq!(root.outcome.as_deref(), Some("fail"));
+        for step in ["a", "b"] {
+            assert_eq!(
+                ledger
+                    .get_bead(&cooked.step_beads[step])
+                    .unwrap()
+                    .unwrap()
+                    .outcome
+                    .as_deref(),
+                Some("skipped"),
+                "step {step}"
+            );
+        }
+        let finalized = events_named(&ledger, "run.finalized");
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].data["final_disposition"], "hard_fail");
+        // idempotent: a second reconcile appends nothing
+        let before = ledger.events_range(1, None).unwrap().len();
+        let mut again = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        again.reconcile(&mut ledger).unwrap();
+        assert_eq!(ledger.events_range(1, None).unwrap().len(), before);
+        assert!(ledger.refold_check().unwrap().drift.is_empty());
     }
 
     #[test]

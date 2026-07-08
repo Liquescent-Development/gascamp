@@ -44,13 +44,31 @@ pub struct CookOptions {
     pub extra_root_labels: Vec<String>,
 }
 
-/// Replace every `{key}` from `vars` in `text`. Plain string replacement —
-/// authored text, not a template language; unknown tokens stay verbatim.
+/// Replace every `{key}` from `vars` in `text` — a SINGLE left-to-right
+/// pass (review MEDIUM 2): inserted values are worker output, never
+/// re-scanned as template syntax. Unknown tokens stay verbatim (authored
+/// text, not a template language).
 fn substitute(text: &str, vars: &BTreeMap<String, String>) -> String {
-    let mut out = text.to_owned();
-    for (key, value) in vars {
-        out = out.replace(&format!("{{{key}}}"), value);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let token = &rest[open + 1..open + close];
+        match vars.get(token) {
+            Some(value) => out.push_str(value),
+            None => {
+                out.push('{');
+                out.push_str(token);
+                out.push('}');
+            }
+        }
+        rest = &rest[open + close + 1..];
     }
+    out.push_str(rest);
     out
 }
 

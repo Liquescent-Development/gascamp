@@ -437,3 +437,43 @@ fn cook_with_substitutes_vars_and_links_the_root() {
     // refold property holds over the whole story
     assert!(ledger.refold_check().unwrap().drift.is_empty());
 }
+
+/// Review MEDIUM 2: a var VALUE that literally contains another var's
+/// {token} (worker output is arbitrary text) must never be re-substituted
+/// — single-pass scanning, not sequential replace.
+#[test]
+fn substitution_never_reinterprets_inserted_values_as_templates() {
+    use camp_core::formula::{CookOptions, cook_with};
+    let (dir, mut ledger) = temp_ledger();
+    let source = "formula = \"child\"\n\n[[steps]]\nid = \"work\"\n\
+                  title = \"Handle {name} at {position}\"\n";
+    let path = dir.path().join("child.toml");
+    std::fs::write(&path, source).unwrap();
+    let formula = parse_and_validate(&path).unwrap();
+
+    let mut vars = std::collections::BTreeMap::new();
+    // worker output embedded in a var value happens to contain "{position}"
+    vars.insert("name".to_owned(), "literal {position} inside".to_owned());
+    vars.insert("position".to_owned(), "0".to_owned());
+    let opts = CookOptions {
+        vars,
+        ..Default::default()
+    };
+    let cooked = cook_with(
+        &mut ledger,
+        &formula,
+        &dir.path().join("runs"),
+        &rig(),
+        "campd",
+        &opts,
+    )
+    .unwrap();
+    let step = ledger
+        .get_bead(&cooked.step_beads["work"])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        step.title, "Handle literal {position} inside at 0",
+        "inserted values are worker output, not template syntax"
+    );
+}
