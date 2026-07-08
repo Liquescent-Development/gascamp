@@ -178,19 +178,39 @@ fn start_socket_accepts_and_status_is_sane() {
     );
 }
 
+/// The poke reply is an ack, not a completion signal (Phase 8, PR #14
+/// review finding 2: ack-before-settle) — the cursor reaches the head
+/// within the same wake, observed with a bounded test-side wait.
+fn wait_cursor_at_head(root: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if campd_cursor(root) == max_seq(root) {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "cursor {} never reached head {}",
+                campd_cursor(root),
+                max_seq(root)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn a_cli_write_pokes_campd_and_the_cursor_advances() {
     let dir = tempfile::tempdir().unwrap();
     let root = init_camp(dir.path());
     let _daemon = Daemon::spawn(&root);
 
-    // create pokes synchronously before it exits, so this is deterministic
+    // create pokes before it exits; the settle lands in the same wake
     run_ok(&root, &["create", "poked"]);
-    assert_eq!(campd_cursor(&root), max_seq(&root));
+    wait_cursor_at_head(&root);
 
     // the readiness recompute path runs on close, live
     run_ok(&root, &["close", "gc-1", "--outcome", "pass"]);
-    assert_eq!(campd_cursor(&root), max_seq(&root));
+    wait_cursor_at_head(&root);
 }
 
 #[test]

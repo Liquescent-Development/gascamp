@@ -1,5 +1,6 @@
 //! The campd event loop (spec §5, §15.1): mio poll over the listener,
-//! per-connection reads, the camp.toml watch pipe, and the cron heap. The
+//! per-connection reads, the camp.toml watch pipe, the SIGCHLD self-pipe
+//! (Phase 8 worker reaping), and the cron heap. The
 //! poll timeout is the earliest armed timer deadline
 //! (`OrdersRuntime::poll_timeout` — the only timeout expression in campd);
 //! an idle heap means `None` and the idle daemon blocks in `poll` with
@@ -19,7 +20,8 @@ use jiff::{SignedDuration, Timestamp};
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
 
-use super::cursor::ReadinessProcessor;
+use super::cursor::{self, ReadinessProcessor};
+use super::dispatch::{Dispatcher, ReapFailure};
 use super::orders::{self, OrdersRuntime};
 use super::socket::{Request, Response};
 
@@ -29,6 +31,9 @@ const LISTENER: Token = Token(0);
 /// watch, 2 = Phase 8's SIGCHLD self-pipe, 3+ = connections. Coordinate
 /// with the lead before renumbering.
 const CONFIG_WATCH: Token = Token(1);
+/// Phase 8's SIGCHLD self-pipe (worker death detection, spec §10.1), per
+/// the shared token layout above.
+const SIGCHLD: Token = Token(2);
 
 /// Upper bound on a single request line (PR #8 review finding 3). Real
 /// requests are tens of bytes; the cap keeps a broken or hostile client
@@ -36,6 +41,24 @@ const CONFIG_WATCH: Token = Token(1);
 /// connection whose buffered line fragment exceeds this is answered with a
 /// clean error and dropped.
 pub(super) const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// How many times a failed reap may self-raise SIGCHLD before degrading to
+/// log-and-wait (PR #14 fix-pass NEW MEDIUM). Each retryable failure is
+/// SQLite contention already bounded by the 5 s busy_timeout, so the
+/// budget bounds total retry work; a persistent failure then waits for the
+/// next natural wake instead of hot-spinning (invariant 1).
+const SELF_RAISE_BUDGET: u32 = 3;
+
+/// Whether a failed reap earns a SIGCHLD self-raise: only retryable
+/// failures, only while the budget lasts. The caller resets the budget on
+/// success.
+fn should_self_raise(retryable: bool, budget: &mut u32) -> bool {
+    if !retryable || *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    true
+}
 
 /// Wall-vs-monotonic divergence beyond this is a wall-clock jump
 /// (sleep/wake, NTP step — spec §9): deadlines recompute and missed fires
@@ -53,14 +76,17 @@ enum ConnState {
     Stop,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     mut listener: UnixListener,
+    sigchld: std::os::unix::net::UnixStream,
     socket_path: &Path,
     ledger: &mut Ledger,
     processor: &mut ReadinessProcessor,
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
     config_rx: &mut mio::unix::pipe::Receiver,
+    dispatcher: &mut Dispatcher,
 ) -> Result<()> {
     let mut poll = Poll::new().context("creating the poller")?;
     let mut events = Events::with_capacity(64);
@@ -70,6 +96,10 @@ pub fn run(
     poll.registry()
         .register(config_rx, CONFIG_WATCH, Interest::READABLE)
         .context("registering the config watch pipe")?;
+    let mut sigchld = UnixStream::from_std(sigchld);
+    poll.registry()
+        .register(&mut sigchld, SIGCHLD, Interest::READABLE)
+        .context("registering the SIGCHLD pipe")?;
     // The connection map is bounded by the process fd limit — the natural
     // cap for a single-user local socket. An artificial cap was considered
     // (PR #8 review finding 3) and rejected: it would reject legitimate
@@ -79,13 +109,22 @@ pub fn run(
     // Token(2) is RESERVED for Phase 8's SIGCHLD self-pipe (the layout
     // above); connections start at 3.
     let mut next_token = 3usize;
+    let mut self_raise_budget = SELF_RAISE_BUDGET;
 
     let mut last_seen = Timestamp::now();
     loop {
         let timeout = runtime.poll_timeout(Timestamp::now());
         let wall_before = Timestamp::now();
         let mono_before = Instant::now();
-        poll.poll(&mut events, timeout).context("poll")?;
+        if let Err(e) = poll.poll(&mut events, timeout) {
+            // A signal (SIGCHLD) interrupting the wait is not an error:
+            // restart the loop — the timeout recomputes, due fires pop,
+            // and the self-pipe byte is readable.
+            if e.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e).context("poll");
+        }
         // Each wake compares expected vs actual wall time (spec §9): a
         // jump recomputes every deadline; an honest wake pops due fires.
         // Both paths apply the same catch-up window rule, so platforms
@@ -133,6 +172,45 @@ pub fn run(
                         Err(e) => return Err(e).context("accept"),
                     }
                 },
+                SIGCHLD => {
+                    drain_signal_pipe(&mut sigchld)?;
+                    // Reap → record ends → settle (catch up, cook, refill
+                    // capacity). Errors are reported, never fatal: a broken
+                    // child must not take campd down, and unrecorded exits
+                    // are retried next wake (try_wait re-returns the
+                    // status).
+                    match reap_and_refill(ledger, processor, runtime, clock, dispatcher) {
+                        Ok(()) => self_raise_budget = SELF_RAISE_BUDGET,
+                        Err(failure) => {
+                            eprintln!("campd: reap failed: {failure}");
+                            // Re-raise SIGCHLD to self (PR #14 review
+                            // finding 3): if this was the LAST live child,
+                            // no further SIGCHLD ever comes and an idle
+                            // camp would never retry. Bounded (fix-pass NEW
+                            // MEDIUM): only retryable failures (SQLite
+                            // contention, each attempt already bounded by
+                            // the 5 s busy_timeout) and only while the
+                            // budget lasts — a persistent failure degrades
+                            // to log-and-wait for the next natural wake
+                            // instead of a hot self-raise loop
+                            // (invariant 1). try_wait OS errors never
+                            // self-raise.
+                            if should_self_raise(failure.retryable, &mut self_raise_budget) {
+                                if let Err(raise_err) =
+                                    signal_hook::low_level::raise(signal_hook::consts::SIGCHLD)
+                                {
+                                    eprintln!("campd: SIGCHLD self-raise failed: {raise_err}");
+                                }
+                            } else {
+                                eprintln!(
+                                    "campd: not self-raising (retryable: {}, budget: {}); \
+                                     the next wake retries",
+                                    failure.retryable, self_raise_budget
+                                );
+                            }
+                        }
+                    }
+                }
                 CONFIG_WATCH => {
                     drain_pipe(config_rx)?;
                     // A dead watcher is a durable, rejected config.changed —
@@ -159,6 +237,7 @@ pub fn run(
                         processor,
                         runtime,
                         clock,
+                        dispatcher,
                         MAX_REQUEST_BYTES,
                     ) {
                         Ok(ConnState::Open) => {
@@ -187,9 +266,11 @@ pub fn run(
         if wake_ledger_work {
             // Timer-path settle errors mirror Phase 7 decision H: surface
             // to stderr, keep serving; the cursor holds position and the
-            // error re-surfaces on the next poke.
-            if let Err(e) = orders::settle(ledger, processor, runtime, clock) {
-                eprintln!("campd: settle failed: {e}");
+            // error re-surfaces on the next poke. The joint settle also
+            // dispatches whatever the cooks made ready (Phase 8), in this
+            // same wake.
+            if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher) {
+                eprintln!("campd: settle failed: {e:#}");
             }
         }
     }
@@ -230,12 +311,14 @@ enum ReadStop {
 /// a pipelining client would wedge. Only a WouldBlock read (kernel empty)
 /// may end in `Open`; only a single line fragment that exceeds the cap is
 /// rejected.
+#[allow(clippy::too_many_arguments)]
 fn serve_connection(
     conn: &mut Conn,
     ledger: &mut Ledger,
     processor: &mut ReadinessProcessor,
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
+    dispatcher: &mut Dispatcher,
     max_request_bytes: usize,
 ) -> Result<ConnState> {
     let mut chunk = [0u8; 4096];
@@ -256,7 +339,7 @@ fn serve_connection(
                 Err(e) => return Err(e).context("reading a request"),
             }
         };
-        let drained = drain_lines(conn, ledger, processor, runtime, clock)?;
+        let drained = drain_lines(conn, ledger, processor, runtime, clock, dispatcher)?;
         if let Some(terminal) = drained {
             return Ok(terminal);
         }
@@ -295,6 +378,7 @@ fn drain_lines(
     processor: &mut ReadinessProcessor,
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
+    dispatcher: &mut Dispatcher,
 ) -> Result<Option<ConnState>> {
     while let Some(newline) = conn.buf.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = conn.buf.drain(..=newline).collect();
@@ -305,22 +389,35 @@ fn drain_lines(
         match serde_json::from_str::<Request>(&line) {
             Ok(Request::Stop) => return Ok(Some(ConnState::Stop)),
             Ok(Request::Poke { seq: _ }) => {
-                // The poked seq is advisory; catch-up reads past the cursor
-                // regardless. A processing error answers the poker, lands on
-                // stderr, and leaves the cursor before the failing event —
-                // surfaced, never skipped. (Phase 10: settle = catch-up +
-                // cook-to-fixpoint; readiness pending is drained inside it.)
-                let response = match orders::settle(ledger, processor, runtime, clock) {
-                    Ok(()) => Response::Ok { ok: true },
-                    Err(e) => {
-                        eprintln!("campd: catch-up failed: {e}");
-                        Response::Error {
-                            ok: false,
-                            error: format!("catch-up failed: {e}"),
-                        }
-                    }
-                };
-                respond(&mut conn.stream, &response)?;
+                // ACK BEFORE SETTLE (PR #14 review finding 2, operator
+                // approved 2026-07-07): the ack means "campd is awake and
+                // will process this wake" — the poker's write is already
+                // durable, so making it wait out a slow settle (worktree
+                // checkouts, cooks, up to max_workers spawns) only risks
+                // its 5 s client timeout and a retried duplicate. The ack
+                // is BEST-EFFORT (fix-pass NEW LOW): a poker that vanished
+                // before reading it must not skip the settle — durable
+                // work is decoupled from the courtesy ack. The poked seq
+                // is advisory; the settle reads past the cursor regardless,
+                // in this same wake. A settle error lands on stderr and
+                // leaves the cursor before the failing event — surfaced,
+                // never skipped; the next wake retries.
+                let ack = respond(&mut conn.stream, &Response::Ok { ok: true });
+                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher) {
+                    eprintln!("campd: poke processing failed: {e:#}");
+                }
+                if let Err(e) = ack {
+                    // ANY ack write error closes the connection, not only
+                    // broken-pipe (round-2 review note): responses are a
+                    // few bytes, so even WouldBlock means the client is
+                    // not reading — the documented respond() contract
+                    // already drops such connections, and any buffered
+                    // lines from a client that cannot hear answers are
+                    // discarded with it. The settle above already ran;
+                    // only the courtesy ack is lost.
+                    eprintln!("campd: poke ack write failed (client gone?): {e:#}");
+                    return Ok(Some(ConnState::Closed));
+                }
             }
             Ok(Request::Status) => {
                 let response = match ledger.status_summary() {
@@ -352,6 +449,68 @@ fn drain_lines(
         }
     }
     Ok(None)
+}
+
+/// Drain the SIGCHLD self-pipe (signal deliveries coalesce; one byte or
+/// many, one sweep of try_wait covers them all).
+fn drain_signal_pipe(stream: &mut UnixStream) -> Result<()> {
+    let mut buf = [0u8; 64];
+    loop {
+        match stream.read(&mut buf) {
+            // the write end lives in the signal handler for the process
+            // lifetime; 0 is unreachable-but-safe
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("draining the SIGCHLD pipe"),
+        }
+    }
+}
+
+/// The SIGCHLD service path (Phase 8 plan decision I): reap exited
+/// workers, record their session ends, then settle — the
+/// 11th-ready-bead-dispatches-on-first-close path.
+fn reap_and_refill(
+    ledger: &mut Ledger,
+    processor: &mut ReadinessProcessor,
+    runtime: &mut OrdersRuntime,
+    clock: &dyn Clock,
+    dispatcher: &mut Dispatcher,
+) -> Result<(), ReapFailure> {
+    dispatcher.reap(ledger)?;
+    // settle failures are ledger-side: retry-worthy, like the appends
+    settle(ledger, processor, runtime, clock, dispatcher).map_err(|error| ReapFailure {
+        retryable: true,
+        error,
+    })
+}
+
+/// One wake's processing, to a joint fixpoint (spec §7.3 append → fold →
+/// dispatch): orders::settle catches up past the cursor and cooks fired
+/// orders to ITS fixpoint (draining the readiness hints — bounded
+/// bookkeeping; the dispatcher converges from ledger truth, Phase 8 plan
+/// decision B), then the dispatcher spawns workers up to the cap, and the
+/// loop repeats until dispatch appends nothing new — so the campd cursor
+/// always settles on the ledger head with every dispatch and cook event
+/// processed, and a cooked run's ready steps dispatch in the same wake.
+/// Bounded by the shrinking cook queue and dispatchable set: convergence,
+/// not polling.
+pub(super) fn settle(
+    ledger: &mut Ledger,
+    processor: &mut ReadinessProcessor,
+    runtime: &mut OrdersRuntime,
+    clock: &dyn Clock,
+    dispatcher: &mut Dispatcher,
+) -> Result<()> {
+    loop {
+        orders::settle(ledger, processor, runtime, clock)?;
+        dispatcher.converge(ledger)?;
+        let cursor = ledger.cursor(cursor::CAMPD_CURSOR)?;
+        if !ledger.has_events_past(cursor)? {
+            return Ok(());
+        }
+    }
 }
 
 fn respond(stream: &mut UnixStream, response: &Response) -> Result<()> {
@@ -386,6 +545,86 @@ mod tests {
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::time::Duration;
 
+    /// PR #14 fix-pass NEW MEDIUM: the self-raise retry budget must bound
+    /// — non-retryable failures never self-raise, and a persistent
+    /// retryable failure degrades to log-and-wait instead of a hot loop.
+    #[test]
+    fn self_raise_budget_bounds_and_resets() {
+        let mut budget = SELF_RAISE_BUDGET;
+        // non-retryable: never raise, budget untouched
+        assert!(!should_self_raise(false, &mut budget));
+        assert_eq!(budget, SELF_RAISE_BUDGET);
+        // retryable: raise while budget lasts
+        for _ in 0..SELF_RAISE_BUDGET {
+            assert!(should_self_raise(true, &mut budget));
+        }
+        // exhausted: degrade to log-and-wait
+        assert!(!should_self_raise(true, &mut budget));
+        assert!(!should_self_raise(true, &mut budget));
+        // success resets the budget (the caller assigns)
+        budget = SELF_RAISE_BUDGET;
+        assert!(should_self_raise(true, &mut budget));
+    }
+
+    /// PR #14 fix-pass NEW LOW: a poke whose ack write fails (client gone)
+    /// must STILL settle in the same wake — the poked write is durable and
+    /// the ack is courtesy. The dead connection closes cleanly.
+    #[test]
+    fn a_dead_client_poke_still_settles() {
+        // a child forked mid-pair-creation could inherit the client end
+        // and keep the "dead" peer alive (see spawn_probe_guard)
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        // one event past the cursor: the settle's catch-up must consume it
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "t", "type": "memory"}),
+            })
+            .unwrap();
+        let mut processor = ReadinessProcessor::default();
+        let mut runtime =
+            OrdersRuntime::build(dir.path(), Timestamp::now(), jiff::tz::TimeZone::UTC).unwrap();
+        let clock = camp_core::clock::SystemClock;
+        let mut dispatcher = Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
+        );
+
+        let (mut client, daemon_end) = StdUnixStream::pair().unwrap();
+        daemon_end.set_nonblocking(true).unwrap();
+        let mut conn = Conn {
+            stream: UnixStream::from_std(daemon_end),
+            buf: Vec::new(),
+        };
+        client.write_all(b"{\"op\":\"poke\",\"seq\":1}\n").unwrap();
+        drop(client); // the poker vanishes before reading its ack
+
+        let state = serve_connection(
+            &mut conn,
+            &mut ledger,
+            &mut processor,
+            &mut runtime,
+            &clock,
+            &mut dispatcher,
+            1024,
+        )
+        .expect("a dead poker must not error the connection loop");
+        assert!(matches!(state, ConnState::Closed));
+        assert_eq!(
+            ledger.cursor(cursor::CAMPD_CURSOR).unwrap(),
+            1,
+            "the settle must run even when the ack write fails"
+        );
+    }
+
     /// PR #8 re-review finding 1, pinned at the unit level: one readable
     /// event must drain everything the kernel already holds. mio is
     /// edge-triggered — if `serve_connection` returns `Open` with data
@@ -411,6 +650,12 @@ mod tests {
         let mut runtime =
             OrdersRuntime::build(dir.path(), Timestamp::now(), jiff::tz::TimeZone::UTC).unwrap();
         let clock = camp_core::clock::SystemClock;
+        let mut dispatcher = Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
+        );
 
         let (mut client, daemon_end) = StdUnixStream::pair().unwrap();
         daemon_end.set_nonblocking(true).unwrap();
@@ -457,6 +702,7 @@ mod tests {
             &mut processor,
             &mut runtime,
             &clock,
+            &mut dispatcher,
             TEST_CAP,
         )
         .unwrap();

@@ -28,6 +28,10 @@ pub enum EventType {
     OrderCompleted,
     OrderFailed,
     ConfigChanged,
+    WorkerMilestone,
+    WorktreeKept,
+    BeadWorktreeReaped,
+    DispatchFailed,
 }
 
 impl EventType {
@@ -48,6 +52,10 @@ impl EventType {
         EventType::OrderCompleted,
         EventType::OrderFailed,
         EventType::ConfigChanged,
+        EventType::WorkerMilestone,
+        EventType::WorktreeKept,
+        EventType::BeadWorktreeReaped,
+        EventType::DispatchFailed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -68,6 +76,10 @@ impl EventType {
             EventType::OrderCompleted => "order.completed",
             EventType::OrderFailed => "order.failed",
             EventType::ConfigChanged => "config.changed",
+            EventType::WorkerMilestone => "worker.milestone",
+            EventType::WorktreeKept => "worktree.kept",
+            EventType::BeadWorktreeReaped => "bead.worktree.reaped",
+            EventType::DispatchFailed => "dispatch.failed",
         }
     }
 

@@ -58,6 +58,7 @@ pub fn add(
         name: name.clone(),
         path: abs.clone(),
         prefix: prefix.clone(),
+        default_agent: None,
     };
 
     let mut ledger = Ledger::open(&camp.db_path())?;

@@ -28,6 +28,12 @@ pub enum CoreError {
     InvalidPrefix(String),
     #[error("invalid search query {query:?}: {reason}")]
     InvalidSearchQuery { query: String, reason: String },
+    #[error("pack: {0}")]
+    Pack(String),
+    #[error(
+        "unknown agent {name:?}; searched {searched:?} (packs in camp.toml order, then <camp>/agents/)"
+    )]
+    UnknownAgent { name: String, searched: Vec<String> },
     /// A formula cook failed before or around the ledger transaction
     /// (bad cook input, run-dir filesystem trouble). NOT a ledger
     /// integrity finding — that is `Corrupt`.

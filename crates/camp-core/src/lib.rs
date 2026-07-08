@@ -9,6 +9,7 @@ pub mod formula;
 pub mod id;
 pub mod ledger;
 pub mod orders;
+pub mod pack;
 pub mod readiness;
 pub mod search;
 pub mod vocab;
