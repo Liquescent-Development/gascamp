@@ -28,6 +28,10 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::OrderCompleted => order_completed(event),
         EventType::OrderFailed => order_failed(event),
         EventType::ConfigChanged => config_changed(event),
+        EventType::WorkerMilestone => worker_milestone(conn, event),
+        EventType::WorktreeKept => worktree_kept(conn, event),
+        EventType::BeadWorktreeReaped => bead_worktree_reaped(conn, event),
+        EventType::DispatchFailed => dispatch_failed(conn, event),
         // Log-only events: no state effect.
         EventType::CampdStarted | EventType::CampdStopped => Ok(()),
     }
@@ -307,6 +311,91 @@ struct RunCooked {
 /// `run.cooked` is log-only: the run's durable truth is its beads (created
 /// in the same transaction) and the pinned run dir. The fold validates the
 /// audit payload so a malformed cook event fails fast.
+fn known_bead(conn: &Connection, id: &str) -> Result<(), CoreError> {
+    if bead_status(conn, id)?.is_none() {
+        return Err(CoreError::UnknownBead(id.to_owned()));
+    }
+    Ok(())
+}
+
+fn non_empty(event: &Event, field: &str, value: &str) -> Result<(), CoreError> {
+    if value.is_empty() {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: format!("empty {field}"),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerMilestone {
+    text: String,
+}
+
+/// `worker.milestone` is log-only: worker breadcrumbs (spec §8.1). The
+/// bead is optional; when named it must exist (fail fast on typos).
+fn worker_milestone(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let p: WorkerMilestone = payload(event)?;
+    non_empty(event, "text", &p.text)?;
+    if let Some(bead) = event.bead.as_deref() {
+        known_bead(conn, bead)?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorktreeKept {
+    path: String,
+    reason: String,
+}
+
+/// `worktree.kept` is log-only: a failed bead's worktree stays for
+/// forensics (spec §12), and the ledger records where and why.
+fn worktree_kept(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let bead = required_bead(event)?;
+    known_bead(conn, bead)?;
+    let p: WorktreeKept = payload(event)?;
+    non_empty(event, "path", &p.path)?;
+    non_empty(event, "reason", &p.reason)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BeadWorktreeReaped {
+    path: String,
+}
+
+/// `bead.worktree.reaped` (gc-mirrored name) is log-only: a clean close's
+/// worktree was removed (spec §12).
+fn bead_worktree_reaped(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let bead = required_bead(event)?;
+    known_bead(conn, bead)?;
+    let p: BeadWorktreeReaped = payload(event)?;
+    non_empty(event, "path", &p.path)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchFailed {
+    reason: String,
+}
+
+/// `dispatch.failed` is log-only: campd could not dispatch a ready bead
+/// (unresolvable agent, missing rig, worktree failure). campd has no
+/// caller, so the error lands here (invariant 5); Phase 8 plan decision F.
+fn dispatch_failed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let bead = required_bead(event)?;
+    known_bead(conn, bead)?;
+    let p: DispatchFailed = payload(event)?;
+    non_empty(event, "reason", &p.reason)?;
+    Ok(())
+}
+
 fn run_cooked(event: &Event) -> Result<(), CoreError> {
     let p: RunCooked = payload(event)?;
     for (field, value) in [
@@ -352,6 +441,12 @@ struct SessionWoke {
     pid: Option<i64>,
     #[serde(default)]
     bead: Option<String>,
+    /// Audit-only (Phase 8): the worktree the worker runs in, when
+    /// isolated. No sessions column exists — schema v1 is frozen; campd
+    /// keeps the live copy in memory and the ledger keeps the record.
+    #[serde(default)]
+    #[allow(dead_code)]
+    worktree: Option<String>,
 }
 
 fn session_woke(conn: &Connection, event: &Event) -> Result<(), CoreError> {
@@ -392,6 +487,16 @@ fn session_woke(conn: &Connection, event: &Event) -> Result<(), CoreError> {
 #[serde(deny_unknown_fields)]
 struct SessionEnd {
     name: String,
+    /// Audit-only (Phase 8, F4 evidence): how the process ended.
+    #[serde(default)]
+    #[allow(dead_code)]
+    exit_code: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    signal: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    reason: Option<String>,
 }
 
 fn session_ended(conn: &Connection, event: &Event, new_status: &str) -> Result<(), CoreError> {

@@ -108,6 +108,33 @@ impl Ledger {
     }
 
     /// Dependents of `closed_bead` its close just made ready (spec §7.3).
+    pub fn dispatchable_beads(&self) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::readiness::dispatchable_beads(&self.conn)
+    }
+
+    /// Allocate the next session name `<camp>/<agent>/<n>` (spec §7.4,
+    /// master plan Phase 8). n = 1 + the highest existing suffix among
+    /// sessions with this exact prefix; suffix parsing happens in Rust so
+    /// odd agent names cannot break a LIKE pattern. Only campd allocates
+    /// in v1; the fold's duplicate-name rejection backstops any race.
+    pub fn next_session_name(&self, camp: &str, agent: &str) -> Result<String, CoreError> {
+        let prefix = format!("{camp}/{agent}/");
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM sessions WHERE agent = ?1")?;
+        let names = stmt.query_map([agent], |r| r.get::<_, String>(0))?;
+        let mut max_n: i64 = 0;
+        for name in names {
+            let name = name?;
+            if let Some(rest) = name.strip_prefix(&prefix)
+                && let Ok(n) = rest.parse::<i64>()
+            {
+                max_n = max_n.max(n);
+            }
+        }
+        Ok(format!("{prefix}{}", max_n + 1))
+    }
+
     pub fn newly_ready(&self, closed_bead: &str) -> Result<Vec<String>, CoreError> {
         crate::readiness::newly_ready(&self.conn, closed_bead)
     }
@@ -127,6 +154,20 @@ impl Ledger {
 
     /// Events with `from <= seq <= to` (unbounded above when `to` is None),
     /// in seq order.
+    /// Whether any event exists past `seq` — the settle-fixpoint probe
+    /// (PR #14 review finding 8: SELECT 1 LIMIT 1, never a materialized
+    /// tail).
+    pub fn has_events_past(&self, seq: Seq) -> Result<bool, CoreError> {
+        use rusqlite::OptionalExtension;
+        let hit: Option<i64> = self
+            .conn
+            .query_row("SELECT 1 FROM events WHERE seq > ?1 LIMIT 1", [seq], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
     pub fn events_range(&self, from: Seq, to: Option<Seq>) -> Result<Vec<Event>, CoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, ts, type, rig, actor, bead, data FROM events
@@ -412,6 +453,207 @@ mod tests {
         )
         .unwrap();
         (dir, ledger)
+    }
+
+    // ---- Phase 8 events (worker.milestone, worktree.kept,
+    // bead.worktree.reaped, dispatch.failed) + extended session payloads --
+
+    fn seeded_bead(l: &mut Ledger, id: &str) {
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some(id.into()),
+            data: serde_json::json!({"title": "t"}),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn has_events_past_probes_without_materializing() {
+        // PR #14 review finding 8: the settle fixpoint probe must not
+        // materialize the tail just to test emptiness.
+        let (_dir, mut l) = temp_ledger();
+        assert!(!l.has_events_past(0).unwrap());
+        seeded_bead(&mut l, "gc-1");
+        assert!(l.has_events_past(0).unwrap());
+        assert!(!l.has_events_past(1).unwrap());
+    }
+
+    #[test]
+    fn next_session_name_allocates_per_camp_and_agent() {
+        let (_dir, mut l) = temp_ledger();
+        assert_eq!(l.next_session_name("t", "dev").unwrap(), "t/dev/1");
+        for name in ["t/dev/1", "t/dev/7", "other/dev/40"] {
+            l.append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({"name": name, "agent": "dev"}),
+            })
+            .unwrap();
+        }
+        // other agents and other camps do not collide
+        assert_eq!(l.next_session_name("t", "dev").unwrap(), "t/dev/8");
+        assert_eq!(
+            l.next_session_name("t", "reviewer").unwrap(),
+            "t/reviewer/1"
+        );
+    }
+
+    #[test]
+    fn worker_milestone_is_log_only_and_validates_payload() {
+        let (_dir, mut l) = temp_ledger();
+        seeded_bead(&mut l, "gc-1");
+        let seq = l
+            .append(EventInput {
+                kind: EventType::WorkerMilestone,
+                rig: Some("gc".into()),
+                actor: "t/dev/1".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"text": "tests passing"}),
+            })
+            .unwrap();
+        assert!(seq > 0);
+        // no bead: still fine (a general breadcrumb)
+        l.append(EventInput {
+            kind: EventType::WorkerMilestone,
+            rig: None,
+            actor: "cli".into(),
+            bead: None,
+            data: serde_json::json!({"text": "note"}),
+        })
+        .unwrap();
+        // empty text rejected, nothing appended
+        let before = l.events_range(1, None).unwrap().len();
+        let err = l.append(EventInput {
+            kind: EventType::WorkerMilestone,
+            rig: None,
+            actor: "cli".into(),
+            bead: None,
+            data: serde_json::json!({"text": ""}),
+        });
+        assert!(err.is_err());
+        // unknown bead rejected
+        let err = l.append(EventInput {
+            kind: EventType::WorkerMilestone,
+            rig: None,
+            actor: "cli".into(),
+            bead: Some("gc-999".into()),
+            data: serde_json::json!({"text": "x"}),
+        });
+        assert!(err.is_err());
+        assert_eq!(l.events_range(1, None).unwrap().len(), before);
+    }
+
+    #[test]
+    fn worktree_events_are_log_only_and_validate_payloads() {
+        let (_dir, mut l) = temp_ledger();
+        seeded_bead(&mut l, "gc-1");
+        l.append(EventInput {
+            kind: EventType::WorktreeKept,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"path": "/camp/worktrees/gc-1", "reason": "outcome fail"}),
+        })
+        .unwrap();
+        l.append(EventInput {
+            kind: EventType::BeadWorktreeReaped,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"path": "/camp/worktrees/gc-1"}),
+        })
+        .unwrap();
+        // missing bead is an error for both
+        for (kind, data) in [
+            (
+                EventType::WorktreeKept,
+                serde_json::json!({"path": "/p", "reason": "r"}),
+            ),
+            (
+                EventType::BeadWorktreeReaped,
+                serde_json::json!({"path": "/p"}),
+            ),
+        ] {
+            let err = l.append(EventInput {
+                kind,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data,
+            });
+            assert!(err.is_err(), "{kind:?} without a bead must fail");
+        }
+    }
+
+    #[test]
+    fn dispatch_failed_requires_bead_and_reason() {
+        let (_dir, mut l) = temp_ledger();
+        seeded_bead(&mut l, "gc-1");
+        l.append(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"reason": "no agent named \"dev\""}),
+        })
+        .unwrap();
+        let err = l.append(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"reason": ""}),
+        });
+        assert!(err.is_err(), "empty reason must fail");
+    }
+
+    #[test]
+    fn session_woke_accepts_worktree_and_session_end_accepts_exit_details() {
+        let (_dir, mut l) = temp_ledger();
+        seeded_bead(&mut l, "gc-1");
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({
+                "name": "t/dev/1", "agent": "dev", "rig": "gc",
+                "claude_session_id": "7bd2befc-b018-4080-8738-429d541b3646",
+                "transcript_path": "/home/u/.claude/projects/-x/7bd2befc.jsonl",
+                "bead": "gc-1",
+                "worktree": "/camp/worktrees/gc-1"
+            }),
+        })
+        .unwrap();
+        l.append(EventInput {
+            kind: EventType::SessionCrashed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "t/dev/1", "exit_code": 7}),
+        })
+        .unwrap();
+        // signal + reason variants also parse (fresh session to end)
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "t/dev/2", "agent": "dev"}),
+        })
+        .unwrap();
+        l.append(EventInput {
+            kind: EventType::SessionCrashed,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "t/dev/2", "signal": 9, "reason": "spawn failed: ..."}),
+        })
+        .unwrap();
     }
 
     #[test]

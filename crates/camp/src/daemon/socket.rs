@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     /// Post-commit poke (spec §7.2). `seq` is advisory: catch-up processes
-    /// everything past the cursor regardless.
+    /// everything past the cursor regardless. The `{"ok":true}` reply is an
+    /// ACK — campd is awake and will process this wake — not a completion
+    /// signal (PR #14 review finding 2, ack-before-settle).
     Poke {
         seq: Seq,
     },
@@ -209,6 +211,7 @@ mod tests {
 
     #[test]
     fn fresh_path_binds() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("campd.sock");
         let listener = bind_or_replace(&path).unwrap();
@@ -225,6 +228,7 @@ mod tests {
 
     #[test]
     fn stale_socket_is_unlinked_and_rebound() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("campd.sock");
         // a dead daemon (kill -9) leaves the file behind, refusing connections
@@ -236,6 +240,7 @@ mod tests {
 
     #[test]
     fn live_socket_refuses_a_second_daemon() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("campd.sock");
         let _keep = bind_or_replace(&path).unwrap();
@@ -253,6 +258,7 @@ mod tests {
     /// unlinked inode (split brain: the one-standing-process shape breaks).
     #[test]
     fn concurrent_bind_or_replace_elects_exactly_one_daemon() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
         use std::sync::{Arc, Barrier};
         for round in 0..50 {
             let dir = tempfile::tempdir().unwrap();

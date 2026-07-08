@@ -55,7 +55,7 @@ pub fn run(
     Ok(())
 }
 
-fn resolve_rig<'a>(config: &'a CampConfig, rig: Option<&str>) -> Result<&'a RigConfig> {
+pub(crate) fn resolve_rig<'a>(config: &'a CampConfig, rig: Option<&str>) -> Result<&'a RigConfig> {
     match rig {
         Some(name) => Ok(config.rig(name)?),
         None => match config.rigs.as_slice() {

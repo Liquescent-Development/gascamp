@@ -103,6 +103,7 @@ fn rig() -> RigConfig {
         name: "gascity".into(),
         path: "/code/gascity".into(),
         prefix: "gc".into(),
+        default_agent: None,
     }
 }
 

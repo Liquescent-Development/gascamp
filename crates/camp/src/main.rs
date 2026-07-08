@@ -7,6 +7,7 @@ mod cmd {
     pub mod close;
     pub mod create;
     pub mod doctor;
+    pub mod event_emit;
     pub mod events;
     pub mod init;
     pub mod ls;
@@ -16,6 +17,7 @@ mod cmd {
     pub mod rig;
     pub mod search;
     pub mod show;
+    pub mod sling;
     pub mod stop;
     pub mod top;
 }
@@ -62,6 +64,11 @@ enum Command {
         /// Validate a formula file against the camp subset (spec §8.2)
         #[arg(long, value_name = "PATH", conflicts_with = "refold")]
         formula: Option<PathBuf>,
+    },
+    /// Append events by hand (worker contract surface)
+    Event {
+        #[command(subcommand)]
+        command: EventCommand,
     },
     /// Print events from the ledger
     Events {
@@ -137,6 +144,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Sling a bead: create it and have campd dispatch a worker (Tier 0)
+    Sling {
+        /// Bead title — what needs doing
+        title: String,
+        /// Route to a specific pack agent (default: the rig's or camp's default_agent)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Rig (default: the only configured rig)
+        #[arg(long)]
+        rig: Option<String>,
+    },
     /// Show a bead's current state and full event history
     Show {
         /// Bead id
@@ -191,6 +209,21 @@ enum OrderCommand {
     Run {
         /// Order name from camp.toml
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventCommand {
+    /// Record a worker.milestone breadcrumb
+    Emit {
+        /// What just happened, one line
+        text: String,
+        /// The bead this milestone belongs to
+        #[arg(long)]
+        bead: Option<String>,
+        /// Emitting session name (actor attribution)
+        #[arg(long)]
+        session: Option<String>,
     },
 }
 
@@ -274,6 +307,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 cmd::doctor::run(&camp, repair)
             }
         },
+        Command::Event { command } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            match command {
+                EventCommand::Emit {
+                    text,
+                    bead,
+                    session,
+                } => cmd::event_emit::run(&camp, text, bead, session),
+            }
+        }
         Command::Events { json, from, to } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::events::run(&camp, json, from, to)
@@ -326,6 +369,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::ls::run(&camp, ready, mine, rig, json)
+        }
+        Command::Sling { title, agent, rig } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::sling::run(&camp, title, agent, rig)
         }
         Command::Show { bead } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;

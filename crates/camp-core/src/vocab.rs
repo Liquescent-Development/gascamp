@@ -16,6 +16,7 @@ pub const GC_MIRRORED_EVENTS: &[&str] = &[
     "order.fired",
     "order.completed",
     "order.failed",
+    "bead.worktree.reaped",
 ];
 
 /// Camp-specific names — additive; never redefinitions of gc names.
@@ -27,6 +28,9 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "config.changed",
     "rig.added",
     "run.cooked",
+    "worker.milestone",
+    "worktree.kept",
+    "dispatch.failed",
 ];
 
 /// Values `bead.closed` accepts for `outcome` — a strict subset of gc's

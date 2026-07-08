@@ -104,6 +104,27 @@ pub fn ready_beads(conn: &Connection, rig: Option<&str>) -> Result<Vec<BeadRow>,
     collect(rows)
 }
 
+/// Beads campd may dispatch a worker for (Phase 8, plan decision C): open,
+/// ready (decision-6 rule), plain work (`type='task'`), not a run root
+/// (roots are finalized by campd, Phase 9), and never dispatched before
+/// (no sessions row bound — respawn-after-crash arrives with retry
+/// budgets, Phase 9/11). Oldest first, like `ready_beads`.
+pub fn dispatchable_beads(conn: &Connection) -> Result<Vec<BeadRow>, CoreError> {
+    let sql = format!(
+        "SELECT {BEAD_COLS} FROM beads b
+         WHERE b.status = 'open' AND b.type = 'task'
+           AND NOT (b.run_id IS NOT NULL AND b.step_id IS NULL)
+           AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.bead = b.id)
+           AND NOT EXISTS (
+             SELECT 1 FROM deps d LEFT JOIN beads t ON t.id = d.needs_id
+             WHERE d.bead_id = b.id AND {UNMET_DEP})
+         ORDER BY b.created_ts, b.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_bead)?;
+    collect(rows)
+}
+
 /// The dependents of `closed_bead` that its close just made ready — campd's
 /// affected-subgraph recompute (spec §7.3). A fail close unblocks nothing.
 pub fn newly_ready(conn: &Connection, closed_bead: &str) -> Result<Vec<String>, CoreError> {
@@ -300,5 +321,86 @@ mod tests {
         assert_eq!(l.list_beads(&Default::default()).unwrap().len(), 1);
         assert_eq!(l.get_bead("gc-1").unwrap().unwrap().status, "open");
         assert!(l.get_bead("gc-404").unwrap().is_none());
+    }
+
+    // ---- Phase 8: the dispatchable set (plan decision C) -----------------
+
+    #[test]
+    fn dispatchable_excludes_blocked_closed_nontask_roots_and_sessioned() {
+        let (_d, mut l) = ledger();
+        // plain ready task: IN
+        create(&mut l, "gc-1", &[]);
+        // blocked: OUT
+        create(&mut l, "gc-2", &["gc-1"]);
+        // memory bead: OUT
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "t".into(),
+            bead: Some("gc-3".into()),
+            data: serde_json::json!({"title": "fact", "type": "memory"}),
+        })
+        .unwrap();
+        // run root (run_id, no step_id): OUT — Phase 9 finalizes roots
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "t".into(),
+            bead: Some("gc-4".into()),
+            data: serde_json::json!({"title": "root", "run_id": "r1"}),
+        })
+        .unwrap();
+        // run STEP (run_id + step_id): IN — steps are worker work
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "t".into(),
+            bead: Some("gc-5".into()),
+            data: serde_json::json!({"title": "step", "run_id": "r1", "step_id": "s1"}),
+        })
+        .unwrap();
+        // bead with a session bound (dispatched already): OUT
+        create(&mut l, "gc-6", &[]);
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "t/dev/1", "agent": "dev", "bead": "gc-6"}),
+        })
+        .unwrap();
+        let ids: Vec<String> = l
+            .dispatchable_beads()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(ids, vec!["gc-1", "gc-5"]);
+    }
+
+    #[test]
+    fn dispatchable_still_excludes_after_bound_session_ends() {
+        // Phase 8 never respawns (plan decision C): a bead whose session
+        // crashed goes back to open but is NOT re-dispatchable until the
+        // Phase 9/11 retry machinery exists.
+        let (_d, mut l) = ledger();
+        create(&mut l, "gc-1", &[]);
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "t/dev/1", "agent": "dev", "bead": "gc-1"}),
+        })
+        .unwrap();
+        l.append(EventInput {
+            kind: EventType::SessionCrashed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "t/dev/1"}),
+        })
+        .unwrap();
+        assert!(l.dispatchable_beads().unwrap().is_empty());
     }
 }
