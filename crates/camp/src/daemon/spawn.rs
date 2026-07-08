@@ -32,10 +32,10 @@ fn task_prompt(bead_id: &str, session_name: &str) -> String {
 
 /// Every non-ASCII-alphanumeric CHARACTER becomes one '-' — Claude Code's
 /// project dir scheme (F3), reused for the sessions/ capture file names.
-/// Unicode note (PR #14 review finding 6): a multi-byte char maps to a
-/// single dash; whether real claude munges unicode cwds per byte instead
-/// is unverified (F3 verified ASCII only) and is a Phase 11 input — the
-/// path is audit-only here.
+/// Unicode (PR #14 review finding 6, resolved): verified per-CHAR against
+/// real claude 2.1.204 (Phase 11 probe P1,
+/// docs/design/2026-07-07-phase-11-probe-findings.md) — a multi-byte char
+/// maps to a single dash in the real project dir too.
 pub fn munge(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -339,10 +339,10 @@ mod tests {
     fn transcript_path_munges_every_non_alphanumeric_to_dash() {
         assert_eq!(munge("/tmp/rig-a"), "-tmp-rig-a");
         assert_eq!(munge("/code/gas_camp.rs"), "-code-gas-camp-rs");
-        // PR #14 review finding 6: munge is per CHAR — one dash per
-        // non-ASCII-alphanumeric character, however many bytes it takes.
-        // Whether real claude munges per byte for unicode cwds is a Phase
-        // 11 verification input; this pins camp's current behavior.
+        // PR #14 review finding 6, resolved: munge is per CHAR — one dash
+        // per non-ASCII-alphanumeric character, however many bytes it
+        // takes — verified against real claude 2.1.204 (Phase 11 probe P1:
+        // cwd basename `héllo-日本` → project dir segment `h-llo---`).
         assert_eq!(munge("/tmp/héllo"), "-tmp-h-llo");
         assert_eq!(munge("日本"), "--");
         let p = transcript_path_under(
