@@ -308,10 +308,9 @@ fn a_symlinked_agent_definition_fails_with_an_actionable_error() {
     .unwrap();
     let out = dir.path().join("city");
     match export_city(&ledger, &config, &camp_root, &out, &NO_SKIP) {
-        Err(CoreError::Export(msg)) => assert!(
-            msg.contains("symlink") && msg.contains("link.md"),
-            "{msg}"
-        ),
+        Err(CoreError::Export(msg)) => {
+            assert!(msg.contains("symlink") && msg.contains("link.md"), "{msg}")
+        }
         other => panic!("expected Export error, got {other:?}"),
     }
 }
