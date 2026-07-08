@@ -1,0 +1,14 @@
+# Example orders — copy into your camp.toml (or a pack's orders.toml) and
+# adjust. An order schedules (cron) or event-triggers a formula (spec §9).
+# `formula` names <camp>/formulas/<name>.toml — here, this pack's
+# guarded-change formula.
+
+[[order]]
+name    = "morning-triage"
+on      = "cron:0 7 * * 1-5"
+formula = "guarded-change"
+
+[[order]]
+name    = "ci-red"
+on      = "event:bead.closed[label=ci-red]"
+formula = "guarded-change"
