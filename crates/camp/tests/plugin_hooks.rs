@@ -55,10 +55,10 @@ fn events(root: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Run a plugin hook script with `camp` on PATH and CAMP_DIR pointed at the
-/// camp. `extra_env` sets additional variables (e.g. the throttle window).
-fn run_hook(
-    script: &str,
+/// Run a plugin script (path relative to `plugin/`) with `camp` on PATH and
+/// CAMP_DIR pointed at the camp. `extra_env` sets additional variables.
+fn run_script(
+    rel: &str,
     stdin: &str,
     camp_dir: &Path,
     extra_env: &[(&str, &str)],
@@ -70,7 +70,7 @@ fn run_hook(
         std::env::var("PATH").unwrap_or_default()
     );
     let mut cmd = Command::new("sh");
-    cmd.arg(plugin().join("hooks").join(script))
+    cmd.arg(plugin().join(rel))
         .env("CAMP_DIR", camp_dir)
         .env("PATH", path)
         .stdin(Stdio::piped())
@@ -82,6 +82,16 @@ fn run_hook(
     let mut child = cmd.spawn().unwrap();
     child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
     child.wait_with_output().unwrap()
+}
+
+/// Run a hook script under `plugin/hooks/`.
+fn run_hook(
+    script: &str,
+    stdin: &str,
+    camp_dir: &Path,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    run_script(&format!("hooks/{script}"), stdin, camp_dir, extra_env)
 }
 
 /// A real campd child; stopped on drop. SessionStart runs `camp adopt`,
@@ -176,6 +186,28 @@ fn breadcrumb_hook_throttles_repeats() {
     let out = run_hook("post-tool-use.sh", &payload, &root, &[("CAMP_BREADCRUMB_THROTTLE", "0")]);
     assert!(out.status.success());
     assert_eq!(milestones(), 2, "window 0 bypasses the throttle");
+}
+
+#[test]
+fn statusline_snippet_renders_the_badge_when_campd_is_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_camp(dir.path());
+    let _daemon = Daemon::spawn(&root);
+    let out = run_script("statusline/statusline.sh", &fixture("statusline.json"), &root, &[]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let badge = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(badge.trim(), "▲0 ●0 ✖0", "unexpected badge: {badge:?}");
+}
+
+#[test]
+fn statusline_snippet_degrades_visibly_when_campd_is_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_camp(dir.path());
+    // no campd running; the snippet must not auto-start one
+    let out = run_script("statusline/statusline.sh", &fixture("statusline.json"), &root, &[]);
+    assert!(out.status.success(), "statusline must exit 0");
+    assert!(out.stdout.is_empty(), "stdout must be empty when campd is down");
+    assert!(!out.stderr.is_empty(), "must emit a visible stderr note");
 }
 
 #[test]
