@@ -132,6 +132,10 @@ pub fn run(camp: &CampDir) -> Result<()> {
     for cook in camp_core::orders::unresponded_fires(&ledger)? {
         runtime.queue_cook(cook);
     }
+    // Phase 9: re-derive graph work whose side effects died with the last
+    // process — interrupted checks re-queue (re-runnable by contract),
+    // incomplete fan-outs re-queue (execute computes what is owed).
+    graph.reconcile(&mut ledger)?;
     // Cron fires missed while campd was down, under each order's window.
     let now = jiff::Timestamp::now();
     let fires: Vec<camp_core::orders::cron::Fire> = runtime

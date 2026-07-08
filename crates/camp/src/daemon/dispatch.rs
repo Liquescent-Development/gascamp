@@ -1013,6 +1013,130 @@ impl GraphRuntime {
         ]))
     }
 
+    /// Startup reconciliation (kill -9 self-heals; observation over
+    /// state, mirroring `unresponded_fires`): re-derive the pending work
+    /// whose side effects were lost with the process.
+    ///
+    /// Orphan run dirs: a kill -9 between cook's run-dir write and its
+    /// ledger batch leaves `runs/<id>/` with no ledger record; the
+    /// fire-dedupe re-cooks under a NEW id, so recovery is idempotent but
+    /// the orphan lingers — the crash window cook.rs's header records as
+    /// the safe direction, its sweep deferred to a future `camp doctor`
+    /// check (review note 4; nothing to reconcile here).
+    pub fn reconcile(&mut self, ledger: &mut Ledger) -> Result<(), CoreError> {
+        // (1) checks due / (2) defensive attempt respawns: every anchor
+        // campd holds is a looping step mid-loop; its latest attempt's
+        // state says what is owed (any landed verdict either closed the
+        // anchor or created a newer attempt — both visible state).
+        let held = ledger.list_beads(&camp_core::readiness::ListFilter {
+            rig: None,
+            mine: Some("campd"),
+        })?;
+        for anchor_row in held {
+            if anchor_row.status != "in_progress" {
+                continue;
+            }
+            let Some(membership) = ledger.run_membership(&anchor_row.id)? else {
+                continue;
+            };
+            let Some(step_id) = membership.step_id else {
+                continue;
+            };
+            let Some(ctx) = self.ctx(&membership.run_id) else {
+                continue; // dead-ended when its events processed
+            };
+            let Some(step_ref) = ctx.step_ref(&step_id) else {
+                continue;
+            };
+            if step_ref.anchor != anchor_row.id {
+                continue;
+            }
+            let attempts = ledger.step_attempts(&membership.run_id, &step_id, &anchor_row.id)?;
+            let Some(latest) = attempts.last() else {
+                continue; // claim landed, attempt creation is cursor-atomic
+            };
+            if step_ref.step.check.is_some()
+                && latest.status == "closed"
+                && latest.outcome.as_deref() == Some("pass")
+            {
+                // the crash window: attempt passed, no verdict yet — the
+                // interrupted check re-runs (checks are re-runnable)
+                self.queue_check(PendingCheck {
+                    run_id: membership.run_id.clone(),
+                    step_id: step_id.clone(),
+                    anchor: anchor_row.id.clone(),
+                    attempt_bead: latest.id.clone(),
+                    attempt_no: flow::check_runs_used(&attempts),
+                });
+            }
+            if let Some(retry) = &step_ref.step.retry
+                && latest.status == "closed"
+                && latest.outcome.as_deref() == Some("fail")
+            {
+                // impossible-by-construction (cursor-atomic), but a
+                // hand-edited ledger heals: recreate the missing respawn
+                let used = ledger.transient_fails_used(&attempts)?;
+                let latest_transient = ledger
+                    .close_event_data(&latest.id)?
+                    .as_ref()
+                    .and_then(|d| d.get("failure_class"))
+                    .and_then(|c| c.as_str())
+                    == Some("transient");
+                if latest_transient && used < retry.max_attempts {
+                    let id = ledger.next_bead_id(prefix_of(&anchor_row.id)?)?;
+                    let base_description = ledger
+                        .created_event_data(&anchor_row.id)?
+                        .as_ref()
+                        .and_then(|d| d.get("description"))
+                        .and_then(|d| d.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let input = attempt_bead_input(
+                        id,
+                        &anchor_row.rig,
+                        &membership.run_id,
+                        step_ref.step,
+                        &anchor_row.title,
+                        &base_description,
+                        attempts.len() + 1,
+                        Some("previous attempt failed transient (reconciled after restart)"),
+                    );
+                    ledger.append(input)?;
+                }
+            }
+        }
+        // (3) fan-outs due: every closed-pass on_complete anchor whose
+        // children may be incomplete. Bounded by total run count
+        // (startup-only); execute() computes what is actually owed.
+        for event in ledger.events_of_type(EventType::RunCooked)? {
+            let Some(run_id) = event.data["run_id"].as_str() else {
+                continue;
+            };
+            let run_id = run_id.to_owned();
+            let Some(ctx) = self.ctx(&run_id) else {
+                continue;
+            };
+            let ctx = Arc::clone(&ctx);
+            for step in &ctx.formula.steps {
+                if step.on_complete.is_none() {
+                    continue;
+                }
+                let anchor = &ctx.anchors[&step.id];
+                let Some(row) = ledger.get_bead(anchor)? else {
+                    continue;
+                };
+                if row.status == "closed" && row.outcome.as_deref() == Some("pass") {
+                    self.queue_fanout(PendingFanout {
+                        run_id: run_id.clone(),
+                        step_id: step.id.clone(),
+                        anchor: anchor.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn ctx(&mut self, run_id: &str) -> Option<Arc<RunContext>> {
         if let Some(cached) = self.runs.get(run_id) {
             return cached.clone();
@@ -2638,6 +2762,79 @@ mod tests {
             failed[0].data
         );
         assert!(bond_children(&ledger, &anchor).is_empty());
+    }
+
+    // ---- Phase 9 Task 8: startup reconciliation ---------------------------
+
+    #[test]
+    fn reconcile_requeues_an_interrupted_check_exactly_once() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let (anchor_id, attempt, _cooked) = checked_run_with_queued_check(
+            &dir,
+            &mut ledger,
+            &mut rt,
+            &mut graph,
+            "#!/bin/sh\nexit 0\n",
+            CHECKED,
+        );
+        // kill -9 before the queued check ever spawned: a fresh campd life
+        // has an empty queue but the same ledger
+        let config =
+            CampConfig::parse(&std::fs::read_to_string(dir.path().join("camp.toml")).unwrap())
+                .unwrap();
+        let mut fresh = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        fresh.reconcile(&mut ledger).unwrap();
+        let queue = fresh.pending_check_queue();
+        assert_eq!(queue.len(), 1, "the interrupted check re-queues");
+        assert_eq!(queue[0].anchor, anchor_id);
+        assert_eq!(queue[0].attempt_bead, attempt);
+        assert_eq!(queue[0].attempt_no, 1);
+        // the verdict lands; a NEXT restart reconciles nothing
+        fresh.execute(&mut ledger).unwrap();
+        wait_and_reap_checks(&mut fresh, &mut ledger);
+        assert_eq!(
+            ledger.get_bead(&anchor_id).unwrap().unwrap().status,
+            "closed"
+        );
+        let mut later = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        later.reconcile(&mut ledger).unwrap();
+        assert!(
+            later.pending_check_queue().is_empty(),
+            "verdict landed: nothing owed"
+        );
+    }
+
+    #[test]
+    fn reconcile_requeues_an_incomplete_fanout() {
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = fan_run(
+            &dir,
+            &mut ledger,
+            &mut rt,
+            &mut graph,
+            FAN_PARALLEL,
+            serde_json::json!({"items":[{"name":"a"},{"name":"b"},{"name":"c"}]}),
+        );
+        let anchor = cooked.step_beads["enumerate"].clone();
+        // crash before execute: children never cooked
+        let config =
+            CampConfig::parse(&std::fs::read_to_string(dir.path().join("camp.toml")).unwrap())
+                .unwrap();
+        let mut fresh = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        fresh.reconcile(&mut ledger).unwrap();
+        fresh.execute(&mut ledger).unwrap();
+        assert_eq!(
+            bond_children(&ledger, &anchor).len(),
+            3,
+            "reconcile + execute completes the lost fan-out"
+        );
+        // a later restart owes nothing new
+        let mut later = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        later.reconcile(&mut ledger).unwrap();
+        let before = ledger.events_range(1, None).unwrap().len();
+        later.execute(&mut ledger).unwrap();
+        assert_eq!(ledger.events_range(1, None).unwrap().len(), before);
     }
 
     #[test]
