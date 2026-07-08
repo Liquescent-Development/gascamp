@@ -11,6 +11,7 @@ pub mod id;
 pub mod ledger;
 pub mod orders;
 pub mod pack;
+pub mod patrol;
 pub mod readiness;
 pub mod search;
 pub mod vocab;
