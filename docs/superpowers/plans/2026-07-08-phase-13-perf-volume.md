@@ -1,5 +1,7 @@
 # Phase 13 — Perf and Volume Suite Implementation Plan
 
+> **APPROVED (2026-07-08)** by the automated Opus plan review, relayed through the team lead: execution-ready, all interface claims verified against origin/main, the ps-cputime ±10 ms tolerance confirmed well-calibrated for macOS centisecond resolution (detects both busy-loop and tick-storm regressions), and the fixture faithfully implements the binding master-plan 1M-event / 100k-bead target with no §14 number weakened. Both flagged items ruled sound (FTS latency depends on corpus SIZE not calendar span; ps-cputime methodology sound on macOS). Three non-blocking corrections folded into this doc: (1) reconciliation prose corrected to the 30-heavy-day / 1M-event scale, not "year-scale volume"; (2) idle-CPU harness carries a macOS-resolution caveat; (3) the harness copy range is `daemon_dispatch.rs:10-149` (the `use` block starts at line 10).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn the spec §14 cost budget into executable, exact assertions run locally via `make perf` — a seeded 1M-event / 100k-bead volume fixture built through the real append path, ledger-write / FTS / readiness latency benchmarks, an idle-daemon CPU+RSS harness, dispatch-latency timing with the fake agent, and a `camp backup` verb (SQLite `VACUUM INTO`) that produces an integrity-checked copy.
@@ -21,7 +23,11 @@
 
 ### Spec reconciliation (documented, not an ambiguity to escalate)
 
-The master plan calls the fixture "30 heavy days, ≥1M events"; spec §14 says FTS "over a year of history" and the Phase 13 table says "year-scale corpus." These agree: **30 heavy days of activity produce a year's worth of VOLUME (≥1M rows)** — the FTS latency target is a function of corpus size, not literal calendar span. The fixture's `AdvancingClock` spreads timestamps across ~34 days (3 s/event × ~1.0M events) so `created_ts` is realistic and monotonic; no assertion depends on the exact span.
+The master plan calls the fixture "30 heavy days, ≥1M events, ~100k beads"; spec §14 says FTS "over a year of history" and the Phase 13 table says "year-scale corpus." The operative point on which these agree: **the FTS latency target is a function of corpus SIZE, not calendar span** — a ranked bm25 query over 1M FTS rows is the workload being bounded, whichever wall-clock window produced those rows.
+
+Be precise about the scale, though: this fixture is the **master-plan-mandated 30-heavy-day / ≥1M-event / ~100k-bead scale**, which is roughly **1/10** of spec §7.6's literal *year* of heavy use (~10–15M events / ~1M beads). It is deliberately NOT "a year's worth of volume." The `AdvancingClock` spreads timestamps across ~34 days (≈1 month, 3 s/event × ~1.0M events) so `created_ts` is realistic and monotonic; no assertion depends on the exact span.
+
+The fixture scale is a single pair of constants in one call — `build_fixture(&db, 100_000, 1_000_000)` in `volume_suite`. A future lead could raise it toward literal §7.6 year-scale (~1M beads / ~10–15M events) if desired; that would **exceed** the master plan's binding ≥1M/~100k target, so it is an enhancement decision, not a contract requirement. **Do not do it in this phase** — meet the mandated target exactly.
 
 ### Consumed interfaces (from merged phases — verified, exact)
 
@@ -42,7 +48,7 @@ The master plan calls the fixture "30 heavy days, ≥1M events"; spec §14 says 
   - `bead.closed`: `{ "outcome": one of ["pass","fail","skipped"], "reason"?: str, "failure_class"?: "transient" (fail only), "final_disposition"?: ["hard_fail","soft_fail"] (fail only) }`; requires bead not already closed; a non-empty `reason` inserts a `search` `'close'` row.
   - `worker.milestone`: `{ "text": <non-empty str> }`; bead optional but if set must exist.
 - **Clock (Phase 1)** `camp_core::clock::Clock { fn now_utc(&self) -> String }` (`clock.rs:4`), `SystemClock`, `FixedClock`.
-- **Daemon harness (Phases 7/8/9)**: real child `campd`, `[dispatch].command` points at `crates/camp/tests/fake-agent.sh`, readiness line `"campd listening on "`. Full template: `crates/camp/tests/daemon_dispatch.rs:12-149`. `session.woke` carries `e["data"]["bead"]`. `sling`/`create` print the new bead id to stdout. Close→dependent pattern: `daemon_dispatch.rs:239-274`.
+- **Daemon harness (Phases 7/8/9)**: real child `campd`, `[dispatch].command` points at `crates/camp/tests/fake-agent.sh`, readiness line `"campd listening on "`. Full template: `crates/camp/tests/daemon_dispatch.rs:10-149` (the `use` block starts at line 10 — `use std::io::{BufRead, BufReader};` / `use std::path::{Path, PathBuf};` — and `BufRead`/`BufReader` are required by `Daemon::spawn`'s readiness read). `session.woke` carries `e["data"]["bead"]`. `sling`/`create` print the new bead id to stdout. Close→dependent pattern: `daemon_dispatch.rs:239-274`.
 - **CampDir (Phase 2)** `crate::campdir::CampDir`: `db_path() -> PathBuf` = `<root>/camp.db`; `CampDir::resolve(flag: Option<&Path>) -> anyhow::Result<CampDir>`.
 
 ---
@@ -763,14 +769,14 @@ git commit -m "test(core): volume + throughput perf suite (spec §14, make perf)
 - Create: `crates/camp/tests/perf_daemon.rs`
 
 **Interfaces:**
-- Consumes: the daemon child-process harness (copy verbatim from `daemon_dispatch.rs:12-149`), `crates/camp/tests/fake-agent.sh`, `ps`.
+- Consumes: the daemon child-process harness (copy verbatim from `daemon_dispatch.rs:10-149`), `crates/camp/tests/fake-agent.sh`, `ps`.
 - Produces (within this file): `fn parse_cputime(s: &str) -> Duration`; `fn parse_rss_kb(s: &str) -> u64`; `fn ps_cputime_rss(pid: u32) -> (Duration, u64)`; `fn wait_for_instant(...) -> Instant`; `Daemon::pid`; the non-ignored parser unit tests; the three `#[ignore]` tests `idle_campd_cpu_delta_zero_and_rss_under_20mb`, `sling_to_worker_spawn_under_2s`, `close_to_dependent_dispatch_under_1s`.
 
 - [ ] **Step 1: Create the file with the copied harness + parser helpers + non-ignored parser tests**
 
-Create `crates/camp/tests/perf_daemon.rs`. Start with the exact harness block copied from `daemon_dispatch.rs:12-149` (the `use` lines through the end of `impl Drop for Daemon`), then add the perf-specific helpers and parser unit tests shown below. Copy verbatim so the two files stay reviewably identical; do not paraphrase the harness.
+Create `crates/camp/tests/perf_daemon.rs`. Start with the exact harness block copied from `daemon_dispatch.rs:10-149` (the `use` lines through the end of `impl Drop for Daemon`), then add the perf-specific helpers and parser unit tests shown below. Copy verbatim so the two files stay reviewably identical; do not paraphrase the harness.
 
-Copy these items unchanged from `daemon_dispatch.rs` (lines 12-149): the `use` block, `const BIN`, `const READY_PREFIX`, `fn fake_agent`, `fn camp`, `fn camp_ok`, `fn scaffold`, `fn write_agent`, `fn events_json`, `fn wait_until`, `fn count`, `fn seq_of`, `struct Daemon`, `impl Daemon` (`spawn`), `impl Drop for Daemon`. Keep the file-level `#![allow(...)]` header line too. (`seq_of` may be unused here — if clippy flags it, delete it; it is not referenced by the tests below.)
+Copy these items unchanged from `daemon_dispatch.rs` (lines 10-149): the **full** `use` block — it starts at line 10 with `use std::io::{BufRead, BufReader};` and `use std::path::{Path, PathBuf};` (both `BufRead` and `BufReader` are needed by `Daemon::spawn`'s readiness read, so do not drop them) through `use std::time::{Duration, Instant};` — then `const BIN`, `const READY_PREFIX`, `fn fake_agent`, `fn camp`, `fn camp_ok`, `fn scaffold`, `fn write_agent`, `fn events_json`, `fn wait_until`, `fn count`, `fn seq_of`, `struct Daemon`, `impl Daemon` (`spawn`), `impl Drop for Daemon`. Keep the file-level `#![allow(...)]` header line too. (`seq_of` may be unused here — if clippy flags it, delete it; it is not referenced by the tests below.)
 
 Then add, after the harness:
 
@@ -868,7 +874,14 @@ Append to `crates/camp/tests/perf_daemon.rs`:
 ```rust
 /// Invariant 1 (idle is free): a campd with no work and no orders blocks in
 /// `poll` — over a 30 s idle window its accumulated CPU time does not move
-/// (±10 ms, the ps cputime resolution) and its RSS stays under 20 MB.
+/// (±10 ms) and its RSS stays under 20 MB.
+///
+/// The ±10 ms tolerance assumes macOS `ps` cputime CENTISECOND resolution
+/// (`MM:SS.ss`): 10 ms is one tick, so this detects both a busy-loop and a
+/// tick-storm regression. NOTE: on Linux `ps -o cputime` has 1-SECOND
+/// resolution, which would make this a coarse busy-loop-only check — a
+/// future Linux runner must not read a 1 s-granularity false-green as a
+/// pass; tighten the sampling (e.g. `/proc/<pid>/stat` jiffies) there.
 #[test]
 #[ignore = "idle harness: run via `make perf` (release, local-only)"]
 fn idle_campd_cpu_delta_zero_and_rss_under_20mb() {
