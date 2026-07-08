@@ -1073,6 +1073,19 @@ pub fn adopt(
         // forbids campd crashing/killing a session in the user's TUI. Keep
         // it live; its SessionEnd hook reconciles it. Only campd-owned
         // workers and pid-bearing rows are probed for liveness.
+        //
+        // KNOWN LIMITATION (review LOW 1, follow-up filed): if the TUI dies
+        // WITHOUT its SessionEnd firing (kill -9, crash, power loss), this
+        // row stays live forever — adopt skips it, patrol never tracks it
+        // (no bead), nothing reaps it, so it lingers in `camp top` /
+        // `/status`. A bounded reaper is deferred: campd has no reliable
+        // liveness signal for an unattributable interactive process (no pid;
+        // transcript mtime conflates idle-but-alive with dead, and a grace
+        // window is needed to avoid the transcript-creation race), and
+        // marking a live-but-idle attended session "stopped" has §10/UX
+        // tradeoffs that warrant dedicated design rather than a rushed fix.
+        // Attended registry liveness is therefore best-effort, keyed on the
+        // SessionEnd hook.
         if row.woke_actor != "campd" && row.pid.is_none() {
             continue;
         }

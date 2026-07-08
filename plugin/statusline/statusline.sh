@@ -5,9 +5,14 @@
 # logic and degradation live in `camp top --statusline` (tested Rust); this
 # script just locates the workspace so `camp` resolves the right camp.
 #
-# Wire it in your settings.json:
+# This is the MAIN session status line. A plugin cannot auto-set the main
+# `statusLine`, so wire it into your own settings.json:
 #   "statusLine": { "type": "command",
 #                   "command": "\"${CLAUDE_PLUGIN_ROOT}\"/statusline/statusline.sh" }
+#
+# (`subagentStatusLine` is a DIFFERENT, per-subagent slot with a different
+# stdin schema — a `tasks` array rendering one row body per teammate — so it
+# is not wired to this fleet-wide badge script.)
 
 INPUT=$(cat)
 # Prefer the workspace's current_dir, else the top-level cwd, so `camp`

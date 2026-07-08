@@ -345,6 +345,14 @@ impl Ledger {
     /// payload's audit field (the sessions table deliberately has no
     /// column — schema v1 is frozen). A live row without its woke event is
     /// ledger corruption: the fold writes them in one transaction.
+    ///
+    /// Best-effort caveat for **hook-registered attended** rows (Phase 12):
+    /// their liveness is keyed on the SessionEnd hook. If the operator's TUI
+    /// dies without SessionEnd firing (kill -9, crash, power loss), the row
+    /// stays `live` here indefinitely — campd cannot probe an unattributable
+    /// interactive process, and adoption deliberately never crashes an
+    /// attended session (spec §10). Such phantom-live rows are expected;
+    /// bounded reaping is a deferred follow-up (see `patrol::adopt`).
     pub fn live_sessions(&self) -> Result<Vec<SessionRow>, CoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT s.name, s.agent, s.rig, s.claude_session_id, s.transcript_path,

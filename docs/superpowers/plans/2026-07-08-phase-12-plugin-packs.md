@@ -16,6 +16,10 @@
 - D5 correction — the spec/master-plan edits now cover ALL three occurrences (spec §11; master-plan Files line; master-plan content-contract line) and reflect the SubagentStop drop. See Task 10.
 - Non-blocking notes folded in: parity test extracts from the fenced `` ```! `` block only (Task 4); register idempotency edge acknowledged (Task 5); rebase reconciles the real daemon-file overlap with phase-13 in socket.rs/event_loop.rs/patrol.rs (Task 11).
 
+**Post-review fix pass (rev 3 — PR #23 Opus code review APPROVE, two LOW findings):**
+- LOW 1 (phantom-live attended sessions) — **document-only + follow-up** (my call, reviewer-sanctioned): a hard-killed TUI (no SessionEnd) leaves a `status="live"` row forever, since adopt keeps attended rows and patrol never tracks them. A correct reaper needs a grace threshold (transcript-creation race) and must not mark a live-but-idle session "stopped" (§10/UX tradeoffs) — dedicated design, not a LOW fix. Documented on `patrol::adopt`, `Ledger::live_sessions`, and `plugin/README.md`; follow-up requested from the lead.
+- LOW 2 (statusline settings-key mismatch) — **fixed**: docs verified (statusline.md §"Subagent status lines") that `subagentStatusLine` is valid but has a *different* stdin schema (`tasks` array, per-teammate row body), so wiring the fleet-badge script there is a semantic mismatch. Removed `plugin/.claude-plugin/settings.json`; the fleet badge is the operator-wired main `statusLine` only (D6 corrected). Script/README clarify the two keys.
+
 ## Global Constraints
 
 Copied verbatim from AGENTS.md invariants, CLAUDE.md, and the kickoff — every task's requirements implicitly include these:
@@ -61,7 +65,9 @@ Spec §11 and master plan Phase 12 say the plugin emits session-end events on "S
 Therefore the wiring is: **SessionStart → register + adopt (attended top-level session); SessionEnd → session end.** No `Stop`, no `SubagentStop`. Per AGENTS.md ("if implementation reality contradicts the spec, stop and update the spec via PR in the same change"), Task 10 corrects all three occurrences (spec §11; master-plan Files line; master-plan content-contract line) to match, in this same PR.
 
 **D6 — Statusline ships as an opt-in script, not a plugin-set `statusLine`.**
-A plugin's bundled `settings.json` supports only `agent` and `subagentStatusLine` (plugins-reference; retrieved 2026-07-08) — it cannot set the main `statusLine`. This matches spec §11's word "*optional* statusline snippet": the plugin ships `plugin/statusline/statusline.sh` and documents wiring it into the user's `~/.claude/settings.json` `statusLine.command`. Optionally, the plugin registers the same script as `subagentStatusLine` (the one plugin-native statusline slot) so teammates show a camp badge. The script's data path is `camp top --statusline` (Task 3).
+A plugin's bundled `settings.json` supports only `agent` and `subagentStatusLine` (plugins-reference; retrieved 2026-07-08) — it cannot set the main `statusLine`. This matches spec §11's word "*optional* statusline snippet": the plugin ships `plugin/statusline/statusline.sh` and documents wiring it into the user's `~/.claude/settings.json` `statusLine.command`. The script's data path is `camp top --statusline` (Task 3).
+
+*Correction (post-review LOW 2, 2026-07-08):* rev-2 also auto-wired the same script as `subagentStatusLine`. The docs (statusline.md §"Subagent status lines") show that key has a **different** stdin schema — a `tasks` array rendering one row body *per teammate*, not a single-session `{cwd, workspace}` — so reusing the fleet-badge script there is a semantic mismatch. The fleet badge is a main-session concept; the plugin ships NO `settings.json` and the badge is operator-wired into the main `statusLine` only. A per-teammate `subagentStatusLine` would be a separate, purpose-built script (out of scope).
 
 ---
 

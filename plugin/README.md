@@ -36,25 +36,35 @@ An optional **PostToolUse breadcrumb** (`hooks/post-tool-use.sh`) ships
 unregistered — patrol watches transcripts instead (spec §10). Enable it only
 if you want explicit per-tool breadcrumbs; it is time-window throttled.
 
-*Registry caveat:* session names are unique forever, so a resumed session
-whose row already ended is not re-registered (a harmless no-op with a stderr
-note). Attended registry rows are best-effort; `camp adopt` keeps live
-attended sessions and never crashes them.
+*Registry caveats (attended rows are best-effort):*
+- A resumed session whose row already ended is not re-registered (session
+  names are unique forever) — a harmless no-op with a stderr note.
+- `camp adopt` keeps live attended sessions and never crashes them (spec §10:
+  campd must not crash/kill a session in the user's TUI).
+- **Phantom-live rows:** if the TUI dies without SessionEnd firing (kill -9,
+  crash, power loss), its row stays `live` in `camp top` / `/status`
+  indefinitely — campd cannot observe an unattributable interactive process.
+  Expected; a bounded reaper is a deferred follow-up.
 
 ## Statusline (opt-in)
 
 `statusline/statusline.sh` renders `▲live ●ready ✖red` from a read-only
 socket query — it never auto-starts campd and degrades to empty output plus a
-stderr note when campd is down. A plugin cannot set the main `statusLine`, so
-wire it into your own `~/.claude/settings.json`:
+stderr note when campd is down. It is the **main session** status line. A
+plugin cannot auto-set the main `statusLine`, so wire it into your own
+`~/.claude/settings.json` (opt-in per D6):
 
 ```json
 { "statusLine": { "type": "command",
                   "command": "\"${CLAUDE_PLUGIN_ROOT}\"/statusline/statusline.sh" } }
 ```
 
-The plugin registers the same script as `subagentStatusLine` (the one
-plugin-native statusline slot) so teammates show a camp badge.
+Note: Claude Code also has a distinct `subagentStatusLine` settings key (which
+a plugin *can* ship). It is a **different** feature — it receives a `tasks`
+array and renders one row body *per teammate* in the agent panel, not a single
+fleet-wide badge. This plugin does not wire the fleet badge there, because the
+schema and semantics differ; a purpose-built per-teammate row would be a
+separate script.
 
 ## Worker skill
 
