@@ -3296,7 +3296,10 @@ mod tests {
     /// path, whose non-child kill frees no slot in `children`.
     #[test]
     fn a_cap_full_patrol_respawn_queues_and_retries_when_a_slot_frees() {
-        let _spawning = crate::daemon::spawn_probe_guard();
+        // NOTE: do NOT hold spawn_probe_guard here — `held_cat_worker`
+        // acquires it per call, and the guard mutex is non-reentrant, so a
+        // test-level hold would self-deadlock. The one fork this test does
+        // outside held_cat_worker (converge → /bin/echo) is guarded inline.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("rig")).unwrap();
@@ -3399,7 +3402,13 @@ mod tests {
             let _ = w.child.wait();
         }
         dispatcher.children.remove(&occupant_pid);
-        dispatcher.converge(&mut ledger).unwrap();
+        {
+            // converge forks /bin/echo for the respawn — serialize it
+            // against the socket-probe tests (the guard is released before
+            // any nested held_cat call, so no re-entrancy).
+            let _spawning = crate::daemon::spawn_probe_guard();
+            dispatcher.converge(&mut ledger).unwrap();
+        }
         assert_eq!(
             gc9_wokes(&ledger),
             2,
