@@ -1074,6 +1074,41 @@ mod tests {
         assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
     }
 
+    /// PR #18 review finding 1: bd v1.0.4 silently SKIPS memory records
+    /// with an empty value and REJECTS a whole import over an empty-title
+    /// issue line — so an empty title must never enter the ledger at all
+    /// (fail fast at the creation boundary, fixing every consumer).
+    #[test]
+    fn bead_titles_must_be_non_empty() {
+        let (_dir, mut ledger) = temp_ledger();
+        for bad in ["", "   "] {
+            match ledger.append(created("gc-1", serde_json::json!({"title": bad}))) {
+                Err(CoreError::InvalidEventData { reason, .. }) => {
+                    assert!(reason.contains("title"), "reason was: {reason}");
+                }
+                other => panic!("expected InvalidEventData, got {other:?}"),
+            }
+        }
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 0);
+
+        // an update cannot blank a title either
+        ledger
+            .append(created("gc-1", serde_json::json!({"title": "ok"})))
+            .unwrap();
+        match ledger.append(input(
+            EventType::BeadUpdated,
+            Some("gc"),
+            Some("gc-1"),
+            serde_json::json!({"title": "  "}),
+        )) {
+            Err(CoreError::InvalidEventData { reason, .. }) => {
+                assert!(reason.contains("title"), "reason was: {reason}");
+            }
+            other => panic!("expected InvalidEventData, got {other:?}"),
+        }
+        assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+    }
+
     #[test]
     fn update_patches_fields_and_rewrites_search() {
         let (_dir, mut ledger) = temp_ledger();
