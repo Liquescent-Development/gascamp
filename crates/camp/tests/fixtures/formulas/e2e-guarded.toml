@@ -1,0 +1,25 @@
+formula = "e2e-guarded"
+description = "E2E: implement a small toy-CLI change with script verification, then review"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "implement"
+title = "Add a --count flag to `toy ls` that prints the number of items; TDD it"
+description = """In the toy project (current directory), add a `--count` flag to the `ls` subcommand: `toy ls --count` prints just the integer count of items (e.g. `3`) instead of listing them, and exits 0. Write a failing unit test in test_toy.py FIRST, then implement it in the `toy` script. Keep the existing `toy ls` behavior unchanged. Verification runs `scripts/verify.sh` (the whole test suite must be green)."""
+
+[steps.check]
+max_attempts = 2
+
+[steps.check.check]
+mode = "exec"
+path = "scripts/verify.sh"
+timeout = "5m"
+
+[[steps]]
+id = "review"
+title = "Review the final diff"
+description = "Read the git diff of the toy project and confirm the --count flag and its test are sound, existing behavior is intact, then close pass."
+assignee = "reviewer"
+needs = ["implement"]
