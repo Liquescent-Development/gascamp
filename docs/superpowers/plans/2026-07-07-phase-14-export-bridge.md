@@ -39,7 +39,7 @@ Camp-side facts (merged main at `20f2d10`):
 - `BeadRow` does **not** expose `description`, `close_reason`, `closed_ts`, `run_id`, `step_id`, or `needs`, and `Ledger.conn` is private → Phase 14 adds `Ledger::export_beads()` (Task 1) following the exact `readiness` delegation pattern.
 - Orders: `OrderConfig { name, on, formula, rig: Option, catch_up_window: Option }` (raw `[[order]]`), `compile_orders(&CampConfig) -> Vec<Order>` where `Order { name, trigger: Trigger, formula, rig, catch_up_window: Duration }`, `Trigger::Cron { expr } | Trigger::Event { event_type, label: Option }`; `CronExpr::source()` returns the raw cron string.
 - Runs: `<camp>/runs/<run-id>/` contains the **verbatim pinned formula copy** `<formula-name>.toml` plus `manifest.json`; run-id = `{compact-ts}-{6 hex, random}` — lexicographic order is chronological, and the random suffix means golden tests must normalize run ids.
-- `<camp>/agents/` is Phase 8's surface (PR #14, in flight): Claude Code agent-definition markdown, copied verbatim. Export treats it as an opaque directory tree, so there is no hard interface dependency; rebase after PR #14 merges is routine.
+- `<camp>/agents/` is Phase 8's surface (merged as `bb279b6`, PR #14): Claude Code agent-definition markdown (YAML frontmatter + prompt; `pack.rs::parse_agent_file` reads them verbatim — zero invented formats). Export treats the directory as an opaque tree to copy and never parses agent files (invariant 4 — no role knowledge in export code). Phase 8 also added `CampConfig.packs`/`dispatch`/`root` fields and a `CoreError::Pack` variant; none intersect this phase's surfaces (`export_city` takes an explicit `camp_root`, so `config.root` is not consumed). Phase 8 left the `beads` schema untouched — the Task 1 SELECT is verified against merged main.
 - No merged phase records a final disposition anywhere (the `bead.closed` payload is `{outcome, reason?}`); Phase 9 (unmerged, not among this phase's dependencies) will. See D6.
 
 ## Flagged Decisions (for plan review)
@@ -54,6 +54,7 @@ Camp-side facts (merged main at `20f2d10`):
 - **D8 — every issue line carries `"priority":2` explicitly** (bd semantics: field not omitted, `0` = critical).
 - **D9 — camp-specific provenance rides in additive `camp.*` metadata keys**: `camp.rig` (always), `camp.claimed_by`, `camp.run_id`, `camp.step_id` (when set). Additive names, never redefinitions (invariant 7).
 - **D10 — export is read-only.** Like `ls`/`show`/`search`, it appends no event and needs no vocab addition. A test pins that the event count is unchanged by an export.
+- **D11 — export ships the camp-local `agents/` layer only.** Phase 8 (merged) layers agent resolution across configured `[packs]` directories with `<camp>/agents/` highest. Spec §15.3(c) exports "the pack's agent definitions" — the camp's own; agent definitions contributed by external pack directories already exist as packs on the operator's disk and are not re-exported. Matches this phase's kickoff scope (`<camp>/agents/` consumed read-only, verbatim).
 
 ## Field-Level Mapping Table (bd wire)
 
