@@ -16,7 +16,7 @@
 //! patrol (plan Decision L).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -839,6 +839,7 @@ impl PatrolRuntime {
                     tracked.claude_session_id.as_deref(),
                     None,
                     &dispatcher.known_pids(),
+                    &self.camp_config.dispatch.command,
                 )?;
                 match probed {
                     None => {
@@ -863,6 +864,7 @@ impl PatrolRuntime {
                             tracked.claude_session_id.as_deref(),
                             None,
                             &dispatcher.known_pids(),
+                            &self.camp_config.dispatch.command,
                         )?
                         .is_some()
                         {
@@ -916,8 +918,33 @@ impl PatrolRuntime {
             tracked.claude_session_id.as_deref(),
             None,
             &dispatcher.known_pids(),
+            &self.camp_config.dispatch.command,
         )? {
             kill_pid(pid)?;
+            // Classification by RE-PROBE (round-2 LOW 4): the stop record
+            // rests on observed death, never on kill's exit chatter.
+            if probe_alive(
+                tracked.claude_session_id.as_deref(),
+                None,
+                &dispatcher.known_pids(),
+                &self.camp_config.dispatch.command,
+            )?
+            .is_some()
+            {
+                ledger.append(EventInput {
+                    kind: EventType::PatrolDegraded,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: None,
+                    data: serde_json::json!({
+                        "error": format!(
+                            "release kill of pid {pid} did not take; the session stays live"
+                        ),
+                        "session": session,
+                    }),
+                })?;
+                return Ok(());
+            }
         }
         ledger.append(EventInput {
             kind: EventType::SessionStopped,
@@ -982,6 +1009,7 @@ pub fn adopt(
             row.claude_session_id.as_deref(),
             row.pid,
             &dispatcher.known_pids(),
+            &config.dispatch.command,
         )?;
         match alive {
             None => {
@@ -1010,6 +1038,32 @@ pub fn adopt(
                     // release rule, non-child flavor. Never applied to
                     // attended sessions (spec §10: never kill in the TUI).
                     kill_pid(pid)?;
+                    // Classification by RE-PROBE (round-2 LOW 4): only an
+                    // observed death earns the stop record; a kill that
+                    // did not take is a durable degradation and the row
+                    // stays live for the next adopt.
+                    if probe_alive(
+                        row.claude_session_id.as_deref(),
+                        row.pid,
+                        &dispatcher.known_pids(),
+                        &config.dispatch.command,
+                    )?
+                    .is_some()
+                    {
+                        ledger.append(EventInput {
+                            kind: EventType::PatrolDegraded,
+                            rig: None,
+                            actor: "campd".into(),
+                            bead: None,
+                            data: serde_json::json!({
+                                "error": format!(
+                                    "adopt release kill of pid {pid} did not take"
+                                ),
+                                "session": row.name,
+                            }),
+                        })?;
+                        continue;
+                    }
                     ledger.append(EventInput {
                         kind: EventType::SessionStopped,
                         rig: row.rig.clone(),
@@ -1140,13 +1194,16 @@ fn nudge_text(bead: &str, session: &str, threshold: &str) -> String {
 /// (spec §8.5): match the pre-assigned claude session uuid against the
 /// process table (`pgrep -f`, uuid-unique and pid-reuse-immune), excluding
 /// pids campd itself owns (a nudge-resume aux child carries the uuid in
-/// its argv). Falls back to `ps -p` for rows that recorded a pid but no
-/// uuid. Neither identity ⇒ unobservable ⇒ not observed alive. A missing
-/// probe binary is a hard error — fail fast, no fallback.
+/// its argv) and pids that are not the worker command (round-2 LOW 3: an
+/// operator's `tail -f <transcript>` carries the uuid too — it must never
+/// be probe-identified, let alone killed). Falls back to `ps -p` for rows
+/// that recorded a pid but no uuid. Neither identity ⇒ unobservable ⇒ not
+/// observed alive. A missing probe binary is a hard error — fail fast.
 pub(super) fn probe_alive(
     claude_session_id: Option<&str>,
     pid: Option<i64>,
     exclude: &HashSet<u32>,
+    worker_command: &Path,
 ) -> Result<Option<i64>> {
     if let Some(uuid) = claude_session_id {
         let out = std::process::Command::new("pgrep")
@@ -1156,15 +1213,21 @@ pub(super) fn probe_alive(
             .context("running pgrep (required for adoption probes)")?;
         return match out.status.code() {
             Some(0) => {
-                let alive = String::from_utf8_lossy(&out.stdout)
+                let candidates: Vec<i64> = String::from_utf8_lossy(&out.stdout)
                     .lines()
                     .filter_map(|l| l.trim().parse::<i64>().ok())
-                    .find(|p| {
+                    .filter(|p| {
                         u32::try_from(*p)
                             .map(|p| !exclude.contains(&p))
                             .unwrap_or(true)
-                    });
-                Ok(alive)
+                    })
+                    .collect();
+                for candidate in candidates {
+                    if pid_runs_command(candidate, worker_command)? {
+                        return Ok(Some(candidate));
+                    }
+                }
+                Ok(None)
             }
             Some(1) => Ok(None), // no match: not observed alive
             _ => anyhow::bail!(
@@ -1186,23 +1249,46 @@ pub(super) fn probe_alive(
     Ok(None)
 }
 
-/// Terminate a NON-child process by pid, via /bin/kill (no unsafe, no new
-/// deps — the master plan's sanctioned `ps`/`kill` route).
+/// Whether the pid's command line names the configured worker command in
+/// its leading argv tokens: token 0 for direct execs (`claude …`, a
+/// script run by path), token 1 for shebang/interpreter execs (`bash
+/// /path/fake-agent.sh …`). Deliberately biased toward UNDER-matching
+/// (paths with spaces mis-tokenize): a probe miss degrades to
+/// "found dead" — a visible respawn in the ledger — never to killing an
+/// innocent process. A pid that vanished mid-probe is simply not the
+/// worker anymore.
+fn pid_runs_command(pid: i64, worker_command: &Path) -> Result<bool> {
+    let Some(want) = worker_command.file_name() else {
+        return Ok(false);
+    };
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .context("running ps (required for adoption probes)")?;
+    if !out.status.success() {
+        return Ok(false); // died between pgrep and ps: not observed alive
+    }
+    let cmdline = String::from_utf8_lossy(&out.stdout);
+    Ok(cmdline
+        .split_whitespace()
+        .take(2)
+        .any(|token| Path::new(token).file_name() == Some(want)))
+}
+
+/// Attempt to terminate a NON-child process by pid, via /bin/kill (no
+/// unsafe, no new deps — the master plan's sanctioned `ps`/`kill` route).
+/// The kill's OWN exit status is deliberately not consulted (round-2 LOW
+/// 4): the process may have exited in the probe-to-kill window (accepted,
+/// ms-scale) and stderr text is platform/locale-dependent — every caller
+/// classifies the outcome by RE-PROBING, which is the observation the
+/// ledger record rests on anyway. Only a missing/unrunnable kill binary
+/// is an error (fail fast).
 fn kill_pid(pid: i64) -> Result<()> {
-    let out = std::process::Command::new("kill")
+    std::process::Command::new("kill")
         .arg("-9")
         .arg(pid.to_string())
         .output()
         .context("running kill")?;
-    if !out.status.success() {
-        // The process may have exited between probe and kill (the ms-scale
-        // window the plan accepts): "no such process" is success-shaped —
-        // the follow-up probe decides. Other failures surface.
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !stderr.contains("No such process") {
-            anyhow::bail!("kill -9 {pid} failed: {}", stderr.trim());
-        }
-    }
     Ok(())
 }
 
@@ -1965,12 +2051,14 @@ mod tests {
         let live_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         // `|| true` keeps the command compound so bash stays resident
         // (a simple command would be exec-replaced, losing the uuid from
-        // the process table).
-        let mut sleeper = std::process::Command::new("bash")
+        // the process table); arg0 makes it worker-shaped for the LOW-3
+        // command filter.
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg0("claude")
             .arg("-c")
-            .arg(format!("sleep 30 || true # {live_uuid}"))
-            .spawn()
-            .unwrap();
+            .arg(format!("sleep 30 || true # {live_uuid}"));
+        let mut sleeper = cmd.spawn().unwrap();
         seeded_bead(&mut ledger, "gc-5");
         let seq = ledger
             .append(EventInput {
@@ -2089,12 +2177,14 @@ mod tests {
         let (dir, mut ledger, config, mut patrol) = fixture();
         let mut dispatcher = dispatcher_for(dir.path(), &config);
         // live worker, OPEN bead → re-armed
+        use std::os::unix::process::CommandExt as _;
         let live_uuid = "11ve0000-0000-4000-8000-00000000aaaa";
-        let mut live = std::process::Command::new("bash")
+        let mut live_cmd = std::process::Command::new("bash");
+        live_cmd
+            .arg0("claude")
             .arg("-c")
-            .arg(format!("sleep 30 || true # {live_uuid}"))
-            .spawn()
-            .unwrap();
+            .arg(format!("sleep 30 || true # {live_uuid}"));
+        let mut live = live_cmd.spawn().unwrap();
         woke_row(
             &mut ledger,
             "t/dev/1",
@@ -2105,11 +2195,12 @@ mod tests {
         );
         // live worker, CLOSED bead → released (killed + reasoned stop)
         let done_uuid = "d0ne0000-0000-4000-8000-00000000bbbb";
-        let mut done = std::process::Command::new("bash")
+        let mut done_cmd = std::process::Command::new("bash");
+        done_cmd
+            .arg0("claude")
             .arg("-c")
-            .arg(format!("sleep 30 || true # {done_uuid}"))
-            .spawn()
-            .unwrap();
+            .arg(format!("sleep 30 || true # {done_uuid}"));
+        let mut done = done_cmd.spawn().unwrap();
         woke_row(
             &mut ledger,
             "t/dev/2",
@@ -2280,12 +2371,14 @@ mod tests {
         let _spawning = crate::daemon::spawn_probe_guard();
         let (dir, mut ledger, config, mut patrol) = fixture();
         let mut dispatcher = dispatcher_for(dir.path(), &config);
+        use std::os::unix::process::CommandExt as _;
         let live_uuid = "1de40000-0000-4000-8000-00000000cccc";
-        let mut live = std::process::Command::new("bash")
+        let mut live_cmd = std::process::Command::new("bash");
+        live_cmd
+            .arg0("claude")
             .arg("-c")
-            .arg(format!("sleep 30 || true # {live_uuid}"))
-            .spawn()
-            .unwrap();
+            .arg(format!("sleep 30 || true # {live_uuid}"));
+        let mut live = live_cmd.spawn().unwrap();
         woke_row(
             &mut ledger,
             "t/dev/1",
@@ -2306,6 +2399,70 @@ mod tests {
         );
         live.kill().unwrap();
         live.wait().unwrap();
+    }
+
+    /// ROUND-2 LOW 3: `pgrep -f <uuid>` substring-matches ANY argv — an
+    /// operator's `tail -f <transcript-with-uuid>` must never read as the
+    /// worker (restart/release would SIGKILL it). The probe accepts only
+    /// pids whose leading argv tokens name the configured worker command.
+    #[test]
+    fn probe_ignores_processes_that_are_not_the_worker_command() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let uuid = "dec0dec0-0000-4000-8000-000000000000";
+        // the decoy: uuid in the args, but argv[0] is bash — an operator
+        // process, not the worker
+        let mut decoy = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("sleep 30 || true # {uuid}"))
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            probe_alive(
+                Some(uuid),
+                None,
+                &HashSet::new(),
+                std::path::Path::new("claude")
+            )
+            .unwrap(),
+            None,
+            "a non-worker process carrying the uuid is INVISIBLE to the probe"
+        );
+        // the worker shape: argv[0] names the configured command
+        use std::os::unix::process::CommandExt as _;
+        let mut real = std::process::Command::new("bash");
+        real.arg0("claude")
+            .arg("-c")
+            .arg(format!("sleep 30 || true # {uuid}"));
+        let mut worker = real.spawn().unwrap();
+        let probed = probe_alive(
+            Some(uuid),
+            None,
+            &HashSet::new(),
+            std::path::Path::new("claude"),
+        )
+        .unwrap();
+        assert_eq!(
+            probed,
+            Some(i64::from(worker.id())),
+            "the worker-shaped process IS the probe's answer"
+        );
+        decoy.kill().unwrap();
+        decoy.wait().unwrap();
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+    }
+
+    /// ROUND-2 LOW 4: kill failures classify by RE-PROBE, never by
+    /// locale-dependent stderr text. pid 1 (launchd/init — never ours)
+    /// yields EPERM: the old string-match on "No such process" turned
+    /// that accepted race-shape into a hard error.
+    #[test]
+    fn kill_pid_never_classifies_by_stderr_text() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        assert!(
+            kill_pid(1).is_ok(),
+            "a failed kill is not an error; the caller's re-probe decides"
+        );
     }
 
     #[test]
