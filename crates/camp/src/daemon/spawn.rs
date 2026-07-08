@@ -237,6 +237,7 @@ mod tests {
             tools: Some(vec!["Read".into(), "Edit".into(), "Bash".into()]),
             permission_mode: Some("acceptEdits".into()),
             isolation: Isolation::None,
+            stall_after: None,
             prompt: "Implement with TDD.".into(),
         }
     }
@@ -315,6 +316,7 @@ mod tests {
             tools: None,
             permission_mode: None,
             isolation: Isolation::None,
+            stall_after: None,
             prompt: "P".into(),
         };
         let spec = build_spec(
