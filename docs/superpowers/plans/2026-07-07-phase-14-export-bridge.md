@@ -1,5 +1,7 @@
 # Phase 14 — Export Bridge Implementation Plan
 
+> **Plan approval:** APPROVED 2026-07-07 by the automated Opus plan review (verified against gascity at the pinned ref AND beadslib v1.0.4 in the module cache), relayed by the team lead. Rulings: D1–D6, D8–D10 accepted as argued. D7 ADOPTED by the operator (relayed 2026-07-07) — the spec §15.3 amendment lands in this PR per Task 8 Step 2. D11 (added post-review) has a targeted ruling in flight — only the external-pack-layer aspect of the agents/ export is held. The reviewer's five non-blocking notes are folded into this doc and the execution (beadslib v1.0.4 provenance, staleness-guard softening, D3 named-rig wording, serde_json key-order comment near `bd_record`, D8 phrasing in export.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** `camp export --city <dir>` (spec §15.3): emit a directory a Gas City operator imports with standard tooling — `beads.jsonl` in the real bd import wire format, the pinned formulas from `runs/`, and a gc-convention pack (agents verbatim, generated `pack.toml`, camp orders translated to gc order TOML). Graduation is an export, not a backend; camp never writes into a live city's store, and export appends nothing to camp's own ledger either.
@@ -23,8 +25,8 @@
 
 All Gas City facts below were extracted from gascity at the pinned ref `12410301884b51131a35e101a335dbaae16cdcb0` (== `ci/gc-compat/GASCITY_REF` == the gc-vocab.json provenance):
 
-- **There are TWO bead wire formats — do not conflate them.** `docs/reference/exec-beads-provider.md` + gc's `internal/beads/beads.go` describe gc's *internal* pluggable-store RPC (`parent`, `needs`, `ref`, `from` fields). The format `bd import` actually reads is the external beads library's `types.Issue` (beadslib v1.1.0, pinned in gascity's go.mod). `beads.jsonl` targets `types.Issue`. Emitting gc's internal shape would import but silently drop `parent`/`needs`/`ref`/`from` — `bd import` uses plain `encoding/json` and **silently ignores unknown fields**.
-- `bd import` reads one JSON object per line; **only `title` is required**; `status` defaults to `open`, `issue_type` to `task`; `metadata` is an arbitrary JSON object preserved **verbatim**; upsert keyed by `id` with `updated_at` staleness guard.
+- **There are TWO bead wire formats — do not conflate them.** `docs/reference/exec-beads-provider.md` + gc's `internal/beads/beads.go` describe gc's *internal* pluggable-store RPC (`parent`, `needs`, `ref`, `from` fields). The format `bd import` actually reads is the external beads library's `types.Issue` (beadslib **v1.0.4** at the pin — corrected by the plan review's module-cache verification). `beads.jsonl` targets `types.Issue`. Emitting gc's internal shape would import but silently drop `parent`/`needs`/`ref`/`from` — `bd import` uses plain `encoding/json` and **silently ignores unknown fields**.
+- `bd import` reads one JSON object per line; **only `title` is required**; `status` defaults to `open`, `issue_type` to `task`; `metadata` is an arbitrary JSON object preserved **verbatim**; upsert keyed by `id`. (A claimed `updated_at` staleness guard could not be confirmed at v1.0.4 — not relied upon anywhere in this phase.) beadslib validation requires `closed_at` present **iff** status is `closed` — camp satisfies this by construction (the fold sets `closed_ts` exactly on close), and export.md documents the import-rejection hazard for hand-edited files.
 - `types.Issue` has **no** `needs`/`parent` field: blocking edges go in a `dependencies` array of `{"issue_id","depends_on_id","type"}`; `blocks` is in bd's blocking-for-ready set.
 - `priority` (int 0–4) has **no omitempty** in bd's own export and `0` means P0/critical; camp has no priority concept, so camp emits an explicit `2` (normal) on every issue line.
 - **Native memory support exists in bd import** as a separate record kind, not an issue type: `{"_type":"memory","key":"<slug>","value":"<content>"}` lines are stored as `bd remember` KV entries. Issue lines may carry `"_type":"issue"` (bd's own export does); absence also means issue.
@@ -33,7 +35,7 @@ All Gas City facts below were extracted from gascity at the pinned ref `12410301
 - gc orders (`internal/orders/order.go`): **one file per order** at `orders/<name>.toml`, wrapped in an `[order]` table; the order **name comes from the filename**; keys: `trigger` (required; `cron|event|cooldown|condition|manual`), `schedule` (required for cron), `on` (required for event), `formula` XOR `exec`, and others camp does not emit. **Orders cannot be declared inside pack.toml** (`PackConfig` has no orders field).
 - gc `pack.toml` (`internal/config/pack.go`): `[pack]` table with `name` (required), `schema` (required, current = 2), optional `version`/`description`. Agents, formulas, and orders are discovered by convention from `<packdir>/agents/`, `<packdir>/formulas/`, `<packdir>/orders/` — never enumerated in the manifest.
 
-Camp-side facts (merged main at `20f2d10`):
+Camp-side facts (verified against merged main at `bb279b6`, this branch's base):
 
 - `beads` table columns: `id, rig, type, title, description, status, assignee, claimed_by, outcome, close_reason, labels (JSON array string), run_id, step_id, created_ts, updated_ts, closed_ts`; `deps(bead_id, needs_id)`; bead types `task|mail|memory` (`BEAD_TYPES`, fold.rs); outcomes `pass|fail`; memory beads are ordinary beads with `type='memory'`, title = the fact.
 - `BeadRow` does **not** expose `description`, `close_reason`, `closed_ts`, `run_id`, `step_id`, or `needs`, and `Ledger.conn` is private → Phase 14 adds `Ledger::export_beads()` (Task 1) following the exact `readiness` delegation pattern.
@@ -46,7 +48,7 @@ Camp-side facts (merged main at `20f2d10`):
 
 - **D1 — memory beads → native bd memory records.** The contract said `issue_type:"task"` + label `camp-memory` "unless your research finds a native memory type in bd import" — it did (the `{"_type":"memory",...}` record kind above), so the native route is taken: `key` = bead id, `value` = title (the fact). bd memories are KV — rig/timestamps/status of memory beads are not representable and are documented as such.
 - **D2 — mail beads → `issue_type:"message"`.** The contract is silent on camp's third bead type. bd has a native `message` type; the vocabulary-mirror principle (match gc verbatim where the concept exists) says use it rather than flatten to `task`.
-- **D3 — orders with `rig` or `catch_up_window` set are untranslatable.** Plan decision 8's principle is "failing fast on untranslatable orders" with `[label=…]` as the *example*. gc order TOML has no key for either field (gc scopes orders by pack placement; no catch-up key exists), so silently dropping them would hide declared behavior. All three cases fail the export listing name + reason; `--skip-untranslatable` opts out per order.
+- **D3 — orders with `rig` or `catch_up_window` set are untranslatable.** Plan decision 8's principle is "failing fast on untranslatable orders" with `[label=…]` as the *example*. gc order TOML has a `scope = "city"|"rig"` key but **no named-rig binding** (which rig an order runs in comes from pack placement), and no catch-up key exists at all — so silently dropping either field would hide declared behavior. All three cases fail the export listing name + reason; `--skip-untranslatable` opts out per order. (Reason wording per plan-review note 3.)
 - **D4 — `pack/formulas/` addition.** A translated order references its formula by name and gc discovers pack formulas at `<packdir>/formulas/` — without them the exported pack imports but cannot run. The exporter copies each exported order's **authored** formula (`<camp>/formulas/<name>.toml`) into `pack/formulas/`; a missing authored file is a hard error naming the order. Additive to the contract's pack/ list, required by the exit criterion ("operator could import ... with standard tooling").
 - **D5 — divergent pinned copies are archived per-run, never flattened, never fatal.** `formulas/` (top level) = the pinned copies from `runs/` per the contract. A formula edited between runs pins different bytes under the same name — a healthy history that must not fail the export. Rule: newest run's copy takes `formulas/<name>.toml`; an older run's copy that differs is written as `formulas/<name>.<run-id>.toml` with a note in the report. Identical copies dedupe. Deterministic, lossless (invariant 3).
 - **D6 — `gc.final_disposition` is defined by the mapping but never emitted by this phase.** No merged phase records one (Phase 9 will, and it is not a dependency of Phase 14). The mapping table pins the key and its legal values (camp's `hard_fail|soft_fail`, a subset of gc's set); the exporter emits it only when a source exists, which today is never. The golden fixture asserts its absence.
@@ -80,7 +82,7 @@ This table also lands verbatim in `docs/reference/export.md` (Task 8).
 | `close_reason` | `close_reason` | when set |
 | `closed_ts` | `closed_at` | RFC3339, when set |
 | `created_ts` | `created_at` | RFC3339 |
-| `updated_ts` | `updated_at` | RFC3339 (bd's import staleness key) |
+| `updated_ts` | `updated_at` | RFC3339 |
 | `labels` | `labels` | verbatim array; omitted when empty |
 | `deps(bead_id, needs_id)` | `dependencies: [{"issue_id":<bead>,"depends_on_id":<needs>,"type":"blocks"}]` | camp `needs` is a readiness-blocking edge → bd `blocks` |
 
@@ -97,7 +99,7 @@ Also lands in `docs/reference/export.md`.
 | `on = "cron:EXPR"` | `trigger = "cron"` + `schedule = "EXPR"` |
 | `on = "event:TYPE"` | `trigger = "event"` + `on = "TYPE"` |
 | `on = "event:TYPE[label=X]"` | **untranslatable** (gc event orders have no label filter) |
-| `rig = "r"` | **untranslatable** (no gc key; gc scopes orders by pack placement, D3) |
+| `rig = "r"` | **untranslatable** (gc's `scope` key is `city`\|`rig` with no named-rig binding — placement picks the rig, D3) |
 | `catch_up_window = "…"` | **untranslatable** (no gc key, D3) |
 
 Untranslatable orders fail the export with every offender listed (name + reason); `--skip-untranslatable` exports without them, naming each skip on stderr. Translation runs before any output is written.
@@ -839,7 +841,7 @@ pub fn translate_order(order: &Order, raw: &OrderConfig) -> OrderTranslation {
         return OrderTranslation::Untranslatable {
             name,
             reason: format!(
-                "rig {rig:?} has no gc order-TOML equivalent (gc scopes orders by pack placement)"
+                "rig {rig:?} cannot be expressed in gc order TOML (gc's scope key is city|rig with no named-rig binding; pack placement picks the rig)"
             ),
         };
     }

@@ -147,6 +147,12 @@ impl Ledger {
         crate::readiness::list_beads(&self.conn, filter)
     }
 
+    /// Full-fidelity bead rows for `camp export` (spec §15.3): every
+    /// `beads` column plus the `needs` edges, in creation order.
+    pub fn export_beads(&self) -> Result<Vec<crate::export::ExportBead>, CoreError> {
+        crate::export::export_beads(&self.conn)
+    }
+
     /// One bead's current state, or `None`.
     pub fn get_bead(&self, id: &str) -> Result<Option<crate::readiness::BeadRow>, CoreError> {
         crate::readiness::get_bead(&self.conn, id)
