@@ -113,6 +113,9 @@ pub fn run(camp: &CampDir) -> Result<()> {
     // dispatch problems are dispatch.failed events, not errors — only a
     // broken ledger stops the daemon.
     let mut processor = ReadinessProcessor::default();
+    // Phase 9: the graph runtime shares the config snapshot the Dispatcher
+    // takes (rig paths for check-script cwd), then the Dispatcher owns it.
+    let mut graph = dispatch::GraphRuntime::new(camp.root.clone(), &config);
     let mut dispatcher = dispatch::Dispatcher::new(camp.clone(), config);
     event_loop::settle(
         &mut ledger,
@@ -120,6 +123,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &mut runtime,
         &clock,
         &mut dispatcher,
+        &mut graph,
     )?;
     // Fires orphaned by a crash between order.fired and its cook (the
     // cursor is already past them): queue them for the next settle —
@@ -142,6 +146,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &mut runtime,
         &clock,
         &mut dispatcher,
+        &mut graph,
     )?;
 
     let mut stdout = std::io::stdout();
@@ -160,6 +165,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &clock,
         &mut receiver,
         &mut dispatcher,
+        &mut graph,
     );
     drop(watcher);
     result

@@ -21,7 +21,7 @@ use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
 
 use super::cursor::{self, ReadinessProcessor};
-use super::dispatch::{Dispatcher, ReapFailure};
+use super::dispatch::{Dispatcher, GraphRuntime, ReapFailure};
 use super::orders::{self, OrdersRuntime};
 use super::socket::{Request, Response};
 
@@ -87,6 +87,7 @@ pub fn run(
     clock: &dyn Clock,
     config_rx: &mut mio::unix::pipe::Receiver,
     dispatcher: &mut Dispatcher,
+    graph: &mut GraphRuntime,
 ) -> Result<()> {
     let mut poll = Poll::new().context("creating the poller")?;
     let mut events = Events::with_capacity(64);
@@ -179,7 +180,7 @@ pub fn run(
                     // child must not take campd down, and unrecorded exits
                     // are retried next wake (try_wait re-returns the
                     // status).
-                    match reap_and_refill(ledger, processor, runtime, clock, dispatcher) {
+                    match reap_and_refill(ledger, processor, runtime, clock, dispatcher, graph) {
                         Ok(()) => self_raise_budget = SELF_RAISE_BUDGET,
                         Err(failure) => {
                             eprintln!("campd: reap failed: {failure}");
@@ -238,6 +239,7 @@ pub fn run(
                         runtime,
                         clock,
                         dispatcher,
+                        graph,
                         MAX_REQUEST_BYTES,
                     ) {
                         Ok(ConnState::Open) => {
@@ -269,7 +271,7 @@ pub fn run(
             // error re-surfaces on the next poke. The joint settle also
             // dispatches whatever the cooks made ready (Phase 8), in this
             // same wake.
-            if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher) {
+            if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph) {
                 eprintln!("campd: settle failed: {e:#}");
             }
         }
@@ -319,6 +321,7 @@ fn serve_connection(
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
+    graph: &mut GraphRuntime,
     max_request_bytes: usize,
 ) -> Result<ConnState> {
     let mut chunk = [0u8; 4096];
@@ -339,7 +342,7 @@ fn serve_connection(
                 Err(e) => return Err(e).context("reading a request"),
             }
         };
-        let drained = drain_lines(conn, ledger, processor, runtime, clock, dispatcher)?;
+        let drained = drain_lines(conn, ledger, processor, runtime, clock, dispatcher, graph)?;
         if let Some(terminal) = drained {
             return Ok(terminal);
         }
@@ -372,6 +375,7 @@ fn serve_connection(
 /// Answer every complete line in the buffer. Returns `Some(state)` when a
 /// line demands the connection (or the daemon) wind down, `None` to keep
 /// serving.
+#[allow(clippy::too_many_arguments)]
 fn drain_lines(
     conn: &mut Conn,
     ledger: &mut Ledger,
@@ -379,6 +383,7 @@ fn drain_lines(
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
+    graph: &mut GraphRuntime,
 ) -> Result<Option<ConnState>> {
     while let Some(newline) = conn.buf.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = conn.buf.drain(..=newline).collect();
@@ -403,7 +408,7 @@ fn drain_lines(
                 // leaves the cursor before the failing event — surfaced,
                 // never skipped; the next wake retries.
                 let ack = respond(&mut conn.stream, &Response::Ok { ok: true });
-                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher) {
+                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph) {
                     eprintln!("campd: poke processing failed: {e:#}");
                 }
                 if let Err(e) = ack {
@@ -477,10 +482,11 @@ fn reap_and_refill(
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
+    graph: &mut GraphRuntime,
 ) -> Result<(), ReapFailure> {
     dispatcher.reap(ledger)?;
     // settle failures are ledger-side: retry-worthy, like the appends
-    settle(ledger, processor, runtime, clock, dispatcher).map_err(|error| ReapFailure {
+    settle(ledger, processor, runtime, clock, dispatcher, graph).map_err(|error| ReapFailure {
         retryable: true,
         error,
     })
@@ -502,9 +508,14 @@ pub(super) fn settle(
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
+    graph: &mut GraphRuntime,
 ) -> Result<()> {
     loop {
-        orders::settle(ledger, processor, runtime, clock)?;
+        orders::settle(ledger, processor, runtime, clock, graph)?;
+        // Phase 9: drain the graph work the processor queued — spawn due
+        // check scripts, cook due bond children. Cooks append events, so
+        // the fixpoint below re-settles them in this same invocation.
+        graph.execute(ledger)?;
         dispatcher.converge(ledger)?;
         let cursor = ledger.cursor(cursor::CAMPD_CURSOR)?;
         if !ledger.has_events_past(cursor)? {
@@ -607,6 +618,10 @@ mod tests {
         client.write_all(b"{\"op\":\"poke\",\"seq\":1}\n").unwrap();
         drop(client); // the poker vanishes before reading its ack
 
+        let mut graph = GraphRuntime::new(
+            dir.path().to_path_buf(),
+            &camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
+        );
         let state = serve_connection(
             &mut conn,
             &mut ledger,
@@ -614,6 +629,7 @@ mod tests {
             &mut runtime,
             &clock,
             &mut dispatcher,
+            &mut graph,
             1024,
         )
         .expect("a dead poker must not error the connection loop");
@@ -696,6 +712,10 @@ mod tests {
         client.write_all(burst.as_bytes()).unwrap();
 
         // One event's worth of serving must answer every request.
+        let mut graph = GraphRuntime::new(
+            dir.path().to_path_buf(),
+            &camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
+        );
         let state = serve_connection(
             &mut conn,
             &mut ledger,
@@ -703,6 +723,7 @@ mod tests {
             &mut runtime,
             &clock,
             &mut dispatcher,
+            &mut graph,
             TEST_CAP,
         )
         .unwrap();

@@ -179,6 +179,43 @@ pub fn attempts(
         .collect())
 }
 
+/// Every bead of a run: (id, step_id) — step_id None is the root. Used by
+/// the daemon's dead-end path when a run dir is unreadable and the pinned
+/// structure is gone (the ledger still knows the beads).
+pub fn run_bead_ids(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Vec<(String, Option<String>)>, CoreError> {
+    let mut stmt = conn.prepare("SELECT id, step_id FROM beads WHERE run_id = ?1 ORDER BY id")?;
+    let rows: Vec<(String, Option<String>)> = stmt
+        .query_map([run_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// The data of a bead's creation event (title/description as authored,
+/// with any bond vars already substituted).
+pub fn created_event_data(
+    conn: &Connection,
+    bead: &str,
+) -> Result<Option<serde_json::Value>, CoreError> {
+    use rusqlite::OptionalExtension;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT data FROM events WHERE bead = ?1 AND type = 'bead.created'
+             ORDER BY seq LIMIT 1",
+            [bead],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match raw {
+        None => Ok(None),
+        Some(text) => Ok(Some(serde_json::from_str(&text).map_err(|e| {
+            CoreError::Corrupt(format!("bead {bead} created data is not JSON: {e}"))
+        })?)),
+    }
+}
+
 /// The data of a bead's close event, if it has closed. A bead closes at
 /// most once (the fold forbids a second close).
 pub fn close_event_data(

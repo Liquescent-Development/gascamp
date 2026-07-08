@@ -404,6 +404,648 @@ impl Dispatcher {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 9: the graph runtime (spec §8.3) — campd as purely mechanical
+// control dispatcher for check loops, retry classification, on_complete
+// fan-out, and run finalization. Ledger bookkeeping runs INSIDE the cursor
+// transaction (CampdProcessor -> GraphRuntime::process -> Ledger::append_on),
+// so every action is exactly-once across kill -9; only check-script spawns
+// and bond cooks are side effects, queued here and drained by
+// event_loop::settle (the Phase 10 pending-cook pattern).
+//
+// Every append is guarded by a state precondition the append destroys
+// (claim requires open; attempt creation requires budget; anchor close
+// requires not-closed; finalization requires the root open), so the settle
+// fixpoint does bounded work per invocation.
+//
+// Zero-Framework-Cognition: this code counts attempts, walks declared
+// edges, and applies declared budgets. Judgments come from workers (close
+// outcomes/classifications) and user-supplied check scripts.
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+
+use camp_core::error::CoreError;
+use camp_core::event::Event;
+use camp_core::formula::ast::Step;
+use camp_core::formula::runtime::{self as flow, RunContext, RunVerdict};
+use rusqlite::Connection;
+
+/// A check-script run the settle loop owes (Task 6 executes it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingCheck {
+    pub run_id: String,
+    pub step_id: String,
+    pub anchor: String,
+    pub attempt_bead: String,
+    /// 1-based: this is the Nth check run of the step.
+    pub attempt_no: u32,
+}
+
+/// A fan-out the settle loop owes (Task 7 executes it): cook the missing
+/// bond children of a closed-pass on_complete anchor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingFanout {
+    pub run_id: String,
+    pub step_id: String,
+    pub anchor: String,
+}
+
+pub struct GraphRuntime {
+    camp_root: PathBuf,
+    /// rig name -> path snapshot (check-script cwd, Task 6) — same
+    /// campd-start freshness as the Dispatcher's config.
+    #[allow(dead_code)] // consumed by the check executor (Task 6)
+    rig_paths: HashMap<String, PathBuf>,
+    /// Run-context cache; `None` = the run dir failed to load and the run
+    /// was dead-ended (evented once, never retried silently).
+    runs: HashMap<String, Option<Arc<RunContext>>>,
+    pending_checks: Vec<PendingCheck>,
+    pending_fanouts: Vec<PendingFanout>,
+}
+
+impl GraphRuntime {
+    pub fn new(camp_root: PathBuf, config: &camp_core::config::CampConfig) -> GraphRuntime {
+        GraphRuntime {
+            camp_root,
+            rig_paths: config
+                .rigs
+                .iter()
+                .map(|r| (r.name.clone(), r.path.clone()))
+                .collect(),
+            runs: HashMap::new(),
+            pending_checks: Vec::new(),
+            pending_fanouts: Vec::new(),
+        }
+    }
+
+    /// The cursor-atomic hook: called from CampdProcessor::process for
+    /// every committed event, inside the cursor transaction. All appends
+    /// go through Ledger::append_on on `conn`.
+    pub fn process(
+        &mut self,
+        conn: &Connection,
+        now: &str,
+        event: &Event,
+    ) -> Result<(), CoreError> {
+        match event.kind {
+            EventType::RunCooked => self.on_run_cooked(conn, now, event),
+            EventType::BeadCreated => self.on_bead_created(conn, now, event),
+            EventType::BeadClosed => self.on_bead_closed(conn, now, event),
+            _ => Ok(()),
+        }
+    }
+
+    /// The side-effect executor, called from event_loop::settle between
+    /// orders::settle and dispatcher.converge. Check spawning (Task 6)
+    /// and bond cooking (Task 7) drain the queues; until then queued work
+    /// waits (dedupe keeps re-queues harmless).
+    pub fn execute(&mut self, _ledger: &mut Ledger) -> Result<()> {
+        Ok(())
+    }
+
+    fn ctx(&mut self, run_id: &str) -> Option<Arc<RunContext>> {
+        if let Some(cached) = self.runs.get(run_id) {
+            return cached.clone();
+        }
+        let loaded = match flow::load_run(&flow::runs_dir(&self.camp_root), run_id) {
+            Ok(ctx) => Some(Arc::new(ctx)),
+            Err(e) => {
+                // surfaced here AND dead-ended durably by the caller
+                eprintln!("campd: run {run_id} context load failed: {e}");
+                None
+            }
+        };
+        self.runs.insert(run_id.to_owned(), loaded.clone());
+        loaded
+    }
+
+    fn on_run_cooked(
+        &mut self,
+        conn: &Connection,
+        now: &str,
+        event: &Event,
+    ) -> Result<(), CoreError> {
+        let run_id = event.data["run_id"].as_str().unwrap_or_default().to_owned();
+        if self.ctx(&run_id).is_none() {
+            // the run just cooked but its dir is unreadable: mechanically
+            // dead — nothing can ever advance it (plan Task 5 ruling)
+            self.dead_end_run(conn, now, &run_id, event.seq)?;
+        }
+        Ok(())
+    }
+
+    fn on_bead_created(
+        &mut self,
+        conn: &Connection,
+        now: &str,
+        event: &Event,
+    ) -> Result<(), CoreError> {
+        let Some(bead) = event.bead.as_deref() else {
+            return Ok(());
+        };
+        self.maybe_claim_looping(conn, now, bead)
+    }
+
+    fn on_bead_closed(
+        &mut self,
+        conn: &Connection,
+        now: &str,
+        event: &Event,
+    ) -> Result<(), CoreError> {
+        let Some(bead) = event.bead.as_deref() else {
+            return Ok(());
+        };
+        let outcome = event.data["outcome"].as_str().unwrap_or_default();
+        // (1) a pass close may make looping anchors ready (spec §7.3
+        // affected-subgraph recompute; plain dependents are converge's job)
+        if outcome == "pass" {
+            for ready in camp_core::readiness::newly_ready(conn, bead)? {
+                self.maybe_claim_looping(conn, now, &ready)?;
+            }
+        }
+        // (2) run-bead handling
+        let Some(membership) = flow::run_membership(conn, bead)? else {
+            return Ok(()); // plain bead
+        };
+        let Some(step_id) = membership.step_id else {
+            // a run ROOT closed: advance any bond chain hanging off it
+            return self.on_root_closed(conn, bead);
+        };
+        let Some(ctx) = self.ctx(&membership.run_id) else {
+            return self.dead_end_run(conn, now, &membership.run_id, event.seq);
+        };
+        let Some(step_ref) = ctx.step_ref(&step_id) else {
+            return Ok(()); // manifest/ledger drift: nothing mechanical to do
+        };
+        if step_ref.anchor == bead {
+            // the STEP resolved
+            if outcome == "pass" && step_ref.step.on_complete.is_some() {
+                self.queue_fanout(PendingFanout {
+                    run_id: ctx.run_id.clone(),
+                    step_id: step_id.clone(),
+                    anchor: bead.to_owned(),
+                });
+            }
+            self.finalize_if_quiescent(conn, now, &ctx, event.seq)
+        } else {
+            // an ATTEMPT resolved: the mechanical loop advances
+            self.on_attempt_closed(conn, now, &ctx, step_ref.step, bead, &event.data)
+        }
+    }
+
+    /// A closed root that carries `bond:<anchor>:<i>` labels is a fan-out
+    /// child: queue the parent anchor's fan-out so a sequential chain can
+    /// cook its next item (the executor decides whether anything is due —
+    /// a non-pass child halts the chain by cooking nothing).
+    fn on_root_closed(&mut self, conn: &Connection, root: &str) -> Result<(), CoreError> {
+        let Some(row) = camp_core::readiness::get_bead(conn, root)? else {
+            return Ok(());
+        };
+        for label in &row.labels {
+            let Some((parent_anchor, _index)) = flow::parse_bond_label(label) else {
+                continue;
+            };
+            let Some(pm) = flow::run_membership(conn, parent_anchor)? else {
+                continue;
+            };
+            let Some(parent_step) = pm.step_id else {
+                continue;
+            };
+            self.queue_fanout(PendingFanout {
+                run_id: pm.run_id,
+                step_id: parent_step,
+                anchor: parent_anchor.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Claim a ready looping-step anchor for campd and create attempt 1.
+    /// Guarded: only anchors, only looping steps, only open + ready — each
+    /// append destroys its own precondition (bounded work, issue #17
+    /// adjacency).
+    fn maybe_claim_looping(
+        &mut self,
+        conn: &Connection,
+        now: &str,
+        bead: &str,
+    ) -> Result<(), CoreError> {
+        let Some(membership) = flow::run_membership(conn, bead)? else {
+            return Ok(());
+        };
+        let Some(step_id) = membership.step_id else {
+            return Ok(());
+        };
+        let Some(ctx) = self.ctx(&membership.run_id) else {
+            return Ok(()); // dead-ended (or about to be) elsewhere
+        };
+        let Some(step_ref) = ctx.step_ref(&step_id) else {
+            return Ok(());
+        };
+        if step_ref.anchor != bead || !flow::is_looping(step_ref.step) {
+            return Ok(());
+        }
+        let Some(row) = camp_core::readiness::get_bead(conn, bead)? else {
+            return Ok(());
+        };
+        if row.status != "open" || !camp_core::readiness::is_ready(conn, bead)? {
+            return Ok(());
+        }
+        Ledger::append_on(
+            conn,
+            now,
+            EventInput {
+                kind: EventType::BeadClaimed,
+                rig: Some(row.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(bead.to_owned()),
+                data: serde_json::json!({"session": "campd"}),
+            },
+        )?;
+        let step = step_ref.step.clone();
+        self.create_attempt(conn, now, &ctx, &step, &row, 1, None)?;
+        Ok(())
+    }
+
+    /// Create attempt bead N for a looping step. The attempt carries the
+    /// anchor's (var-substituted) title + description, the step's assignee
+    /// routing hint, and — for respawns — the previous attempt's failure
+    /// evidence (mechanical copying; the worker needs it).
+    #[allow(clippy::too_many_arguments)]
+    fn create_attempt(
+        &mut self,
+        conn: &Connection,
+        now: &str,
+        ctx: &RunContext,
+        step: &Step,
+        anchor_row: &BeadRow,
+        attempt_no: usize,
+        evidence: Option<String>,
+    ) -> Result<(), CoreError> {
+        let (prefix, _) = camp_core::id::parse_bead_id(&anchor_row.id).ok_or_else(|| {
+            CoreError::Corrupt(format!("anchor id {:?} is not a bead id", anchor_row.id))
+        })?;
+        let id = camp_core::id::next_bead_id(conn, prefix)?;
+        let base_description = flow::created_event_data(conn, &anchor_row.id)?
+            .as_ref()
+            .and_then(|d| d.get("description"))
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let description = match evidence {
+            Some(evidence) if base_description.is_empty() => evidence,
+            Some(evidence) => format!("{base_description}\n\n{evidence}"),
+            None => base_description,
+        };
+        let mut data = serde_json::json!({
+            "title": format!("{} (attempt {attempt_no})", anchor_row.title),
+            "run_id": ctx.run_id,
+            "step_id": step.id,
+        });
+        if !description.is_empty() {
+            data["description"] = serde_json::json!(description);
+        }
+        if let Some(assignee) = &step.assignee {
+            data["assignee"] = serde_json::json!(assignee);
+        }
+        Ledger::append_on(
+            conn,
+            now,
+            EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some(anchor_row.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(id),
+                data,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The worker's close of an attempt is the loop's input (spec §8.3):
+    /// check steps queue the mechanical checker on pass and hard-fail
+    /// otherwise (Decision 13); retry steps classify per gc's
+    /// pass/hard/transient rules with the declared budget.
+    fn on_attempt_closed(
+        &mut self,
+        conn: &Connection,
+        now: &str,
+        ctx: &RunContext,
+        step: &Step,
+        attempt_bead: &str,
+        close_data: &serde_json::Value,
+    ) -> Result<(), CoreError> {
+        let anchor_id = ctx.anchors[&step.id].clone();
+        let Some(anchor_row) = camp_core::readiness::get_bead(conn, &anchor_id)? else {
+            return Ok(());
+        };
+        if anchor_row.status != "in_progress" || anchor_row.claimed_by.as_deref() != Some("campd") {
+            // not campd's loop anymore (manual interference is visible in
+            // the ledger); appending here would fight the operator
+            return Ok(());
+        }
+        let outcome = close_data["outcome"].as_str().unwrap_or_default();
+        let reason = close_data["reason"].as_str().unwrap_or("no reason given");
+        let attempts = flow::attempts(conn, &ctx.run_id, &step.id, &anchor_id)?;
+        let attempt_no = attempts
+            .iter()
+            .position(|b| b.id == attempt_bead)
+            .map(|i| i + 1)
+            .unwrap_or(attempts.len());
+
+        if step.check.is_some() {
+            if outcome == "pass" {
+                self.queue_check(PendingCheck {
+                    run_id: ctx.run_id.clone(),
+                    step_id: step.id.clone(),
+                    anchor: anchor_id,
+                    attempt_bead: attempt_bead.to_owned(),
+                    attempt_no: flow::check_runs_used(&attempts),
+                });
+                return Ok(());
+            }
+            // a worker failure on a check step is hard: the check budget
+            // counts check runs, not worker failures (Decision 13)
+            return close_anchor(
+                conn,
+                now,
+                &anchor_row,
+                "fail",
+                Some("hard_fail"),
+                None,
+                &format!("attempt {attempt_no} failed: {reason}"),
+            );
+        }
+        if let Some(retry) = &step.retry {
+            if outcome == "pass" {
+                return close_anchor(
+                    conn,
+                    now,
+                    &anchor_row,
+                    "pass",
+                    None,
+                    close_data.get("output").cloned(),
+                    &format!("attempt {attempt_no} passed"),
+                );
+            }
+            let transient =
+                close_data.get("failure_class").and_then(|c| c.as_str()) == Some("transient");
+            if transient {
+                let used = flow::transient_fails_used(conn, &attempts)?;
+                if used < retry.max_attempts {
+                    let step = step.clone();
+                    let evidence = format!("attempt {attempt_no} failed transient: {reason}");
+                    self.create_attempt(
+                        conn,
+                        now,
+                        ctx,
+                        &step,
+                        &anchor_row,
+                        attempts.len() + 1,
+                        Some(evidence),
+                    )?;
+                    return Ok(());
+                }
+                return close_anchor(
+                    conn,
+                    now,
+                    &anchor_row,
+                    "fail",
+                    Some(retry.on_exhausted.as_str()),
+                    None,
+                    &format!("retry budget ({}) exhausted", retry.max_attempts),
+                );
+            }
+            // hard fail: the worker said so
+            return close_anchor(
+                conn,
+                now,
+                &anchor_row,
+                "fail",
+                Some("hard_fail"),
+                None,
+                &format!("attempt {attempt_no} failed: {reason}"),
+            );
+        }
+        Ok(()) // plain steps have no attempts; nothing mechanical to do
+    }
+
+    /// Finalization (plan Decision 3, approved): when the run is quiescent,
+    /// close unreachable anchors `skipped`, close the root (outcome only),
+    /// and append `run.finalized` with the run-level disposition and its
+    /// cause — all in this same cursor transaction.
+    fn finalize_if_quiescent(
+        &mut self,
+        conn: &Connection,
+        now: &str,
+        ctx: &RunContext,
+        cause_seq: i64,
+    ) -> Result<(), CoreError> {
+        match flow::finalization(conn, ctx)? {
+            RunVerdict::NotQuiescent => Ok(()),
+            RunVerdict::Finalize {
+                outcome,
+                disposition,
+                soft_failed,
+                skipped,
+                to_skip,
+            } => {
+                for bead in &to_skip {
+                    Ledger::append_on(
+                        conn,
+                        now,
+                        EventInput {
+                            kind: EventType::BeadClosed,
+                            rig: Some(ctx.rig.clone()),
+                            actor: "campd".into(),
+                            bead: Some(bead.clone()),
+                            data: serde_json::json!({
+                                "outcome": "skipped",
+                                "reason": "needs cannot be satisfied",
+                            }),
+                        },
+                    )?;
+                }
+                Ledger::append_on(
+                    conn,
+                    now,
+                    EventInput {
+                        kind: EventType::BeadClosed,
+                        rig: Some(ctx.rig.clone()),
+                        actor: "campd".into(),
+                        bead: Some(ctx.root.clone()),
+                        data: serde_json::json!({
+                            "outcome": outcome,
+                            "reason": "run finalized",
+                        }),
+                    },
+                )?;
+                Ledger::append_on(
+                    conn,
+                    now,
+                    EventInput {
+                        kind: EventType::RunFinalized,
+                        rig: Some(ctx.rig.clone()),
+                        actor: "campd".into(),
+                        bead: Some(ctx.root.clone()),
+                        data: serde_json::json!({
+                            "run_id": ctx.run_id,
+                            "root": ctx.root,
+                            "outcome": outcome,
+                            "final_disposition": disposition,
+                            "cause_seq": cause_seq,
+                            "soft_failed": soft_failed,
+                            "skipped": skipped,
+                        }),
+                    },
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    /// A run whose pinned dir is unreadable can never advance: close every
+    /// open run bead `skipped`, the root `fail`, and finalize — the honest
+    /// mechanical dead-end, evented, never silent (plan Task 5 ruling).
+    fn dead_end_run(
+        &mut self,
+        conn: &Connection,
+        now: &str,
+        run_id: &str,
+        cause_seq: i64,
+    ) -> Result<(), CoreError> {
+        let beads = flow::run_bead_ids(conn, run_id)?;
+        let root = beads.iter().find(|(_, step)| step.is_none());
+        let Some((root_id, _)) = root else {
+            return Ok(()); // no root: nothing to finalize
+        };
+        let Some(root_row) = camp_core::readiness::get_bead(conn, root_id)? else {
+            return Ok(());
+        };
+        if root_row.status == "closed" {
+            return Ok(()); // already dead-ended
+        }
+        let mut skipped: Vec<String> = Vec::new();
+        for (id, step_id) in &beads {
+            let Some(step_id) = step_id else { continue };
+            let Some(row) = camp_core::readiness::get_bead(conn, id)? else {
+                continue;
+            };
+            if row.status != "closed" {
+                Ledger::append_on(
+                    conn,
+                    now,
+                    EventInput {
+                        kind: EventType::BeadClosed,
+                        rig: Some(row.rig.clone()),
+                        actor: "campd".into(),
+                        bead: Some(id.clone()),
+                        data: serde_json::json!({
+                            "outcome": "skipped",
+                            "reason": "run dir unreadable; the run cannot advance",
+                        }),
+                    },
+                )?;
+                if !skipped.contains(step_id) {
+                    skipped.push(step_id.clone());
+                }
+            }
+        }
+        Ledger::append_on(
+            conn,
+            now,
+            EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some(root_row.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(root_id.clone()),
+                data: serde_json::json!({
+                    "outcome": "fail",
+                    "reason": "run dir unreadable; the run cannot advance",
+                }),
+            },
+        )?;
+        Ledger::append_on(
+            conn,
+            now,
+            EventInput {
+                kind: EventType::RunFinalized,
+                rig: Some(root_row.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(root_id.clone()),
+                data: serde_json::json!({
+                    "run_id": run_id,
+                    "root": root_id,
+                    "outcome": "fail",
+                    "final_disposition": "hard_fail",
+                    "cause_seq": cause_seq,
+                    "soft_failed": [],
+                    "skipped": skipped,
+                }),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn queue_check(&mut self, pending: PendingCheck) {
+        if !self.pending_checks.contains(&pending) {
+            self.pending_checks.push(pending);
+        }
+    }
+
+    fn queue_fanout(&mut self, pending: PendingFanout) {
+        if !self.pending_fanouts.contains(&pending) {
+            self.pending_fanouts.push(pending);
+        }
+    }
+
+    /// Test observability (production drains via the Task 6/7 executors).
+    #[cfg(test)]
+    pub fn pending_check_queue(&self) -> &[PendingCheck] {
+        &self.pending_checks
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // consumed by the Task 7 fan-out tests
+    pub fn pending_fanout_queue(&self) -> &[PendingFanout] {
+        &self.pending_fanouts
+    }
+}
+
+/// Close a looping-step anchor with campd's verdict. The disposition is
+/// close-vocabulary (`hard_fail|soft_fail`) only; the run-level "pass"
+/// lives in run.finalized (plan Decision 3 / review Blocker A).
+fn close_anchor(
+    conn: &Connection,
+    now: &str,
+    anchor: &BeadRow,
+    outcome: &str,
+    final_disposition: Option<&str>,
+    output: Option<serde_json::Value>,
+    reason: &str,
+) -> Result<(), CoreError> {
+    let mut data = serde_json::json!({ "outcome": outcome, "reason": reason });
+    if let Some(disposition) = final_disposition {
+        data["final_disposition"] = serde_json::json!(disposition);
+    }
+    if let Some(output) = output {
+        data["output"] = output;
+    }
+    Ledger::append_on(
+        conn,
+        now,
+        EventInput {
+            kind: EventType::BeadClosed,
+            rig: Some(anchor.rig.clone()),
+            actor: "campd".into(),
+            bead: Some(anchor.id.clone()),
+            data,
+        },
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -663,5 +1305,347 @@ mod tests {
                 "route error must name {needle}: {err}"
             );
         }
+    }
+
+    // ---- Phase 9 Task 5: GraphRuntime processor hooks --------------------
+
+    use camp_core::clock::FixedClock;
+    use camp_core::formula::CookedRun;
+    use camp_core::formula::runtime::runs_dir;
+
+    /// A camp root with one rig; ledger + orders runtime + graph runtime.
+    fn graph_fixture() -> (
+        tempfile::TempDir,
+        Ledger,
+        super::super::orders::OrdersRuntime,
+        GraphRuntime,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("repo")).unwrap();
+        std::fs::write(
+            dir.path().join("camp.toml"),
+            format!(
+                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n",
+                dir.path().join("repo").display()
+            ),
+        )
+        .unwrap();
+        let ledger = Ledger::open_with_clock(
+            &dir.path().join("camp.db"),
+            Box::new(FixedClock::new("2026-07-07T12:00:00Z")),
+        )
+        .unwrap();
+        let rt = super::super::orders::OrdersRuntime::build(
+            dir.path(),
+            "2026-07-07T12:00:00Z".parse().unwrap(),
+            jiff::tz::TimeZone::UTC,
+        )
+        .unwrap();
+        let config =
+            CampConfig::parse(&std::fs::read_to_string(dir.path().join("camp.toml")).unwrap())
+                .unwrap();
+        let graph = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        (dir, ledger, rt, graph)
+    }
+
+    fn cook_into(
+        dir: &tempfile::TempDir,
+        ledger: &mut Ledger,
+        name: &str,
+        toml: &str,
+    ) -> CookedRun {
+        let path = dir.path().join(format!("{name}.toml"));
+        std::fs::write(&path, toml).unwrap();
+        let formula = camp_core::formula::parse_and_validate(&path).unwrap();
+        let rig = camp_core::config::RigConfig {
+            name: "gc".into(),
+            path: dir.path().join("repo"),
+            prefix: "gc".into(),
+            default_agent: None,
+        };
+        camp_core::formula::cook(ledger, &formula, &runs_dir(dir.path()), &rig, "test").unwrap()
+    }
+
+    fn settle_graph(
+        ledger: &mut Ledger,
+        rt: &mut super::super::orders::OrdersRuntime,
+        graph: &mut GraphRuntime,
+    ) {
+        let mut readiness = crate::daemon::cursor::ReadinessProcessor::default();
+        let clock = FixedClock::new("2026-07-07T12:00:01Z");
+        super::super::orders::settle(ledger, &mut readiness, rt, &clock, graph).unwrap();
+    }
+
+    fn append_close(l: &mut Ledger, bead: &str, data: serde_json::Value) -> i64 {
+        l.append(EventInput {
+            kind: EventType::BeadClosed,
+            rig: Some("gc".into()),
+            actor: "session:fake".into(),
+            bead: Some(bead.into()),
+            data,
+        })
+        .unwrap()
+    }
+
+    const RETRY_SOFT: &str = "formula = \"retry-soft\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[steps]]\nid = \"fetch\"\ntitle = \"Fetch\"\n\n[steps.retry]\nmax_attempts = 2\non_exhausted = \"soft_fail\"\n";
+    const RETRY_HARD: &str = "formula = \"retry-hard\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[steps]]\nid = \"fetch\"\ntitle = \"Fetch\"\n\n[steps.retry]\nmax_attempts = 2\non_exhausted = \"hard_fail\"\n";
+    const CHECKED: &str = "formula = \"checked\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[steps]]\nid = \"impl\"\ntitle = \"Implement\"\n\n[steps.check]\nmax_attempts = 3\n\n[steps.check.check]\nmode = \"exec\"\npath = \"verify.sh\"\ntimeout = \"1m\"\n";
+    const TWO_STEP: &str = "formula = \"two-step\"\n\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n\n[[steps]]\nid = \"b\"\ntitle = \"B\"\nneeds = [\"a\"]\n";
+
+    fn events_named(l: &Ledger, kind: &str) -> Vec<camp_core::event::Event> {
+        l.events_range(1, None)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind.as_str() == kind)
+            .collect()
+    }
+
+    #[test]
+    fn a_ready_looping_anchor_is_claimed_with_attempt_one() {
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = cook_into(&dir, &mut ledger, "retry-soft", RETRY_SOFT);
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let anchor = ledger
+            .get_bead(&cooked.step_beads["fetch"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(anchor.status, "in_progress");
+        assert_eq!(anchor.claimed_by.as_deref(), Some("campd"));
+        let attempts = ledger
+            .step_attempts(&cooked.run_id, "fetch", &anchor.id)
+            .unwrap();
+        assert_eq!(attempts.len(), 1, "exactly one attempt bead");
+        assert!(attempts[0].title.contains("(attempt 1)"));
+        // the ATTEMPT is dispatchable; the claimed anchor is not
+        let dispatchable: Vec<String> = ledger
+            .dispatchable_beads()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert!(dispatchable.contains(&attempts[0].id), "{dispatchable:?}");
+        assert!(!dispatchable.contains(&anchor.id), "{dispatchable:?}");
+    }
+
+    #[test]
+    fn retry_classification_pass_hard_transient() {
+        // pass: anchor closes pass with the attempt output copied; the
+        // single-step run finalizes
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = cook_into(&dir, &mut ledger, "retry-soft", RETRY_SOFT);
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let anchor_id = cooked.step_beads["fetch"].clone();
+        let attempt = ledger
+            .step_attempts(&cooked.run_id, "fetch", &anchor_id)
+            .unwrap()[0]
+            .id
+            .clone();
+        append_close(
+            &mut ledger,
+            &attempt,
+            serde_json::json!({"outcome":"pass","output":{"items":[1]}}),
+        );
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let anchor = ledger.get_bead(&anchor_id).unwrap().unwrap();
+        assert_eq!(anchor.status, "closed");
+        assert_eq!(anchor.outcome.as_deref(), Some("pass"));
+        let close = ledger.close_event_data(&anchor_id).unwrap().unwrap();
+        assert_eq!(close["output"]["items"][0], 1, "output copied to the step");
+        let finalized = events_named(&ledger, "run.finalized");
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].data["outcome"], "pass");
+        assert_eq!(finalized[0].data["final_disposition"], "pass");
+        let root = ledger.get_bead(&cooked.root_bead).unwrap().unwrap();
+        assert_eq!(root.outcome.as_deref(), Some("pass"));
+        assert!(
+            ledger.close_event_data(&cooked.root_bead).unwrap().unwrap()["final_disposition"]
+                .is_null(),
+            "root closes carry outcome only (Decision 3)"
+        );
+
+        // hard fail: the worker said fail without a classification
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = cook_into(&dir, &mut ledger, "retry-soft", RETRY_SOFT);
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let anchor_id = cooked.step_beads["fetch"].clone();
+        let attempt = ledger
+            .step_attempts(&cooked.run_id, "fetch", &anchor_id)
+            .unwrap()[0]
+            .id
+            .clone();
+        append_close(
+            &mut ledger,
+            &attempt,
+            serde_json::json!({"outcome":"fail","reason":"broke"}),
+        );
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let close = ledger.close_event_data(&anchor_id).unwrap().unwrap();
+        assert_eq!(close["outcome"], "fail");
+        assert_eq!(close["final_disposition"], "hard_fail");
+        assert_eq!(
+            events_named(&ledger, "run.finalized")[0].data["final_disposition"],
+            "hard_fail"
+        );
+
+        // transient with budget left: attempt 2 appears, anchor stays campd's
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = cook_into(&dir, &mut ledger, "retry-soft", RETRY_SOFT);
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let anchor_id = cooked.step_beads["fetch"].clone();
+        let attempt = ledger
+            .step_attempts(&cooked.run_id, "fetch", &anchor_id)
+            .unwrap()[0]
+            .id
+            .clone();
+        append_close(
+            &mut ledger,
+            &attempt,
+            serde_json::json!({"outcome":"fail","failure_class":"transient","reason":"net"}),
+        );
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let attempts = ledger
+            .step_attempts(&cooked.run_id, "fetch", &anchor_id)
+            .unwrap();
+        assert_eq!(attempts.len(), 2, "the respawn attempt exists");
+        assert!(attempts[1].title.contains("(attempt 2)"));
+        let created = camp_core::formula::runtime::created_event_data(
+            // description carries the failure evidence, mechanically copied
+            &rusqlite::Connection::open(dir.path().join("camp.db")).unwrap(),
+            &attempts[1].id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            created["description"].as_str().unwrap().contains("net"),
+            "{created}"
+        );
+        assert_eq!(
+            ledger.get_bead(&anchor_id).unwrap().unwrap().status,
+            "in_progress"
+        );
+    }
+
+    #[test]
+    fn retry_exhaustion_honors_on_exhausted() {
+        for (name, toml, disposition, run_outcome, run_disposition) in [
+            ("retry-soft", RETRY_SOFT, "soft_fail", "pass", "soft_fail"),
+            ("retry-hard", RETRY_HARD, "hard_fail", "fail", "hard_fail"),
+        ] {
+            let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+            let cooked = cook_into(&dir, &mut ledger, name, toml);
+            settle_graph(&mut ledger, &mut rt, &mut graph);
+            let anchor_id = cooked.step_beads["fetch"].clone();
+            for _ in 0..2 {
+                let attempts = ledger
+                    .step_attempts(&cooked.run_id, "fetch", &anchor_id)
+                    .unwrap();
+                let open = attempts
+                    .iter()
+                    .find(|b| b.status == "open")
+                    .unwrap()
+                    .id
+                    .clone();
+                append_close(
+                    &mut ledger,
+                    &open,
+                    serde_json::json!({"outcome":"fail","failure_class":"transient"}),
+                );
+                settle_graph(&mut ledger, &mut rt, &mut graph);
+            }
+            let close = ledger.close_event_data(&anchor_id).unwrap().unwrap();
+            assert_eq!(close["outcome"], "fail", "{name}");
+            assert_eq!(close["final_disposition"], disposition.to_owned(), "{name}");
+            assert!(
+                close["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("retry budget (2) exhausted"),
+                "{name}: {close}"
+            );
+            let finalized = events_named(&ledger, "run.finalized");
+            assert_eq!(finalized.len(), 1, "{name}");
+            assert_eq!(
+                finalized[0].data["outcome"],
+                run_outcome.to_owned(),
+                "{name}"
+            );
+            assert_eq!(
+                finalized[0].data["final_disposition"],
+                run_disposition.to_owned(),
+                "{name}"
+            );
+            // exactly 2 attempts ever: the budget bounds the loop
+            assert_eq!(
+                ledger
+                    .step_attempts(&cooked.run_id, "fetch", &anchor_id)
+                    .unwrap()
+                    .len(),
+                2,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn finalization_closes_root_with_cause_and_skips_unreachable() {
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = cook_into(&dir, &mut ledger, "two-step", TWO_STEP);
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        // a worker hard-fails plain step a; b can never run
+        let cause_seq = append_close(
+            &mut ledger,
+            &cooked.step_beads["a"],
+            serde_json::json!({"outcome":"fail","reason":"broke"}),
+        );
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let b = ledger.get_bead(&cooked.step_beads["b"]).unwrap().unwrap();
+        assert_eq!(b.outcome.as_deref(), Some("skipped"));
+        let root = ledger.get_bead(&cooked.root_bead).unwrap().unwrap();
+        assert_eq!(root.outcome.as_deref(), Some("fail"));
+        let finalized = events_named(&ledger, "run.finalized");
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].data["cause_seq"], cause_seq);
+        assert_eq!(finalized[0].data["final_disposition"], "hard_fail");
+        assert_eq!(finalized[0].data["skipped"][0], "b");
+    }
+
+    #[test]
+    fn a_passing_check_step_attempt_queues_a_check_not_an_anchor_close() {
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = cook_into(&dir, &mut ledger, "checked", CHECKED);
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let anchor_id = cooked.step_beads["impl"].clone();
+        let attempt = ledger
+            .step_attempts(&cooked.run_id, "impl", &anchor_id)
+            .unwrap()[0]
+            .id
+            .clone();
+        append_close(&mut ledger, &attempt, serde_json::json!({"outcome":"pass"}));
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        assert_eq!(
+            ledger.get_bead(&anchor_id).unwrap().unwrap().status,
+            "in_progress",
+            "the check verdict, not the worker, resolves a check step"
+        );
+        let queue = graph.pending_check_queue();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].attempt_no, 1);
+        assert_eq!(queue[0].anchor, anchor_id);
+        assert_eq!(queue[0].attempt_bead, attempt);
+    }
+
+    #[test]
+    fn graph_appends_are_idempotent_across_resettles() {
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        cook_into(&dir, &mut ledger, "retry-soft", RETRY_SOFT);
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let before = ledger.events_range(1, None).unwrap().len();
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        assert_eq!(
+            ledger.events_range(1, None).unwrap().len(),
+            before,
+            "re-settling an already-settled ledger appends nothing"
+        );
     }
 }

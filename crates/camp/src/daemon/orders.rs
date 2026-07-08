@@ -28,6 +28,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use super::cursor::{self, EventProcessor, ReadinessProcessor};
+use super::dispatch::GraphRuntime;
 
 /// campd's compiled-order state: the config text last applied, the
 /// compiled orders, the armed cron heap, and the cooks queued by the
@@ -285,12 +286,14 @@ pub fn catch_up_anchor(ledger: &Ledger, now: Timestamp) -> Result<Timestamp, Cor
     })
 }
 
-/// The campd processor: readiness (Phase 7) plus orders (Phase 10), one
-/// pass per committed event, inside the cursor transaction.
+/// The campd processor: readiness (Phase 7) plus orders (Phase 10) plus
+/// graph execution (Phase 9), one pass per committed event, inside the
+/// cursor transaction.
 pub struct CampdProcessor<'a> {
     pub readiness: &'a mut ReadinessProcessor,
     pub runtime: &'a mut OrdersRuntime,
     pub clock: &'a dyn Clock,
+    pub graph: &'a mut GraphRuntime,
 }
 
 impl EventProcessor for CampdProcessor<'_> {
@@ -327,6 +330,11 @@ impl EventProcessor for CampdProcessor<'_> {
                 ),
             )?;
         }
+        // (5) Phase 9 graph execution: looping-step claims, attempt
+        //     classification, and finalization — cursor-atomic via
+        //     append_on; check spawns and bond cooks are queued for the
+        //     settle loop's executor.
+        self.graph.process(conn, &self.clock.now_utc(), event)?;
         Ok(())
     }
 }
@@ -344,6 +352,7 @@ pub fn settle(
     readiness: &mut ReadinessProcessor,
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
+    graph: &mut GraphRuntime,
 ) -> Result<(), CoreError> {
     loop {
         {
@@ -351,6 +360,7 @@ pub fn settle(
                 readiness,
                 runtime,
                 clock,
+                graph,
             };
             cursor::catch_up(ledger, &mut processor)?;
         }
@@ -455,9 +465,15 @@ mod tests {
         FixedClock::new("2026-07-06T07:00:00Z")
     }
 
+    /// A GraphRuntime over the fixture's camp root (Phase 9 settle param).
+    fn graph_for(runtime: &OrdersRuntime) -> GraphRuntime {
+        GraphRuntime::new(runtime.camp_root.clone(), &runtime.config)
+    }
+
     fn settle_all(ledger: &mut Ledger, runtime: &mut OrdersRuntime) {
         let mut readiness = ReadinessProcessor::default();
-        settle(ledger, &mut readiness, runtime, &clock()).unwrap();
+        let mut graph = graph_for(runtime);
+        settle(ledger, &mut readiness, runtime, &clock(), &mut graph).unwrap();
     }
 
     fn types(ledger: &Ledger) -> Vec<String> {
@@ -797,7 +813,8 @@ mod tests {
         .unwrap();
 
         let mut readiness = ReadinessProcessor::default();
-        let err = settle(&mut ledger, &mut readiness, &mut rt, &clock());
+        let mut graph = graph_for(&rt);
+        let err = settle(&mut ledger, &mut readiness, &mut rt, &clock(), &mut graph);
         assert!(err.is_err(), "the infra error must surface");
         // BOTH cooks survive for the next settle (the failing one included)
         assert_eq!(rt.pending_cook_count(), 2);
@@ -805,7 +822,10 @@ mod tests {
         // infrastructure recovers → the next settle drains them
         raw.execute_batch("DROP TRIGGER inject_infra_error")
             .unwrap();
-        settle(&mut ledger, &mut readiness, &mut rt, &clock()).unwrap();
+        {
+            let mut graph = graph_for(&rt);
+            settle(&mut ledger, &mut readiness, &mut rt, &clock(), &mut graph).unwrap();
+        }
         assert_eq!(rt.pending_cook_count(), 0);
         assert_eq!(
             ledger.events_of_type(EventType::OrderFailed).unwrap().len(),
@@ -882,7 +902,10 @@ mod tests {
         );
         let mut rt = runtime(&dir, "2026-07-06T07:40:00Z");
         let mut readiness = ReadinessProcessor::default();
-        settle(&mut ledger, &mut readiness, &mut rt, &clock()).unwrap();
+        {
+            let mut graph = graph_for(&rt);
+            settle(&mut ledger, &mut readiness, &mut rt, &clock(), &mut graph).unwrap();
+        }
         for cook in camp_core::orders::unresponded_fires(&ledger).unwrap() {
             rt.queue_cook(cook);
         }
@@ -892,7 +915,10 @@ mod tests {
             .map(|c| c.into_fire(now))
             .collect();
         declare_cron_fires(&mut ledger, &fires).unwrap();
-        settle(&mut ledger, &mut readiness, &mut rt, &clock()).unwrap();
+        {
+            let mut graph = graph_for(&rt);
+            settle(&mut ledger, &mut readiness, &mut rt, &clock(), &mut graph).unwrap();
+        }
 
         // spec §9 "fire once": ONE declaration, ONE cooked run.
         assert_eq!(
