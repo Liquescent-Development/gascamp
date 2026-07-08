@@ -2412,7 +2412,12 @@ mod tests {
     ) {
         let mut readiness = crate::daemon::cursor::ReadinessProcessor::default();
         let clock = FixedClock::new("2026-07-07T12:00:01Z");
-        super::super::orders::settle(ledger, &mut readiness, rt, &clock, graph).unwrap();
+        // Phase 11: settle threads a patrol runtime too (unwatched/empty here).
+        let cfg = CampConfig::parse("[camp]\nname = \"t\"\n").unwrap();
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&cfg.patrol).unwrap();
+        let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &cfg);
+        super::super::orders::settle(ledger, &mut readiness, rt, &clock, graph, &mut patrol)
+            .unwrap();
     }
 
     fn append_close(l: &mut Ledger, bead: &str, data: serde_json::Value) -> i64 {

@@ -1476,104 +1476,81 @@ mod tests {
     #[test]
     fn ledger_activity_resets_the_timer_by_all_three_keys() {
         let (dir, mut ledger, _config, mut patrol) = fixture();
-        let transcript = dir.path().join("projects/-p/sid.jsonl");
-        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
         let t0 = ts("2026-07-07T07:00:00Z");
-        patrol.observe(&event);
+        // Three distinct workers, each armed once at t0 (10m default →
+        // deadline 07:10) — one per Decision-J key, so no artificial
+        // re-arm is needed (the round-2 fix-2 guard skips a re-Track of an
+        // already-tracked session, which the old single-session re-observe
+        // relied on).
+        for (name, bead) in [
+            ("t/dev/1", "gc-1"),
+            ("t/dev/2", "gc-2"),
+            ("t/dev/3", "gc-3"),
+        ] {
+            let transcript = dir.path().join(format!("projects/-p/{bead}.jsonl"));
+            let event = woke_event(&mut ledger, name, "dev", bead, &transcript, "campd");
+            patrol.observe(&event);
+        }
         patrol.apply_tracking(&mut ledger, t0).unwrap();
 
-        // Decision J's three keys, each observed at 07:05 → deadline 07:15
-        let activity: [(EventType, Option<&str>, &str, serde_json::Value); 3] = [
-            // (a) bead match (worker.milestone --bead)
-            (
-                EventType::WorkerMilestone,
-                Some("gc-1"),
-                "cli",
-                serde_json::json!({"text": "progress"}),
-            ),
-            // (b) actor == session name (event emit --session)
-            (
-                EventType::WorkerMilestone,
-                None,
-                "t/dev/1",
-                serde_json::json!({"text": "note"}),
-            ),
-            // (c) data.session == session name (bead.claimed)
-            (
-                EventType::BeadClaimed,
-                Some("gc-1"),
-                "cli",
-                serde_json::json!({"session": "t/dev/1"}),
-            ),
-        ];
-        for (i, (kind, bead, actor, data)) in activity.into_iter().enumerate() {
-            // fresh arm at t0 each round
-            patrol.observe(&woke_or_reset_probe(
-                &mut ledger,
-                kind,
-                bead,
-                actor,
-                data,
-                i,
-            ));
-            patrol
-                .apply_tracking(&mut ledger, ts("2026-07-07T07:05:00Z"))
-                .unwrap();
-            assert!(
-                patrol.fire_due(ts("2026-07-07T07:10:00Z")).is_empty(),
-                "key {i}: the old deadline must be gone"
-            );
-            assert_eq!(
-                patrol.fire_due(ts("2026-07-07T07:15:00Z")).len(),
-                1,
-                "key {i}: the pushed deadline fires"
-            );
-            // re-arm for the next round
-            let event = ledger
-                .events_of_type(EventType::SessionWoke)
-                .unwrap()
-                .remove(0);
-            patrol.observe(&event);
-            patrol.apply_tracking(&mut ledger, t0).unwrap();
-        }
-    }
-
-    /// Build a ledger event of the given shape for reset probing. The
-    /// bead.claimed arm claims and immediately synthesizes; milestones
-    /// append plainly.
-    fn woke_or_reset_probe(
-        ledger: &mut Ledger,
-        kind: EventType,
-        bead: Option<&str>,
-        actor: &str,
-        data: serde_json::Value,
-        round: usize,
-    ) -> Event {
-        if kind == EventType::BeadClaimed {
-            // a claimable bead per round (a bead claims once)
-            let id = format!("gc-{}", 100 + round);
-            seeded_bead(ledger, &id);
-            let seq = ledger
+        let ev = |l: &mut Ledger,
+                  kind: EventType,
+                  bead: Option<&str>,
+                  actor: &str,
+                  data: serde_json::Value|
+         -> Event {
+            let seq = l
                 .append(EventInput {
                     kind,
                     rig: Some("gc".into()),
                     actor: actor.into(),
-                    bead: Some(id),
+                    bead: bead.map(str::to_owned),
                     data,
                 })
                 .unwrap();
-            return ledger.events_range(seq, Some(seq)).unwrap().remove(0);
+            l.events_range(seq, Some(seq)).unwrap().remove(0)
+        };
+        // (a) bead match: worker.milestone --bead gc-1  (resets t/dev/1)
+        let a = ev(
+            &mut ledger,
+            EventType::WorkerMilestone,
+            Some("gc-1"),
+            "cli",
+            serde_json::json!({"text": "progress"}),
+        );
+        // (b) actor == session name: event emit --session (actor t/dev/2)
+        let b = ev(
+            &mut ledger,
+            EventType::WorkerMilestone,
+            None,
+            "t/dev/2",
+            serde_json::json!({"text": "note"}),
+        );
+        // (c) data.session == session name: bead.claimed session t/dev/3
+        let c = ev(
+            &mut ledger,
+            EventType::BeadClaimed,
+            Some("gc-3"),
+            "cli",
+            serde_json::json!({"session": "t/dev/3"}),
+        );
+        for e in [&a, &b, &c] {
+            patrol.observe(e);
         }
-        let seq = ledger
-            .append(EventInput {
-                kind,
-                rig: Some("gc".into()),
-                actor: actor.into(),
-                bead: bead.map(str::to_owned),
-                data,
-            })
+        patrol
+            .apply_tracking(&mut ledger, ts("2026-07-07T07:05:00Z"))
             .unwrap();
-        ledger.events_range(seq, Some(seq)).unwrap().remove(0)
+
+        // every old deadline (07:10) is gone; every pushed one fires at 07:15
+        assert!(
+            patrol.fire_due(ts("2026-07-07T07:10:00Z")).is_empty(),
+            "all three deadlines must be pushed past 07:10"
+        );
+        assert_eq!(
+            patrol.fire_due(ts("2026-07-07T07:15:00Z")).len(),
+            3,
+            "each Decision-J key pushed its session's deadline to 07:15"
+        );
     }
 
     #[test]

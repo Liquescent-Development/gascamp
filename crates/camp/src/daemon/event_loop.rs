@@ -388,8 +388,9 @@ fn serve_connection(
                 Err(e) => return Err(e).context("reading a request"),
             }
         };
-        let drained =
-            drain_lines(conn, ledger, processor, runtime, clock, dispatcher, graph, patrol)?;
+        let drained = drain_lines(
+            conn, ledger, processor, runtime, clock, dispatcher, graph, patrol,
+        )?;
         if let Some(terminal) = drained {
             return Ok(terminal);
         }
@@ -456,8 +457,7 @@ fn drain_lines(
                 // leaves the cursor before the failing event — surfaced,
                 // never skipped; the next wake retries.
                 let ack = respond(&mut conn.stream, &Response::Ok { ok: true });
-                if let Err(e) =
-                    settle(ledger, processor, runtime, clock, dispatcher, graph, patrol)
+                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol)
                 {
                     eprintln!("campd: poke processing failed: {e:#}");
                 }
@@ -513,7 +513,8 @@ fn drain_lines(
                     }
                 };
                 respond(&mut conn.stream, &response)?;
-                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, patrol) {
+                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol)
+                {
                     eprintln!("campd: adopt settle failed: {e:#}");
                 }
             }
@@ -685,7 +686,10 @@ mod tests {
         assert_eq!(min_deadline(a, b), a);
         assert_eq!(min_deadline(b, a), a);
         // the three-source composition: earliest of all three
-        assert_eq!(min_deadline(min_deadline(a, b), Some(Duration::from_secs(2))), Some(Duration::from_secs(2)));
+        assert_eq!(
+            min_deadline(min_deadline(a, b), Some(Duration::from_secs(2))),
+            Some(Duration::from_secs(2))
+        );
     }
 
     /// Phase 11 wiring pin: a due stall declares agent.stalled on the wake
@@ -738,6 +742,7 @@ mod tests {
         );
         let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
         let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config);
+        let mut graph = GraphRuntime::new(dir.path().to_path_buf(), &config);
 
         // first settle: observe the woke row, arm the timer
         settle(
@@ -746,6 +751,7 @@ mod tests {
             &mut runtime,
             &clock,
             &mut dispatcher,
+            &mut graph,
             &mut patrol,
         )
         .unwrap();
@@ -771,6 +777,7 @@ mod tests {
             &mut runtime,
             &clock,
             &mut dispatcher,
+            &mut graph,
             &mut patrol,
         )
         .unwrap();
@@ -926,6 +933,8 @@ mod tests {
         )
         .unwrap();
         let mut graph = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config);
         let mut dispatcher = Dispatcher::new(
             crate::campdir::CampDir {
                 root: dir.path().to_path_buf(),
@@ -940,6 +949,7 @@ mod tests {
             &clock,
             &mut dispatcher,
             &mut graph,
+            &mut patrol,
         )
         .expect("settle must return despite the regenerative order");
 
@@ -975,6 +985,7 @@ mod tests {
             &clock,
             &mut dispatcher,
             &mut graph,
+            &mut patrol,
         )
         .unwrap();
         assert_eq!(
