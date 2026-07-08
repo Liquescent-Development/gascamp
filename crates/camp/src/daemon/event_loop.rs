@@ -181,7 +181,7 @@ pub fn run(
         // agent.stalled lands durably here; the settle executes the
         // queued ladder actions.
         let stall_fires = patrol.fire_due(now);
-        wake_ledger_work |= patrol.declare_stalls(ledger, &stall_fires)?;
+        wake_ledger_work |= patrol.declare_stalls(ledger, &stall_fires, now)?;
         for event in events.iter() {
             match event.token() {
                 LISTENER => loop {
@@ -760,7 +760,11 @@ mod tests {
             .unwrap();
         let stall_fires = patrol.fire_due(later);
         assert_eq!(stall_fires.len(), 1, "the 10m default threshold fired");
-        assert!(patrol.declare_stalls(&mut ledger, &stall_fires).unwrap());
+        assert!(
+            patrol
+                .declare_stalls(&mut ledger, &stall_fires, later)
+                .unwrap()
+        );
         settle(
             &mut ledger,
             &mut processor,

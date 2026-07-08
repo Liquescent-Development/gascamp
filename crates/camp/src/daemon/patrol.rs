@@ -58,8 +58,11 @@ struct Tracked {
     /// The resolved base threshold (agent override or camp default);
     /// the ladder's backoff scales it per restart.
     base_threshold: Option<SignedDuration>, // resolved at apply_tracking
-    /// Agent stall_after string, resolved lazily OUTSIDE the cursor txn.
-    watch_registered: bool,
+    /// The CANONICAL transcript path the watch filter is keyed on: the
+    /// watch backend (FSEvents/inotify) reports canonicalized paths, and
+    /// tempdirs/symlinked homes would otherwise never match (macOS /var →
+    /// /private/var). Set at apply_tracking; used to unwatch.
+    watch_key: Option<PathBuf>,
 }
 
 /// Shared with the notify callback thread (the orders-watch mold, plus a
@@ -76,8 +79,15 @@ pub struct WatchFilter {
 /// agent-file I/O live there).
 #[derive(Debug)]
 enum TrackOp {
-    Track { session: String, tracked: Tracked },
-    Untrack { session: String },
+    // boxed: Tracked is ~230 bytes and Untrack is a bare String
+    // (clippy::large_enum_variant)
+    Track {
+        session: String,
+        tracked: Box<Tracked>,
+    },
+    Untrack {
+        session: String,
+    },
 }
 
 /// Ladder actions queued by `declare_stalls` (after the durable
@@ -85,10 +95,27 @@ enum TrackOp {
 /// by `execute_pending` (Task 11.11).
 #[derive(Debug, PartialEq)]
 pub(super) enum PendingAction {
-    Nudge { session: String, cause_seq: Seq },
-    Restart { session: String, cause_seq: Seq },
-    Release { bead: String },
-    KillReleased { session: String },
+    Nudge {
+        session: String,
+        cause_seq: Seq,
+    },
+    Restart {
+        session: String,
+        cause_seq: Seq,
+    },
+    /// Re-hook the bead after a patrol-caused crash: a TARGETED dispatch
+    /// (Dispatcher::dispatch_bead) — the general dispatchable set
+    /// deliberately excludes ever-sessioned beads (Phase 8 decision C) so
+    /// organic crashes cannot hot-loop; the ladder budget bounds these.
+    Respawn {
+        bead: String,
+    },
+    Release {
+        bead: String,
+    },
+    KillReleased {
+        session: String,
+    },
 }
 
 pub struct PatrolRuntime {
@@ -214,6 +241,19 @@ impl PatrolRuntime {
             }
             EventType::SessionStopped | EventType::SessionCrashed => {
                 if let Some(name) = event.data["name"].as_str() {
+                    // A crash PATROL caused re-hooks the bead (spec §10.2
+                    // "restart (kill, respawn, re-hook the bead)"): queue
+                    // the targeted respawn before the row untracks.
+                    if event.kind == EventType::SessionCrashed
+                        && event.data["reason"]
+                            .as_str()
+                            .is_some_and(|r| r.starts_with("patrol restart"))
+                        && let Some(t) = self.tracked.get(name)
+                    {
+                        self.pending.push(PendingAction::Respawn {
+                            bead: t.bead.clone(),
+                        });
+                    }
                     self.track_ops.push(TrackOp::Untrack {
                         session: name.to_owned(),
                     });
@@ -274,7 +314,7 @@ impl PatrolRuntime {
         };
         self.track_ops.push(TrackOp::Track {
             session: name.to_owned(),
-            tracked: Tracked {
+            tracked: Box::new(Tracked {
                 bead: bead.to_owned(),
                 agent: agent.to_owned(),
                 rig: data["rig"].as_str().map(str::to_owned),
@@ -283,8 +323,8 @@ impl PatrolRuntime {
                 worktree: data["worktree"].as_str().map(PathBuf::from),
                 owned,
                 base_threshold: None,
-                watch_registered: false,
-            },
+                watch_key: None,
+            }),
         });
     }
 
@@ -312,7 +352,7 @@ impl PatrolRuntime {
         };
         self.track_ops.push(TrackOp::Track {
             session: row.name.clone(),
-            tracked: Tracked {
+            tracked: Box::new(Tracked {
                 bead: bead.to_owned(),
                 agent: row.agent.clone(),
                 rig: row.rig.clone(),
@@ -321,8 +361,8 @@ impl PatrolRuntime {
                 worktree: row.worktree.as_deref().map(PathBuf::from),
                 owned,
                 base_threshold: None,
-                watch_registered: false,
-            },
+                watch_key: None,
+            }),
         });
     }
 
@@ -369,7 +409,7 @@ impl PatrolRuntime {
                     self.watch_transcript(ledger, &session, &mut tracked)?;
                     let effective = self.ladder.effective_threshold(&tracked.bead, base);
                     self.timers.arm(&session, TimerKind::Stall, effective, now);
-                    self.tracked.insert(session, tracked);
+                    self.tracked.insert(session, *tracked);
                 }
                 TrackOp::Untrack { session } => {
                     self.timers.disarm(&session);
@@ -399,11 +439,23 @@ impl PatrolRuntime {
         // Ahead of claude: the project dir must exist to be watchable.
         std::fs::create_dir_all(&parent)
             .with_context(|| format!("creating {}", parent.display()))?;
+        // The watch backend reports CANONICAL paths (macOS /var →
+        // /private/var, symlinked homes): key the filter on them or the
+        // touches never match.
+        let parent = parent
+            .canonicalize()
+            .with_context(|| format!("canonicalizing {}", parent.display()))?;
+        let file_name = tracked
+            .transcript_path
+            .file_name()
+            .context("transcript path has no file name")?;
+        let watch_key = parent.join(file_name);
         lock_unpoisoned(&self.filter)
             .registered
-            .insert(tracked.transcript_path.clone());
+            .insert(watch_key.clone());
         self.path_to_session
-            .insert(tracked.transcript_path.clone(), session.to_owned());
+            .insert(watch_key.clone(), session.to_owned());
+        tracked.watch_key = Some(watch_key);
         let count = self.watched_dirs.entry(parent.clone()).or_insert(0);
         *count += 1;
         if *count == 1
@@ -425,16 +477,16 @@ impl PatrolRuntime {
                 }),
             })?;
         }
-        tracked.watch_registered = true;
         Ok(())
     }
 
     fn unwatch_transcript(&mut self, tracked: &Tracked) {
-        lock_unpoisoned(&self.filter)
-            .registered
-            .remove(&tracked.transcript_path);
-        self.path_to_session.remove(&tracked.transcript_path);
-        let Some(parent) = tracked.transcript_path.parent() else {
+        let Some(watch_key) = tracked.watch_key.as_ref() else {
+            return; // never registered (apply_tracking not reached)
+        };
+        lock_unpoisoned(&self.filter).registered.remove(watch_key);
+        self.path_to_session.remove(watch_key);
+        let Some(parent) = watch_key.parent() else {
             return;
         };
         if let Some(count) = self.watched_dirs.get_mut(parent) {
@@ -485,8 +537,15 @@ impl PatrolRuntime {
     /// Declare due stall fires durably — one agent.stalled each, action
     /// chosen by the ladder — and queue the actions for execute_pending.
     /// The declaration precedes the action (the declare_cron_fires mold).
+    /// `now` is the wake's instant: re-arms anchor at max(deadline, now)
+    /// so a lagging wake still grants full revival grace after a nudge.
     /// Returns whether anything was appended (drives wake_ledger_work).
-    pub fn declare_stalls(&mut self, ledger: &mut Ledger, fires: &[StallFire]) -> Result<bool> {
+    pub fn declare_stalls(
+        &mut self,
+        ledger: &mut Ledger,
+        fires: &[StallFire],
+        now: Timestamp,
+    ) -> Result<bool> {
         let mut declared = false;
         for fire in fires {
             match fire.kind {
@@ -541,7 +600,7 @@ impl PatrolRuntime {
                         session: fire.session.clone(),
                         cause_seq: seq,
                     });
-                    self.rearm(&fire.session, &tracked, fire.deadline);
+                    self.rearm(&fire.session, &tracked, fire.deadline.max(now));
                 }
                 "restart" => {
                     self.pending.push(PendingAction::Restart {
@@ -551,20 +610,21 @@ impl PatrolRuntime {
                     // Re-armed at the (now doubled) effective threshold: a
                     // successful kill untracks via the crash observation; a
                     // failed non-child kill retries at the next fire.
-                    self.rearm(&fire.session, &tracked, fire.deadline);
+                    self.rearm(&fire.session, &tracked, fire.deadline.max(now));
                 }
                 _ => {
                     // annotate: re-arm, nothing mechanical beyond the event
-                    self.rearm(&fire.session, &tracked, fire.deadline);
+                    self.rearm(&fire.session, &tracked, fire.deadline.max(now));
                 }
             }
         }
         Ok(declared)
     }
 
-    /// Re-arm anchored at the fired deadline (explicit-time discipline,
-    /// plan Decision A): the next silence window starts where the last
-    /// one demonstrably ended, deterministic under test.
+    /// Re-arm anchored at max(fired deadline, wake now) — explicit-time
+    /// discipline (plan Decision A), and a lagging wake still grants a
+    /// delivered nudge the full threshold of revival grace before any
+    /// escalation.
     fn rearm(&mut self, session: &str, tracked: &Tracked, at: Timestamp) {
         let base = tracked.base_threshold.unwrap_or(self.config.stall_after);
         let effective = self.ladder.effective_threshold(&tracked.bead, base);
@@ -588,6 +648,9 @@ impl PatrolRuntime {
                 }
                 PendingAction::Restart { session, cause_seq } => {
                     self.do_restart(ledger, dispatcher, &session, cause_seq)?;
+                }
+                PendingAction::Respawn { bead } => {
+                    dispatcher.dispatch_bead(ledger, &bead)?;
                 }
                 PendingAction::Release { bead } => {
                     if let Some(session) =
@@ -1242,14 +1305,21 @@ mod tests {
             transcript.parent().unwrap().is_dir(),
             "the watch dir is created ahead of claude"
         );
+        let canonical = transcript
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(transcript.file_name().unwrap());
         assert!(
             patrol
                 .filter_slot()
                 .lock()
                 .unwrap()
                 .registered
-                .contains(&transcript),
-            "the transcript path is registered for the callback filter"
+                .contains(&canonical),
+            "the CANONICAL transcript path is registered (watch backends \
+             report canonical paths)"
         );
         // default threshold: fires at stall_after (10m), not before
         assert!(patrol.fire_due(ts("2026-07-07T07:09:59Z")).is_empty());
@@ -1395,9 +1465,16 @@ mod tests {
             .apply_tracking(&mut ledger, ts("2026-07-07T07:00:00Z"))
             .unwrap();
 
-        // the notify callback observed activity on the registered path...
+        // the notify callback observed activity on the registered path —
+        // reported CANONICALIZED, as the real backends do...
+        let canonical = transcript
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(transcript.file_name().unwrap());
         let mut hit = notify::Event::new(notify::EventKind::Any);
-        hit.paths.push(transcript.clone());
+        hit.paths.push(canonical);
         on_watch_event(Ok(hit), None, &patrol.filter_slot());
         // ...and an unrelated path, which must not reset anything
         let mut other = notify::Event::new(notify::EventKind::Any);
@@ -1446,7 +1523,11 @@ mod tests {
 
         // first fire: nudge
         let fires = patrol.fire_due(ts("2026-07-07T07:10:00Z"));
-        assert!(patrol.declare_stalls(&mut ledger, &fires).unwrap());
+        assert!(
+            patrol
+                .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:10:00Z"))
+                .unwrap()
+        );
         let stalled = stalled_events(&ledger);
         assert_eq!(stalled.len(), 1);
         assert_eq!(stalled[0].data["action"], "nudge");
@@ -1460,7 +1541,9 @@ mod tests {
         // still silent: the re-armed timer fires again → restart
         let fires = patrol.fire_due(ts("2026-07-07T07:20:00Z"));
         assert_eq!(fires.len(), 1, "the nudge declaration re-armed the timer");
-        patrol.declare_stalls(&mut ledger, &fires).unwrap();
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:20:00Z"))
+            .unwrap();
         let stalled = stalled_events(&ledger);
         assert_eq!(stalled.len(), 2);
         assert_eq!(stalled[1].data["action"], "restart");
@@ -1482,7 +1565,9 @@ mod tests {
             .unwrap();
 
         let fires = patrol.fire_due(ts("2026-07-07T07:10:00Z"));
-        patrol.declare_stalls(&mut ledger, &fires).unwrap();
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:10:00Z"))
+            .unwrap();
         // the settle's catch-up now observes the just-appended declaration
         let declared = stalled_events(&ledger).remove(0);
         patrol.observe(&declared);
@@ -1493,7 +1578,9 @@ mod tests {
         // on_activity (exclusive dispatch): covered below by escalation.
         let fires = patrol.fire_due(ts("2026-07-07T07:20:00Z"));
         assert_eq!(fires.len(), 1);
-        patrol.declare_stalls(&mut ledger, &fires).unwrap();
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:20:00Z"))
+            .unwrap();
         let stalled = stalled_events(&ledger);
         assert_eq!(
             stalled[1].data["action"], "restart",
@@ -1542,9 +1629,13 @@ mod tests {
             .apply_tracking(&mut ledger, ts("2026-07-07T07:02:00Z"))
             .unwrap();
         let fires = patrol.fire_due(ts("2026-07-07T07:12:00Z"));
-        patrol.declare_stalls(&mut ledger, &fires).unwrap(); // nudge
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:12:00Z"))
+            .unwrap(); // nudge
         let fires = patrol.fire_due(ts("2026-07-07T07:22:00Z"));
-        patrol.declare_stalls(&mut ledger, &fires).unwrap(); // exhausted
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:22:00Z"))
+            .unwrap(); // exhausted
         let stalled = stalled_events(&ledger);
         assert_eq!(stalled.last().unwrap().data["action"], "exhausted");
         assert_eq!(
@@ -1577,7 +1668,7 @@ mod tests {
         {
             let fires = patrol.fire_due(ts(at));
             assert_eq!(fires.len(), 1, "round {i}: annotate re-arms");
-            patrol.declare_stalls(&mut ledger, &fires).unwrap();
+            patrol.declare_stalls(&mut ledger, &fires, ts(at)).unwrap();
         }
         for e in stalled_events(&ledger) {
             assert_eq!(
@@ -1752,7 +1843,9 @@ mod tests {
         // the ladder advanced: the next fire is a restart
         let fires = patrol.fire_due(ts("2026-07-07T07:30:00Z"));
         assert_eq!(fires.len(), 1, "nudge_failed re-armed the timer");
-        patrol.declare_stalls(&mut ledger, &fires).unwrap();
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:30:00Z"))
+            .unwrap();
         assert_eq!(
             stalled_events(&ledger).last().unwrap().data["action"],
             "restart"
@@ -2073,6 +2166,8 @@ mod tests {
             vec!["init", "-b", "main"],
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
+            // hermetic: never depend on the host's signing agent
+            vec!["config", "commit.gpgsign", "false"],
             vec!["commit", "--allow-empty", "-m", "init"],
         ] {
             let out = std::process::Command::new("git")
@@ -2262,7 +2357,9 @@ mod tests {
         assert_eq!(fires[0].kind, TimerKind::Release);
 
         // the grace fires: kill_released -> reap -> stopped with reason
-        patrol.declare_stalls(&mut ledger, &fires).unwrap();
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:20:30Z"))
+            .unwrap();
         patrol
             .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:30Z"))
             .unwrap();

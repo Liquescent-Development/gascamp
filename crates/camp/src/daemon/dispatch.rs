@@ -333,6 +333,37 @@ impl Dispatcher {
         }
     }
 
+    /// Targeted respawn for a patrol restart (Phase 11, spec §10.2): the
+    /// general dispatchable set deliberately excludes ever-sessioned beads
+    /// (Phase 8 decision C — organic crashes must not hot-loop until the
+    /// Phase 9 retry machinery routes them); a PATROL-caused crash is
+    /// budget-bounded by the ladder, so its bead re-hooks through this
+    /// explicit path instead. A cap-full dispatcher records the deferral
+    /// as dispatch.failed — evented, never silent (invariant 5).
+    pub fn dispatch_bead(&mut self, ledger: &mut Ledger, bead_id: &str) -> Result<()> {
+        let Some(bead) = ledger.get_bead(bead_id)? else {
+            return Ok(()); // gone from the ledger: nothing to re-hook
+        };
+        if bead.status != "open" {
+            return Ok(()); // closed or re-claimed since the kill
+        }
+        if self.children.len() >= self.config.dispatch.max_workers {
+            ledger.append(EventInput {
+                kind: EventType::DispatchFailed,
+                rig: Some(bead.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(bead.id.clone()),
+                data: serde_json::json!({
+                    "reason": "patrol respawn deferred: worker cap reached",
+                }),
+            })?;
+            return Ok(());
+        }
+        // a patrol respawn supersedes an earlier same-life dispatch failure
+        self.failed.remove(bead_id);
+        self.dispatch_one(ledger, &bead)
+    }
+
     /// One bead → one worker. Per-bead failures append dispatch.failed and
     /// return Ok — a broken bead must not stall its neighbors; a ledger
     /// failure is the only Err.
