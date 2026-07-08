@@ -34,6 +34,12 @@ impl CampDir {
         self.root.join("worktrees")
     }
 
+    /// Cooked runs (spec §8.2) — the one definition of the subdir lives in
+    /// camp-core (`RUNS_SUBDIR`), shared with `orders::execute_fire`.
+    pub fn runs_path(&self) -> PathBuf {
+        self.root.join(camp_core::formula::runtime::RUNS_SUBDIR)
+    }
+
     pub fn resolve(flag: Option<&Path>) -> Result<CampDir> {
         if let Some(dir) = flag {
             return Self::at(dir);

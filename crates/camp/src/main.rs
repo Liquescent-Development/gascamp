@@ -129,6 +129,12 @@ enum Command {
         /// Close note (searchable)
         #[arg(long)]
         reason: Option<String>,
+        /// Classify this failure as transient (retry vocabulary, spec §8.2)
+        #[arg(long)]
+        transient: bool,
+        /// Structured step output: a JSON file path, or "-" for stdin
+        #[arg(long, value_name = "FILE")]
+        output_json: Option<String>,
     },
     /// List beads
     Ls {
@@ -145,16 +151,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Sling a bead: create it and have campd dispatch a worker (Tier 0)
+    /// Sling work: a bare title (Tier 0) or --formula (cook a run)
     Sling {
-        /// Bead title — what needs doing
-        title: String,
+        /// Bead title — what needs doing (Tier 0)
+        #[arg(required_unless_present = "formula", conflicts_with = "formula")]
+        title: Option<String>,
         /// Route to a specific pack agent (default: the rig's or camp's default_agent)
         #[arg(long)]
         agent: Option<String>,
         /// Rig (default: the only configured rig)
         #[arg(long)]
         rig: Option<String>,
+        /// Cook <camp>/formulas/<name>.toml into a run (spec §8.2)
+        #[arg(long, value_name = "NAME")]
+        formula: Option<String>,
     },
     /// Show a bead's current state and full event history
     Show {
@@ -370,9 +380,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             bead,
             outcome,
             reason,
+            transient,
+            output_json,
         } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
-            cmd::close::run(&camp, bead, outcome, reason)
+            cmd::close::run(&camp, bead, outcome, reason, transient, output_json)
         }
         Command::Ls {
             ready,
@@ -383,9 +395,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::ls::run(&camp, ready, mine, rig, json)
         }
-        Command::Sling { title, agent, rig } => {
+        Command::Sling {
+            title,
+            agent,
+            rig,
+            formula,
+        } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
-            cmd::sling::run(&camp, title, agent, rig)
+            cmd::sling::run(&camp, title, agent, rig, formula)
         }
         Command::Show { bead } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
