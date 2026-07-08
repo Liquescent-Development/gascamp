@@ -12,7 +12,11 @@ fn camp() -> Command {
 #[test]
 fn e2e_guarded_formula_is_a_valid_subset() {
     let dir = tempfile::tempdir().unwrap();
-    camp().current_dir(dir.path()).arg("init").assert().success();
+    camp()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .success();
 
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
