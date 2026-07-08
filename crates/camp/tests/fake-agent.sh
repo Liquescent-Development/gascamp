@@ -55,4 +55,35 @@ if [[ -n "${FAKE_AGENT_HOLD_DIR:-}" ]]; then
   done
 fi
 
-"$CAMP_BIN" close "$CAMP_BEAD" --outcome "${FAKE_AGENT_OUTCOME:-pass}" --reason "fake agent done"
+# Close spec (Phase 9): FAKE_AGENT_PLAN names a file whose FIRST line is
+# consumed per invocation — "pass", "fail", or "fail-transient", optionally
+# followed by "output=<json-file>". Attempts of one looping step are
+# strictly sequential (the next attempt exists only after the previous
+# close), so the pop is race-free in these tests. An empty/missing plan
+# falls through to FAKE_AGENT_OUTCOME.
+outcome="${FAKE_AGENT_OUTCOME:-pass}"
+transient=""
+output_json="${FAKE_AGENT_OUTPUT_JSON:-}"
+if [[ -n "${FAKE_AGENT_PLAN:-}" && -s "$FAKE_AGENT_PLAN" ]]; then
+  line="$(head -n 1 "$FAKE_AGENT_PLAN")"
+  tail -n +2 "$FAKE_AGENT_PLAN" > "$FAKE_AGENT_PLAN.tmp"
+  mv "$FAKE_AGENT_PLAN.tmp" "$FAKE_AGENT_PLAN"
+  for word in $line; do
+    case "$word" in
+      pass) outcome="pass" ;;
+      fail) outcome="fail" ;;
+      fail-transient) outcome="fail"; transient="yes" ;;
+      output=*) output_json="${word#output=}" ;;
+      *) echo "fake-agent: unknown plan word $word" >&2; exit 96 ;;
+    esac
+  done
+fi
+
+close_args=(close "$CAMP_BEAD" --outcome "$outcome" --reason "fake agent done")
+if [[ -n "$transient" ]]; then
+  close_args+=(--transient)
+fi
+if [[ -n "$output_json" ]]; then
+  close_args+=(--output-json "$output_json")
+fi
+"$CAMP_BIN" "${close_args[@]}"

@@ -352,3 +352,128 @@ fn cook_atomicity_fault_injection_leaves_nothing() {
     let cooked = cook(&mut ledger, &formula, &runs, &rig(), "cli").unwrap();
     assert_eq!(cooked.root_bead, "gc-3");
 }
+
+// ---- Phase 9 Task 3: cook options (vars, root linkage) --------------------
+
+#[test]
+fn cook_with_substitutes_vars_and_links_the_root() {
+    use camp_core::formula::{CookOptions, cook_with};
+    let (dir, mut ledger) = temp_ledger();
+    // a pre-existing bead the child root will need (the previous bond child)
+    ledger
+        .append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"title": "previous child root"}),
+        })
+        .unwrap();
+
+    let source = "formula = \"child\"\n\n[[steps]]\nid = \"work\"\n\
+                  title = \"Handle {name} at {position}\"\ndescription = \"for {name}\"\n";
+    let path = dir.path().join("child.toml");
+    std::fs::write(&path, source).unwrap();
+    let formula = parse_and_validate(&path).unwrap();
+
+    let mut vars = std::collections::BTreeMap::new();
+    vars.insert("name".to_owned(), "alpha".to_owned());
+    vars.insert("position".to_owned(), "0".to_owned());
+    let opts = CookOptions {
+        vars,
+        extra_root_needs: vec!["gc-1".to_owned()],
+        extra_root_labels: vec!["bond:gc-1:0".to_owned()],
+    };
+    let runs = dir.path().join("runs");
+    let cooked = cook_with(&mut ledger, &formula, &runs, &rig(), "campd", &opts).unwrap();
+
+    // vars substituted into the step bead's title and description
+    let step = ledger
+        .get_bead(&cooked.step_beads["work"])
+        .unwrap()
+        .unwrap();
+    assert_eq!(step.title, "Handle alpha at 0");
+    let events = ledger.events_range(1, None).unwrap();
+    let step_created = events
+        .iter()
+        .find(|e| e.kind == EventType::BeadCreated && e.bead.as_deref() == Some(step.id.as_str()))
+        .unwrap();
+    assert_eq!(step_created.data["description"], "for alpha");
+
+    // root carries the bond label and the extra needs edge
+    let root = ledger.get_bead(&cooked.root_bead).unwrap().unwrap();
+    assert_eq!(root.labels, vec!["bond:gc-1:0".to_owned()]);
+    let root_created = events
+        .iter()
+        .find(|e| e.kind == EventType::BeadCreated && e.bead.as_deref() == Some(root.id.as_str()))
+        .unwrap();
+    let needs: Vec<String> = root_created.data["needs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    assert!(needs.contains(&"gc-1".to_owned()), "needs: {needs:?}");
+    assert!(
+        needs.contains(&cooked.step_beads["work"]),
+        "needs: {needs:?}"
+    );
+
+    // the pinned file stays byte-verbatim (materialization property)
+    let pinned = std::fs::read_to_string(runs.join(&cooked.run_id).join("child.toml")).unwrap();
+    assert_eq!(pinned, source);
+
+    // the manifest records the substituted vars
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(runs.join(&cooked.run_id).join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["vars"]["name"], "alpha");
+
+    // the loaded RunContext round-trips (runtime consumes bond manifests too)
+    let ctx = camp_core::formula::runtime::load_run(&runs, &cooked.run_id).unwrap();
+    assert_eq!(ctx.anchors, cooked.step_beads);
+
+    // refold property holds over the whole story
+    assert!(ledger.refold_check().unwrap().drift.is_empty());
+}
+
+/// Review MEDIUM 2: a var VALUE that literally contains another var's
+/// {token} (worker output is arbitrary text) must never be re-substituted
+/// — single-pass scanning, not sequential replace.
+#[test]
+fn substitution_never_reinterprets_inserted_values_as_templates() {
+    use camp_core::formula::{CookOptions, cook_with};
+    let (dir, mut ledger) = temp_ledger();
+    let source = "formula = \"child\"\n\n[[steps]]\nid = \"work\"\n\
+                  title = \"Handle {name} at {position}\"\n";
+    let path = dir.path().join("child.toml");
+    std::fs::write(&path, source).unwrap();
+    let formula = parse_and_validate(&path).unwrap();
+
+    let mut vars = std::collections::BTreeMap::new();
+    // worker output embedded in a var value happens to contain "{position}"
+    vars.insert("name".to_owned(), "literal {position} inside".to_owned());
+    vars.insert("position".to_owned(), "0".to_owned());
+    let opts = CookOptions {
+        vars,
+        ..Default::default()
+    };
+    let cooked = cook_with(
+        &mut ledger,
+        &formula,
+        &dir.path().join("runs"),
+        &rig(),
+        "campd",
+        &opts,
+    )
+    .unwrap();
+    let step = ledger
+        .get_bead(&cooked.step_beads["work"])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        step.title, "Handle literal {position} inside at 0",
+        "inserted values are worker output, not template syntax"
+    );
+}

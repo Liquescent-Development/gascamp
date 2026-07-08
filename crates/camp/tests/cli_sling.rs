@@ -160,3 +160,86 @@ fn explicit_agent_flag_outranks_everything() {
     assert_eq!(created["data"]["assignee"], "special");
     stop_campd(&root);
 }
+
+// ---- Phase 9 Task 4: sling --formula (spec §8.2 cooking surface) ----------
+
+#[test]
+fn sling_formula_cooks_a_run_and_pins_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = scaffold(dir.path(), Some("dev"), None);
+    write_agent(&root, "dev");
+    std::fs::create_dir_all(root.join("formulas")).unwrap();
+    std::fs::write(
+        root.join("formulas/one-step.toml"),
+        "formula = \"one-step\"\n\n[[steps]]\nid = \"s1\"\ntitle = \"one step\"\n",
+    )
+    .unwrap();
+    let out = camp(&root, &["sling", "--formula", "one-step"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    // prints "<run_id> root <root-bead>"
+    let mut words = stdout.split_whitespace();
+    let run_id = words.next().unwrap().to_owned();
+    assert_eq!(words.next(), Some("root"));
+    let root_bead = words.next().unwrap().to_owned();
+    assert!(root_bead.starts_with("gc-"), "{stdout}");
+    // pinned run dir exists with manifest + formula copy
+    assert!(
+        root.join("runs")
+            .join(&run_id)
+            .join("manifest.json")
+            .exists()
+    );
+    assert!(
+        root.join("runs")
+            .join(&run_id)
+            .join("one-step.toml")
+            .exists()
+    );
+    // run.cooked landed with actor cli
+    let events = camp(&root, &["events", "--json"]);
+    let cooked = String::from_utf8(events.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e["type"] == "run.cooked")
+        .expect("run.cooked event");
+    assert_eq!(cooked["actor"], "cli");
+    assert_eq!(cooked["data"]["run_id"], run_id.as_str());
+}
+
+#[test]
+fn sling_formula_errors_name_the_formula() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = scaffold(dir.path(), Some("dev"), None);
+    write_agent(&root, "dev");
+    // missing file
+    let out = camp(&root, &["sling", "--formula", "nope"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("nope"), "must name the formula: {err}");
+    // invalid formula (city-only construct)
+    std::fs::create_dir_all(root.join("formulas")).unwrap();
+    std::fs::write(
+        root.join("formulas/bad.toml"),
+        "formula = \"bad\"\npour = true\n\n[[steps]]\nid = \"s\"\ntitle = \"t\"\n",
+    )
+    .unwrap();
+    let out = camp(&root, &["sling", "--formula", "bad"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("bad"), "must name the formula: {err}");
+}
+
+#[test]
+fn sling_rejects_formula_combined_with_a_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = scaffold(dir.path(), Some("dev"), None);
+    write_agent(&root, "dev");
+    let out = camp(&root, &["sling", "some title", "--formula", "one-step"]);
+    assert!(!out.status.success());
+}

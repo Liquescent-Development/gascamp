@@ -21,7 +21,7 @@ use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
 
 use super::cursor::{self, ReadinessProcessor};
-use super::dispatch::{Dispatcher, ReapFailure};
+use super::dispatch::{Dispatcher, GraphRuntime, ReapFailure};
 use super::orders::{self, OrdersRuntime};
 use super::socket::{Request, Response};
 
@@ -87,6 +87,7 @@ pub fn run(
     clock: &dyn Clock,
     config_rx: &mut mio::unix::pipe::Receiver,
     dispatcher: &mut Dispatcher,
+    graph: &mut GraphRuntime,
 ) -> Result<()> {
     let mut poll = Poll::new().context("creating the poller")?;
     let mut events = Events::with_capacity(64);
@@ -113,7 +114,14 @@ pub fn run(
 
     let mut last_seen = Timestamp::now();
     loop {
-        let timeout = runtime.poll_timeout(Timestamp::now());
+        // Decision 11c: THE poll-timeout composition point. Each deadline
+        // source converts its own deadline to a Duration-from-now (cron is
+        // wall-anchored, checks are monotonic); phase-11's stall timers
+        // join this same combinator at rebase.
+        let timeout = min_deadline(
+            runtime.poll_timeout(Timestamp::now()),
+            graph.poll_timeout(Instant::now()),
+        );
         let wall_before = Timestamp::now();
         let mono_before = Instant::now();
         if let Err(e) = poll.poll(&mut events, timeout) {
@@ -146,6 +154,10 @@ pub fn run(
             runtime.fire_due(now)
         };
         last_seen = now;
+        // Decision 11d: enforce check deadlines on every wake (a
+        // deadline-only wake has no other trigger). Kills convert to
+        // SIGCHLD -> reap_checks -> timed-out check.failed verdicts.
+        graph.kill_expired(Instant::now());
         // Declare the fires (durable first); the settle below cooks them.
         // A ledger that refuses the declaration is fatal — campd must not
         // run automation it cannot record.
@@ -179,7 +191,7 @@ pub fn run(
                     // child must not take campd down, and unrecorded exits
                     // are retried next wake (try_wait re-returns the
                     // status).
-                    match reap_and_refill(ledger, processor, runtime, clock, dispatcher) {
+                    match reap_and_refill(ledger, processor, runtime, clock, dispatcher, graph) {
                         Ok(()) => self_raise_budget = SELF_RAISE_BUDGET,
                         Err(failure) => {
                             eprintln!("campd: reap failed: {failure}");
@@ -238,6 +250,7 @@ pub fn run(
                         runtime,
                         clock,
                         dispatcher,
+                        graph,
                         MAX_REQUEST_BYTES,
                     ) {
                         Ok(ConnState::Open) => {
@@ -269,7 +282,7 @@ pub fn run(
             // error re-surfaces on the next poke. The joint settle also
             // dispatches whatever the cooks made ready (Phase 8), in this
             // same wake.
-            if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher) {
+            if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph) {
                 eprintln!("campd: settle failed: {e:#}");
             }
         }
@@ -319,6 +332,7 @@ fn serve_connection(
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
+    graph: &mut GraphRuntime,
     max_request_bytes: usize,
 ) -> Result<ConnState> {
     let mut chunk = [0u8; 4096];
@@ -339,7 +353,7 @@ fn serve_connection(
                 Err(e) => return Err(e).context("reading a request"),
             }
         };
-        let drained = drain_lines(conn, ledger, processor, runtime, clock, dispatcher)?;
+        let drained = drain_lines(conn, ledger, processor, runtime, clock, dispatcher, graph)?;
         if let Some(terminal) = drained {
             return Ok(terminal);
         }
@@ -372,6 +386,7 @@ fn serve_connection(
 /// Answer every complete line in the buffer. Returns `Some(state)` when a
 /// line demands the connection (or the daemon) wind down, `None` to keep
 /// serving.
+#[allow(clippy::too_many_arguments)]
 fn drain_lines(
     conn: &mut Conn,
     ledger: &mut Ledger,
@@ -379,6 +394,7 @@ fn drain_lines(
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
+    graph: &mut GraphRuntime,
 ) -> Result<Option<ConnState>> {
     while let Some(newline) = conn.buf.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = conn.buf.drain(..=newline).collect();
@@ -403,7 +419,7 @@ fn drain_lines(
                 // leaves the cursor before the failing event — surfaced,
                 // never skipped; the next wake retries.
                 let ack = respond(&mut conn.stream, &Response::Ok { ok: true });
-                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher) {
+                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph) {
                     eprintln!("campd: poke processing failed: {e:#}");
                 }
                 if let Err(e) = ack {
@@ -477,10 +493,14 @@ fn reap_and_refill(
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
+    graph: &mut GraphRuntime,
 ) -> Result<(), ReapFailure> {
     dispatcher.reap(ledger)?;
+    // Decision 11e: check-script children ride the same SIGCHLD pipe;
+    // their verdict batches land before the settle that acts on them.
+    graph.reap_checks(ledger)?;
     // settle failures are ledger-side: retry-worthy, like the appends
-    settle(ledger, processor, runtime, clock, dispatcher).map_err(|error| ReapFailure {
+    settle(ledger, processor, runtime, clock, dispatcher, graph).map_err(|error| ReapFailure {
         retryable: true,
         error,
     })
@@ -502,14 +522,38 @@ pub(super) fn settle(
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
     dispatcher: &mut Dispatcher,
+    graph: &mut GraphRuntime,
 ) -> Result<()> {
+    // Decision 11f / issue #17: the fire budget spans this WHOLE
+    // invocation (every orders::settle / converge round below) — resetting
+    // any deeper lets through-converge regeneration escape the budget.
+    runtime.reset_fire_budget();
     loop {
-        orders::settle(ledger, processor, runtime, clock)?;
+        orders::settle(ledger, processor, runtime, clock, graph)?;
+        // Phase 9: drain the graph work the processor queued — spawn due
+        // check scripts, cook due bond children. Cooks append events, so
+        // the fixpoint below re-settles them in this same invocation.
+        graph.execute(ledger)?;
         dispatcher.converge(ledger)?;
         let cursor = ledger.cursor(cursor::CAMPD_CURSOR)?;
         if !ledger.has_events_past(cursor)? {
             return Ok(());
         }
+    }
+}
+
+/// The poll-timeout combinator (Decision 11c, review note 1): None = no
+/// deadline from that source; the earliest wins. Deliberately THE single
+/// composition point — new deadline sources (phase-11 stall timers) join
+/// here.
+fn min_deadline(
+    a: Option<std::time::Duration>,
+    b: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    match (a, b) {
+        (None, x) => x,
+        (x, None) => x,
+        (Some(a), Some(b)) => Some(a.min(b)),
     }
 }
 
@@ -607,6 +651,10 @@ mod tests {
         client.write_all(b"{\"op\":\"poke\",\"seq\":1}\n").unwrap();
         drop(client); // the poker vanishes before reading its ack
 
+        let mut graph = GraphRuntime::new(
+            dir.path().to_path_buf(),
+            &camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
+        );
         let state = serve_connection(
             &mut conn,
             &mut ledger,
@@ -614,6 +662,7 @@ mod tests {
             &mut runtime,
             &clock,
             &mut dispatcher,
+            &mut graph,
             1024,
         )
         .expect("a dead poker must not error the connection loop");
@@ -622,6 +671,112 @@ mod tests {
             ledger.cursor(cursor::CAMPD_CURSOR).unwrap(),
             1,
             "the settle must run even when the ack write fails"
+        );
+    }
+
+    /// Issue #17 scenario 2 — the review's Blocker B trace, pinned: an
+    /// order on event:dispatch.failed in a camp with a ROUTING HOLE
+    /// regenerates one fire per OUTER settle iteration (fire -> cook ->
+    /// converge appends dispatch.failed for the fresh step bead -> fire).
+    /// The budget only catches this because it resets per event_loop::
+    /// settle INVOCATION — a per-orders::settle reset never accumulates
+    /// (the rejected scoping; red state: this test never terminates).
+    /// Process-free: converge's prepare fails routing before any spawn.
+    #[test]
+    fn through_converge_regeneration_is_budget_bounded_and_quiesces() {
+        let dir = tempfile::tempdir().unwrap();
+        let rig = dir.path().join("repo");
+        std::fs::create_dir_all(&rig).unwrap();
+        // no step assignee, no rig/dispatch default_agent: a routing hole
+        std::fs::write(
+            dir.path().join("camp.toml"),
+            format!(
+                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n[[order]]\nname=\"resurrector\"\non=\"event:dispatch.failed\"\nformula=\"one-step\"\n",
+                rig.display()
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("formulas")).unwrap();
+        std::fs::write(
+            dir.path().join("formulas/one-step.toml"),
+            "formula = \"one-step\"\n\n[[steps]]\nid = \"s1\"\ntitle = \"one step\"\n",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        // the seed: one ready task the dispatcher cannot route
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "seed"}),
+            })
+            .unwrap();
+        let mut processor = ReadinessProcessor::default();
+        let mut runtime =
+            OrdersRuntime::build(dir.path(), Timestamp::now(), jiff::tz::TimeZone::UTC).unwrap();
+        let clock = camp_core::clock::SystemClock;
+        let config = camp_core::config::CampConfig::parse(
+            &std::fs::read_to_string(dir.path().join("camp.toml")).unwrap(),
+        )
+        .unwrap();
+        let mut graph = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        let mut dispatcher = Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            config,
+        );
+
+        settle(
+            &mut ledger,
+            &mut processor,
+            &mut runtime,
+            &clock,
+            &mut dispatcher,
+            &mut graph,
+        )
+        .expect("settle must return despite the regenerative order");
+
+        let budget_failures: Vec<_> = ledger
+            .events_of_type(EventType::OrderFailed)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.data["error"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("fire budget"))
+            })
+            .collect();
+        assert_eq!(budget_failures.len(), 1, "exactly one budget failure");
+        assert_eq!(budget_failures[0].data["order"], "resurrector");
+        let total = ledger.events_range(1, None).unwrap().len();
+        assert!(
+            total < super::super::orders::FIRE_BUDGET * 8,
+            "event growth is bounded, got {total}"
+        );
+        // true quiescence: the cursor sits on the head
+        let cursor = ledger.cursor(cursor::CAMPD_CURSOR).unwrap();
+        assert!(!ledger.has_events_past(cursor).unwrap());
+
+        // and the drip STOPS: a second invocation (fresh budget) appends
+        // nothing — suppressed matches are behind the cursor, and each
+        // cooked step already carries its per-lifetime dispatch.failed
+        let before = ledger.events_range(1, None).unwrap().len();
+        settle(
+            &mut ledger,
+            &mut processor,
+            &mut runtime,
+            &clock,
+            &mut dispatcher,
+            &mut graph,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.events_range(1, None).unwrap().len(),
+            before,
+            "a second settle invocation regenerates nothing"
         );
     }
 
@@ -696,6 +851,10 @@ mod tests {
         client.write_all(burst.as_bytes()).unwrap();
 
         // One event's worth of serving must answer every request.
+        let mut graph = GraphRuntime::new(
+            dir.path().to_path_buf(),
+            &camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
+        );
         let state = serve_connection(
             &mut conn,
             &mut ledger,
@@ -703,6 +862,7 @@ mod tests {
             &mut runtime,
             &clock,
             &mut dispatcher,
+            &mut graph,
             TEST_CAP,
         )
         .unwrap();

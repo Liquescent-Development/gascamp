@@ -31,12 +31,30 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "worker.milestone",
     "worktree.kept",
     "dispatch.failed",
+    "check.passed",
+    "check.failed",
+    "run.finalized",
 ];
 
 /// Values `bead.closed` accepts for `outcome` — a strict subset of gc's
-/// outcome vocabulary (spec §8.2).
-pub const CAMP_OUTCOMES: &[&str] = &["pass", "fail"];
+/// outcome vocabulary (spec §8.2). `skipped` is campd's finalization close
+/// for steps whose `needs` can never be satisfied (Phase 9 plan Decision 2
+/// — gc's own word for exactly this).
+pub const CAMP_OUTCOMES: &[&str] = &["pass", "fail", "skipped"];
 
-/// Values camp uses for `final_disposition` (retry exhaustion, Phase 9) — a
-/// strict subset of gc's, and exactly gc's legal `on_exhausted` values.
+/// Values `bead.closed` accepts for `final_disposition` (retry exhaustion,
+/// Phase 9) — a strict subset of gc's, and exactly gc's legal
+/// `on_exhausted` values. A close NEVER carries "pass": the run-level pass
+/// disposition lives only in `run.finalized` (CAMP_RUN_DISPOSITIONS).
 pub const CAMP_FINAL_DISPOSITIONS: &[&str] = &["hard_fail", "soft_fail"];
+
+/// Values `run.finalized` accepts for its run-level `final_disposition` — a
+/// strict subset of gc's `final_disposition` vocabulary (Phase 9 plan
+/// Decision 3 as revised per review Blocker A).
+pub const CAMP_RUN_DISPOSITIONS: &[&str] = &["pass", "hard_fail", "soft_fail"];
+
+/// Values `bead.closed` accepts for `failure_class` (spec §8.2 retry
+/// classification: `camp close --outcome fail --transient`). The gc-vocab
+/// fixture carries no failure_class list; this follows the master plan's
+/// wording (`failure_class:"transient"`, gc's key vocabulary) verbatim.
+pub const CAMP_FAILURE_CLASSES: &[&str] = &["transient"];

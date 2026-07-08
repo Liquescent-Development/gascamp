@@ -87,4 +87,13 @@ fn outcome_vocabulary_is_a_strict_subset_of_gc() {
             "camp final_disposition {value:?} is not a legal gc on_exhausted value"
         );
     }
+
+    // Phase 9: the run-level disposition vocabulary (run.finalized) is a
+    // strict subset of gc's final_disposition list.
+    for value in vocab::CAMP_RUN_DISPOSITIONS {
+        assert!(
+            gc_dispositions.contains(*value),
+            "camp run disposition {value:?} is not gc vocabulary"
+        );
+    }
 }
