@@ -41,6 +41,10 @@ pub enum Response {
         ok: bool,
         #[serde(flatten)]
         summary: StatusSummary,
+        /// Live sessions currently stalled by patrol — the `✖red` of the
+        /// fleet badge (spec §10/§11, Phase 12 Decision D2). Serialized
+        /// after the flattened summary, before `campd_pid`.
+        red: u64,
         campd_pid: u32,
     },
     Adopt {
@@ -196,11 +200,12 @@ mod tests {
                 ready: 1,
                 open: 2,
             },
+            red: 1,
             campd_pid: 4242,
         };
         assert_eq!(
             serde_json::to_string(&status).unwrap(),
-            r#"{"ok":true,"live_sessions":["camp/dev/1"],"ready":1,"open":2,"campd_pid":4242}"#
+            r#"{"ok":true,"live_sessions":["camp/dev/1"],"ready":1,"open":2,"red":1,"campd_pid":4242}"#
         );
         assert_eq!(
             serde_json::to_string(&Response::Error {
@@ -236,7 +241,7 @@ mod tests {
         ));
         assert!(matches!(
             serde_json::from_str::<Response>(
-                r#"{"ok":true,"live_sessions":[],"ready":0,"open":0,"campd_pid":1}"#
+                r#"{"ok":true,"live_sessions":[],"ready":0,"open":0,"red":0,"campd_pid":1}"#
             )
             .unwrap(),
             Response::Status { .. }
