@@ -1,0 +1,4 @@
+[order]
+formula = "one-step"
+trigger = "event"
+on = "bead.closed"

@@ -105,16 +105,46 @@ pub(crate) fn open_db(path: &Path) -> Result<Connection, CoreError> {
     Ok(conn)
 }
 
-fn init_schema(conn: &Connection) -> Result<(), CoreError> {
-    let has_meta: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
-        [],
-        |r| r.get(0),
+/// Open an existing ledger read-only (`SQLITE_OPEN_READ_ONLY`) — the
+/// `camp export` path (spec §15.3). No schema creation, no journal-mode
+/// pragma (WAL is a database-file property already set at creation); a
+/// missing or schema-less database is a hard error, never repaired.
+pub(crate) fn open_db_read_only(path: &Path) -> Result<Connection, CoreError> {
+    use rusqlite::OpenFlags;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
     )?;
-    if !has_meta {
+    conn.busy_timeout(Duration::from_millis(5000))?;
+    if !has_meta(&conn)? {
+        return Err(CoreError::Corrupt(format!(
+            "{} has no meta table — not an initialized camp ledger",
+            path.display()
+        )));
+    }
+    verify_schema_version(&conn)?;
+    Ok(conn)
+}
+
+fn init_schema(conn: &Connection) -> Result<(), CoreError> {
+    if !has_meta(conn)? {
         conn.execute_batch(&format!("BEGIN;{FULL_DDL_PREFIX}{STATE_DDL}COMMIT;"))?;
         return Ok(());
     }
+    verify_schema_version(conn)
+}
+
+fn has_meta(conn: &Connection) -> Result<bool, CoreError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+fn verify_schema_version(conn: &Connection) -> Result<(), CoreError> {
     let raw: String = conn.query_row(
         "SELECT value FROM meta WHERE key = 'schema_version'",
         [],

@@ -9,6 +9,7 @@ mod cmd {
     pub mod doctor;
     pub mod event_emit;
     pub mod events;
+    pub mod export;
     pub mod init;
     pub mod ls;
     pub mod order;
@@ -183,6 +184,18 @@ enum Command {
         /// Maximum number of hits
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Export the camp for Gas City import (spec §15.3): beads.jsonl,
+    /// pinned formulas, and a pack directory. Read-only — camp never
+    /// writes into a live city's store.
+    Export {
+        /// Output directory (created; must not already contain anything)
+        #[arg(long, value_name = "DIR")]
+        city: PathBuf,
+        /// Skip orders that cannot be translated to gc order TOML
+        /// instead of failing the export
+        #[arg(long)]
+        skip_untranslatable: bool,
     },
     /// Manage orders (scheduled and event-triggered formulas)
     Order {
@@ -389,6 +402,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Recall { query, limit } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::recall::run(&camp, &query, limit)
+        }
+        Command::Export {
+            city,
+            skip_untranslatable,
+        } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::export::run(&camp, &city, skip_untranslatable)
         }
         Command::Order { command } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;

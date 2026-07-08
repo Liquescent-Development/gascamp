@@ -667,10 +667,13 @@ Three concrete contracts, each CI-enforced in the implementation plan:
   historical beads — IDs, titles, status, `needs` edges, labels, outcome
   metadata; (b) the pinned formulas from `runs/` (already valid v2 subset
   files); (c) the pack's agent definitions with a generated `pack.toml`
-  wrapper, including the camp's orders translated into the wrapper as
-  city-order declarations. The output is a directory a Gas City operator imports with
-  standard `bd import` / pack installation; camp does not write into a
-  live city's store directly.
+  wrapper, the camp's orders translated into city order files
+  (`orders/<name>.toml` — gc packs declare orders as files by convention;
+  gc's `pack.toml` cannot declare orders inline), and the authored
+  formulas those orders reference. Field-level mapping:
+  `docs/reference/export.md`. The output is a directory a Gas City
+  operator imports with standard `bd import` / pack installation; camp
+  does not write into a live city's store directly.
 - City → camp is documented as manual subset extraction (take the formulas
   that fit the subset, the agent prompts, and open beads); automating it is
   explicitly out of scope until someone actually wants it.
