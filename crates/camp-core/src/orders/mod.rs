@@ -396,7 +396,7 @@ pub fn execute_fire(
     match crate::formula::cook(
         ledger,
         &formula,
-        &camp_root.join("runs"),
+        &crate::formula::runtime::runs_dir(camp_root),
         &rig,
         &cook_actor(&order.name, fired_seq),
     ) {
@@ -761,7 +761,7 @@ mod tests {
         assert_eq!(cooked[0].actor, cook_actor("t", fired));
         assert!(
             dir.path()
-                .join("runs")
+                .join(crate::formula::runtime::RUNS_SUBDIR)
                 .join(&run.run_id)
                 .join("manifest.json")
                 .exists()

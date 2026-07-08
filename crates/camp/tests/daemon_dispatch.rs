@@ -412,6 +412,9 @@ fn git_rig(rig: &Path) {
         vec!["init", "-b", "main"],
         vec!["config", "user.email", "t@t"],
         vec!["config", "user.name", "t"],
+        // hermetic against operator gitconfig: a global
+        // commit.gpgsign=true would stall the fixture (CI never signs)
+        vec!["config", "commit.gpgsign", "false"],
         vec!["commit", "--allow-empty", "-m", "init"],
     ] {
         let out = Command::new("git")

@@ -198,7 +198,13 @@ fn a_manual_fire_cooks_and_completes_via_the_fake_agent_contract() {
     // The fake-agent contract, spoken through the camp CLI:
     run_ok(&root, &["claim", &step_bead, "--session", "fake-agent"]);
     run_ok(&root, &["close", &step_bead, "--outcome", "pass"]);
-    run_ok(&root, &["close", &root_bead, "--outcome", "pass"]);
+    // Phase 9: campd finalizes the run itself — the last step's close
+    // closes the root with the aggregated outcome and appends
+    // run.finalized (spec §8.3); nobody closes roots by hand anymore.
+    let finalized = wait_for(&root, "run.finalized", Duration::from_secs(10));
+    assert_eq!(finalized[0]["data"]["root"], root_bead.as_str());
+    assert_eq!(finalized[0]["data"]["outcome"], "pass");
+    assert_eq!(finalized[0]["data"]["final_disposition"], "pass");
 
     let completed = wait_for(&root, "order.completed", Duration::from_secs(10));
     assert_eq!(completed[0]["data"]["order"], "one-shot");

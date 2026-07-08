@@ -151,6 +151,87 @@ impl Ledger {
         crate::readiness::newly_ready(&self.conn, closed_bead)
     }
 
+    // ---- Phase 9 graph-runtime reads (thin wrappers over the pure
+    // functions in formula::runtime, mirroring the readiness wrappers) ----
+
+    /// A bead's run membership (`None` for plain beads; `step_id: None`
+    /// marks a run root).
+    pub fn run_membership(
+        &self,
+        bead: &str,
+    ) -> Result<Option<crate::formula::runtime::RunMembership>, CoreError> {
+        crate::formula::runtime::run_membership(&self.conn, bead)
+    }
+
+    /// All beads of one run step (anchor + attempts), creation order.
+    pub fn run_step_beads(
+        &self,
+        run_id: &str,
+        step_id: &str,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::run_step_beads(&self.conn, run_id, step_id)
+    }
+
+    /// The attempts of a looping step (its beads minus the anchor),
+    /// creation order.
+    pub fn step_attempts(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        anchor: &str,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::attempts(&self.conn, run_id, step_id, anchor)
+    }
+
+    /// The retry budget already spent on a step's attempts.
+    pub fn transient_fails_used(
+        &self,
+        attempts: &[crate::readiness::BeadRow],
+    ) -> Result<u32, CoreError> {
+        crate::formula::runtime::transient_fails_used(&self.conn, attempts)
+    }
+
+    /// The data of a bead's close event, if closed.
+    pub fn close_event_data(&self, bead: &str) -> Result<Option<serde_json::Value>, CoreError> {
+        crate::formula::runtime::close_event_data(&self.conn, bead)
+    }
+
+    /// The data of a bead's creation event (authored title/description).
+    pub fn created_event_data(&self, bead: &str) -> Result<Option<serde_json::Value>, CoreError> {
+        crate::formula::runtime::created_event_data(&self.conn, bead)
+    }
+
+    /// The bond children already cooked for an anchor, by index (Phase 9).
+    pub fn bond_children(
+        &self,
+        anchor: &str,
+    ) -> Result<std::collections::BTreeMap<usize, crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::bond_children(&self.conn, anchor)
+    }
+
+    /// The dead-end batch for a run that can never advance (Phase 9).
+    pub fn dead_end_inputs(
+        &self,
+        run_id: &str,
+        cause_seq: Seq,
+        reason: &str,
+    ) -> Result<Vec<EventInput>, CoreError> {
+        crate::formula::runtime::dead_end_inputs(&self.conn, run_id, cause_seq, reason)
+    }
+
+    /// True when `bead`'s needs can never all pass.
+    pub fn unsatisfiable(&self, bead: &str) -> Result<bool, CoreError> {
+        crate::formula::runtime::unsatisfiable(&self.conn, bead)
+    }
+
+    /// The finalization verdict for a run (Phase 9 plan Decision 3).
+    pub fn finalization(
+        &self,
+        ctx: &crate::formula::runtime::RunContext,
+    ) -> Result<crate::formula::runtime::RunVerdict, CoreError> {
+        crate::formula::runtime::finalization(&self.conn, ctx)
+    }
+
     /// Beads matching `filter`, in creation order.
     pub fn list_beads(
         &self,
@@ -1067,7 +1148,11 @@ mod tests {
     }
 
     #[test]
-    fn close_outcome_vocabulary_is_pass_or_fail_only() {
+    fn close_outcome_vocabulary_is_enforced() {
+        // Phase 9 (plan Decision 2, approved): "skipped" joined the close
+        // vocabulary — campd's finalization close for unreachable steps.
+        // The out-of-vocabulary counterexample is a value gc has but camp
+        // deliberately does not accept ("missing_root").
         let (_dir, mut ledger) = temp_ledger();
         ledger
             .append(created("gc-1", serde_json::json!({"title": "one"})))
@@ -1076,10 +1161,10 @@ mod tests {
             EventType::BeadClosed,
             Some("gc"),
             Some("gc-1"),
-            serde_json::json!({"outcome": "skipped"}),
+            serde_json::json!({"outcome": "missing_root"}),
         )) {
             Err(CoreError::InvalidEventData { reason, .. }) => {
-                assert!(reason.contains("skipped"), "reason was: {reason}");
+                assert!(reason.contains("missing_root"), "reason was: {reason}");
             }
             other => panic!("expected InvalidEventData, got {other:?}"),
         }

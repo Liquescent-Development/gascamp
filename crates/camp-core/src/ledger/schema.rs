@@ -24,7 +24,7 @@ CREATE TABLE beads (
   status       TEXT NOT NULL CHECK (status IN ('open','in_progress','closed')),
   assignee     TEXT,
   claimed_by   TEXT,
-  outcome      TEXT CHECK (outcome IN ('pass','fail')),
+  outcome      TEXT CHECK (outcome IN ('pass','fail','skipped')),
   close_reason TEXT,
   labels       TEXT NOT NULL DEFAULT '[]',
   run_id       TEXT,
