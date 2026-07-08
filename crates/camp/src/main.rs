@@ -4,6 +4,7 @@ mod campdir;
 mod daemon;
 mod cmd {
     pub mod adopt;
+    pub mod backup;
     pub mod claim;
     pub mod close;
     pub mod create;
@@ -221,6 +222,12 @@ enum Command {
     Adopt,
     /// One campd status snapshot as plain text (auto-starts the daemon)
     Top,
+    /// Write a consistent, integrity-checked copy of the ledger (VACUUM
+    /// INTO). DEST must not already exist.
+    Backup {
+        /// Destination file for the backup copy.
+        dest: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -449,6 +456,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Top => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::top::run(&camp)
+        }
+        Command::Backup { dest } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::backup::run(&camp, dest)
         }
     }
 }
