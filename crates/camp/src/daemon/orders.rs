@@ -7,7 +7,21 @@
 //! fire is an `order.fired` event; processing one queues its cook;
 //! `settle` runs catch-up and cook execution to a fixpoint. Convergence,
 //! not polling — each iteration consumes ledger progress.
+//!
+//! Issue #17 (self-triggering event orders): an order matching an event
+//! type the settle itself produces can regenerate fires without bound —
+//! inside one `orders::settle` fixpoint (`event:bead.created` feedback
+//! through cooks) or through the OUTER `event_loop::settle` loop
+//! (`event:dispatch.failed` + a routing hole regenerates one fire per
+//! converge pass). The guard is `FIRE_BUDGET` per order per
+//! `event_loop::settle` INVOCATION — reset by `reset_fire_budget()` at
+//! the invocation's entry, never per `orders::settle` call (a per-call
+//! reset never accumulates across converge passes). Beyond the budget the
+//! order's fires are suppressed until the next invocation and ONE
+//! `order.failed` records why; suppressed matches advance behind the
+//! cursor and never re-fire, so the loop quiesces.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,6 +44,12 @@ use jiff::tz::TimeZone;
 use super::cursor::{self, EventProcessor, ReadinessProcessor};
 use super::dispatch::GraphRuntime;
 
+/// Issue #17: event-trigger fires allowed per order per
+/// `event_loop::settle` invocation. Legitimate bursts are bounded by the
+/// pre-existing backlog; only regenerative loops (fire -> cook -> matching
+/// event -> fire) reach this.
+pub(super) const FIRE_BUDGET: usize = 256;
+
 /// campd's compiled-order state: the config text last applied, the
 /// compiled orders, the armed cron heap, and the cooks queued by the
 /// processor for the settle loop.
@@ -41,6 +61,9 @@ pub struct OrdersRuntime {
     orders: Vec<Order>,
     heap: CronHeap,
     pending_cooks: Vec<PendingCook>,
+    /// Event-trigger fires per order in the CURRENT event_loop::settle
+    /// invocation (issue #17 guard); reset_fire_budget() clears it.
+    fires_this_invocation: HashMap<String, usize>,
     /// Errors from the notify watcher thread, awaiting their ledger event
     /// (PR #13 review LOW 8). The callback fills it; the loop drains it.
     watch_error: Arc<Mutex<Option<String>>>,
@@ -64,6 +87,7 @@ impl OrdersRuntime {
             orders,
             heap,
             pending_cooks: Vec::new(),
+            fires_this_invocation: HashMap::new(),
             watch_error: Arc::new(Mutex::new(None)),
         })
     }
@@ -93,6 +117,14 @@ impl OrdersRuntime {
 
     pub fn recompute(&mut self, now: Timestamp, last_seen: Timestamp) -> Vec<CatchUp> {
         self.heap.recompute(now, last_seen)
+    }
+
+    /// Reset the issue-#17 fire budget. Called ONCE at event_loop::settle
+    /// entry (Decision 11f) — the budget must span every orders::settle /
+    /// converge round of one invocation, or the through-converge
+    /// regeneration escapes it (review Blocker B).
+    pub fn reset_fire_budget(&mut self) {
+        self.fires_this_invocation.clear();
     }
 
     pub fn queue_cook(&mut self, cook: PendingCook) {
@@ -319,6 +351,40 @@ impl EventProcessor for CampdProcessor<'_> {
             }
         }
         for name in fired {
+            // Issue #17 guard: FIRE_BUDGET fires per order per settle
+            // invocation. The budget-exhaustion failure is evented exactly
+            // once (fired_seq = the matching event's seq — its cause);
+            // further matches are suppressed until the next invocation and
+            // advance behind the cursor, never to re-fire.
+            let count = self
+                .runtime
+                .fires_this_invocation
+                .entry(name.clone())
+                .or_insert(0);
+            *count += 1;
+            if *count > FIRE_BUDGET {
+                if *count == FIRE_BUDGET + 1 {
+                    Ledger::append_on(
+                        conn,
+                        &self.clock.now_utc(),
+                        EventInput {
+                            kind: EventType::OrderFailed,
+                            rig: None,
+                            actor: "campd".into(),
+                            bead: None,
+                            data: serde_json::json!({
+                                "order": name,
+                                "fired_seq": event.seq,
+                                "error": format!(
+                                    "event-trigger fire budget ({FIRE_BUDGET}) exhausted in one \
+                                     settle invocation — likely a self-triggering order (issue #17)"
+                                ),
+                            }),
+                        },
+                    )?;
+                }
+                continue;
+            }
             Ledger::append_on(
                 conn,
                 &self.clock.now_utc(),
@@ -694,6 +760,56 @@ mod tests {
                 .contains("no longer configured"),
             "{}",
             failed[0].data
+        );
+    }
+
+    /// Issue #17 scenario 1 (in-settle feedback): an order on
+    /// event:bead.created whose cook itself creates beads re-matches its
+    /// own consequences inside ONE orders::settle fixpoint. The budget
+    /// must bound it: settle RETURNS, one budget order.failed, bounded
+    /// event growth. (Red state without the budget: the fixpoint appends
+    /// without bound and never returns.)
+    #[test]
+    fn a_self_triggering_event_order_is_budget_bounded_in_one_settle() {
+        let (dir, mut ledger) = fixture(
+            "[[order]]\nname=\"amplifier\"\non=\"event:bead.created\"\nformula=\"one-step\"\n",
+        );
+        let mut rt = runtime(&dir, "2026-07-06T07:20:00Z");
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title":"seed"}),
+            })
+            .unwrap();
+        rt.reset_fire_budget(); // event_loop::settle does this at entry
+        settle_all(&mut ledger, &mut rt);
+        let failed = ledger.events_of_type(EventType::OrderFailed).unwrap();
+        let budget_failures: Vec<_> = failed
+            .iter()
+            .filter(|e| {
+                e.data["error"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("fire budget"))
+            })
+            .collect();
+        assert_eq!(budget_failures.len(), 1, "exactly one budget failure");
+        assert_eq!(budget_failures[0].data["order"], "amplifier");
+        assert!(
+            budget_failures[0].data["fired_seq"].as_i64().unwrap() >= 1,
+            "the failure carries its cause seq"
+        );
+        assert_eq!(
+            ledger.events_of_type(EventType::OrderFired).unwrap().len(),
+            FIRE_BUDGET,
+            "fires stop exactly at the budget"
+        );
+        let total = ledger.events_range(1, None).unwrap().len();
+        assert!(
+            total < FIRE_BUDGET * 8,
+            "event growth is bounded, got {total}"
         );
     }
 

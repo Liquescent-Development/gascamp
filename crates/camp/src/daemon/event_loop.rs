@@ -524,6 +524,10 @@ pub(super) fn settle(
     dispatcher: &mut Dispatcher,
     graph: &mut GraphRuntime,
 ) -> Result<()> {
+    // Decision 11f / issue #17: the fire budget spans this WHOLE
+    // invocation (every orders::settle / converge round below) — resetting
+    // any deeper lets through-converge regeneration escape the budget.
+    runtime.reset_fire_budget();
     loop {
         orders::settle(ledger, processor, runtime, clock, graph)?;
         // Phase 9: drain the graph work the processor queued — spawn due
@@ -667,6 +671,112 @@ mod tests {
             ledger.cursor(cursor::CAMPD_CURSOR).unwrap(),
             1,
             "the settle must run even when the ack write fails"
+        );
+    }
+
+    /// Issue #17 scenario 2 — the review's Blocker B trace, pinned: an
+    /// order on event:dispatch.failed in a camp with a ROUTING HOLE
+    /// regenerates one fire per OUTER settle iteration (fire -> cook ->
+    /// converge appends dispatch.failed for the fresh step bead -> fire).
+    /// The budget only catches this because it resets per event_loop::
+    /// settle INVOCATION — a per-orders::settle reset never accumulates
+    /// (the rejected scoping; red state: this test never terminates).
+    /// Process-free: converge's prepare fails routing before any spawn.
+    #[test]
+    fn through_converge_regeneration_is_budget_bounded_and_quiesces() {
+        let dir = tempfile::tempdir().unwrap();
+        let rig = dir.path().join("repo");
+        std::fs::create_dir_all(&rig).unwrap();
+        // no step assignee, no rig/dispatch default_agent: a routing hole
+        std::fs::write(
+            dir.path().join("camp.toml"),
+            format!(
+                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n[[order]]\nname=\"resurrector\"\non=\"event:dispatch.failed\"\nformula=\"one-step\"\n",
+                rig.display()
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("formulas")).unwrap();
+        std::fs::write(
+            dir.path().join("formulas/one-step.toml"),
+            "formula = \"one-step\"\n\n[[steps]]\nid = \"s1\"\ntitle = \"one step\"\n",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        // the seed: one ready task the dispatcher cannot route
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "seed"}),
+            })
+            .unwrap();
+        let mut processor = ReadinessProcessor::default();
+        let mut runtime =
+            OrdersRuntime::build(dir.path(), Timestamp::now(), jiff::tz::TimeZone::UTC).unwrap();
+        let clock = camp_core::clock::SystemClock;
+        let config = camp_core::config::CampConfig::parse(
+            &std::fs::read_to_string(dir.path().join("camp.toml")).unwrap(),
+        )
+        .unwrap();
+        let mut graph = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        let mut dispatcher = Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            config,
+        );
+
+        settle(
+            &mut ledger,
+            &mut processor,
+            &mut runtime,
+            &clock,
+            &mut dispatcher,
+            &mut graph,
+        )
+        .expect("settle must return despite the regenerative order");
+
+        let budget_failures: Vec<_> = ledger
+            .events_of_type(EventType::OrderFailed)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.data["error"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("fire budget"))
+            })
+            .collect();
+        assert_eq!(budget_failures.len(), 1, "exactly one budget failure");
+        assert_eq!(budget_failures[0].data["order"], "resurrector");
+        let total = ledger.events_range(1, None).unwrap().len();
+        assert!(
+            total < super::super::orders::FIRE_BUDGET * 8,
+            "event growth is bounded, got {total}"
+        );
+        // true quiescence: the cursor sits on the head
+        let cursor = ledger.cursor(cursor::CAMPD_CURSOR).unwrap();
+        assert!(!ledger.has_events_past(cursor).unwrap());
+
+        // and the drip STOPS: a second invocation (fresh budget) appends
+        // nothing — suppressed matches are behind the cursor, and each
+        // cooked step already carries its per-lifetime dispatch.failed
+        let before = ledger.events_range(1, None).unwrap().len();
+        settle(
+            &mut ledger,
+            &mut processor,
+            &mut runtime,
+            &clock,
+            &mut dispatcher,
+            &mut graph,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.events_range(1, None).unwrap().len(),
+            before,
+            "a second settle invocation regenerates nothing"
         );
     }
 
