@@ -35,6 +35,8 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::CheckPassed => check_passed(conn, event),
         EventType::CheckFailed => check_failed(conn, event),
         EventType::RunFinalized => run_finalized(conn, event),
+        EventType::AgentStalled => agent_stalled(conn, event),
+        EventType::PatrolDegraded => patrol_degraded(event),
         // Log-only events: no state effect.
         EventType::CampdStarted | EventType::CampdStopped => Ok(()),
     }
@@ -448,6 +450,80 @@ fn bead_worktree_reaped(conn: &Connection, event: &Event) -> Result<(), CoreErro
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AgentStalled {
+    session: String,
+    agent: String,
+    action: String,
+    threshold: String,
+    #[allow(dead_code)] // audit content: validated for shape, not read back
+    restarts: u32,
+    #[serde(default)]
+    via: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+const STALL_ACTIONS: &[&str] = &["nudge", "nudge_failed", "restart", "exhausted", "annotate"];
+
+/// `agent.stalled` is log-only (spec §10.2): the patrol fire declaration —
+/// which worker, which bead, which ladder action, at what effective
+/// threshold. Escalation to judgment matches this event (pack content).
+/// The bead is required and must exist; sessions.status deliberately does
+/// NOT change (observation over state — subsequent activity in the ledger
+/// is the recovery signal).
+fn agent_stalled(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let bead = required_bead(event)?;
+    known_bead(conn, bead)?;
+    let p: AgentStalled = payload(event)?;
+    let bad = |reason: String| CoreError::InvalidEventData {
+        event_type: event.kind.as_str().to_owned(),
+        reason,
+    };
+    for (field, value) in [
+        ("session", &p.session),
+        ("agent", &p.agent),
+        ("threshold", &p.threshold),
+    ] {
+        if value.is_empty() {
+            return Err(bad(format!("empty {field}")));
+        }
+    }
+    if !STALL_ACTIONS.contains(&p.action.as_str()) {
+        return Err(bad(format!(
+            "action {:?} is not in {STALL_ACTIONS:?}",
+            p.action
+        )));
+    }
+    if p.action == "nudge_failed" && p.error.as_deref().is_none_or(str::is_empty) {
+        return Err(bad("a nudge_failed record requires the error".into()));
+    }
+    if p.via.is_some() && !matches!(p.action.as_str(), "nudge" | "nudge_failed") {
+        return Err(bad("via is a nudge-only field".into()));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatrolDegraded {
+    error: String,
+    #[serde(default)]
+    #[allow(dead_code)] // audit content: which session's patrol degraded
+    session: Option<String>,
+}
+
+/// `patrol.degraded` is log-only: a patrol subsystem impairment (a dead
+/// transcript watcher, a failed nudge-resume child) — durable in the
+/// ledger, never just a stderr line on a detached daemon (invariant 5;
+/// the Phase 10 LOW-8 mold).
+fn patrol_degraded(event: &Event) -> Result<(), CoreError> {
+    let p: PatrolDegraded = payload(event)?;
+    non_empty(event, "error", &p.error)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DispatchFailed {
     reason: String,
 }
@@ -695,6 +771,11 @@ struct SessionEnd {
     #[serde(default)]
     #[allow(dead_code)]
     reason: Option<String>,
+    /// Audit-only (Phase 11): a patrol-initiated kill names the
+    /// agent.stalled event that caused it (every action carries its cause).
+    #[serde(default)]
+    #[allow(dead_code)]
+    cause_seq: Option<i64>,
 }
 
 fn session_ended(conn: &Connection, event: &Event, new_status: &str) -> Result<(), CoreError> {

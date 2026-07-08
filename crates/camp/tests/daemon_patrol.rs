@@ -1,0 +1,490 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+//! Phase 11 integration (master plan test obligations; spec §8.5, §10):
+//! stall → nudge revival; nudge ignored → restart re-hooks the bead;
+//! ladder exhaustion emits and stops; kill -9 campd → restart → adopt
+//! reconciles exactly; transcript activity keeps a working agent
+//! unmolested — all driven by fake-agent.sh, no Claude anywhere.
+//!
+//! campd is a real child process (SIGCHLD and the patrol pipe are
+//! per-process). Test-side waiting polls the ledger — sanctioned for
+//! harnesses only. CLAUDE_CONFIG_DIR points into the test tempdir so the
+//! computed transcript paths (and the patrol watches on them) stay
+//! hermetic.
+
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+const BIN: &str = env!("CARGO_BIN_EXE_camp");
+const READY_PREFIX: &str = "campd listening on ";
+
+fn fake_agent() -> String {
+    format!("{}/tests/fake-agent.sh", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn camp(root: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(BIN)
+        .env_remove("CAMP_DIR")
+        .arg("--camp")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn camp_ok(root: &Path, args: &[&str]) -> String {
+    let out = camp(root, args);
+    assert!(
+        out.status.success(),
+        "camp {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// A camp with one rig, dispatch config, and a `[patrol]` section.
+fn scaffold(dir: &Path, patrol_toml: &str, agents: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+    let root = dir.join(".camp");
+    std::fs::create_dir_all(&root).unwrap();
+    let rig = dir.join("repo");
+    std::fs::create_dir_all(&rig).unwrap();
+    std::fs::write(
+        root.join("camp.toml"),
+        format!(
+            "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+             [dispatch]\nmax_workers = 4\ncommand = \"{}\"\ndefault_agent = \"dev\"\n\n\
+             [patrol]\n{patrol_toml}\n",
+            rig.display(),
+            fake_agent(),
+        ),
+    )
+    .unwrap();
+    for (name, front_extra) in agents {
+        write_agent(&root, name, front_extra);
+    }
+    // create the ledger so every verb (and campd) finds it
+    camp_ok(&root, &["events", "--json"]);
+    (root, rig)
+}
+
+fn write_agent(root: &Path, name: &str, front_extra: &str) {
+    let agents = root.join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join(format!("{name}.md")),
+        format!("---\nname: {name}\n{front_extra}---\nDo the work.\n"),
+    )
+    .unwrap();
+}
+
+fn git_rig(rig: &Path) {
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+        // hermetic: never depend on the host's signing agent
+        vec!["config", "commit.gpgsign", "false"],
+        vec!["commit", "--allow-empty", "-m", "init"],
+    ] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(rig)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+fn events_json(root: &Path) -> Vec<serde_json::Value> {
+    camp_ok(root, &["events", "--json"])
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// Test-harness wait (camp never polls; tests may). Panics with the event
+/// dump on timeout so failures are diagnosable.
+fn wait_until(root: &Path, what: &str, pred: impl Fn(&[serde_json::Value]) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let events = events_json(root);
+        if pred(&events) {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("timed out waiting for {what}; events: {events:#?}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn count(events: &[serde_json::Value], kind: &str) -> usize {
+    events.iter().filter(|e| e["type"] == kind).count()
+}
+
+fn stalled_actions(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e["type"] == "agent.stalled")
+        .map(|e| e["data"]["action"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// campd as a real child process with fake-agent behavior env plus a
+/// hermetic CLAUDE_CONFIG_DIR. Drop kills and reaps it.
+struct Daemon {
+    child: Child,
+}
+
+impl Daemon {
+    fn spawn(root: &Path, claude_dir: &Path, envs: &[(&str, &str)]) -> Daemon {
+        std::fs::create_dir_all(claude_dir).unwrap();
+        let mut cmd = Command::new(BIN);
+        cmd.env_remove("CAMP_DIR")
+            .env("CAMP_BIN", BIN)
+            .env("CLAUDE_CONFIG_DIR", claude_dir)
+            .args(["daemon", "--camp"])
+            .arg(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut line = String::new();
+        BufReader::new(stdout).read_line(&mut line).unwrap();
+        assert!(
+            line.starts_with(READY_PREFIX),
+            "unexpected first line from campd: {line:?}"
+        );
+        Daemon { child }
+    }
+
+    /// The crash the master plan demands: kill -9, no goodbye.
+    fn kill9(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        std::mem::forget(self); // Drop would double-kill
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Master plan: "fake agent goes silent → stall → nudge revives it." The
+/// worker blocks reading stdin (silent — fake agents write no transcript
+/// unless told to); the stall declares a nudge; the nudge line lands on
+/// the held stream stdin, unblocks the worker, and it closes pass. No
+/// restart happens: the nudge alone revived it.
+#[test]
+fn silent_worker_stalls_and_a_nudge_revives_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), "stall_after = \"500ms\"", &[("dev", "")]);
+    let _campd = Daemon::spawn(
+        &root,
+        &dir.path().join("claude-home"),
+        &[("FAKE_AGENT_NUDGE_CLOSE", "1")],
+    );
+    camp_ok(&root, &["sling", "revive me"]);
+
+    wait_until(&root, "the nudge declaration", |e| {
+        stalled_actions(e).contains(&"nudge".to_owned())
+    });
+    wait_until(&root, "the revived close", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "bead.closed" && ev["data"]["outcome"] == "pass")
+    });
+    wait_until(&root, "the session end", |e| {
+        count(e, "session.stopped") == 1
+    });
+
+    let events = events_json(&root);
+    assert_eq!(count(&events, "session.woke"), 1, "no restart: one worker");
+    assert_eq!(count(&events, "session.crashed"), 0);
+    let stalled: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "agent.stalled")
+        .collect();
+    let first = stalled[0];
+    assert_eq!(first["data"]["action"], "nudge");
+    assert_eq!(first["data"]["agent"], "dev");
+    assert_eq!(first["data"]["restarts"], 0);
+    assert!(first["bead"].as_str().unwrap().starts_with("gc-"));
+    assert_eq!(first["actor"], "campd");
+    assert!(
+        !stalled_actions(&events).contains(&"restart".to_owned()),
+        "the nudge revived it; no restart may follow: {events:#?}"
+    );
+}
+
+/// Master plan: "nudge fails → restart re-hooks the bead." The worker
+/// ignores its stdin (HOLD gate), so the nudge changes nothing; the next
+/// fire restarts: kill (caused session.crashed) → fold releases the bead
+/// → converge respawns → the SECOND worker claims the SAME bead and,
+/// with the gate now open, closes it pass.
+#[test]
+fn an_unresponsive_worker_is_restarted_and_the_bead_rehooked() {
+    let dir = tempfile::tempdir().unwrap();
+    let hold = dir.path().join("hold");
+    std::fs::create_dir_all(&hold).unwrap();
+    let (root, _rig) = scaffold(
+        dir.path(),
+        "stall_after = \"500ms\"\nrestart_budget = 1",
+        &[("dev", "")],
+    );
+    let _campd = Daemon::spawn(
+        &root,
+        &dir.path().join("claude-home"),
+        &[("FAKE_AGENT_HOLD_DIR", hold.to_str().unwrap())],
+    );
+    camp_ok(&root, &["sling", "stubborn work"]);
+
+    // stall #1 → nudge (ignored: the agent holds, reading no stdin)
+    wait_until(&root, "the ignored nudge", |e| {
+        stalled_actions(e).contains(&"nudge".to_owned())
+    });
+    // stall #2 → restart with the cause chained to the declaration
+    wait_until(&root, "the caused restart crash", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "session.crashed" && ev["data"]["reason"] == "patrol restart")
+    });
+    let events = events_json(&root);
+    let restart_decl = events
+        .iter()
+        .find(|e| e["type"] == "agent.stalled" && e["data"]["action"] == "restart")
+        .expect("the restart declaration precedes the kill");
+    let crashed = events
+        .iter()
+        .find(|e| e["type"] == "session.crashed")
+        .unwrap();
+    assert_eq!(
+        crashed["data"]["cause_seq"], restart_decl["seq"],
+        "the kill names its cause"
+    );
+
+    // the respawned worker re-hooks the bead; open the gate and it passes
+    wait_until(&root, "the respawn", |e| count(e, "session.woke") == 2);
+    let bead = restart_decl["bead"].as_str().unwrap().to_owned();
+    std::fs::write(hold.join(&bead), "go").unwrap();
+    wait_until(&root, "the re-hooked close", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "bead.closed" && ev["data"]["outcome"] == "pass")
+    });
+    let events = events_json(&root);
+    assert_eq!(count(&events, "bead.claimed"), 2, "re-hooked: two claims");
+    let woke_beads: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "session.woke")
+        .map(|e| e["data"]["bead"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(woke_beads, vec![bead.clone(), bead], "same bead, twice");
+}
+
+/// Master plan ladder table, integration half: budget 0 means nudge then
+/// EXHAUSTED — emit and stop. No kill, no further fires; campd keeps
+/// serving; escalation is pack content matching event:agent.stalled.
+#[test]
+fn ladder_exhaustion_emits_and_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let hold = dir.path().join("hold");
+    std::fs::create_dir_all(&hold).unwrap();
+    let (root, _rig) = scaffold(
+        dir.path(),
+        "stall_after = \"400ms\"\nrestart_budget = 0",
+        &[("dev", "")],
+    );
+    let campd = Daemon::spawn(
+        &root,
+        &dir.path().join("claude-home"),
+        &[("FAKE_AGENT_HOLD_DIR", hold.to_str().unwrap())],
+    );
+    camp_ok(&root, &["sling", "hopeless work"]);
+
+    wait_until(&root, "exhaustion", |e| {
+        stalled_actions(e).contains(&"exhausted".to_owned())
+    });
+    // a bounded quiet window: exhaustion means NO further patrol activity
+    std::thread::sleep(Duration::from_millis(1500));
+    let events = events_json(&root);
+    assert_eq!(
+        stalled_actions(&events),
+        vec!["nudge".to_owned(), "exhausted".to_owned()],
+        "emit and stop"
+    );
+    assert_eq!(count(&events, "session.crashed"), 0, "never killed");
+    assert_eq!(count(&events, "session.woke"), 1, "never respawned");
+    // campd is unharmed
+    let out = camp_ok(&root, &["top"]);
+    assert!(out.contains("live"), "top output: {out}");
+    // release the held worker so the daemon teardown is clean
+    let bead = events
+        .iter()
+        .find(|e| e["type"] == "agent.stalled")
+        .and_then(|e| e["bead"].as_str())
+        .unwrap()
+        .to_owned();
+    std::fs::write(hold.join(bead), "go").unwrap();
+    drop(campd);
+}
+
+/// Master plan: "kill -9 campd mid-run → restart → adopt reconciles
+/// exactly (crashed marked, live re-armed, orphan worktree swept)."
+/// Worker A (worktree-isolated) is SIGKILLed while campd is dead and its
+/// bead closed by hand — the interrupted-disposition orphan. Worker B
+/// stays alive and held. The restarted campd's automatic adoption marks A
+/// crashed, re-arms B, and sweeps A's worktree; a second `camp adopt` is
+/// exactly zero.
+#[test]
+fn kill9_campd_then_adopt_reconciles_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let hold = dir.path().join("hold");
+    std::fs::create_dir_all(&hold).unwrap();
+    let (root, rig) = scaffold(
+        dir.path(),
+        "stall_after = \"10s\"", // long: no stalls during the window
+        &[("iso", "isolation: worktree\n"), ("dev", "")],
+    );
+    git_rig(&rig);
+    let claude_home = dir.path().join("claude-home");
+    let campd = Daemon::spawn(
+        &root,
+        &claude_home,
+        &[("FAKE_AGENT_HOLD_DIR", hold.to_str().unwrap())],
+    );
+    camp_ok(&root, &["create", "doomed work", "--assignee", "iso"]);
+    camp_ok(&root, &["create", "surviving work", "--assignee", "dev"]);
+    camp_ok(&root, &["events", "--json"]); // any verb pokes; explicit poke:
+    wait_until(&root, "both workers claimed", |e| {
+        count(e, "bead.claimed") == 2
+    });
+    let events = events_json(&root);
+    let woke_of = |agent: &str| -> serde_json::Value {
+        events
+            .iter()
+            .find(|e| e["type"] == "session.woke" && e["data"]["agent"] == agent)
+            .unwrap_or_else(|| panic!("no woke for {agent}: {events:#?}"))
+            .clone()
+    };
+    let woke_a = woke_of("iso");
+    let bead_a = woke_a["data"]["bead"].as_str().unwrap().to_owned();
+    let sid_a = woke_a["data"]["claude_session_id"].as_str().unwrap();
+    let session_a = woke_a["data"]["name"].as_str().unwrap().to_owned();
+    let bead_b = woke_of("dev")["data"]["bead"].as_str().unwrap().to_owned();
+    assert!(
+        root.join("worktrees").join(&bead_a).is_dir(),
+        "A runs isolated"
+    );
+
+    // the crash: campd dies ungracefully, then A dies too
+    campd.kill9();
+    let pkill = Command::new("pkill")
+        .args(["-9", "-f", sid_a])
+        .status()
+        .unwrap();
+    assert!(pkill.success(), "worker A must have been alive to kill");
+    // A's bead closes pass by hand while campd is down: the disposition
+    // (worktree removal) is now interrupted — the orphan.
+    camp_ok(
+        &root,
+        &[
+            "close",
+            &bead_a,
+            "--outcome",
+            "pass",
+            "--reason",
+            "done by hand",
+        ],
+    );
+
+    // the restart: adoption runs before the ready line
+    let _campd2 = Daemon::spawn(
+        &root,
+        &claude_home,
+        &[("FAKE_AGENT_HOLD_DIR", hold.to_str().unwrap())],
+    );
+    wait_until(&root, "A marked crashed by adopt", |e| {
+        e.iter().any(|ev| {
+            ev["type"] == "session.crashed"
+                && ev["data"]["name"] == session_a.as_str()
+                && ev["data"]["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("adopt: process not found"))
+        })
+    });
+    wait_until(&root, "A's orphan worktree swept", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "bead.worktree.reaped" && ev["bead"] == bead_a.as_str())
+    });
+    assert!(
+        !root.join("worktrees").join(&bead_a).exists(),
+        "the orphan is gone"
+    );
+
+    // exactly once: a manual adopt now reconciles NOTHING (B is tracked)
+    let second = camp_ok(&root, &["adopt"]);
+    assert_eq!(
+        second.trim(),
+        "adopted: 0 crashed, 0 re-armed, 0 released, 0 worktrees swept, 0 kept",
+        "adoption is idempotent"
+    );
+    let events = events_json(&root);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "session.crashed" && e["data"]["name"] == session_a.as_str())
+            .count(),
+        1,
+        "A crashed exactly once"
+    );
+
+    // B was re-armed and stays functional: open its gate, it closes pass
+    std::fs::write(hold.join(&bead_b), "go").unwrap();
+    wait_until(&root, "B's close", |e| {
+        e.iter().any(|ev| {
+            ev["type"] == "bead.closed"
+                && ev["bead"] == bead_b.as_str()
+                && ev["data"]["outcome"] == "pass"
+        })
+    });
+}
+
+/// Master plan: "transcript touch resets." A worker that heartbeats its
+/// transcript every 250 ms for ~2 s of work under a 1 s threshold must
+/// NEVER look stalled — any missed watch-reset fires a stall before the
+/// close and fails this test. (Watch item 3: if platform watch latency
+/// makes this flaky in CI, the unit-level reset pins carry the obligation
+/// and this test is demoted — noted in the PR.)
+#[test]
+fn transcript_activity_keeps_a_working_agent_unmolested() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), "stall_after = \"1s\"", &[("dev", "")]);
+    let _campd = Daemon::spawn(
+        &root,
+        &dir.path().join("claude-home"),
+        &[("FAKE_AGENT_TOUCH_TRANSCRIPT_LOOP", "8")], // ~2 s of heartbeats
+    );
+    camp_ok(&root, &["sling", "steady work"]);
+    wait_until(&root, "the working close", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "bead.closed" && ev["data"]["outcome"] == "pass")
+    });
+    let events = events_json(&root);
+    assert_eq!(
+        count(&events, "agent.stalled"),
+        0,
+        "a heartbeating worker is never stalled: {events:#?}"
+    );
+    assert_eq!(count(&events, "session.crashed"), 0);
+}

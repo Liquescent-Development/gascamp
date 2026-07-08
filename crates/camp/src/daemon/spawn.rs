@@ -32,10 +32,10 @@ fn task_prompt(bead_id: &str, session_name: &str) -> String {
 
 /// Every non-ASCII-alphanumeric CHARACTER becomes one '-' — Claude Code's
 /// project dir scheme (F3), reused for the sessions/ capture file names.
-/// Unicode note (PR #14 review finding 6): a multi-byte char maps to a
-/// single dash; whether real claude munges unicode cwds per byte instead
-/// is unverified (F3 verified ASCII only) and is a Phase 11 input — the
-/// path is audit-only here.
+/// Unicode (PR #14 review finding 6, resolved): verified per-CHAR against
+/// real claude 2.1.204 (Phase 11 probe P1,
+/// docs/design/2026-07-07-phase-11-probe-findings.md) — a multi-byte char
+/// maps to a single dash in the real project dir too.
 pub fn munge(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -66,6 +66,31 @@ pub fn transcript_path_under(root: &Path, worker_cwd: &Path, session_id: &str) -
         .join(format!("{session_id}.jsonl"))
 }
 
+/// How the worker's stdin is wired (Decision C, probe P2/P3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdinMode {
+    /// /dev/null (F5): the json-envelope mode, task via `-p`.
+    Null,
+    /// A pipe campd holds for the worker's lifetime: stream-json input
+    /// mode. The task is the first `user_message` line; patrol nudges are
+    /// later lines; dropping the write end starts the release path (an
+    /// idle stream worker does NOT exit on EOF — probe P3 — so a release
+    /// grace timer bounds the linger).
+    HeldStream,
+}
+
+/// One stream-json user turn as claude accepts it (probe P2), newline
+/// terminated: `{"type":"user","message":{"role":"user","content":<text>}}`.
+pub fn user_message(text: &str) -> String {
+    let mut line = serde_json::json!({
+        "type": "user",
+        "message": {"role": "user", "content": text},
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
 pub struct SpawnSpec {
     pub session_name: String,
     pub claude_session_id: String,
@@ -75,10 +100,18 @@ pub struct SpawnSpec {
     pub env: Vec<(String, String)>,
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
+    pub stdin_mode: StdinMode,
+}
+
+/// The worker-contract task text for this spawn — the first stream
+/// message in HeldStream mode (the caller writes it after spawn).
+pub fn task_message(bead_id: &str, session_name: &str) -> String {
+    user_message(&task_prompt(bead_id, session_name))
 }
 
 /// Assemble the exec plan. Pure — no filesystem, no process. The argv is
-/// asserted verbatim by tests against F1/F2/F7 and plan decision L.
+/// asserted verbatim by tests against F1/F2/F7, plan decision L, and
+/// (stream mode) probe P2.
 #[allow(clippy::too_many_arguments)]
 pub fn build_spec(
     command: &Path,
@@ -89,12 +122,25 @@ pub fn build_spec(
     session_id: &str,
     transcript_path: &Path,
     cwd: &Path,
+    stdin_mode: StdinMode,
 ) -> SpawnSpec {
     let mut argv: Vec<OsString> = vec![command.as_os_str().to_owned()];
     {
         let mut arg = |s: &str| argv.push(OsString::from(s));
-        arg("--output-format");
-        arg("json"); // F2
+        match stdin_mode {
+            StdinMode::Null => {
+                arg("--output-format");
+                arg("json"); // F2
+            }
+            StdinMode::HeldStream => {
+                // P2: stream in requires stream out; both accepted with
+                // the pinned flags at 2.1.204.
+                arg("--output-format");
+                arg("stream-json");
+                arg("--input-format");
+                arg("stream-json");
+            }
+        }
         arg("--session-id");
         arg(session_id); // F1
         if let Some(model) = &agent.model {
@@ -114,7 +160,11 @@ pub fn build_spec(
             arg(&agent.prompt); // decision L: the role prompt
         }
         arg("-p");
-        arg(&task_prompt(bead_id, session_name)); // the task
+        if stdin_mode == StdinMode::Null {
+            arg(&task_prompt(bead_id, session_name)); // the task
+        }
+        // HeldStream: NO positional task — the task is the first
+        // user_message the dispatcher writes to the held pipe.
     }
 
     let sessions_dir = camp_root.join("sessions");
@@ -132,18 +182,26 @@ pub fn build_spec(
             ),
             ("CAMP_BEAD".to_owned(), bead_id.to_owned()),
             ("CAMP_SESSION".to_owned(), session_name.to_owned()),
+            (
+                "CAMP_TRANSCRIPT".to_owned(),
+                transcript_path.to_string_lossy().into_owned(),
+            ),
         ],
         stdout_path: sessions_dir.join(format!("{file_stem}.json")),
         stderr_path: sessions_dir.join(format!("{file_stem}.log")),
+        stdin_mode,
     }
 }
 
-/// Exec the worker. stdin is /dev/null (F5 — an open non-pipe stdin costs
-/// a 3 s sniff; stream-json stdin-held workers are the Phase 11 nudge
-/// path). stdout/stderr go to the sessions/ capture files (decision G).
-/// The child is deliberately not waited here: SIGCHLD-driven try_wait in
-/// the dispatcher reaps it, and workers intentionally outlive a killed
-/// campd (adoption, spec §8.5).
+/// Exec the worker. stdin is /dev/null in Null mode (F5 — an open
+/// non-pipe stdin costs a 3 s sniff) or a campd-held pipe in HeldStream
+/// mode (Decision C — the live nudge path; the caller takes
+/// `child.stdin`). stdout/stderr go to the sessions/ capture files
+/// (decision G; stream mode makes the .json capture stream-JSONL, one
+/// event per line). The child is deliberately not waited here:
+/// SIGCHLD-driven try_wait in the dispatcher reaps it, and workers
+/// intentionally outlive a killed campd (adoption, spec §8.5; P3: EOF
+/// does not kill a stream worker).
 #[allow(clippy::zombie_processes)]
 pub fn spawn(spec: &SpawnSpec) -> Result<Child> {
     let sessions_dir = spec
@@ -159,7 +217,10 @@ pub fn spawn(spec: &SpawnSpec) -> Result<Child> {
     let mut cmd = Command::new(&spec.argv[0]);
     cmd.args(&spec.argv[1..])
         .current_dir(&spec.cwd)
-        .stdin(Stdio::null()) // F5
+        .stdin(match spec.stdin_mode {
+            StdinMode::Null => Stdio::null(), // F5
+            StdinMode::HeldStream => Stdio::piped(),
+        })
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     for (key, value) in &spec.env {
@@ -203,6 +264,34 @@ pub fn create_worktree(rig_path: &Path, worktrees_dir: &Path, bead_id: &str) -> 
     Ok(dir)
 }
 
+/// `create_worktree` with respawn reuse (Phase 11 plan Decision H): an
+/// existing directory is REUSED iff it is a git worktree whose checked-out
+/// branch is camp/<bead> — the same bead's earlier generation, partial
+/// work preserved. Anything else keeps the fail-fast residue error.
+pub fn ensure_worktree(rig_path: &Path, worktrees_dir: &Path, bead_id: &str) -> Result<PathBuf> {
+    let dir = worktrees_dir.join(bead_id);
+    if !dir.exists() {
+        return create_worktree(rig_path, worktrees_dir, bead_id);
+    }
+    if dir.join(".git").exists() {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["branch", "--show-current"])
+            .output()
+            .context("running git branch --show-current")?;
+        if out.status.success()
+            && String::from_utf8_lossy(&out.stdout).trim() == format!("camp/{bead_id}")
+        {
+            return Ok(dir);
+        }
+    }
+    bail!(
+        "worktree {} already exists (may be residue of an earlier failed dispatch)",
+        dir.display()
+    );
+}
+
 /// Remove a clean worktree (decision H). The camp/<bead> branch is left
 /// standing — it may hold unpushed work; sweeping is Phase 11 policy.
 pub fn remove_worktree(rig_path: &Path, worktree: &Path) -> Result<()> {
@@ -237,6 +326,7 @@ mod tests {
             tools: Some(vec!["Read".into(), "Edit".into(), "Bash".into()]),
             permission_mode: Some("acceptEdits".into()),
             isolation: Isolation::None,
+            stall_after: None,
             prompt: "Implement with TDD.".into(),
         }
     }
@@ -255,6 +345,7 @@ mod tests {
             sid,
             Path::new("/home/u/.claude/projects/-code-gc/x.jsonl"),
             Path::new("/code/gc"),
+            StdinMode::Null,
         );
         let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
         // F2: json envelope; F1: pre-assigned session id; F7: per-agent
@@ -294,6 +385,10 @@ mod tests {
                 ("CAMP_DIR".to_owned(), "/camps/dev".to_owned()),
                 ("CAMP_BEAD".to_owned(), "gc-142".to_owned()),
                 ("CAMP_SESSION".to_owned(), "dev/dev/1".to_owned()),
+                (
+                    "CAMP_TRANSCRIPT".to_owned(),
+                    "/home/u/.claude/projects/-code-gc/x.jsonl".to_owned()
+                ),
             ]
         );
         // decision G: capture paths under <camp>/sessions/
@@ -315,6 +410,7 @@ mod tests {
             tools: None,
             permission_mode: None,
             isolation: Isolation::None,
+            stall_after: None,
             prompt: "P".into(),
         };
         let spec = build_spec(
@@ -326,6 +422,7 @@ mod tests {
             "sid",
             Path::new("/t.jsonl"),
             Path::new("/code"),
+            StdinMode::Null,
         );
         let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
         for flag in ["--model", "--permission-mode", "--allowedTools"] {
@@ -339,10 +436,10 @@ mod tests {
     fn transcript_path_munges_every_non_alphanumeric_to_dash() {
         assert_eq!(munge("/tmp/rig-a"), "-tmp-rig-a");
         assert_eq!(munge("/code/gas_camp.rs"), "-code-gas-camp-rs");
-        // PR #14 review finding 6: munge is per CHAR — one dash per
-        // non-ASCII-alphanumeric character, however many bytes it takes.
-        // Whether real claude munges per byte for unicode cwds is a Phase
-        // 11 verification input; this pins camp's current behavior.
+        // PR #14 review finding 6, resolved: munge is per CHAR — one dash
+        // per non-ASCII-alphanumeric character, however many bytes it
+        // takes — verified against real claude 2.1.204 (Phase 11 probe P1:
+        // cwd basename `héllo-日本` → project dir segment `h-llo---`).
         assert_eq!(munge("/tmp/héllo"), "-tmp-h-llo");
         assert_eq!(munge("日本"), "--");
         let p = transcript_path_under(
@@ -367,12 +464,10 @@ mod tests {
         assert_eq!(a.as_bytes()[14], b'4', "uuid version nibble must be 4");
     }
 
-    /// Worktree lifecycle against a real git repo (decision H).
-    #[test]
-    fn worktree_create_and_remove_round_trip() {
-        let _spawning = crate::daemon::spawn_probe_guard();
-        let dir = tempfile::tempdir().unwrap();
-        let rig = dir.path().join("rig");
+    /// A committed git repo to serve as a rig (shared by the worktree
+    /// tests).
+    fn git_rig(dir: &Path) -> PathBuf {
+        let rig = dir.join("rig");
         std::fs::create_dir_all(&rig).unwrap();
         for args in [
             vec!["init", "-b", "main"],
@@ -397,6 +492,15 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+        rig
+    }
+
+    /// Worktree lifecycle against a real git repo (decision H).
+    #[test]
+    fn worktree_create_and_remove_round_trip() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let rig = git_rig(dir.path());
         let worktrees = dir.path().join("worktrees");
         let wt = create_worktree(&rig, &worktrees, "gc-7").unwrap();
         assert_eq!(wt, worktrees.join("gc-7"));
@@ -420,5 +524,137 @@ mod tests {
         );
         remove_worktree(&rig, &wt).unwrap();
         assert!(!wt.exists());
+    }
+
+    // ---- Phase 11: stream mode (Decision C, probe P2) + worktree reuse ---
+
+    /// The stream spawn argv, pinned against probe P2 and F1/F7/decision L.
+    #[test]
+    fn stream_argv_matches_probe_p2_and_the_fixture_facts() {
+        let sid = "7bd2befc-b018-4080-8738-429d541b3646";
+        let spec = build_spec(
+            Path::new("claude"),
+            &full_agent(),
+            Path::new("/camps/dev"),
+            "gc-142",
+            "dev/dev/1",
+            sid,
+            Path::new("/home/u/.claude/projects/-code-gc/x.jsonl"),
+            Path::new("/code/gc"),
+            StdinMode::HeldStream,
+        );
+        let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(
+            argv,
+            vec![
+                "claude",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--session-id",
+                sid,
+                "--model",
+                "sonnet",
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                "Read,Edit,Bash",
+                "--append-system-prompt",
+                "Implement with TDD.",
+                "-p",
+            ],
+            "NO positional task in stream mode — the task is the first \
+             user_message over stdin"
+        );
+        assert!(
+            spec.env.contains(&(
+                "CAMP_TRANSCRIPT".to_owned(),
+                "/home/u/.claude/projects/-code-gc/x.jsonl".to_owned()
+            )),
+            "env: {:?}",
+            spec.env
+        );
+        assert_eq!(spec.stdin_mode, StdinMode::HeldStream);
+    }
+
+    /// The nudge/task wire shape, pinned against probe P2.
+    #[test]
+    fn user_message_is_one_escaped_stream_json_line() {
+        let line = user_message("say \"hi\"\nnow");
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1, "ONE line on the wire");
+        let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"], "say \"hi\"\nnow");
+    }
+
+    /// F5 as amended by Decision C: Null mode keeps /dev/null stdin;
+    /// HeldStream pipes it and the caller owns the write end.
+    #[test]
+    fn held_stream_spawn_pipes_stdin_and_null_spawn_does_not() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let spec_for = |mode: StdinMode| SpawnSpec {
+            session_name: "t/dev/1".into(),
+            claude_session_id: "sid".into(),
+            transcript_path: dir.path().join("t.jsonl"),
+            cwd: dir.path().to_path_buf(),
+            argv: vec![OsString::from("cat")],
+            env: vec![],
+            stdout_path: dir.path().join("sessions/out.json"),
+            stderr_path: dir.path().join("sessions/err.log"),
+            stdin_mode: mode,
+        };
+
+        let mut held = spawn(&spec_for(StdinMode::HeldStream)).unwrap();
+        let mut stdin = held.stdin.take().expect("HeldStream must pipe stdin");
+        use std::io::Write as _;
+        stdin.write_all(b"ping\n").unwrap();
+        drop(stdin); // EOF: cat exits 0
+        let status = held.wait().unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sessions/out.json")).unwrap(),
+            "ping\n",
+            "the capture file still receives stdout"
+        );
+
+        let mut null = spawn(&spec_for(StdinMode::Null)).unwrap();
+        assert!(null.stdin.is_none(), "Null mode keeps /dev/null (F5)");
+        assert!(null.wait().unwrap().success());
+    }
+
+    /// Decision H: a patrol respawn reuses the bead's own worktree
+    /// (partial work preserved); anything else keeps the residue error.
+    #[test]
+    fn ensure_worktree_reuses_the_beads_worktree_and_rejects_impostors() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let rig = git_rig(dir.path());
+        let worktrees = dir.path().join("worktrees");
+
+        // absent -> creates (parity with create_worktree)
+        let wt = ensure_worktree(&rig, &worktrees, "gc-7").unwrap();
+        assert!(wt.join(".git").exists());
+
+        // existing valid worktree on camp/<bead> -> reused, work preserved
+        std::fs::write(wt.join("partial.txt"), "half-done").unwrap();
+        let again = ensure_worktree(&rig, &worktrees, "gc-7").unwrap();
+        assert_eq!(again, wt);
+        assert_eq!(
+            std::fs::read_to_string(wt.join("partial.txt")).unwrap(),
+            "half-done"
+        );
+
+        // a plain directory (not a worktree) -> the residue error, verbatim
+        let imposter_dir = worktrees.join("gc-8");
+        std::fs::create_dir_all(&imposter_dir).unwrap();
+        let err = ensure_worktree(&rig, &worktrees, "gc-8").unwrap_err();
+        assert!(
+            err.to_string().contains("residue"),
+            "plain dir must fail fast: {err:#}"
+        );
     }
 }

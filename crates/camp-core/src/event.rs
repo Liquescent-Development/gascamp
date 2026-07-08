@@ -35,6 +35,8 @@ pub enum EventType {
     CheckPassed,
     CheckFailed,
     RunFinalized,
+    AgentStalled,
+    PatrolDegraded,
 }
 
 impl EventType {
@@ -62,6 +64,8 @@ impl EventType {
         EventType::CheckPassed,
         EventType::CheckFailed,
         EventType::RunFinalized,
+        EventType::AgentStalled,
+        EventType::PatrolDegraded,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -89,6 +93,8 @@ impl EventType {
             EventType::CheckPassed => "check.passed",
             EventType::CheckFailed => "check.failed",
             EventType::RunFinalized => "run.finalized",
+            EventType::AgentStalled => "agent.stalled",
+            EventType::PatrolDegraded => "patrol.degraded",
         }
     }
 

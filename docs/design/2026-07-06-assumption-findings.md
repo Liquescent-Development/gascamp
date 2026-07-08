@@ -266,8 +266,9 @@ real — three separate live paths exist:
    `claude -p --input-format stream-json --output-format stream-json`
    process answered a first user message and then a second one written to
    its stdin 15 s later (`FIRST-OK`, `SECOND-OK`, same session id, exit 0
-   on stdin EOF). A campd that spawns workers in stream mode and holds the
-   stdin pipe can inject a nudge turn into the live process.
+   on stdin EOF) [exit-on-EOF superseded at 2.1.204 — see the A4-3
+   supersession note below]. A campd that spawns workers in stream mode
+   and holds the stdin pipe can inject a nudge turn into the live process.
 4. **Concurrent resume also works** (probe A4-4): with the original
    process *verifiably still alive* (`alive_at_nudge=yes`, and still alive
    after), `claude -p --resume <sid>` completed successfully (`NUDGE-OK`,
@@ -285,6 +286,8 @@ experiment-established facts, version-pinned to 2.1.201.
 A4-1 tail log:  t=1 alive=yes lines=0 · t=2 alive=yes lines=8 · … · t=16 alive=yes lines=26 · t=17 alive=no lines=28 · exit=0
 A4-2 resume:    result "GASCAMP-ZEBRA-42", session_id unchanged (043325a5-…), transcript 28→35 lines
 A4-3 stream:    two result events, both success: "FIRST-OK" then "SECOND-OK", one process, one session id, exit 0
+                [SUPERSEDED at claude 2.1.204: an idle stream worker does NOT exit on stdin EOF — see probe P3,
+                 docs/design/2026-07-07-phase-11-probe-findings.md; the live-input capability itself is unchanged]
 A4-4 v2:        alive_at_nudge=yes · concurrent-resume exit=0 result "NUDGE-OK" (same sid) · alive_after_nudge=yes · long-run exit=0
 ```
 
@@ -295,3 +298,7 @@ A4-4 v2:        alive_at_nudge=yes · concurrent-resume exit=0 result "NUDGE-OK"
 campd-spawned workers started in stream-json mode. Spec edit lands in this
 PR (see §17/§10 resolution note). Structure unchanged: the ledger, dispatch,
 and patrol designs did not assume the absence of this capability.
+Phase 11 re-probed at 2.1.204: exit-on-EOF did not reproduce (P3,
+docs/design/2026-07-07-phase-11-probe-findings.md) — stream-worker lifetime
+is campd-managed via the release rule; the stronger verdict (live input
+exists) stands.

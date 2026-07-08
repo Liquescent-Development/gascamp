@@ -15,6 +15,13 @@
 #   FAKE_AGENT_TOUCH      write this file (relative to cwd) to prove where
 #                         the worker ran (worktree tests)
 #   FAKE_AGENT_OUTCOME    close outcome, default "pass"
+#   FAKE_AGENT_NUDGE_CLOSE     Phase 11 stream-mode contract: line 1 on
+#                              stdin is the task message; block until a
+#                              LATER line (a patrol nudge) arrives, then
+#                              close — the nudge-revival proof
+#   FAKE_AGENT_TOUCH_TRANSCRIPT_LOOP  Phase 11: N iterations of appending
+#                              to $CAMP_TRANSCRIPT every 250 ms after the
+#                              claim — a working agent's heartbeat
 set -euo pipefail
 
 : "${CAMP_BIN:?fake-agent: CAMP_BIN must point at the camp binary}"
@@ -39,6 +46,19 @@ if [[ -n "${FAKE_AGENT_CRASH:-}" ]]; then
   esac
 fi
 
+if [[ -n "${FAKE_AGENT_TOUCH_TRANSCRIPT_LOOP:-}" ]]; then
+  # The transcript heartbeat a real claude produces for free (A4-1): the
+  # stall timer must keep resetting while this loop runs.
+  : "${CAMP_TRANSCRIPT:?fake-agent: CAMP_TRANSCRIPT must be set by campd}"
+  mkdir -p "$(dirname "$CAMP_TRANSCRIPT")"
+  i=0
+  while [ "$i" -lt "$FAKE_AGENT_TOUCH_TRANSCRIPT_LOOP" ]; do
+    echo "heartbeat $i" >> "$CAMP_TRANSCRIPT"
+    sleep 0.25
+    i=$((i + 1))
+  done
+fi
+
 if [[ -n "${FAKE_AGENT_HOLD_DIR:-}" ]]; then
   # Test-harness gate, not camp machinery: camp never polls; this script is
   # the stand-in for a model thinking. Bounded (plan-review note 3): a test
@@ -53,6 +73,15 @@ if [[ -n "${FAKE_AGENT_HOLD_DIR:-}" ]]; then
       exit 97
     fi
   done
+fi
+
+if [[ -n "${FAKE_AGENT_NUDGE_CLOSE:-}" ]]; then
+  # Stream-mode contract (Phase 11 Decision C): campd wrote the TASK as
+  # the first stdin line at spawn; a LATER line is a patrol nudge. Block
+  # silently (no transcript writes = a stalled worker) until nudged, then
+  # fall through to the close — the revival the master plan demands.
+  read -r _task_line
+  read -r _nudge_line
 fi
 
 # Close spec (Phase 9): FAKE_AGENT_PLAN names a file whose FIRST line is

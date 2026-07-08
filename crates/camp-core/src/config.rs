@@ -24,6 +24,10 @@ pub struct CampConfig {
     pub packs: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "DispatchConfig::is_default")]
     pub dispatch: DispatchConfig,
+    /// `[patrol]` (spec §10): stall threshold, restart budget, release
+    /// grace. Validated at parse; typed via `patrol::PatrolConfig`.
+    #[serde(default, skip_serializing_if = "PatrolSection::is_default")]
+    pub patrol: PatrolSection,
     /// The directory containing camp.toml — set by `load`, never
     /// serialized. Needed to resolve relative pack paths and the local
     /// agents/ layer while keeping the master plan's pinned
@@ -77,6 +81,55 @@ pub struct CampSection {
     pub name: String,
 }
 
+/// `[patrol]` as written in camp.toml (spec §10). Durations are jiff
+/// friendly strings; `patrol::PatrolConfig::from_section` resolves and
+/// validates them (strictly positive).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatrolSection {
+    /// Stall threshold: silence longer than this fires `agent.stalled`.
+    /// Agent frontmatter `stall_after` overrides per agent.
+    #[serde(default = "default_stall_after")]
+    pub stall_after: String,
+    /// Patrol restarts per bead per campd lifetime before the ladder
+    /// exhausts (emit-and-stop).
+    #[serde(default = "default_restart_budget")]
+    pub restart_budget: u32,
+    /// How long a released stream worker (bead closed, stdin dropped) may
+    /// linger before campd terminates it (probe P3: idle stream workers do
+    /// not exit on EOF).
+    #[serde(default = "default_release_grace")]
+    pub release_grace: String,
+}
+
+fn default_stall_after() -> String {
+    "10m".to_owned()
+}
+
+fn default_restart_budget() -> u32 {
+    2
+}
+
+fn default_release_grace() -> String {
+    "30s".to_owned()
+}
+
+impl Default for PatrolSection {
+    fn default() -> Self {
+        PatrolSection {
+            stall_after: default_stall_after(),
+            restart_budget: default_restart_budget(),
+            release_grace: default_release_grace(),
+        }
+    }
+}
+
+impl PatrolSection {
+    fn is_default(&self) -> bool {
+        *self == PatrolSection::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RigConfig {
@@ -110,6 +163,9 @@ impl CampConfig {
                     .to_owned(),
             ));
         }
+        // Same law for [patrol]: a typo'd threshold must not become dead
+        // config (validation only; campd resolves the typed values later).
+        crate::patrol::PatrolConfig::from_section(&cfg.patrol)?;
         Ok(cfg)
     }
 
@@ -187,6 +243,7 @@ prefix = "gc"
             orders: vec![],
             packs: Vec::new(),
             dispatch: DispatchConfig::default(),
+            patrol: PatrolSection::default(),
             root: None,
         };
         let text = toml::to_string(&cfg).unwrap();
@@ -281,5 +338,47 @@ default_agent = "dev"
         std::fs::write(&path, "[camp]\nname = \"dev\"\n").unwrap();
         let cfg = CampConfig::load(&path).unwrap();
         assert_eq!(cfg.root.as_deref(), Some(dir.path()));
+    }
+
+    // ---- Phase 11: [patrol] ----------------------------------------------
+
+    #[test]
+    fn patrol_section_parses_with_defaults_and_overrides() {
+        let cfg = CampConfig::parse("[camp]\nname=\"d\"\n").unwrap();
+        assert_eq!(cfg.patrol.stall_after, "10m");
+        assert_eq!(cfg.patrol.restart_budget, 2);
+        assert_eq!(cfg.patrol.release_grace, "30s");
+        let cfg = CampConfig::parse(
+            "[camp]\nname=\"d\"\n[patrol]\nstall_after=\"90s\"\nrestart_budget=1\nrelease_grace=\"500ms\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.patrol.stall_after, "90s");
+        assert_eq!(cfg.patrol.restart_budget, 1);
+        assert_eq!(cfg.patrol.release_grace, "500ms");
+    }
+
+    #[test]
+    fn bad_patrol_durations_are_rejected_at_parse() {
+        // A typo'd threshold must not silently become dead patrol config
+        // (the max_workers precedent, PR #14 review finding 5).
+        for toml in [
+            "[camp]\nname=\"d\"\n[patrol]\nstall_after=\"0s\"\n",
+            "[camp]\nname=\"d\"\n[patrol]\nstall_after=\"nope\"\n",
+            "[camp]\nname=\"d\"\n[patrol]\nrelease_grace=\"-1s\"\n",
+        ] {
+            let err = CampConfig::parse(toml).unwrap_err();
+            assert!(err.to_string().contains("patrol"), "{toml}: {err}");
+        }
+    }
+
+    #[test]
+    fn unknown_patrol_key_is_rejected() {
+        assert!(CampConfig::parse("[camp]\nname=\"d\"\n[patrol]\nbogus=1\n").is_err());
+    }
+
+    #[test]
+    fn patrol_defaults_do_not_pollute_serialization() {
+        let cfg = CampConfig::parse("[camp]\nname = \"dev\"\n").unwrap();
+        assert!(!toml::to_string(&cfg).unwrap().contains("patrol"));
     }
 }

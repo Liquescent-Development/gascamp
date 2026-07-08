@@ -319,17 +319,22 @@ pub fn catch_up_anchor(ledger: &Ledger, now: Timestamp) -> Result<Timestamp, Cor
 }
 
 /// The campd processor: readiness (Phase 7) plus orders (Phase 10) plus
-/// graph execution (Phase 9), one pass per committed event, inside the
-/// cursor transaction.
+/// graph execution (Phase 9) plus patrol observation (Phase 11), one pass
+/// per committed event, inside the cursor transaction.
 pub struct CampdProcessor<'a> {
     pub readiness: &'a mut ReadinessProcessor,
     pub runtime: &'a mut OrdersRuntime,
     pub clock: &'a dyn Clock,
     pub graph: &'a mut GraphRuntime,
+    pub patrol: &'a mut super::patrol::PatrolRuntime,
 }
 
 impl EventProcessor for CampdProcessor<'_> {
     fn process(&mut self, conn: &rusqlite::Connection, event: &Event) -> Result<(), CoreError> {
+        // (0) patrol observation (Phase 11): memory-only — tracks woke
+        //     rows, queues releases, resets stall timers on worker
+        //     activity (Decision J). Watches/timers apply after the txn.
+        self.patrol.observe(event);
         // (1) readiness bookkeeping — untouched Phase 7 behavior
         self.readiness.process(conn, event)?;
         // (2) a fire declaration → queue its cook for the settle loop
@@ -419,6 +424,7 @@ pub fn settle(
     runtime: &mut OrdersRuntime,
     clock: &dyn Clock,
     graph: &mut GraphRuntime,
+    patrol: &mut super::patrol::PatrolRuntime,
 ) -> Result<(), CoreError> {
     loop {
         {
@@ -427,6 +433,7 @@ pub fn settle(
                 runtime,
                 clock,
                 graph,
+                patrol,
             };
             cursor::catch_up(ledger, &mut processor)?;
         }
@@ -536,10 +543,25 @@ mod tests {
         GraphRuntime::new(runtime.camp_root.clone(), &runtime.config)
     }
 
+    /// A patrol runtime for settle threading (Phase 11): unwatched, empty.
+    fn test_patrol() -> super::super::patrol::PatrolRuntime {
+        let config = CampConfig::parse("[camp]\nname = \"t\"\n").unwrap();
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        super::super::patrol::PatrolRuntime::new(patrol_config, &config)
+    }
+
     fn settle_all(ledger: &mut Ledger, runtime: &mut OrdersRuntime) {
         let mut readiness = ReadinessProcessor::default();
         let mut graph = graph_for(runtime);
-        settle(ledger, &mut readiness, runtime, &clock(), &mut graph).unwrap();
+        settle(
+            ledger,
+            &mut readiness,
+            runtime,
+            &clock(),
+            &mut graph,
+            &mut test_patrol(),
+        )
+        .unwrap();
     }
 
     fn types(ledger: &Ledger) -> Vec<String> {
@@ -930,7 +952,14 @@ mod tests {
 
         let mut readiness = ReadinessProcessor::default();
         let mut graph = graph_for(&rt);
-        let err = settle(&mut ledger, &mut readiness, &mut rt, &clock(), &mut graph);
+        let err = settle(
+            &mut ledger,
+            &mut readiness,
+            &mut rt,
+            &clock(),
+            &mut graph,
+            &mut test_patrol(),
+        );
         assert!(err.is_err(), "the infra error must surface");
         // BOTH cooks survive for the next settle (the failing one included)
         assert_eq!(rt.pending_cook_count(), 2);
@@ -940,7 +969,15 @@ mod tests {
             .unwrap();
         {
             let mut graph = graph_for(&rt);
-            settle(&mut ledger, &mut readiness, &mut rt, &clock(), &mut graph).unwrap();
+            settle(
+                &mut ledger,
+                &mut readiness,
+                &mut rt,
+                &clock(),
+                &mut graph,
+                &mut test_patrol(),
+            )
+            .unwrap();
         }
         assert_eq!(rt.pending_cook_count(), 0);
         assert_eq!(
@@ -1020,7 +1057,15 @@ mod tests {
         let mut readiness = ReadinessProcessor::default();
         {
             let mut graph = graph_for(&rt);
-            settle(&mut ledger, &mut readiness, &mut rt, &clock(), &mut graph).unwrap();
+            settle(
+                &mut ledger,
+                &mut readiness,
+                &mut rt,
+                &clock(),
+                &mut graph,
+                &mut test_patrol(),
+            )
+            .unwrap();
         }
         for cook in camp_core::orders::unresponded_fires(&ledger).unwrap() {
             rt.queue_cook(cook);
@@ -1033,7 +1078,15 @@ mod tests {
         declare_cron_fires(&mut ledger, &fires).unwrap();
         {
             let mut graph = graph_for(&rt);
-            settle(&mut ledger, &mut readiness, &mut rt, &clock(), &mut graph).unwrap();
+            settle(
+                &mut ledger,
+                &mut readiness,
+                &mut rt,
+                &clock(),
+                &mut graph,
+                &mut test_patrol(),
+            )
+            .unwrap();
         }
 
         // spec §9 "fire once": ONE declaration, ONE cooked run.
