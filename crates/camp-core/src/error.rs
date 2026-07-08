@@ -48,6 +48,10 @@ pub enum CoreError {
     /// bad output directory, unreadable inputs, malformed run dirs.
     #[error("export: {0}")]
     Export(String),
+    /// A `camp backup` failure: the destination already exists, the VACUUM
+    /// INTO copy failed, or the copy did not pass `PRAGMA integrity_check`.
+    #[error("backup: {0}")]
+    Backup(String),
     /// Orders that cannot be expressed as gc order TOML (spec §15.3, plan
     /// decision 8). Listed in full; the flag named here is the contract's
     /// explicit opt-out.
