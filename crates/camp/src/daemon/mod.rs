@@ -8,6 +8,7 @@ pub mod cursor;
 pub mod dispatch;
 pub mod event_loop;
 pub mod orders;
+pub mod patrol;
 pub mod socket;
 pub mod spawn;
 
