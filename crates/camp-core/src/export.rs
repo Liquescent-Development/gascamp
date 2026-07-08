@@ -87,6 +87,144 @@ pub(crate) fn export_beads(conn: &Connection) -> Result<Vec<ExportBead>, CoreErr
     Ok(beads)
 }
 
+/// One issue line of `beads.jsonl` — the bd import/export wire format
+/// (beadslib `types.Issue`, v1.0.4 at the gascity pin; the format
+/// `bd import` actually reads, NOT Gas City's internal exec-provider
+/// shape, whose `parent`/`needs`/`ref` fields bd silently drops).
+/// Serialize-only: camp emits, bd consumes. Field-level mapping:
+/// docs/reference/export.md.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BdIssue {
+    /// bd's own export tags issue lines; absence also means issue.
+    #[serde(rename = "_type")]
+    pub record: &'static str,
+    pub id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub status: String,
+    /// bd priority 0 means P0/critical and the field carries no omitempty
+    /// in bd's export; absent priority is NOT defaulted at import — camp
+    /// has no priority, so every line says 2 (normal) explicitly.
+    pub priority: i64,
+    pub issue_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<BdDependency>,
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One `dependencies` entry: camp's `needs` edge is a readiness-blocking
+/// dependency, bd's `blocks` type (in bd's blocking-for-ready set).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BdDependency {
+    pub issue_id: String,
+    pub depends_on_id: String,
+    #[serde(rename = "type")]
+    pub dep_type: &'static str,
+}
+
+/// A native bd memory record: `bd import` stores these as `bd remember`
+/// KV entries, not issues. key = the camp bead id, value = the fact.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BdMemory {
+    #[serde(rename = "_type")]
+    pub record: &'static str,
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BdRecord {
+    Issue(Box<BdIssue>),
+    Memory(BdMemory),
+}
+
+/// Map one camp bead to its `beads.jsonl` record. Field-level table:
+/// docs/reference/export.md.
+///
+/// Golden-output coupling, deliberate: `serde_json::Map` is a BTreeMap
+/// (alphabetical key order) unless serde_json's `preserve_order` feature
+/// is enabled — the golden fixtures encode that order and break loudly if
+/// it ever changes.
+pub fn bd_record(bead: &ExportBead) -> Result<BdRecord, CoreError> {
+    let issue_type = match bead.kind.as_str() {
+        "memory" => {
+            return Ok(BdRecord::Memory(BdMemory {
+                record: "memory",
+                key: bead.id.clone(),
+                value: bead.title.clone(),
+            }));
+        }
+        "task" => "task",
+        "mail" => "message",
+        other => {
+            return Err(CoreError::Export(format!(
+                "bead {} has unknown type {other:?}",
+                bead.id
+            )));
+        }
+    };
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("camp.rig".into(), bead.rig.clone().into());
+    if let Some(claimed_by) = &bead.claimed_by {
+        metadata.insert("camp.claimed_by".into(), claimed_by.clone().into());
+    }
+    if let Some(run_id) = &bead.run_id {
+        metadata.insert("camp.run_id".into(), run_id.clone().into());
+    }
+    if let Some(step_id) = &bead.step_id {
+        metadata.insert("camp.step_id".into(), step_id.clone().into());
+    }
+    if let Some(outcome) = &bead.outcome {
+        metadata.insert("gc.outcome".into(), outcome.clone().into());
+    }
+    let dependencies = bead
+        .needs
+        .iter()
+        .map(|needs_id| BdDependency {
+            issue_id: bead.id.clone(),
+            depends_on_id: needs_id.clone(),
+            dep_type: "blocks",
+        })
+        .collect();
+    Ok(BdRecord::Issue(Box::new(BdIssue {
+        record: "issue",
+        id: bead.id.clone(),
+        title: bead.title.clone(),
+        description: bead.description.clone(),
+        status: bead.status.clone(),
+        priority: 2,
+        issue_type,
+        assignee: bead.assignee.clone(),
+        created_at: bead.created_ts.clone(),
+        updated_at: bead.updated_ts.clone(),
+        closed_at: bead.closed_ts.clone(),
+        close_reason: bead.close_reason.clone(),
+        labels: bead.labels.clone(),
+        dependencies,
+        metadata,
+    })))
+}
+
+/// One `beads.jsonl` line (no trailing newline).
+pub fn jsonl_line(record: &BdRecord) -> Result<String, CoreError> {
+    Ok(match record {
+        BdRecord::Issue(issue) => serde_json::to_string(issue)?,
+        BdRecord::Memory(memory) => serde_json::to_string(memory)?,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -217,5 +355,111 @@ mod tests {
         let b5 = &beads[4];
         assert_eq!(b5.run_id.as_deref(), Some("20260705T211403Z-abc123"));
         assert_eq!(b5.step_id.as_deref(), Some("s1"));
+    }
+
+    fn full_bead() -> ExportBead {
+        ExportBead {
+            id: "gc-1".into(),
+            rig: "gc".into(),
+            kind: "task".into(),
+            title: "implement widget".into(),
+            description: "the change".into(),
+            status: "closed".into(),
+            assignee: Some("dev".into()),
+            claimed_by: Some("camp/dev/1".into()),
+            outcome: Some("pass".into()),
+            close_reason: Some("shipped the widget".into()),
+            labels: vec!["cli".into()],
+            run_id: None,
+            step_id: None,
+            needs: vec!["gc-0".into()],
+            created_ts: TS.into(),
+            updated_ts: TS.into(),
+            closed_ts: Some(TS.into()),
+        }
+    }
+
+    fn minimal_bead() -> ExportBead {
+        ExportBead {
+            id: "gc-2".into(),
+            rig: "gc".into(),
+            kind: "task".into(),
+            title: "review".into(),
+            description: String::new(),
+            status: "open".into(),
+            assignee: None,
+            claimed_by: None,
+            outcome: None,
+            close_reason: None,
+            labels: vec![],
+            run_id: None,
+            step_id: None,
+            needs: vec![],
+            created_ts: TS.into(),
+            updated_ts: TS.into(),
+            closed_ts: None,
+        }
+    }
+
+    #[test]
+    fn closed_task_maps_to_a_bd_issue_line_exactly() {
+        let line = jsonl_line(&bd_record(&full_bead()).unwrap()).unwrap();
+        assert_eq!(
+            line,
+            r#"{"_type":"issue","id":"gc-1","title":"implement widget","description":"the change","status":"closed","priority":2,"issue_type":"task","assignee":"dev","created_at":"2026-07-05T21:14:03Z","updated_at":"2026-07-05T21:14:03Z","closed_at":"2026-07-05T21:14:03Z","close_reason":"shipped the widget","labels":["cli"],"dependencies":[{"issue_id":"gc-1","depends_on_id":"gc-0","type":"blocks"}],"metadata":{"camp.claimed_by":"camp/dev/1","camp.rig":"gc","gc.outcome":"pass"}}"#
+        );
+    }
+
+    #[test]
+    fn open_minimal_task_omits_empty_fields_and_keeps_priority() {
+        let line = jsonl_line(&bd_record(&minimal_bead()).unwrap()).unwrap();
+        assert_eq!(
+            line,
+            r#"{"_type":"issue","id":"gc-2","title":"review","status":"open","priority":2,"issue_type":"task","created_at":"2026-07-05T21:14:03Z","updated_at":"2026-07-05T21:14:03Z","metadata":{"camp.rig":"gc"}}"#
+        );
+    }
+
+    #[test]
+    fn mail_maps_to_the_native_bd_message_type() {
+        let mut bead = minimal_bead();
+        bead.kind = "mail".into();
+        let line = jsonl_line(&bd_record(&bead).unwrap()).unwrap();
+        assert!(line.contains(r#""issue_type":"message""#), "{line}");
+    }
+
+    #[test]
+    fn memory_maps_to_a_native_bd_memory_record() {
+        let mut bead = minimal_bead();
+        bead.id = "gc-4".into();
+        bead.kind = "memory".into();
+        bead.title = "deploy needs the VPN profile".into();
+        let line = jsonl_line(&bd_record(&bead).unwrap()).unwrap();
+        assert_eq!(
+            line,
+            r#"{"_type":"memory","key":"gc-4","value":"deploy needs the VPN profile"}"#
+        );
+    }
+
+    #[test]
+    fn run_and_step_provenance_ride_in_camp_metadata() {
+        let mut bead = minimal_bead();
+        bead.run_id = Some("20260705T211403Z-abc123".into());
+        bead.step_id = Some("s1".into());
+        let line = jsonl_line(&bd_record(&bead).unwrap()).unwrap();
+        assert!(
+            line.contains(r#""camp.run_id":"20260705T211403Z-abc123""#)
+                && line.contains(r#""camp.step_id":"s1""#),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn unknown_bead_type_is_an_export_error() {
+        let mut bead = minimal_bead();
+        bead.kind = "vibes".into();
+        match bd_record(&bead) {
+            Err(CoreError::Export(msg)) => assert!(msg.contains("vibes"), "{msg}"),
+            other => panic!("expected Export error, got {other:?}"),
+        }
     }
 }
