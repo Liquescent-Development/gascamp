@@ -34,6 +34,8 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "check.passed",
     "check.failed",
     "run.finalized",
+    "agent.stalled",
+    "patrol.degraded",
 ];
 
 /// Values `bead.closed` accepts for `outcome` — a strict subset of gc's

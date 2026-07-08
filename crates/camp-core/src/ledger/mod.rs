@@ -646,6 +646,165 @@ mod tests {
         assert_eq!(l.events_range(1, None).unwrap().len(), before);
     }
 
+    // ---- Phase 11 events (agent.stalled, patrol.degraded) + crash cause --
+
+    #[test]
+    fn agent_stalled_validates_shape_and_is_log_only() {
+        let (_dir, mut l) = temp_ledger();
+        seeded_bead(&mut l, "gc-1");
+        let valid = serde_json::json!({
+            "session": "t/dev/1", "agent": "dev", "action": "nudge",
+            "threshold": "10m", "restarts": 0, "via": "stdin",
+        });
+        let seq = l
+            .append(EventInput {
+                kind: EventType::AgentStalled,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: valid.clone(),
+            })
+            .unwrap();
+        assert!(seq > 0);
+        // log-only: the bead is untouched
+        let bead = l.get_bead("gc-1").unwrap().unwrap();
+        assert_eq!(bead.status, "open");
+
+        let before = l.events_range(1, None).unwrap().len();
+        let reject = |l: &mut Ledger, data: serde_json::Value, bead: Option<&str>| {
+            let err = l.append(EventInput {
+                kind: EventType::AgentStalled,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: bead.map(str::to_owned),
+                data,
+            });
+            assert!(err.is_err(), "must reject");
+        };
+        // missing session
+        reject(
+            &mut l,
+            serde_json::json!({"agent": "dev", "action": "nudge", "threshold": "10m", "restarts": 0}),
+            Some("gc-1"),
+        );
+        // unknown action
+        let mut bad = valid.clone();
+        bad["action"] = serde_json::json!("dance");
+        reject(&mut l, bad, Some("gc-1"));
+        // nudge_failed requires the error
+        let mut bad = valid.clone();
+        bad["action"] = serde_json::json!("nudge_failed");
+        reject(&mut l, bad, Some("gc-1"));
+        // via is a nudge-only field
+        let mut bad = valid.clone();
+        bad["action"] = serde_json::json!("restart");
+        reject(&mut l, bad, Some("gc-1"));
+        // unknown field
+        let mut bad = valid.clone();
+        bad["extra"] = serde_json::json!(1);
+        reject(&mut l, bad, Some("gc-1"));
+        // bead absent / unknown
+        reject(&mut l, valid.clone(), None);
+        reject(&mut l, valid.clone(), Some("gc-999"));
+        assert_eq!(l.events_range(1, None).unwrap().len(), before);
+
+        // the other legal shapes: nudge_failed with error+via, restart,
+        // exhausted, annotate (no via)
+        for (action, extra) in [
+            ("nudge_failed", Some(("error", "broken pipe"))),
+            ("restart", None),
+            ("exhausted", None),
+            ("annotate", None),
+        ] {
+            let mut data = serde_json::json!({
+                "session": "t/dev/1", "agent": "dev", "action": action,
+                "threshold": "10m", "restarts": 1,
+            });
+            if let Some((k, v)) = extra {
+                data[k] = serde_json::json!(v);
+                data["via"] = serde_json::json!("resume");
+            }
+            l.append(EventInput {
+                kind: EventType::AgentStalled,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data,
+            })
+            .unwrap_or_else(|e| panic!("{action} must be a legal shape: {e}"));
+        }
+    }
+
+    #[test]
+    fn patrol_degraded_requires_the_error() {
+        let (_dir, mut l) = temp_ledger();
+        l.append(EventInput {
+            kind: EventType::PatrolDegraded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"error": "inotify watch limit reached"}),
+        })
+        .unwrap();
+        // optional session context
+        l.append(EventInput {
+            kind: EventType::PatrolDegraded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"error": "nudge resume exited 1", "session": "t/dev/1"}),
+        })
+        .unwrap();
+        for bad in [serde_json::json!({}), serde_json::json!({"error": ""})] {
+            assert!(
+                l.append(EventInput {
+                    kind: EventType::PatrolDegraded,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: None,
+                    data: bad,
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn session_crashed_accepts_an_audit_cause_seq() {
+        let (_dir, mut l) = temp_ledger();
+        seeded_bead(&mut l, "gc-1");
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"name": "t/dev/1", "agent": "dev", "bead": "gc-1"}),
+        })
+        .unwrap();
+        l.append(EventInput {
+            kind: EventType::BeadClaimed,
+            rig: Some("gc".into()),
+            actor: "cli".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"session": "t/dev/1"}),
+        })
+        .unwrap();
+        l.append(EventInput {
+            kind: EventType::SessionCrashed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "name": "t/dev/1", "reason": "patrol restart", "cause_seq": 3, "signal": 9,
+            }),
+        })
+        .unwrap();
+        // the release semantics are unchanged: the claimed bead reopened
+        let bead = l.get_bead("gc-1").unwrap().unwrap();
+        assert_eq!(bead.status, "open");
+        assert!(bead.claimed_by.is_none());
+    }
+
     #[test]
     fn worktree_events_are_log_only_and_validate_payloads() {
         let (_dir, mut l) = temp_ledger();
