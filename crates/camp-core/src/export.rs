@@ -17,7 +17,10 @@ use crate::orders::{Order, Trigger};
 
 /// One bead with every column `beads.jsonl` needs — the full-fidelity
 /// superset of [`crate::readiness::BeadRow`] plus the `needs` edges from
-/// `deps`. Creation order (`ORDER BY created_ts, id`), read-only.
+/// `deps`. True creation order (`ORDER BY rowid` — the fold inserts in
+/// event-seq order and refold rebuilds in seq order, so rowid is creation
+/// order; a `created_ts, id` sort would misorder same-second beads with
+/// double-digit ids). Read-only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportBead {
     pub id: String,
@@ -54,7 +57,7 @@ pub(crate) fn export_beads(conn: &Connection) -> Result<Vec<ExportBead>, CoreErr
         "SELECT id, rig, type, title, description, status, assignee, claimed_by,
                 outcome, close_reason, labels, run_id, step_id, created_ts,
                 updated_ts, closed_ts
-         FROM beads ORDER BY created_ts, id",
+         FROM beads ORDER BY rowid",
     )?;
     let rows = stmt.query_map([], |row| {
         let labels_json: String = row.get(10)?;
@@ -777,6 +780,31 @@ mod tests {
         let b5 = &beads[4];
         assert_eq!(b5.run_id.as_deref(), Some("20260705T211403Z-abc123"));
         assert_eq!(b5.step_id.as_deref(), Some("s1"));
+    }
+
+    /// PR #18 review finding 2: created_ts is whole-second, so a
+    /// lexicographic id tiebreak would put gc-10 before gc-2. rowid is
+    /// true creation order (the fold inserts in event-seq order and
+    /// refold rebuilds in seq order).
+    #[test]
+    fn export_order_is_true_creation_order_for_same_second_double_digit_ids() {
+        let (_dir, mut ledger) = temp_ledger();
+        for i in 1..=12 {
+            append(
+                &mut ledger,
+                EventType::BeadCreated,
+                &format!("gc-{i}"),
+                serde_json::json!({"title": "t"}),
+            );
+        }
+        let ids: Vec<String> = ledger
+            .export_beads()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        let expected: Vec<String> = (1..=12).map(|i| format!("gc-{i}")).collect();
+        assert_eq!(ids, expected, "rowid order, not lexicographic id order");
     }
 
     fn full_bead() -> ExportBead {

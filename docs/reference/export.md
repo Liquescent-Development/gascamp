@@ -91,8 +91,10 @@ Consequences camp's exporter encodes:
 | `labels` | `labels` | verbatim array; omitted when empty |
 | `deps(bead_id, needs_id)` | `dependencies: [{"issue_id":<bead>,"depends_on_id":<needs>,"type":"blocks"}]` | camp `needs` is a readiness-blocking edge → bd `blocks` |
 
-Issue lines appear in creation order (`ORDER BY created_ts, id`); memory
-records interleave at their creation position. All metadata values are
+Issue lines appear in true creation order (the beads table's insertion
+order, which follows event-seq order — not a timestamp/id sort, which
+would misorder same-second beads with double-digit ids); memory records
+interleave at their creation position. All metadata values are
 JSON strings; `camp.*` keys are additive camp provenance, `gc.*` keys
 follow the vocabulary mirror (camp's `outcome` values are a strict subset
 of gc's `pass|fail|skipped|missing_root`).
