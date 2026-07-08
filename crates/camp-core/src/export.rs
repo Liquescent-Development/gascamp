@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use rusqlite::Connection;
 
 use crate::error::CoreError;
+use crate::orders::parse::OrderConfig;
+use crate::orders::{Order, Trigger};
 
 /// One bead with every column `beads.jsonl` needs — the full-fidelity
 /// superset of [`crate::readiness::BeadRow`] plus the `needs` edges from
@@ -223,6 +225,93 @@ pub fn jsonl_line(record: &BdRecord) -> Result<String, CoreError> {
         BdRecord::Issue(issue) => serde_json::to_string(issue)?,
         BdRecord::Memory(memory) => serde_json::to_string(memory)?,
     })
+}
+
+/// A gc `orders/<name>.toml` file: an `[order]` table. gc derives the
+/// order's name from the FILENAME, so the name lives beside this struct,
+/// not in it. Keys per gascity `internal/orders/order.go` at the pinned
+/// ref: `trigger` (required), `schedule` (cron), `on` (event), `formula`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GcOrderFile {
+    pub order: GcOrder,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GcOrder {
+    pub formula: String,
+    pub trigger: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+/// The outcome of translating one camp order (plan decision 8: an explicit
+/// mapping table, failing fast on anything gc order TOML cannot express).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderTranslation {
+    Translated { name: String, file: GcOrderFile },
+    Untranslatable { name: String, reason: String },
+}
+
+/// Translate one compiled camp order to gc order TOML. Translation table:
+/// docs/reference/export.md. `raw` is the same order's `[[order]]` config,
+/// needed because the compiled form defaults `catch_up_window` and would
+/// hide whether the camp declared one.
+pub fn translate_order(order: &Order, raw: &OrderConfig) -> OrderTranslation {
+    let name = order.name.clone();
+    if raw.catch_up_window.is_some() {
+        return OrderTranslation::Untranslatable {
+            name,
+            reason: "catch_up_window has no gc order-TOML equivalent".to_owned(),
+        };
+    }
+    if let Some(rig) = &order.rig {
+        return OrderTranslation::Untranslatable {
+            name,
+            reason: format!(
+                "rig {rig:?} cannot be expressed in gc order TOML (gc's scope key is city|rig \
+                 with no named-rig binding; pack placement picks the rig)"
+            ),
+        };
+    }
+    match &order.trigger {
+        Trigger::Cron { expr } => OrderTranslation::Translated {
+            name,
+            file: GcOrderFile {
+                order: GcOrder {
+                    formula: order.formula.clone(),
+                    trigger: "cron",
+                    schedule: Some(expr.source().to_owned()),
+                    on: None,
+                },
+            },
+        },
+        Trigger::Event {
+            event_type,
+            label: None,
+        } => OrderTranslation::Translated {
+            name,
+            file: GcOrderFile {
+                order: GcOrder {
+                    formula: order.formula.clone(),
+                    trigger: "event",
+                    schedule: None,
+                    on: Some(event_type.clone()),
+                },
+            },
+        },
+        Trigger::Event {
+            event_type,
+            label: Some(label),
+        } => OrderTranslation::Untranslatable {
+            name,
+            reason: format!(
+                "event trigger {event_type:?} has a [label={label}] filter — gc event orders \
+                 have no label filter"
+            ),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -461,5 +550,84 @@ mod tests {
             Err(CoreError::Export(msg)) => assert!(msg.contains("vibes"), "{msg}"),
             other => panic!("expected Export error, got {other:?}"),
         }
+    }
+
+    /// Compile a camp.toml text and hand back (compiled, raw) order pairs.
+    fn orders_from(
+        toml_text: &str,
+    ) -> Vec<(crate::orders::Order, crate::orders::parse::OrderConfig)> {
+        let config = crate::config::CampConfig::parse(toml_text).unwrap();
+        let compiled = crate::orders::parse::compile_orders(&config).unwrap();
+        compiled.into_iter().zip(config.orders).collect()
+    }
+
+    const RIGGED: &str = r#"
+[camp]
+name = "golden"
+
+[[rigs]]
+name = "gc"
+path = "/tmp/rig"
+prefix = "gc"
+"#;
+
+    #[test]
+    fn cron_order_translates_to_trigger_and_schedule() {
+        let text = format!(
+            "{RIGGED}\n[[order]]\nname = \"nightly\"\non = \"cron:0 7 * * 1-5\"\nformula = \"one-step\"\n"
+        );
+        let pairs = orders_from(&text);
+        match translate_order(&pairs[0].0, &pairs[0].1) {
+            OrderTranslation::Translated { name, file } => {
+                assert_eq!(name, "nightly");
+                assert_eq!(
+                    toml::to_string(&file).unwrap(),
+                    "[order]\nformula = \"one-step\"\ntrigger = \"cron\"\nschedule = \"0 7 * * 1-5\"\n"
+                );
+            }
+            other => panic!("expected Translated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_order_translates_to_trigger_and_on() {
+        let text = format!(
+            "{RIGGED}\n[[order]]\nname = \"on-close\"\non = \"event:bead.closed\"\nformula = \"one-step\"\n"
+        );
+        let pairs = orders_from(&text);
+        match translate_order(&pairs[0].0, &pairs[0].1) {
+            OrderTranslation::Translated { file, .. } => assert_eq!(
+                toml::to_string(&file).unwrap(),
+                "[order]\nformula = \"one-step\"\ntrigger = \"event\"\non = \"bead.closed\"\n"
+            ),
+            other => panic!("expected Translated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn label_filter_rig_and_catch_up_window_are_untranslatable() {
+        let text = format!(
+            concat!(
+                "{}\n",
+                "[[order]]\nname = \"ci-red\"\non = \"event:bead.closed[label=ci-red]\"\nformula = \"fix-ci\"\n\n",
+                "[[order]]\nname = \"rigged\"\non = \"cron:0 7 * * *\"\nformula = \"one-step\"\nrig = \"gc\"\n\n",
+                "[[order]]\nname = \"caught-up\"\non = \"cron:0 7 * * *\"\nformula = \"one-step\"\ncatch_up_window = \"4h\"\n"
+            ),
+            RIGGED
+        );
+        let pairs = orders_from(&text);
+        let reasons: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(order, raw)| match translate_order(order, raw) {
+                OrderTranslation::Untranslatable { name, reason } => (name, reason),
+                other => panic!("expected Untranslatable, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(reasons[0].0, "ci-red");
+        assert!(reasons[0].1.contains("label"), "{}", reasons[0].1);
+        assert_eq!(reasons[1].0, "rigged");
+        assert!(reasons[1].1.contains("rig"), "{}", reasons[1].1);
+        assert_eq!(reasons[2].0, "caught-up");
+        assert!(reasons[2].1.contains("catch_up_window"), "{}", reasons[2].1);
     }
 }
