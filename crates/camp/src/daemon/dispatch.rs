@@ -455,10 +455,9 @@ pub struct PendingFanout {
 
 pub struct GraphRuntime {
     camp_root: PathBuf,
-    /// rig name -> path snapshot (check-script cwd, Task 6) — same
+    /// rig snapshot (check-script cwd, bond-cook prefix) — same
     /// campd-start freshness as the Dispatcher's config.
-    #[allow(dead_code)] // consumed by the check executor (Task 6)
-    rig_paths: HashMap<String, PathBuf>,
+    rigs: HashMap<String, camp_core::config::RigConfig>,
     /// Run-context cache; `None` = the run dir failed to load and the run
     /// was dead-ended (evented once, never retried silently).
     runs: HashMap<String, Option<Arc<RunContext>>>,
@@ -487,10 +486,10 @@ impl GraphRuntime {
     pub fn new(camp_root: PathBuf, config: &camp_core::config::CampConfig) -> GraphRuntime {
         GraphRuntime {
             camp_root,
-            rig_paths: config
+            rigs: config
                 .rigs
                 .iter()
-                .map(|r| (r.name.clone(), r.path.clone()))
+                .map(|r| (r.name.clone(), r.clone()))
                 .collect(),
             runs: HashMap::new(),
             pending_checks: Vec::new(),
@@ -540,6 +539,126 @@ impl GraphRuntime {
                 return Err(error);
             }
         }
+        let fanouts = std::mem::take(&mut self.pending_fanouts);
+        for (i, fanout) in fanouts.iter().enumerate() {
+            if let Err(error) = self.execute_fanout(ledger, fanout) {
+                for survivor in &fanouts[i..] {
+                    self.pending_fanouts.push(survivor.clone());
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Cook the bond children a closed-pass on_complete anchor is owed
+    /// (spec §8.2): parallel cooks every missing item; sequential cooks
+    /// item N only when children 0..N all closed pass (lazy chaining,
+    /// plan Decision 4 — a non-pass child halts by cooking nothing).
+    /// Fan-out-level failures (bad for_each/vars, missing bond formula,
+    /// cook errors) append dispatch.failed on the anchor and drop the
+    /// fan-out — evented, never silent, never fatal (Ok). Only ledger
+    /// errors surface as Err.
+    fn execute_fanout(&mut self, ledger: &mut Ledger, fanout: &PendingFanout) -> Result<()> {
+        let Some(ctx) = self.ctx(&fanout.run_id) else {
+            return Ok(());
+        };
+        let Some(step_ref) = ctx.step_ref(&fanout.step_id) else {
+            return Ok(());
+        };
+        let Some(oc) = &step_ref.step.on_complete else {
+            return Ok(());
+        };
+        let Some(close_data) = ledger.close_event_data(&fanout.anchor)? else {
+            return Ok(()); // anchor not closed yet: nothing due
+        };
+        if close_data["outcome"] != "pass" {
+            return Ok(());
+        }
+        let items = match flow::resolve_for_each(&close_data, &oc.for_each) {
+            Ok(items) => items.clone(),
+            Err(reason) => return fanout_failure(ledger, fanout, &ctx, &reason),
+        };
+        let children = existing_bond_children(ledger, &fanout.anchor)?;
+        let due: Vec<usize> = if oc.parallel {
+            (0..items.len())
+                .filter(|i| !children.contains_key(i))
+                .collect()
+        } else {
+            // sequential: the next index, only when every existing child
+            // closed pass (a non-pass child halts the chain)
+            let next = children.len();
+            let all_passed = children
+                .values()
+                .all(|row| row.status == "closed" && row.outcome.as_deref() == Some("pass"));
+            if all_passed && next < items.len() && !children.contains_key(&next) {
+                vec![next]
+            } else {
+                Vec::new()
+            }
+        };
+        if due.is_empty() {
+            return Ok(());
+        }
+        let Some(rig) = self.rigs.get(&ctx.rig).cloned() else {
+            return fanout_failure(
+                ledger,
+                fanout,
+                &ctx,
+                &format!("rig {:?} is not configured", ctx.rig),
+            );
+        };
+        let bond_path = self
+            .camp_root
+            .join("formulas")
+            .join(format!("{}.toml", oc.bond));
+        let bond = match camp_core::formula::parse_and_validate(&bond_path) {
+            Ok(bond) => bond,
+            Err(e) => {
+                return fanout_failure(
+                    ledger,
+                    fanout,
+                    &ctx,
+                    &format!("bond formula {:?} is unusable: {e}", oc.bond),
+                );
+            }
+        };
+        for index in due {
+            let item = &items[index];
+            let vars = match flow::substitute_vars(&oc.vars, item, index) {
+                Ok(vars) => vars,
+                Err(reason) => return fanout_failure(ledger, fanout, &ctx, &reason),
+            };
+            let extra_root_needs = if !oc.parallel && index > 0 {
+                // the literal chain edge (plan Decision 4): audit + gate
+                match children.get(&(index - 1)) {
+                    Some(prev) => vec![prev.id.clone()],
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let opts = camp_core::formula::CookOptions {
+                vars,
+                extra_root_needs,
+                extra_root_labels: vec![flow::bond_label(&fanout.anchor, index)],
+            };
+            if let Err(e) = camp_core::formula::cook_with(
+                ledger,
+                &bond,
+                &flow::runs_dir(&self.camp_root),
+                &rig,
+                "campd",
+                &opts,
+            ) {
+                return fanout_failure(
+                    ledger,
+                    fanout,
+                    &ctx,
+                    &format!("cooking bond {:?} item {index} failed: {e}", oc.bond),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -564,7 +683,7 @@ impl GraphRuntime {
         if anchor_row.status != "in_progress" || anchor_row.claimed_by.as_deref() != Some("campd") {
             return Ok(());
         }
-        let Some(rig_path) = self.rig_paths.get(&ctx.rig).cloned() else {
+        let Some(rig_path) = self.rigs.get(&ctx.rig).map(|r| r.path.clone()) else {
             return self.check_spawn_failure(
                 ledger,
                 pending,
@@ -1428,6 +1547,54 @@ fn attempt_bead_input(
         bead: Some(id),
         data,
     }
+}
+
+/// The bond children already cooked for an anchor, by index: root beads
+/// whose labels parse as `bond:<anchor>:<i>` (pure beads/events state, so
+/// crash recovery and re-execution converge on the same answer).
+fn existing_bond_children(
+    ledger: &Ledger,
+    anchor: &str,
+) -> Result<std::collections::BTreeMap<usize, BeadRow>, CoreError> {
+    let mut children = std::collections::BTreeMap::new();
+    for event in ledger.events_of_type(EventType::RunCooked)? {
+        let Some(root) = event.data["root"].as_str() else {
+            continue;
+        };
+        let Some(row) = ledger.get_bead(root)? else {
+            continue;
+        };
+        for label in &row.labels {
+            if let Some((parent, index)) = flow::parse_bond_label(label)
+                && parent == anchor
+            {
+                children.insert(index, row.clone());
+                break;
+            }
+        }
+    }
+    Ok(children)
+}
+
+/// A fan-out-level failure: evented on the anchor (invariant 5 — campd
+/// has no caller), fan-out dropped. dispatch.failed is the honest name:
+/// campd could not dispatch the declared follow-on work.
+fn fanout_failure(
+    ledger: &mut Ledger,
+    fanout: &PendingFanout,
+    ctx: &RunContext,
+    reason: &str,
+) -> Result<()> {
+    ledger.append(EventInput {
+        kind: EventType::DispatchFailed,
+        rig: Some(ctx.rig.clone()),
+        actor: "campd".into(),
+        bead: Some(fanout.anchor.clone()),
+        data: serde_json::json!({
+            "reason": format!("on_complete fan-out: {reason}"),
+        }),
+    })?;
+    Ok(())
 }
 
 /// The last ~2 KB of a check log — the mechanical evidence copied into the
@@ -2297,6 +2464,180 @@ mod tests {
             1,
             "no budget loop over a structural problem"
         );
+    }
+
+    // ---- Phase 9 Task 7: on_complete fan-out -----------------------------
+
+    const FAN_PARALLEL: &str = "formula = \"fan\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[steps]]\nid = \"enumerate\"\ntitle = \"Enumerate\"\n\n[steps.on_complete]\nfor_each = \"output.items\"\nbond = \"child\"\n\n[steps.on_complete.vars]\nname = \"{item.name}\"\nposition = \"{index}\"\n";
+    const FAN_SEQUENTIAL: &str = "formula = \"fan\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[steps]]\nid = \"enumerate\"\ntitle = \"Enumerate\"\n\n[steps.on_complete]\nfor_each = \"output.items\"\nbond = \"child\"\nsequential = true\n\n[steps.on_complete.vars]\nname = \"{item.name}\"\nposition = \"{index}\"\n";
+    const CHILD: &str = "formula = \"child\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Handle {name} at {position}\"\n";
+
+    fn write_bond(dir: &tempfile::TempDir) {
+        std::fs::create_dir_all(dir.path().join("formulas")).unwrap();
+        std::fs::write(dir.path().join("formulas/child.toml"), CHILD).unwrap();
+    }
+
+    /// Cook a fan parent and close its enumerate step pass with `output`.
+    fn fan_run(
+        dir: &tempfile::TempDir,
+        ledger: &mut Ledger,
+        rt: &mut super::super::orders::OrdersRuntime,
+        graph: &mut GraphRuntime,
+        toml: &str,
+        output: serde_json::Value,
+    ) -> CookedRun {
+        write_bond(dir);
+        let cooked = cook_into(dir, ledger, "fan", toml);
+        settle_graph(ledger, rt, graph);
+        append_close(
+            ledger,
+            &cooked.step_beads["enumerate"],
+            serde_json::json!({"outcome":"pass","output": output}),
+        );
+        settle_graph(ledger, rt, graph);
+        cooked
+    }
+
+    fn bond_children(ledger: &Ledger, anchor: &str) -> Vec<(usize, BeadRow)> {
+        existing_bond_children(ledger, anchor)
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn parallel_fanout_cooks_every_item_with_substituted_vars() {
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = fan_run(
+            &dir,
+            &mut ledger,
+            &mut rt,
+            &mut graph,
+            FAN_PARALLEL,
+            serde_json::json!({"items":[{"name":"a"},{"name":"b"},{"name":"c"}]}),
+        );
+        let anchor = cooked.step_beads["enumerate"].clone();
+        graph.execute(&mut ledger).unwrap();
+        let children = bond_children(&ledger, &anchor);
+        assert_eq!(children.len(), 3, "three bonds fan out");
+        assert_eq!(
+            children.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // vars substituted into the child step beads
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let mut titles: Vec<String> = Vec::new();
+        for (_, root) in &children {
+            let m = ledger.run_membership(&root.id).unwrap().unwrap();
+            for bead in ledger.run_step_beads(&m.run_id, "work").unwrap() {
+                titles.push(bead.title);
+            }
+        }
+        titles.sort();
+        assert_eq!(
+            titles,
+            vec!["Handle a at 0", "Handle b at 1", "Handle c at 2"]
+        );
+        // the parent run finalizes without waiting for children (Decision 5)
+        assert_eq!(events_named(&ledger, "run.finalized").len(), 1);
+        // idempotent: re-settle + re-execute cooks nothing more
+        let before = ledger.events_range(1, None).unwrap().len();
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        graph.execute(&mut ledger).unwrap();
+        assert_eq!(ledger.events_range(1, None).unwrap().len(), before);
+        assert!(ledger.refold_check().unwrap().drift.is_empty());
+    }
+
+    #[test]
+    fn sequential_fanout_cooks_lazily_and_chains_on_pass() {
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = fan_run(
+            &dir,
+            &mut ledger,
+            &mut rt,
+            &mut graph,
+            FAN_SEQUENTIAL,
+            serde_json::json!({"items":[{"name":"a"},{"name":"b"},{"name":"c"}]}),
+        );
+        let anchor = cooked.step_beads["enumerate"].clone();
+        graph.execute(&mut ledger).unwrap();
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let children = bond_children(&ledger, &anchor);
+        assert_eq!(children.len(), 1, "sequential cooks item 0 alone");
+
+        // child 0 passes: its finalization queues the parent fan-out again
+        let child0 = &children[0].1;
+        let m0 = ledger.run_membership(&child0.id).unwrap().unwrap();
+        let step0 = ledger.run_step_beads(&m0.run_id, "work").unwrap()[0]
+            .id
+            .clone();
+        append_close(&mut ledger, &step0, serde_json::json!({"outcome":"pass"}));
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        assert_eq!(
+            ledger.get_bead(&child0.id).unwrap().unwrap().status,
+            "closed",
+            "child 0 finalized"
+        );
+        graph.execute(&mut ledger).unwrap();
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        let children = bond_children(&ledger, &anchor);
+        assert_eq!(children.len(), 2, "child 1 cooked after child 0 passed");
+        // the literal chain edge: child 1's root needs child 0's root
+        let child1_created = ledger
+            .created_event_data(&children[1].1.id)
+            .unwrap()
+            .unwrap();
+        let needs: Vec<String> = child1_created["needs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        assert!(needs.contains(&child0.id), "{needs:?}");
+
+        // child 1 FAILS: the chain halts — no child 2, ever
+        let m1 = ledger.run_membership(&children[1].1.id).unwrap().unwrap();
+        let step1 = ledger.run_step_beads(&m1.run_id, "work").unwrap()[0]
+            .id
+            .clone();
+        append_close(&mut ledger, &step1, serde_json::json!({"outcome":"fail"}));
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        graph.execute(&mut ledger).unwrap();
+        settle_graph(&mut ledger, &mut rt, &mut graph);
+        graph.execute(&mut ledger).unwrap();
+        assert_eq!(
+            bond_children(&ledger, &anchor).len(),
+            2,
+            "a non-pass child halts the chain"
+        );
+        assert!(ledger.refold_check().unwrap().drift.is_empty());
+    }
+
+    #[test]
+    fn a_bad_for_each_path_events_a_dispatch_failed_on_the_anchor() {
+        let (dir, mut ledger, mut rt, mut graph) = graph_fixture();
+        let cooked = fan_run(
+            &dir,
+            &mut ledger,
+            &mut rt,
+            &mut graph,
+            FAN_PARALLEL,
+            serde_json::json!({"wrong": []}),
+        );
+        let anchor = cooked.step_beads["enumerate"].clone();
+        graph.execute(&mut ledger).unwrap();
+        let failed = events_named(&ledger, "dispatch.failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].bead.as_deref(), Some(anchor.as_str()));
+        assert!(
+            failed[0].data["reason"]
+                .as_str()
+                .unwrap()
+                .contains("output.items"),
+            "{}",
+            failed[0].data
+        );
+        assert!(bond_children(&ledger, &anchor).is_empty());
     }
 
     #[test]
