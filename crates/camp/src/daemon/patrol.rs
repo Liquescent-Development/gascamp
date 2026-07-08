@@ -15,10 +15,6 @@
 //! Patrol config is read at campd start; hot reload does not re-arm
 //! patrol (plan Decision L).
 
-// STAGING ALLOW: the event loop consumes this module in plan Task 11.13;
-// this attribute is REMOVED there (the Task 11.16 gates run without it).
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -1916,11 +1912,6 @@ mod tests {
     }
 
     // ---- Task 11.12: adoption --------------------------------------------
-
-    fn append_and_get(ledger: &mut Ledger, input: EventInput) -> Event {
-        let seq = ledger.append(input).unwrap();
-        ledger.events_range(seq, Some(seq)).unwrap().remove(0)
-    }
 
     fn woke_row(
         ledger: &mut Ledger,

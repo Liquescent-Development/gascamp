@@ -107,17 +107,35 @@ pub fn run(camp: &CampDir) -> Result<()> {
     )
     .context("watching the camp directory")?;
 
+    // The patrol runtime (Phase 11, spec §10): typed config fails fast
+    // (already validated at parse — belt-and-braces), transcript watches
+    // signal the loop through their own self-pipe (Token 3), and the
+    // watcher installs before any settle can track a session.
+    let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut patrol = patrol::PatrolRuntime::new(patrol_config, &config);
+    let (patrol_sender, mut patrol_receiver) =
+        mio::unix::pipe::new().context("creating the patrol watch pipe")?;
+    let patrol_filter = patrol.filter_slot();
+    let patrol_watcher =
+        notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+            patrol::on_watch_event(result, Some(&patrol_sender), &patrol_filter);
+        })
+        .context("creating the transcript watcher")?;
+    patrol.set_watcher(patrol_watcher);
+
     // Startup settle is fatal on error: a daemon that cannot process its
     // backlog must not pretend to be up (fail fast). Settle drains events
     // past the cursor, cooks any order.fired they declare, AND dispatches
-    // whatever is ready (the Phase 8 + Phase 10 joint fixpoint). Per-bead
-    // dispatch problems are dispatch.failed events, not errors — only a
-    // broken ledger stops the daemon.
+    // whatever is ready (the Phase 8 + Phase 10 + Phase 11 joint
+    // fixpoint). Per-bead dispatch problems are dispatch.failed events,
+    // not errors — only a broken ledger stops the daemon.
     let mut processor = ReadinessProcessor::default();
     // Phase 9: the graph runtime shares the config snapshot the Dispatcher
-    // takes (rig paths for check-script cwd), then the Dispatcher owns it.
+    // takes (rig paths for check-script cwd). Phase 11's patrol::adopt
+    // below also needs the config, so the Dispatcher takes a clone.
     let mut graph = dispatch::GraphRuntime::new(camp.root.clone(), &config);
-    let mut dispatcher = dispatch::Dispatcher::new(camp.clone(), config);
+    let mut dispatcher = dispatch::Dispatcher::new(camp.clone(), config.clone());
     event_loop::settle(
         &mut ledger,
         &mut processor,
@@ -125,7 +143,19 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &clock,
         &mut dispatcher,
         &mut graph,
+        &mut patrol,
     )?;
+    // Adoption (spec §8.5, automatic at start): reconcile the registry
+    // against the process table — dead rows crash (beads release), living
+    // workers re-arm, finished lingerers release, orphan worktrees sweep.
+    // Its events drain in the settle below.
+    let adopted = patrol::adopt(&mut ledger, &mut patrol, &mut dispatcher, camp, &config)?;
+    if adopted != patrol::AdoptSummary::default() {
+        eprintln!(
+            "campd: adopted: {} crashed, {} re-armed, {} released, {} worktrees swept, {} kept",
+            adopted.crashed, adopted.rearmed, adopted.released, adopted.swept, adopted.kept
+        );
+    }
     // Fires orphaned by a crash between order.fired and its cook (the
     // cursor is already past them): queue them for the next settle —
     // exactly once, execute_fire dedupes. Observation over state; kill -9
@@ -152,6 +182,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &clock,
         &mut dispatcher,
         &mut graph,
+        &mut patrol,
     )?;
 
     let mut stdout = std::io::stdout();
@@ -159,7 +190,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
     stdout.flush().context("flushing the readiness line")?;
 
     // `watcher` must live until the loop returns — dropping it kills the
-    // camp.toml watch.
+    // camp.toml watch (the patrol watcher lives inside `patrol`).
     let result = event_loop::run(
         listener,
         sigchld_read,
@@ -171,6 +202,8 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &mut receiver,
         &mut dispatcher,
         &mut graph,
+        &mut patrol,
+        &mut patrol_receiver,
     );
     drop(watcher);
     result

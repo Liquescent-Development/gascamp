@@ -46,15 +46,8 @@ struct Worker {
     /// disposition retry must skip the end-append or the fold's
     /// already-ended rejection would wedge the pid forever.
     end_recorded: bool,
-    /// The pre-assigned claude session id (F1) — patrol's resume-nudge and
-    /// adoption probes key on it.
-    #[allow(dead_code)] // consumed by patrol (Task 11.11)
-    claude_session_id: String,
     /// The held stream-json stdin (Decision C). Dropping it is the release
     /// EOF; `None` after release (or for Null-mode spawns).
-    // Production reader is nudge_via_stdin, whose consumer is the patrol
-    // executor (plan Task 11.11); the allow comes off when it wires in.
-    #[allow(dead_code)]
     stdin: Option<std::process::ChildStdin>,
     /// Set when campd released this worker (bead closed, stdin dropped):
     /// its exit reaps as session.stopped with this reason — campd
@@ -72,9 +65,6 @@ struct AuxChild {
 }
 
 /// How a nudge write went (Phase 11 plan Task 11.9).
-// The daemon/patrol.rs action executor (plan Task 11.11) is this API's
-// production consumer; the allow comes off when the event loop wires it.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum NudgeOutcome {
     /// The status-request turn is in the worker's stdin pipe.
@@ -160,16 +150,12 @@ impl Dispatcher {
     }
 
     /// Whether campd holds this session as a live child of its own.
-    // The patrol executor (plan Task 11.11) consumes this lifecycle API;
-    // the allow comes off when the event loop wires it in (Task 11.13).
-    #[allow(dead_code)]
     pub fn is_child(&self, session: &str) -> bool {
         self.children.values().any(|w| w.session == session)
     }
 
     /// Write one status-request turn into the session's held stdin
     /// (Decision C: the live nudge path).
-    #[allow(dead_code)] // consumed by the patrol executor (Task 11.11)
     pub fn nudge_via_stdin(&mut self, session: &str, text: &str) -> NudgeOutcome {
         use std::io::Write as _;
         let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
@@ -193,7 +179,6 @@ impl Dispatcher {
     /// the fold releases the bead, and converge respawns — each step its
     /// own event. Returns false when the session is not our child (the
     /// AdoptedPid path handles those).
-    #[allow(dead_code)] // consumed by the patrol executor (Task 11.11)
     pub fn kill_worker(&mut self, session: &str, cause_seq: Seq) -> bool {
         let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
             return false;
@@ -213,7 +198,6 @@ impl Dispatcher {
     /// session.stopped with the reason. Returns the session name when a
     /// live un-released worker held that bead (the caller arms the release
     /// grace timer); None otherwise (idempotent).
-    #[allow(dead_code)] // consumed by the patrol executor (Task 11.11)
     pub fn release_worker(&mut self, bead: &str, reason: &str) -> Option<String> {
         let worker = self
             .children
@@ -226,7 +210,6 @@ impl Dispatcher {
 
     /// The release grace expired and the worker is still ours: terminate
     /// it (P3: an idle stream worker does not exit on EOF alone).
-    #[allow(dead_code)] // consumed by the patrol executor (Task 11.11)
     pub fn kill_released(&mut self, session: &str) -> bool {
         let Some(worker) = self
             .children
@@ -243,7 +226,6 @@ impl Dispatcher {
 
     /// Spawn an auxiliary patrol child (nudge-resume). Reaped in the
     /// normal SIGCHLD sweep; a nonzero exit lands as patrol.degraded.
-    #[allow(dead_code)] // consumed by the patrol executor (Task 11.11)
     pub fn spawn_aux(
         &mut self,
         session: &str,
@@ -314,7 +296,6 @@ impl Dispatcher {
                 rig_path: dir.to_path_buf(),
                 worktree: None,
                 end_recorded: false,
-                claude_session_id: "sid-test".into(),
                 stdin,
                 released: None,
                 patrol_kill: None,
@@ -517,7 +498,6 @@ impl Dispatcher {
                         rig_path: prep.rig_path,
                         worktree,
                         end_recorded: false,
-                        claude_session_id: prep.spec.claude_session_id,
                         stdin,
                         released: None,
                         patrol_kill: None,
@@ -2176,7 +2156,6 @@ mod tests {
                 rig_path: dir.path().to_path_buf(),
                 worktree: Some(worktree.clone()),
                 end_recorded: false,
-                claude_session_id: "sid-test".into(),
                 stdin: None,
                 released: None,
                 patrol_kill: None,
@@ -2262,7 +2241,6 @@ mod tests {
                 rig_path: dir.path().to_path_buf(), // not a git repo
                 worktree: Some(worktree.clone()),
                 end_recorded: false,
-                claude_session_id: "sid-test".into(),
                 stdin: None,
                 released: None,
                 patrol_kill: None,
@@ -3240,7 +3218,6 @@ mod tests {
             rig_path: dir.to_path_buf(),
             worktree: None,
             end_recorded: false,
-            claude_session_id: "sid-test".into(),
             stdin,
             released: None,
             patrol_kill: None,
