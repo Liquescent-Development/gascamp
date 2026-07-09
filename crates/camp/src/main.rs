@@ -215,7 +215,9 @@ enum Command {
         #[command(subcommand)]
         command: OrderCommand,
     },
-    /// Run the daemon in the foreground (also reachable via a campd symlink)
+    /// Run the daemon in the foreground (also reachable via a campd symlink,
+    /// or as `camp campd` — the two names are the same command)
+    #[command(visible_alias = "campd")]
     Daemon,
     /// Stop the running daemon gracefully
     Stop,
