@@ -1,18 +1,23 @@
 # Gas Camp
 
-**One small Rust binary that runs durable, AI-agent work on your laptop — one
-SQLite ledger, zero cost when idle.**
+**A lightweight, single-user, local way to run Claude Code workers — one small
+Rust binary, one SQLite ledger, zero cost when idle.**
 
-Gas Camp (`camp`) is a single-user, local, event-sourced orchestrator for
-task tracking *and* AI-agent work. Everything durable lives in one SQLite
-ledger (`camp.db`): an append-only event log plus the state folded from it, so
-every action has a cause and `kill -9` never loses history. Its daemon
-(`campd`) sleeps on OS events and burns no CPU when nothing is happening; real
-work is dispatched to [Claude Code](https://docs.claude.com/en/docs/claude-code)
+Gas Camp (`camp`) is a single-user, local, event-sourced orchestrator for task
+tracking *and* AI-agent work. Everything durable lives in one SQLite ledger
+(`camp.db`): an append-only event log plus the state folded from it, so every
+action has a cause and `kill -9` never loses history. Its daemon (`campd`)
+sleeps on OS events and burns no CPU when nothing is happening; real work is
+dispatched to [Claude Code](https://docs.claude.com/en/docs/claude-code)
 workers you can watch, tail, and talk to.
 
-Camp is the local, single-user sibling of [Gas
-City](https://github.com/gastownhall/gascity): what **k3s is to k8s** — the
+**The most approachable way in is the Claude Code plugin.** Install it and drive
+your local agent fleet with `/sling`, `/status`, `/adopt`, and `/events` from
+inside a Claude Code session — no raw-CLI ceremony. Every command also works
+straight from the `camp` terminal CLI; the plugin is a thin wrapper over it.
+
+Think of camp as a **simpler local sibling of [Gas
+City](https://github.com/gastownhall/gascity)** — what **k3s is to k8s**: the
 same six primitives and convergence model, with the heavyweight store (Dolt)
 swapped for one proportionate SQLite file. The compatibility is exact where it
 counts: **every valid camp formula is a valid Gas City formula-v2 file**, and
@@ -22,6 +27,10 @@ fleets.
 
 ## Highlights
 
+- **Orchestrate from inside Claude Code.** camp ships a Claude Code plugin: run
+  and watch a local fleet of agents with `/sling`, `/status`, `/adopt`, and
+  `/events` — slash commands that are thin wrappers over the `camp` CLI — plus
+  session-lifecycle hooks, the worker skill, and a fleet statusline.
 - **Idle is free.** No ticks, no polling loops. Idle `campd` targets < 20 MB
   RSS and 0.0% CPU; an idle camp has zero agent processes.
 - **One SQLite ledger = the whole story.** Append-only events + folded state in
@@ -30,17 +39,14 @@ fleets.
 - **Kill-9-safe.** `campd` holds no private state. Crash anything, restart, and
   it picks up from the ledger. `camp doctor --refold` rebuilds state from
   history and reports any drift.
-- **Dispatches real Claude Code workers.** `camp sling "…"` spawns a worker
-  that claims a bead, does the work, emits milestones, and closes with an
-  outcome — every worker registered at birth, tailable, and resumable.
+- **Dispatches real Claude Code workers.** `camp sling "…"` (or `/sling`) spawns
+  a worker that claims a bead, does the work, emits milestones, and closes with
+  an outcome — every worker registered at birth, tailable, and resumable.
 - **Formula graphs when you want them.** Dependency-gated steps with script
   verification (`check`), bounded transient retries (`retry`), and runtime
   fan-out (`on_complete`) — all declared in TOML.
 - **Cron & event orders.** Scheduled or event-triggered formulas, including
   while you're away, with an optional launchd agent for fire-at-login.
-- **Claude Code plugin.** Drive camp from inside a session with `/sling`,
-  `/status`, `/adopt`, `/events`, lifecycle hooks, a fleet statusline, and the
-  worker skill.
 
 ## Requirements
 
@@ -93,8 +99,68 @@ ledger, and waits for readiness), and `camp stop` shuts it down. That's the
 
 ## Quickstart
 
-Five minutes, no API spend. This drives a bead through its whole life against a
-throwaway camp:
+Two ways in — the Claude Code plugin (recommended) or the raw CLI. They do the
+same thing; the plugin is a thin wrapper.
+
+### Use camp from inside Claude Code (recommended)
+
+**1. Install the `camp` binary and put it on your `PATH`.** The plugin's slash
+commands shell out to `camp`, so the binary MUST be installed and on `PATH` for
+the plugin to do anything:
+
+```sh
+git clone https://github.com/richardkiene/gascamp
+cd gascamp
+make install                              # -> ~/.local/bin/camp (+ campd symlink)
+export PATH="$HOME/.local/bin:$PATH"      # if it isn't already
+```
+
+(See [Install](#install) for `PREFIX` overrides and `make uninstall`.)
+
+**2. Install the Claude Code plugin.** From inside a Claude Code session, add
+this repo as a plugin marketplace, install the `camp` plugin, and reload:
+
+```
+/plugin marketplace add richardkiene/gascamp
+/plugin install camp@gascamp
+/reload-plugins
+```
+
+Claude Code reads the repo's `.claude-plugin/marketplace.json`; `camp` is the
+plugin name and `gascamp` is the marketplace name. `/reload-plugins` activates
+it without a restart.
+
+**3. Make a camp, then drive it with slash commands.** Create a camp once and
+start Claude Code from inside it (the plugin's SessionStart hook registers the
+session):
+
+```sh
+mkdir demo && cd demo
+camp init                                  # create ./.camp (ledger + config)
+camp rig add . --prefix demo               # register this repo as a rig
+# now start Claude Code in this directory
+```
+
+From that session:
+
+```
+/status                                    # fleet snapshot: live sessions, ready/open beads
+/sling "add a --json flag to toy ls, TDD it"
+/events                                    # the append-only event log — the whole story
+/adopt                                     # reconcile the session registry against reality
+```
+
+`/sling` hands the bead to a **real Claude Code worker** that follows the
+plugin's **worker skill** (recall → claim → work → emit milestones → remember →
+close → exit) and, when you're present, spawns it as a teammate you can talk to
+mid-run. That one step needs an authenticated `claude` CLI and a routable agent
+— see [The AI step](#the-ai-step). `/status`, `/events`, and `/adopt` are free
+and need neither.
+
+### …or drive it straight from the CLI
+
+Every verb works identically in the terminal — the plugin adds no privilege.
+The whole free bead lifecycle against a throwaway camp, no API spend:
 
 ```sh
 mkdir demo && cd demo
@@ -130,14 +196,14 @@ history:
 
 ### The AI step
 
-`camp sling` is the 90% path: one write, one worker spawn. It hands the bead to
-a **real Claude Code worker** instead of you.
+`camp sling` (or `/sling` in the plugin) is the 90% path: one write, one worker
+spawn. It hands the bead to a **real Claude Code worker** instead of you.
 
 ```sh
 camp sling "add a --json flag to ls, TDD it"
 ```
 
-This needs two things the quickstart above did not: an **authenticated `claude`
+This needs two things the free lifecycle did not: an **authenticated `claude`
 CLI** and a **routable agent**. Install the [starter pack](packs/starter/) and
 name a default agent in `camp.toml`:
 
@@ -148,9 +214,9 @@ packs = ["packs/starter"]
 default_agent = "dev"          # packs/starter/agents/dev.md
 ```
 
-Then `camp sling "…"` creates the bead, auto-starts `campd`, and dispatches the
-worker. Route to a specific role with `--agent reviewer`. Watch the fleet with
-`camp top`.
+Then `camp sling "…"` (or `/sling "…"`) creates the bead, auto-starts `campd`,
+and dispatches the worker. Route to a specific role with `--agent reviewer`.
+Watch the fleet with `camp top` or `/status`.
 
 ## Concepts
 
@@ -326,6 +392,24 @@ control plane. It is machinery only — it ships **zero roles**:
 - An opt-in statusline rendering the fleet badge from a read-only socket query.
 - The **worker skill** (`skills/worker/SKILL.md`): the worker lifecycle
   contract — recall → claim → work → emit milestones → remember → close → exit.
+
+Install it from this repo (see the [quickstart](#use-camp-from-inside-claude-code-recommended)):
+
+```
+/plugin marketplace add richardkiene/gascamp
+/plugin install camp@gascamp
+/reload-plugins
+```
+
+The statusline is opt-in: a plugin cannot set your main status line for you, so
+wire it into your own `~/.claude/settings.json`. It renders `▲live ●ready ✖red`
+from a read-only socket query, never auto-starts `campd`, and degrades to empty
+output when `campd` is down.
+
+```json
+{ "statusLine": { "type": "command",
+                  "command": "\"${CLAUDE_PLUGIN_ROOT}\"/statusline/statusline.sh" } }
+```
 
 ### Export / graduation to Gas City
 

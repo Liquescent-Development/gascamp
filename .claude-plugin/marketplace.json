@@ -1,0 +1,13 @@
+{
+  "name": "gascamp",
+  "owner": {
+    "name": "Richard Kiene"
+  },
+  "plugins": [
+    {
+      "name": "camp",
+      "source": "./plugin",
+      "description": "Gas Camp control plane for Claude Code: /sling, /status, /adopt, /events, session lifecycle hooks, the worker skill, and a fleet statusline — thin wrappers over the camp CLI."
+    }
+  ]
+}
