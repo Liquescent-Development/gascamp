@@ -12,7 +12,7 @@ dispatched to [Claude Code](https://docs.claude.com/en/docs/claude-code)
 workers you can watch, tail, and talk to.
 
 **The most approachable way in is the Claude Code plugin.** Install it and drive
-your local agent fleet with `/sling`, `/status`, `/adopt`, and `/events` from
+your local agent fleet with `/camp:sling`, `/camp:status`, `/camp:adopt`, and `/camp:events` from
 inside a Claude Code session — no raw-CLI ceremony. Every command also works
 straight from the `camp` terminal CLI; the plugin is a thin wrapper over it.
 
@@ -28,8 +28,8 @@ fleets.
 ## Highlights
 
 - **Orchestrate from inside Claude Code.** camp ships a Claude Code plugin: run
-  and watch a local fleet of agents with `/sling`, `/status`, `/adopt`, and
-  `/events` — slash commands that are thin wrappers over the `camp` CLI — plus
+  and watch a local fleet of agents with `/camp:sling`, `/camp:status`, `/camp:adopt`, and
+  `/camp:events` — slash commands that are thin wrappers over the `camp` CLI — plus
   session-lifecycle hooks, the worker skill, and a fleet statusline.
 - **Idle is free.** No ticks, no polling loops. Idle `campd` targets < 20 MB
   RSS and 0.0% CPU; an idle camp has zero agent processes.
@@ -39,7 +39,7 @@ fleets.
 - **Kill-9-safe.** `campd` holds no private state. Crash anything, restart, and
   it picks up from the ledger. `camp doctor --refold` rebuilds state from
   history and reports any drift.
-- **Dispatches real Claude Code workers.** `camp sling "…"` (or `/sling`) spawns
+- **Dispatches real Claude Code workers.** `camp sling "…"` (or `/camp:sling`) spawns
   a worker that claims a bead, does the work, emits milestones, and closes with
   an outcome — every worker registered at birth, tailable, and resumable.
 - **Formula graphs when you want them.** Dependency-gated steps with script
@@ -128,7 +128,9 @@ this repo as a plugin marketplace, install the `camp` plugin, and reload:
 
 Claude Code reads the repo's `.claude-plugin/marketplace.json`; `camp` is the
 plugin name and `gascamp` is the marketplace name. `/reload-plugins` activates
-it without a restart.
+it without a restart. The plugin's commands are namespaced under the plugin
+name, so they appear as `/camp:sling`, `/camp:status`, `/camp:adopt`, and
+`/camp:events`.
 
 **3. Make a camp, then drive it with slash commands.** Create a camp once and
 start Claude Code from inside it (the plugin's SessionStart hook registers the
@@ -144,17 +146,17 @@ camp rig add . --prefix demo               # register this repo as a rig
 From that session:
 
 ```
-/status                                    # fleet snapshot: live sessions, ready/open beads
-/sling "add a --json flag to toy ls, TDD it"
-/events                                    # the append-only event log — the whole story
-/adopt                                     # reconcile the session registry against reality
+/camp:status                                    # fleet snapshot: live sessions, ready/open beads
+/camp:sling "add a --json flag to toy ls, TDD it"
+/camp:events                                    # the append-only event log — the whole story
+/camp:adopt                                     # reconcile the session registry against reality
 ```
 
-`/sling` hands the bead to a **real Claude Code worker** that follows the
+`/camp:sling` hands the bead to a **real Claude Code worker** that follows the
 plugin's **worker skill** (recall → claim → work → emit milestones → remember →
 close → exit) and, when you're present, spawns it as a teammate you can talk to
 mid-run. That one step needs an authenticated `claude` CLI and a routable agent
-— see [The AI step](#the-ai-step). `/status`, `/events`, and `/adopt` are free
+— see [The AI step](#the-ai-step). `/camp:status`, `/camp:events`, and `/camp:adopt` are free
 and need neither.
 
 ### …or drive it straight from the CLI
@@ -196,7 +198,7 @@ history:
 
 ### The AI step
 
-`camp sling` (or `/sling` in the plugin) is the 90% path: one write, one worker
+`camp sling` (or `/camp:sling` in the plugin) is the 90% path: one write, one worker
 spawn. It hands the bead to a **real Claude Code worker** instead of you.
 
 ```sh
@@ -214,9 +216,9 @@ packs = ["packs/starter"]
 default_agent = "dev"          # packs/starter/agents/dev.md
 ```
 
-Then `camp sling "…"` (or `/sling "…"`) creates the bead, auto-starts `campd`,
+Then `camp sling "…"` (or `/camp:sling "…"`) creates the bead, auto-starts `campd`,
 and dispatches the worker. Route to a specific role with `--agent reviewer`.
-Watch the fleet with `camp top` or `/status`.
+Watch the fleet with `camp top` or `/camp:status`.
 
 ## Concepts
 
@@ -384,7 +386,7 @@ gc-validated formula as an example to copy, not a dependency.
 The **camp plugin** ([plugin/](plugin/)) makes a Claude Code session the
 control plane. It is machinery only — it ships **zero roles**:
 
-- Slash commands `/sling`, `/status`, `/adopt`, `/events` (thin wrappers over
+- Slash commands `/camp:sling`, `/camp:status`, `/camp:adopt`, `/camp:events` (thin wrappers over
   the `camp` CLI — the session's scripting surface is identical to the
   terminal's).
 - SessionStart / SessionEnd lifecycle hooks that register and end attended
