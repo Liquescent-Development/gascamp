@@ -14,6 +14,7 @@ scripting surface is identical to the terminal's (spec §13 guarantee 6).
 | Command | Wraps | Does |
 |---|---|---|
 | `/sling` | `camp sling` | Create work — a Tier-0 bead or a `--formula` run. Enqueue only; campd is the sole dispatcher (spec §8.4). |
+| `/nudge` | `camp nudge` | Converse with any session — live over campd's held stdin, else via `claude --resume`. |
 | `/status` | `camp top` | Fleet snapshot: live sessions, ready/open beads. |
 | `/adopt` | `camp adopt` | Reconcile the session registry against reality. |
 | `/events` | `camp events` | Print the event log — the whole story. |

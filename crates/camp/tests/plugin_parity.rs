@@ -127,5 +127,5 @@ fn every_command_wrapper_uses_only_real_cli_flags() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 4, "expected exactly four command wrappers");
+    assert_eq!(checked, 5, "expected exactly five command wrappers");
 }
