@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Proposal for review — NO behavior change in this PR |
+| Status | Design record — ALL decisions SETTLED (2026-07-09), approved for merge. Docs-only; NO behavior change in this PR. |
 | Date | 2026-07-09 |
 | Author role | design agent (proposal only) |
 | Refs | #29 (attended sling races autonomous dispatch), #31 (no worktree/branch isolation), #34 (pass on un-integrable work) |
@@ -48,9 +48,15 @@ the operator.**
   as a SEPARATE axis from the control `Outcome` (`pass`/`fail`/`skipped`/…).
   Un-integrable work is `blocked` on the WorkOutcome axis — not shoehorned into
   `outcome`. campd still fails fast when a rig can't host a worktree.
-- **Still open (operator to close):** **Q4** (is v1 "landed" a local bead branch,
-  or grow remote/PR awareness?) and **Q5** (unify the two worker-contract copies
-  before adding delivery semantics?).
+- **v1 "landed" = a local bead branch with a base (Q4, SETTLED).** Landed means
+  committed on the `camp/<bead>` branch that descends from / merges into the rig's
+  integration branch — the branch is the reviewable/mergeable artifact. **Remote
+  push / PR-host / MR creation is explicitly OUT of scope for v1** (camp has zero
+  git-remote code today; a future scoping decision if ever wanted).
+- **Nothing remains open.** All operator questions — **Q1, Q3, Q4, Q5, Q6, Q7 —
+  are SETTLED.** (Q5, SETTLED: the two worker-contract copies are unified into one
+  source *before* delivery semantics are added — the first step of Phase 3.) This
+  note is the merge-ready design record.
 
 ### Decision log
 
@@ -97,6 +103,18 @@ the operator.**
   `crates/camp-core/tests/fixtures/gc-vocab.json` and validate via
   `ci/gc-compat/check_vocab.sh` — an additive **mirrored** axis, not a
   redefinition, so the mirror invariant is preserved. Folded into §4.3 + §7 Q3.
+- **2026-07-09 — Operator SETTLED Q4. v1 "landed" = committed on the bead branch
+  with a base** (local): the `camp/<bead>` branch, reachable and diffable, is the
+  reviewable/mergeable artifact. **Remote push / PR-host / MR creation is
+  explicitly OUT of scope for v1** (camp has no git-remote code; a future scoping
+  decision if ever wanted). Folded into §4.3 + §7 Q4.
+- **2026-07-09 — Operator SETTLED Q5. Unify the two worker-contract copies**
+  (`plugin/skills/worker/SKILL.md` + the mechanical `WORKER_CONTRACT` in
+  `crates/camp/src/daemon/spawn.rs`) into ONE source **before** adding delivery
+  semantics — the first step of Phase 3. Folded into §7 Q5 + Phase 3.
+- **2026-07-09 — ALL QUESTIONS SETTLED.** Q1/Q3/Q4/Q5/Q6/Q7 are closed; Q2 is
+  superseded (history). Nothing remains open — the note is the merge-ready design
+  record. Approved for merge as PR #39.
 
 ## Reframe (2026-07-09, operator): pack-first, mirror Gas City — SUPERSEDES §4.1 reservation & the §8.4 exception
 
@@ -468,8 +486,9 @@ the worker skill's "claim first" shape. See §7 Q2.
 of "attended vs headless is an explicit choice," but it adds a bead field and a
 camp-additive concept → §7 Q2/Q3.
 
-**Hand-off / release policy** (open question §7 Q2): if the operator dismisses
-the teammate without it claiming, the reserved bead sits `in_progress`, visible
+**Hand-off / release policy** (DEPRECATED — was §7 Q2, now SUPERSEDED; moot with
+no reservation): if the operator dismissed the teammate without it claiming, the
+reserved bead would sit `in_progress`, visible
 in `camp ls`. Do we (i) leave it for the operator, (ii) offer
 `camp sling --headless <bead>` / a release verb to hand it to autonomous
 dispatch, or (iii) let adoption reclaim it after the attended session ends?
@@ -528,14 +547,14 @@ implementation PR, not here**):
 - **Commit to the bead branch.** In an isolated autonomous worker, work is
   committed to `camp/<bead>` (the branch it was dispatched onto). The worker does
   **not** invent branching policy from unrelated global rules.
-- **Define "landed" for v1** (recommended, minimal scope): work is *landed* when
-  it is **committed on the bead branch and that branch has a base** (it descends
-  from, or is mergeable into, the rig's integration branch). The bead branch,
+- **"Landed" for v1 — SETTLED 2026-07-09 (Q4).** Work is *landed* when it is
+  **committed on the bead branch and that branch has a base** (it descends from,
+  or is mergeable into, the rig's integration branch). The `camp/<bead>` branch,
   reachable and diffable, **is** the reviewable/mergeable artifact — matching the
   operator's "changes reach the integration branch only via review" workflow
-  **without** camp needing a remote or a PR host. Remote push / PR creation is
-  **explicitly out of scope for v1** (§8) and would be a spec + scope decision
-  (§7 Q4).
+  **without** camp needing a remote or a PR host. **Remote push / PR-host / MR
+  creation is explicitly OUT of scope for v1** (§8); camp has zero git-remote code
+  today, and adding it would be a future spec + scope decision.
 - **Fresh / empty repo — DECIDED 2026-07-09: fail fast at dispatch.** The
   "always branch + PR" pattern is meaningless with no base and no `main`. campd
   **refuses to dispatch** code work into such a rig: `git worktree add` fails,
@@ -660,11 +679,12 @@ must document this contract prominently so it is not a surprise.
   amendment (Q1 APPROVED). Edited later, serialized through the operator; NOT in
   this PR.
 
-## 7. Open questions requiring operator / spec sign-off
+## 7. Questions — ALL SETTLED (operator, 2026-07-09)
 
-Status (2026-07-09): **Q1, Q3, Q6, Q7 are SETTLED** by the operator; **Q2 is
-SUPERSEDED** (retained for history); **Q4 and Q5 remain open** for the operator
-to close.
+Status: **Q1, Q3, Q4, Q5, Q6, Q7 are SETTLED**; **Q2 is SUPERSEDED** (retained
+for history). **Nothing remains open** — this section is the resolution record
+for the merged design. The spec §8.4/§12 edits and the `WorkOutcome` vocabulary
+addition are future implementation, serialized through the operator.
 
 - **Q1 — Default isolation (SPEC §12 EDIT). RESOLVED 2026-07-09 — APPROVED.**
   Autonomous dispatch defaults to worktree isolation, with `isolation = "none"`
@@ -793,17 +813,18 @@ detail is the teammate take-over of a bead the attended orchestrator reserved
 (claim reassignment), plus the release policy — both listed under Q2 above for
 the operator's pick.
 
-- **Q4 — What "landed" means / remote scope.** Is v1 "landed" = "committed on
-  the bead branch with a base" (recommended; no remote/PR host needed), or does
-  the operator want camp to grow remote-push / PR-creation awareness (new scope;
-  camp has zero git-remote/PR code today; would be a spec addition)? **Answerable:
-  confirm local-branch definition, or open a separate scoping decision.**
+- **Q4 — What "landed" means / remote scope. RESOLVED 2026-07-09 — SETTLED.**
+  v1 "landed" = **committed on the bead branch with a base** (local); the
+  `camp/<bead>` branch is the reviewable/mergeable artifact. **Remote push /
+  PR-host / MR creation is explicitly OUT of scope for v1** — camp has zero
+  git-remote code today; a future scoping decision if ever wanted. Folded into
+  §4.3.
 
-- **Q5 — Worker-contract duplication.** The delivery contract must live in two
-  places kept in lockstep (`plugin/skills/worker/SKILL.md` and the mechanical
-  `WORKER_CONTRACT` in `spawn.rs`). Should these be unified to one source before
-  adding delivery semantics, to avoid drift? **Answerable: unify first, or accept
-  two synchronized copies.**
+- **Q5 — Worker-contract duplication. RESOLVED 2026-07-09 — SETTLED: unify
+  first.** The two worker-contract copies (`plugin/skills/worker/SKILL.md` and the
+  mechanical `WORKER_CONTRACT` in `crates/camp/src/daemon/spawn.rs`) are unified
+  into ONE source **before** delivery semantics are added — the first step of
+  Phase 3. Folded into Phase 3.
 
 - **Q6 — Remove the spec §8.4 "attended teammate is the one surface exception"
   (SPEC §8.4 EDIT). RESOLVED 2026-07-09 — APPROVED.** Collapse to **one dispatch
@@ -836,7 +857,8 @@ the operator's pick.
 
 Ordered by dependency. Each phase is independently landable, TDD per AGENTS.md,
 gates green (`fmt`, `clippy -D warnings`, `cargo test --workspace`) before push.
-**No phase begins until its blocking open question is signed off.**
+**All design questions are now signed off** — the remaining gates are code
+dependencies (#35) and the serialized spec edits (§8.4, §12), not open decisions.
 
 ### Phase 1 — Coordination: one dispatch path + converse verb (#29) — REFRAMED
 
@@ -885,24 +907,30 @@ spec §12 amendment.* Independent of Phase 1.
   `dispatch.failed`, no worker spawned, no stranded commit; (iii) two concurrent
   autonomous workers on one rig get distinct worktrees (no shared-tree collision).
 
-### Phase 3 — Delivery via pack + the `WorkOutcome` axis (#34) — REVISED
+### Phase 3 — Delivery via pack + the `WorkOutcome` axis (#34) — SETTLED
 
-*Q3 REVISED & SETTLED (2026-07-09); still gated on Q4 (remote scope) and Q5
-(contract unification).* Depends on Phase 2 (the bead branch is the delivery
-vehicle) and #35.
+*Q3 REVISED, Q4 & Q5 SETTLED (2026-07-09) — no open gates.* Depends on Phase 2
+(the bead branch is the delivery vehicle) and #35. Steps, in order:
 
-- **Delivery is pack content** (mirror gc's swarm): a delivery-aware `dev`/coder
-  prompt — how to commit to the bead branch, and optionally a dedicated
-  `committer` agent that owns git. Ships in the starter pack; the plugin stays
-  role-free. (Q5) Optionally unify the two worker-contract copies
-  (`plugin/skills/worker/SKILL.md` + the `WORKER_CONTRACT` in `spawn.rs`) first.
-- **Adopt the `WorkOutcome` axis (Q3-revised):** pin gc's set
+- **(a) Unify the worker-contract copies FIRST (Q5).** Collapse
+  `plugin/skills/worker/SKILL.md` and the mechanical `WORKER_CONTRACT` in
+  `crates/camp/src/daemon/spawn.rs` into ONE source of truth, so delivery
+  semantics are added once and cannot drift. This precedes everything else in the
+  phase.
+- **(b) Add the delivery contract as pack/prompt content** (mirror gc's swarm):
+  a delivery-aware `dev`/coder prompt covering how to commit to the `camp/<bead>`
+  branch, and optionally a dedicated `committer` agent that owns git. Ships in the
+  starter pack; the plugin stays role-free (spec §11).
+- **(c) Adopt the `WorkOutcome` axis (Q3):** pin gc's set
   (`shipped`/`no-op`/`blocked`/`abandoned`) in
   `crates/camp-core/tests/fixtures/gc-vocab.json`, extend the fold/close path to
   record a `WorkOutcome` **separately** from the control `outcome`, and have
   `ci/gc-compat/check_vocab.sh` validate it as an additive mirrored axis.
-  Un-integrable work is `blocked` on the WorkOutcome axis. campd still fails fast
-  when a rig can't host a worktree (mechanical).
+  Un-integrable work is `blocked`; landed work is `shipped`. campd still fails
+  fast when a rig can't host a worktree (mechanical).
+- **(d) v1 "landed" = local bead branch with a base (Q4), no remote.** The
+  `camp/<bead>` branch (descends from / mergeable into the integration branch) is
+  the deliverable; **no remote push / PR-host / MR creation** in v1.
 - **Spec:** amend §8.4's worker-lifecycle-contract portion for delivery (the
   §8.4 surface-exception removal is Phase 1); serialized through the operator.
 - **Test obligations:** (i) a fake worker that commits to a dead-end branch on a
@@ -912,7 +940,8 @@ vehicle) and #35.
   WorkOutcome set (mirror invariant intact) and `camp export --city` emits
   city-native history including WorkOutcome; (iv) the control `outcome` axis is
   unchanged (regression guard — WorkOutcome is additive, not a redefinition);
-  (v) worktree kept when work is not `shipped`, so nothing is lost.
+  (v) the unified worker contract is the single source (no second copy remains);
+  (vi) worktree kept when work is not `shipped`, so nothing is lost.
 
 ### Sequencing summary
 
@@ -924,15 +953,17 @@ Q6 APPROVED ─► Phase 1 (one dispatch path + converse verb)   (independent; l
 #35 (gitignore) ─┐
 Q1 APPROVED ─────┼─► Phase 2 (isolation default = worktree) ─► Phase 3 (delivery)
 spec §12 edit ───┘                                                    ▲
-Q3 REVISED (WorkOutcome axis) ───────────────────────────────────────┘
-Q4, Q5 open ─────────────────────────────────────────────────────────┘ (close before Phase 3)
+Q3/Q4/Q5 SETTLED ────────────────────────────────────────────────────┘
+   Phase 3 = (a) unify worker contract (Q5) → (b) delivery pack →
+             (c) WorkOutcome axis (Q3) → (d) local "landed", no remote (Q4)
 ```
 
-Status of the gates (2026-07-09): **Q1 APPROVED**, **Q3 REVISED & SETTLED**
-(adopt the `WorkOutcome` axis), **Q6 APPROVED** (one dispatch path + converse
-verb; §8.4 removal), **Q7 SETTLED** (overseer = the human's session; no core
-standing session). **Q2 SUPERSEDED.** Still open for the operator: **Q4** (remote
-scope) and **Q5** (worker-contract unification).
+Status of the gates (2026-07-09) — **ALL SETTLED, nothing open:** **Q1 APPROVED**
+(isolation default), **Q3 REVISED & SETTLED** (adopt the `WorkOutcome` axis),
+**Q4 SETTLED** (local bead branch = landed; no remote), **Q5 SETTLED** (unify the
+worker contract first), **Q6 APPROVED** (one dispatch path + converse verb; §8.4
+removal), **Q7 SETTLED** (overseer = the human's session; no core standing
+session). **Q2 SUPERSEDED** (history). The note is merge-ready.
 
 Phase 1 (coordination) is the highest-value, lowest-risk first land: one dispatch
 path + a converse verb, no new isolation/delivery semantics, and it structurally
