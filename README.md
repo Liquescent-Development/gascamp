@@ -235,7 +235,7 @@ Two things to get right, both easy to miss:
   paste `packs = [...]` at the *bottom* of the file (as you'd naturally do
   after running those commands), TOML attaches it to the last `[[rigs]]`
   entry instead of the top level. Since `camp.toml` rejects unknown fields,
-  that surfaces as a confusing `unknown field \`packs\`` error rather than
+  that surfaces as a confusing `` unknown field `packs` `` error rather than
   anything mentioning placement — add the line above `[camp]`, not below
   `[[rigs]]`.
 - **Relative pack paths resolve against the directory holding `camp.toml`**
