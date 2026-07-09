@@ -26,6 +26,149 @@
 - **2026-07-09 — Q2 investigated** against the pinned Gas City reference
   (§7 Q2 investigation). Verdict: **no meaningful deviation from Gas City**;
   recommend **claim-at-creation reservation**. Pending operator pick.
+- **2026-07-09 — REFRAME (operator directive), SUPERSEDES the reservation
+  approach.** Camp is k3s-to-gc's-k8s: a conformant lighter implementation of the
+  SAME model, not a snowflake. Broad Gas City source study (see the **Reframe**
+  section) confirms the operator's premise: Gas City is driven "talk-to-overseer
+  + converse-with-any-worker" entirely by **pack content** (a `mayor` agent, a
+  `committer` agent, `named_session` modes, mail) over **one dispatch path**,
+  with interactivity supplied by the **runtime/harness**. Camp's spec §8.4
+  "attended teammate is the one surface exception" + a reservation is the
+  snowflake to remove. The reservation approach (old §4.1 / §7 Q2) is **marked
+  deprecated below, kept for history.** The §8.4 removal is flagged as an
+  operator/spec open question (§7 Q6) — not edited here.
+
+## Reframe (2026-07-09, operator): pack-first, mirror Gas City — SUPERSEDES §4.1 reservation & the §8.4 exception
+
+> **This section supersedes the reservation mechanism (old §4.1) and the
+> "attended teammate is the one surface exception" framing.** Those are kept
+> below, marked DEPRECATED, for history. Everything here is still
+> proposal-only — no code, no spec edit, no pack change.
+
+**The reframing.** Camp is k3s to Gas City's k8s: a lighter, *conformant*
+implementation of the **same** model for daily-driving from Claude Code — not a
+snowflake with camp-specific concepts. Invariant 4 ("six primitives, zero roles
+in code; campd moves work, never reasons about it") means the "how you drive it"
+experience — an overseer you talk to, plus the ability to converse with any
+worker — must live in **packs over the six primitives**, not baked into
+core/spec. The operator's premise: *Gas City is already driven this way with the
+right pack.* I verified it against the actual Gas City source at the pinned ref
+(`ci/gc-compat/GASCITY_REF` = `12410301…`); the premise **holds**.
+
+### Gas City ground truth (source-cited, gascity@`12410301…`)
+
+**1. How a human drives work.** One path: create/`sling` beads → the
+controller/reconciler dispatches sessions → workers **claim ready, unassigned
+beads** and work them. The mayor's own prompt spells it out: "You plan work,
+break it into tasks (beads), and let the rig coders self-organize to claim them"
+and coders "Run `gc bd ready --unassigned` … then claim and work on a task"
+(`examples/swarm/packs/swarm/agents/mayor/prompt.template.md`,
+`agents/coder/agent.toml`). The human converses with any session — overseer or
+worker — through **uniform verbs**: `gc mail`, `gc nudge`, a session-message API
+(`sendUserMessageToSession`, `internal/api/handler_session_interaction.go`),
+`gc handoff`, `gc prime` (`cmd/gc/cmd_{mail,nudge,handoff,prime,session}.go`).
+There is **no "attended vs autonomous" dispatch fork.** In Gas City "attended"
+means only *a human is attached to a session's process, so the controller does
+not restart it* — a lifecycle property, not a way to dispatch work
+(`cmd/gc/cmd_handoff.go`: "the controller cannot restart the **user-attended
+process**"). Source search: `attended` appears 11× (all docs / tmux / handoff /
+reconciler lifecycle), `teammate` 1× (a design doc) — neither is a core dispatch
+concept.
+
+**2. Is there an overseer / "mayor"?** Yes — and it is an **agent (a prompt),
+not a core service.** Gas City ships a *default* mayor prompt
+(`cmd/gc/prompts/mayor.md`: "You are the mayor … plan work, manage rigs and
+agents, dispatch tasks, monitor progress"), and packs define their own
+(`examples/swarm/packs/swarm/agents/mayor/`). The mayor's `agent.toml` is three
+lines (`scope`, `nudge`, `idle_timeout`); everything it *does* is prompt-driven
+and uses ordinary verbs (`gc bd …`, `gc mail …`, `gc status`). "Never Code: If
+you see a bug … file a bead. Don't fix it yourself." A pack declares standing
+overseer sessions via `[[named_session]]` with a `mode`
+(`always`/`on_demand`) and `scope` (`examples/swarm/packs/swarm/pack.toml`:
+mayor=on_demand, deacon=always). The overseer is **pack content over the
+primitives**, full stop.
+
+**3. Pack/formula-defined vs core.** The whole "talk-to-overseer +
+converse-with-worker" experience is **pack content**: a `mayor` agent (planning
++ mail), `coder` agents (claim + work), even a dedicated **`committer` agent**
+that is "the only agent in the swarm that touches git"
+(`examples/swarm/packs/swarm/agents/committer/prompt.template.md`), wired by
+`named_session` modes + mail. **Core** provides only the mechanical substrate:
+the store/ledger, one controller dispatch path, sessions, the runtime
+abstraction, and the verbs (`sling`/`mail`/`nudge`/session-message). So yes — a
+pack turns Gas City into exactly the experience the operator wants, with zero
+core role logic. Camp already mirrors the shape (plugin = machinery/verbs, roles
+= packs, spec §11).
+
+**4. Attach / converse mechanics — core vs runtime vs harness.** Conversing with
+a running worker is a **core verb** (`session message` / `nudge` →
+`SessionHandle.Respond`, `internal/worker/handle_interaction.go`) whose
+*interactivity is a runtime/provider capability*: `PendingStatus` returns
+`supported bool` — "whether the underlying runtime supports interactive blocking
+requests at all." Interactive attach is the **tmux provider** (attachable panes,
+`docs/reference/tmux-agent-slice.md`); the `exec`/subprocess providers are
+headless children; `acp` is an interactive protocol runtime
+(`internal/runtime/{tmux,exec,acp}/`). Each provider is conformance-tested for
+"Interactions" (`internal/worker/builtin/README.md`, grid: claude/codex/gemini/…
+all ✅). **So "attach to / talk to a running worker" = a core verb + a
+runtime/harness capability, never a bespoke dispatch mode.**
+
+### Verdict on the premise
+
+**Confirmed, strongly.** Gas City delivers "talk to an overseer, converse with
+any worker" with **pack content over one dispatch path**, interactivity from the
+runtime/harness. Camp's §8.4 "attended Tier-0 sling spawns the worker as a
+teammate … the one surface exception," and the reservation that a second spawner
+needs to avoid racing campd, are a **camp snowflake with no Gas City analog** —
+exactly what invariant 4 says not to build. Remove it.
+
+### Pack-first redesign — what is pack, core, harness
+
+| Concern | Where it lives (mirror-gc) |
+|---|---|
+| The overseer you talk to ("mayor") | **Pack** — a starter-pack agent + prompt (plans, `camp sling`s beads, reads `camp ls`/`camp top`, never codes). Camp's twist: the **human's own Claude Code session + camp plugin already IS the interactive overseer** (spec §4 "drive from inside Claude Code"); a *persistent* pack overseer is optional, for away-mode, mirroring gc's `mode="on_demand"` mayor. |
+| Deciding who does the work | **Core, one path** — `camp sling`/`camp create` → campd dispatches → worker claims. No second spawner, no reservation. |
+| Git delivery (how/what/when to commit, branch, land) | **Pack** — coder/committer agent prompts (gc's `committer` role). Camp already ships a starter `dev` agent; a delivery-aware prompt (and/or a committer agent) is pack content, not core. |
+| Isolation (worktree/branch) | **Pack/agent-declared** — already the `isolation=` field (gc packs choose per pack: swarm=none, gastown=worktree). The *default* is a core policy (Q1). |
+| Converse with a running worker | **Core verb + harness** — a uniform `camp` "send a turn to a session" verb (mirror of `gc nudge`/session-message), delivered live over the held stdin pipe (already built: `nudge_via_stdin`, dispatch.rs) or via `claude --resume` after the turn (A4). Camp has **no user-facing converse verb today** — this is the one small core surface the drive-experience needs. |
+| Standing/named overseer session | **Core capability (minimal) + pack declaration** — gc's `[[named_session]] mode=always/on_demand`. **Open tension:** a persistent overseer process conflicts with camp's "idle = zero agent processes" (spec §8.4). Likely resolved by "the human's session is the overseer; a persistent pack overseer is opt-in for away-mode." Flagged §7 Q7. |
+
+### §8.4 disposition
+
+**Recommend REMOVING the "attended teammate is the one surface exception"
+mechanism** and collapsing to one dispatch path + pack-defined drive +
+a uniform converse verb. This **requires a spec §8.4 edit** (delete the surface
+exception; state that conversing with any worker is a verb over the
+runtime/harness, and the overseer is pack content / the human's own session).
+**Flagged as operator/spec open question §7 Q6 — not edited here.**
+
+### Reframed #29 / #31 / #34
+
+- **#29 (the race) — dissolved, not reserved.** The bug is that `/camp:sling`
+  adds a **second spawner** (an attended teammate) racing campd's dispatch. The
+  mirror-gc fix: `/camp:sling` and `camp sling` are the **same single path** —
+  enqueue a bead; campd dispatches; the worker claims. "Talking to the work" is
+  the uniform converse verb (held-stdin live / resume), **not** a reservation
+  that lets a competing spawner win. No reservation, no `dispatch="attended"`
+  field, no §8.4 exception. (The Q2 investigation stands as the record of *why*
+  reservation was mirror-safe-but-unnecessary: the cleaner answer is to not have
+  a second spawner at all.)
+- **#31 (isolation) — already pack/agent-shaped; keep Q1.** gc treats isolation
+  as a per-pack/agent choice (swarm=none, gastown=worktree); camp already mirrors
+  this via `isolation=`. The operator-approved worktree **default** (Q1) is a
+  core default policy, fully consistent with mirroring gc — not a snowflake.
+  Unchanged.
+- **#34 (delivery) — pack behavior + mirror-safe outcome.** *How* work is
+  committed/branched/landed is **pack/prompt content** (gc's `coder`+`committer`
+  roles), not a core mechanism — so the delivery contract belongs in a
+  starter-pack agent prompt (and optionally a committer agent), mirroring gc.
+  *Whether* it landed: gc expresses this on a **`WorkOutcome` axis
+  (`shipped`/`no-op`/`blocked`/`abandoned`)** distinct from the control `Outcome`
+  (`pass`/`fail`/…) — see §7 Q3. The operator's Q3 decision (gate as
+  `fail`-with-reason, no new `outcome` value) remains valid and minimal; the
+  **more mirror-faithful** option is to adopt gc's `WorkOutcome` axis verbatim
+  (native to city export). Surfaced as a refinement in §7 Q3, not a reversal.
+  campd still fails fast when a rig can't host a worktree (mechanical, core).
 
 ## 0. Scope and constraint
 
@@ -181,6 +324,11 @@ From AGENTS.md and spec §2/§4 — cited so the proposal stays inside the lines
 
 ## 3. The model in one paragraph
 
+> **NOTE (2026-07-09):** gate (1) below is SUPERSEDED by the Reframe — the live
+> model for coordination is **one dispatch path + a converse verb**, not an
+> attended/autonomous reservation. Gates (2) isolation and (3) delivery still
+> hold. Read the Reframe section for the current gate (1).
+
 A bead's lifecycle has three declared, mechanical gates, each a ledger fact:
 (1) **Coordination** — at sling time the operator makes an *explicit* choice,
 attended or autonomous, and an attended choice writes a durable reservation that
@@ -199,6 +347,12 @@ isolation, and the outcome tells the truth about whether it can land.
 ## 4. Proposed model
 
 ### 4.1 Coordination — attended vs autonomous is an explicit, atomic choice (#29)
+
+> **DEPRECATED (2026-07-09) — SUPERSEDED by the Reframe section.** The
+> reservation mechanism below is kept for history and for the Q2 mirror-safety
+> record. The adopted direction is: **one dispatch path + a uniform converse
+> verb; no reservation, no attended/autonomous fork.** Read the Reframe section
+> for the live design; this subsection no longer drives #29.
 
 **Principle:** attended-vs-autonomous is a *declared choice*, resolved in the
 `camp` CLI before any poke — never a race, never campd "reasoning" about
@@ -351,6 +505,12 @@ Rust.
 
 ### 4.4 How the three compose — and the teammate-cwd tension
 
+> **PARTIALLY SUPERSEDED (2026-07-09) by the Reframe section.** With the attended
+> teammate removed (one dispatch path + converse verb), the attended-teammate
+> cwd tension below is moot for the *dispatch* decision. It survives only as
+> context for isolation (autonomous workers isolate; the human's own overseer
+> session runs in the operator's tree). Read the Reframe section first.
+
 The three gates are one lifecycle, but they interact at one sharp point:
 **A2 (resolved, settled): a teammate's cwd is pinned to the parent session's
 directory — there is no per-agent cwd for teammates.** Therefore:
@@ -381,9 +541,14 @@ must document this contract prominently so it is not a surprise.
 
 ## 5. Fit with spec §4 decisions and the invariants
 
+> **NOTE (2026-07-09):** rows mentioning "reservation" / "teammate exception"
+> describe the DEPRECATED approach. Under the Reframe, the fit is *stronger*:
+> one dispatch path + pack-defined drive + a converse verb removes the §8.4
+> snowflake and honors invariant 4 more directly. See the Reframe section.
+
 | Constraint | How the proposal fits |
 |---|---|
-| campd sole dispatcher; teammate is the one surface exception (§8.4) | Kept. Autonomous path unchanged; attended reservation only *removes* a bead from campd's set via an existing exclusion. |
+| campd sole dispatcher; ~~teammate is the one surface exception (§8.4)~~ → **one dispatch path (Reframe)** | Reframe: campd is the *only* dispatcher; the §8.4 teammate exception is removed (Q6). Conversing with a worker is a verb over the harness, not a second spawner. |
 | Zero roles / campd never reasons (§2 inv.4, §8.3) | campd honors a declared reservation and mechanical git facts; all judgment stays with the worker's close outcome and git, like check-scripts. |
 | Idle is free / no query loops (§7.3) | All new facts evaluated on the existing append→fold→dispatch path; no poll added. |
 | Cost proportional to job (§2 inv.2) | Attended reservation = one extra event in the same batch; delivery gate = worker behavior + one git check at dispatch. Tier-0 stays ~3 writes + one spawn. |
@@ -394,12 +559,25 @@ must document this contract prominently so it is not a surprise.
 
 ## 6. What this touches when implemented (for reviewers — NOT in this PR)
 
-- `crates/camp/src/cmd/sling.rs` — attended vs autonomous resolution + atomic
-  reservation write.
-- `plugin/commands/sling.md` — pass the attended signal; keep the teammate spawn.
-- `crates/camp-core/src/readiness.rs` — only if the "new field" reservation
-  variant (§4.1 alternative) is chosen; the recommended claim-at-creation
-  variant needs no query change.
+> **UPDATED for the Reframe (2026-07-09).** The reservation-era items are struck;
+> the live list reflects one dispatch path + a converse verb + pack-defined drive.
+
+- `plugin/commands/sling.md` — **remove the teammate-spawn instruction**;
+  `/camp:sling` becomes a thin wrapper over `camp sling` (enqueue only), same
+  single path as the CLI.
+- **NEW core verb** (mirror of `gc nudge`/session-message): a user-facing
+  `camp` verb to send a turn to any running session (worker or overseer),
+  delivered live over the held stdin pipe (`nudge_via_stdin` already exists,
+  dispatch.rs) or via `claude --resume` after the turn (A4). Camp has no such
+  user verb today.
+- **Pack (starter), not core** — a delivery-aware `dev`/coder prompt and,
+  optionally, a `committer` agent and a persistent `overseer`/mayor agent
+  (mirroring gc's swarm pack). Ships as pack content; the camp plugin stays
+  role-free (spec §11).
+- ~~`crates/camp/src/cmd/sling.rs` — reservation write~~ (dropped: no
+  reservation).
+- ~~`crates/camp-core/src/readiness.rs` — reservation exclusion~~ (dropped: one
+  dispatch path needs no new exclusion).
 - `crates/camp-core/src/pack.rs` — flip the `Isolation` default to worktree
   (Q1 APPROVED); add the explicit `isolation = "none"` opt-out.
 - `plugin/skills/worker/SKILL.md` + `crates/camp/src/daemon/spawn.rs`
@@ -426,15 +604,12 @@ remain open.
   Attended teammates are the documented standing exception (A2 forbids
   per-teammate cwd, §4.4). Folded into §4.2.
 
-- **Q2 — Reservation mechanism and hand-off. RESEARCHED — recommendation
-  pending operator pick.** See the **Q2 investigation** below for the Gas City
-  findings, verdict, and recommendation. Decision still owned by the operator:
-  (a) reserve via claim-at-creation + a teammate claim-reassignment
-  (**recommended** — mirror-safe, no new vocabulary), or (b) a new
-  `dispatch = "attended"` bead field; and the release policy when an attended
-  teammate never claims (adoption reclaim after the attended session ends is
-  likely free once the reservation is a real claim; an explicit
-  `camp sling --headless <bead>` / release verb; or leave for the operator).
+- **Q2 — Reservation mechanism and hand-off. SUPERSEDED 2026-07-09 by the
+  Reframe (no reservation).** The Reframe removes the second spawner entirely, so
+  there is nothing to reserve against. The **Q2 investigation** below is retained
+  as the durable record of *why* a reservation would have been mirror-safe but
+  is unnecessary — Gas City has no attended/autonomous fork; the mirror answer is
+  one dispatch path + a converse verb, not a reservation. Replaced by Q6.
 
 - **Q3 — Delivery gate outcome + fresh-repo policy. RESOLVED 2026-07-09.**
   Un-integrable work closes **`fail`** with a precise reason (mirror-safe). **No
@@ -458,6 +633,16 @@ remain open.
     an extra `outcome` value. Flagged for the operator as a future option; not
     proposed for v1. (AGENTS.md: reference reality and the doc must not silently
     diverge — hence this correction is recorded rather than buried.)
+  - **Reframe refinement (2026-07-09).** Because the whole reframe is "mirror Gas
+    City," the **most** mirror-faithful #34 answer is to adopt gc's `WorkOutcome`
+    axis (`shipped`/`no-op`/`blocked`/`abandoned`) verbatim — it is native to gc
+    and therefore to city export, and it is where gc *does* record "blocked." The
+    operator's `fail`-with-reason decision remains the minimal, subset-conformant
+    v1 choice; adopting the `WorkOutcome` axis is the heavier, fuller-mirror
+    alternative. Presented as a refinement for the operator to weigh, **not** a
+    reversal of the Q3 decision. Either way, *how* work is delivered
+    (commit/branch/land) is pack/prompt content (gc's `committer` role), not
+    core.
 
 ### Q2 investigation — does camp deviate meaningfully from Gas City?
 
@@ -544,6 +729,31 @@ the operator's pick.
   adding delivery semantics, to avoid drift? **Answerable: unify first, or accept
   two synchronized copies.**
 
+- **Q6 — Remove the spec §8.4 "attended teammate is the one surface exception"?
+  (SPEC §8.4 EDIT — the load-bearing reframe decision.)** The Reframe recommends
+  collapsing to **one dispatch path** (campd only) + a **uniform converse verb**
+  (send a turn to any session, live over held-stdin or via `claude --resume`) +
+  **pack-defined drive** (overseer/committer agents), mirroring Gas City, which
+  has no attended/autonomous fork. This deletes the §8.4 surface exception and
+  the reservation idea entirely. **Requires a spec §8.4 edit** (and touches the
+  §4 mental model that "the user drives from inside Claude Code" — now made
+  literal: the human's own session is the interactive overseer). **Answerable:
+  approve the §8.4 removal + the new converse verb; then the §8.4 amendment is
+  drafted and lands serialized through the operator.** This is the question that
+  supersedes Q2 and reshapes Phase 1.
+
+- **Q7 — Persistent overseer: core `named_session` capability, or human-session-
+  only?** Gas City's overseer is a standing `[[named_session]]` (`mode` =
+  `always`/`on_demand`). Camp's premise is "the human's Claude Code session is
+  the overseer," and "idle = zero agent processes" (spec §8.4) resists a standing
+  daemon-managed agent. Options: (a) **human-session-only** overseer (no core
+  change; a persistent pack overseer is out of scope) — leanest, fits "idle is
+  free"; (b) add a minimal **core standing-session capability** (a pack-declared
+  `on_demand` overseer campd can wake for away-mode), mirroring gc more fully but
+  costing an idle process while active. **Answerable: (a) lean / human-only for
+  v1, or (b) add named sessions.** Recommend **(a)** for v1; (b) as a later,
+  mirror-faithful extension when away-mode planning is wanted.
+
 ## 8. Explicitly out of scope for v1 (unless sign-off says otherwise)
 
 - Remote push, PR/MR creation, or any git-host integration (Q4).
@@ -558,23 +768,32 @@ Ordered by dependency. Each phase is independently landable, TDD per AGENTS.md,
 gates green (`fmt`, `clippy -D warnings`, `cargo test --workspace`) before push.
 **No phase begins until its blocking open question is signed off.**
 
-### Phase 1 — Coordination: kill the race (#29)
+### Phase 1 — Coordination: one dispatch path + converse verb (#29) — REFRAMED
 
-*Blocked on Q2 (recommendation: option (a), claim-at-creation; awaiting operator
-pick + release policy).* Depends on nothing in the code (uses existing
-dispatchable exclusion).
+*Blocked on Q6 (approve §8.4 removal + the converse verb). Supersedes the
+reservation plan.* Depends on nothing in the code (removes a spawner; adds a
+verb over the existing held-stdin/resume capability).
 
-- Resolve attended vs autonomous explicitly in `camp sling`; attended writes the
-  atomic reservation (§4.1) in the same batch as `bead.created`.
-- Update `/camp:sling` to pass the attended signal and keep the teammate spawn.
-- Add the teammate take-over step (reassign or clean claim per Q2).
-- **Test obligations:** (i) attended sling → NO `session.woke` from campd for
-  that bead across converge, even after a subsequent unrelated poke (the
-  full-requery race); (ii) autonomous sling → campd dispatches exactly one
-  headless worker; (iii) reservation atomicity — no window between `bead.created`
-  and exclusion (assert via the ledger, fake-agent integration test); (iv)
-  hand-off: teammate that never claims + attended session ends → bead returns to
-  the chosen state (adoption test).
+- **Remove the second spawner:** `/camp:sling` (`plugin/commands/sling.md`) stops
+  spawning an attended teammate; it becomes a thin wrapper over `camp sling`
+  (enqueue only). campd is the sole dispatcher — the race cannot occur because
+  there is only one path.
+- **Add the converse verb:** a user-facing `camp` verb to send a turn to any
+  running session (worker or overseer), delivered live over the held stdin pipe
+  (`nudge_via_stdin` exists) or `claude --resume` after the current turn (A4).
+  This is "talking to the work," mirror of `gc nudge`/session-message.
+- **Pack (starter), not core:** a delivery-aware coder prompt and optionally a
+  `committer` / persistent `overseer` agent (mirroring gc's swarm pack) — pack
+  content; the plugin stays role-free.
+- **Spec:** draft the §8.4 amendment (delete the surface exception; state the
+  converse verb + pack-defined drive), landed serialized through the operator.
+- **Test obligations:** (i) a single `camp sling` / `/camp:sling` produces exactly
+  ONE `session.woke` (campd), never two — the #29 race is structurally gone;
+  (ii) the converse verb delivers a turn to a live worker (held-stdin) and to an
+  exited worker (`claude --resume`), asserted end-to-end with a fake agent;
+  (iii) `/camp:sling` and `camp sling` are behaviorally identical (same single
+  path); (iv) no reservation state exists in the ledger (regression guard that
+  the deprecated approach did not leak in).
 
 ### Phase 2 — Isolation contract (#31)
 
@@ -622,13 +841,15 @@ unification).* Depends on Phase 2 (the bead branch is the delivery vehicle) and
 #35 (gitignore, parallel) ─┐
                            ├─► Phase 2 (isolation) ─► Phase 3 (delivery)
 Q1 APPROVED ───────────────┘        ▲
-Q2 (rec: (a); pending pick) ─► Phase 1 (coordination)   (independent; land first)
+Q6 (§8.4 removal + verb) ─► Phase 1 (one path + converse)  (independent; land first)
 Q3 RESOLVED; Q4,Q5 open ────────────┘► Phase 3
 ```
 
-Status of the gates (2026-07-09): **Q1 APPROVED**, **Q3 RESOLVED**; **Q2**
-researched (recommend option (a) claim-at-creation) — awaiting operator pick +
-release policy; **Q4** (remote scope) and **Q5** (contract unification) open.
+Status of the gates (2026-07-09): **Q1 APPROVED**, **Q3 RESOLVED**; **Q6** (the
+reframe: remove §8.4 exception, one dispatch path + converse verb) is the new
+load-bearing decision replacing the deprecated **Q2** (reservation, superseded);
+**Q7** (persistent overseer — recommend human-session-only for v1), **Q4**
+(remote scope), **Q5** (contract unification) open.
 
 Phase 1 (coordination) is the highest-value, lowest-risk first land: it needs no
 new isolation or delivery semantics and directly removes the observed race.
