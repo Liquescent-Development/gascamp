@@ -207,14 +207,43 @@ camp sling "add a --json flag to ls, TDD it"
 
 This needs two things the free lifecycle did not: an **authenticated `claude`
 CLI** and a **routable agent**. Install the [starter pack](packs/starter/) and
-name a default agent in `camp.toml`:
+name a default agent in `camp.toml` — here is the full file for the `demo` camp
+above, `packs` added:
 
 ```toml
-packs = ["packs/starter"]
+# Gas Camp configuration (spec §7.1)
+packs = ["/absolute/path/to/gascamp/packs/starter"]
+
+[camp]
+name = "demo"
+
+[[rigs]]
+name = "demo"
+path = "/absolute/path/to/demo"
+prefix = "demo"
 
 [dispatch]
 default_agent = "dev"          # packs/starter/agents/dev.md
 ```
+
+Two things to get right, both easy to miss:
+
+- **`packs` is a top-level key, and it must come before every `[section]`
+  header** (`[camp]`, `[[rigs]]`, `[dispatch]`) — TOML binds a bare key to
+  whichever table precedes it, not to the file as a whole. `camp init` writes
+  `[camp]` first and `camp rig add` appends `[[rigs]]` after it, so if you
+  paste `packs = [...]` at the *bottom* of the file (as you'd naturally do
+  after running those commands), TOML attaches it to the last `[[rigs]]`
+  entry instead of the top level. Since `camp.toml` rejects unknown fields,
+  that surfaces as a confusing `` unknown field `packs` `` error rather than
+  anything mentioning placement — add the line above `[camp]`, not below
+  `[[rigs]]`.
+- **Relative pack paths resolve against the directory holding `camp.toml`**
+  (the `.camp/` directory `camp init` creates), not your shell's cwd. A bare
+  `packs = ["packs/starter"]` in the `demo` camp above would look for
+  `demo/.camp/packs/starter`, which doesn't exist. Use an absolute path to
+  your gascamp clone's `packs/starter` (as above), or copy the pack directory
+  into `.camp/` instead.
 
 Then `camp sling "…"` (or `/camp:sling "…"`) creates the bead, auto-starts `campd`,
 and dispatches the worker. Route to a specific role with `--agent reviewer`.
