@@ -1188,3 +1188,55 @@ fn worktree_worker_cwd_is_canonicalized_on_a_symlinked_camp_root() {
         munge(&raw_cwd.to_string_lossy())
     );
 }
+
+/// Test obligation (i), dispatch-lifecycle Phase 1 (#29): ONE sling → exactly
+/// ONE session.woke — including across later converge wakes. converge()
+/// re-queries the full dispatchable set on EVERY wake (dispatch.rs), so bead
+/// A being held live while bead B's sling pokes campd is precisely the
+/// re-dispatch hazard; the sessions-bound exclusion in dispatchable_beads()
+/// must keep A invisible. No reservation, no second spawner.
+#[test]
+fn a_single_sling_dispatches_exactly_once_across_subsequent_wakes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4, "");
+    let hold = dir.path().join("hold");
+    std::fs::create_dir_all(&hold).unwrap();
+    let _campd = Daemon::spawn(&root, &[("FAKE_AGENT_HOLD_DIR", hold.to_str().unwrap())]);
+
+    let bead_a = camp_ok(&root, &["sling", "bead a"]).trim().to_owned();
+    // A is dispatched and its worker holds (claimed, alive, not closing).
+    wait_until(&root, "bead a claimed", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "bead.claimed" && ev["bead"] == bead_a.as_str())
+    });
+
+    // A later, unrelated wake: converge() re-runs the full dispatchable
+    // query. Bead A must not be dispatched a second time.
+    let bead_b = camp_ok(&root, &["sling", "bead b"]).trim().to_owned();
+    wait_until(&root, "bead b claimed", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "bead.claimed" && ev["bead"] == bead_b.as_str())
+    });
+
+    // Release both holds; both close pass.
+    std::fs::write(hold.join(&bead_a), "go").unwrap();
+    std::fs::write(hold.join(&bead_b), "go").unwrap();
+    wait_until(&root, "both beads closed", |e| count(e, "bead.closed") == 2);
+
+    let events = events_json(&root);
+    let wokes_a = events
+        .iter()
+        .filter(|e| e["type"] == "session.woke" && e["data"]["bead"] == bead_a.as_str())
+        .count();
+    let wokes_b = events
+        .iter()
+        .filter(|e| e["type"] == "session.woke" && e["data"]["bead"] == bead_b.as_str())
+        .count();
+    assert_eq!(wokes_a, 1, "bead a: exactly one dispatch, ever");
+    assert_eq!(wokes_b, 1, "bead b: exactly one dispatch, ever");
+    assert_eq!(
+        count(&events, "session.woke"),
+        2,
+        "no third spawn of any kind"
+    );
+}
