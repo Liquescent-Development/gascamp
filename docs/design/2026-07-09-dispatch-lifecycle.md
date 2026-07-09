@@ -9,6 +9,24 @@
 | Depends on | #35 (`.camp/` gitignore, parallel PR) |
 | Authoritative spec | `docs/design/2026-07-05-gas-camp-design.md` — its §4 decision record is SETTLED |
 
+### Decision log
+
+- **2026-07-09 — Operator APPROVED Q1.** Worktree isolation is the DEFAULT for
+  autonomous dispatch; the operator signs off on the spec §12 edit this implies
+  (the actual §12 change + implementation land later, serialized through the
+  operator, per §9). Attended teammates remain the documented exception (A2).
+  Folded into §4.2 and §7.
+- **2026-07-09 — Operator DECIDED Q3.** Gate un-integrable work as
+  `fail`-with-reason (mirror-safe). Do NOT add a `blocked`/`needs-integration`
+  value to the `outcome` axis — preserving native city export is a hard
+  requirement. Fresh-repo/no-remote = fail-fast at dispatch. Folded into §4.3
+  and §7. (An honest correction to the *rationale* — gc does have a `blocked`
+  value on a *separate* axis — is recorded in §7 Q3; it does not change the
+  decision.)
+- **2026-07-09 — Q2 investigated** against the pinned Gas City reference
+  (§7 Q2 investigation). Verdict: **no meaningful deviation from Gas City**;
+  recommend **claim-at-creation reservation**. Pending operator pick.
+
 ## 0. Scope and constraint
 
 This note designs ONE subsystem — the lifecycle of a dispatched worker from
@@ -99,7 +117,9 @@ This **matches the current spec** — §12 says "Dispatch sets the worker's cwd 
 the rig — *or* to a camp-managed worktree ... when the agent definition sets
 `isolation = "worktree"`." Worktree isolation is opt-in by design today. So #31
 is not a spec-vs-code divergence; it is a request to **change the spec's
-default**, which is an open question (§7 Q1), not a decision this note makes.
+default** — a spec §12 edit, **APPROVED by the operator 2026-07-09** (§4.2, §7
+Q1). The §12 amendment and code change land later, serialized through the
+operator; this note only records the decision.
 
 ### 1.3 #34 — `pass` has no delivery semantics
 
@@ -144,11 +164,15 @@ From AGENTS.md and spec §2/§4 — cited so the proposal stays inside the lines
   mechanical git facts, exactly like check-scripts (`check.mode="exec"`).
 - **Fail fast** (inv. 5; spec §15.1). A rig that cannot support the delivery
   workflow must fail at dispatch with a ledger event, not silently strand work.
-- **Vocabulary mirror** (inv. 7; spec §8.2, §15.2). `outcome` values must stay a
-  subset/mirror of Gas City's `["pass","fail","skipped","missing_root"]`
-  (`crates/camp-core/tests/fixtures/gc-vocab.json`) so exported history reads
-  natively in a city. **Gas City has no `blocked` outcome** — so introducing one
-  is a vocabulary decision requiring sign-off (§7 Q3), not a free addition.
+- **Vocabulary mirror** (inv. 7; spec §8.2, §15.2). camp's `outcome` values must
+  stay a subset/mirror of Gas City's control `Outcome` set
+  (`["pass","fail","skipped","missing_root"]`,
+  `crates/camp-core/tests/fixtures/gc-vocab.json`) so exported history reads
+  natively in a city. **camp's `outcome` axis has no `blocked`, and Q3 keeps it
+  that way** (un-integrable work → `fail`-with-reason). Note (Q2 source finding):
+  Gas City *does* define a `blocked` value, but on a separate `WorkOutcome` axis
+  camp does not model — see §7 Q3; it does not license adding `blocked` to the
+  `outcome` axis.
 - **Settled §4 / §8.4 that this proposal keeps:** campd is the sole dispatcher
   of autonomous/graph work; the attended teammate is the single surface
   exception; A2 (resolved) — a teammate's cwd is pinned to the parent session's
@@ -167,8 +191,8 @@ touches the rig's live tree; campd refuses to dispatch a worktree into a rig
 that cannot support one (not a git repo / no base commit), failing fast rather
 than stranding work. (3) **Delivery** — the worker skill gains an explicit
 delivery contract (commit to the bead branch; define "landed"), and `pass` is
-gated on landable work, with a distinct non-`pass` disposition for
-"work exists but cannot be integrated here." The three gates compose into one
+gated on landable work — un-integrable work closes `fail`-with-reason (Q3
+DECIDED: mirror-safe, no new outcome value). The three gates compose into one
 honest lifecycle: the operator chose the surface, the work happened in
 isolation, and the outcome tells the truth about whether it can land.
 
@@ -201,6 +225,16 @@ Why this shape:
   (e.g. `camp sling --attended`, or the plugin passing an attended marker), with
   a config default. campd never inspects "is a user present" — it only honors a
   declared ledger fact (inv. 4).
+
+**Mirror-safety (Q2, verified — see §7 Q2 investigation).** Claim-at-creation is
+the mirror-safe choice: it reuses camp's *existing* additive `bead.claimed`
+event (`CAMP_SPECIFIC_EVENTS`, CI-verified absent from Gas City source) and
+introduces **zero** new vocabulary. A reserved bead is simply `in_progress` with
+an `assignee`/`claimed_by` — a state Gas City understands natively, so it exports
+cleanly. Gas City has no attended-vs-autonomous concept at all, so this
+coordination is a permissible camp-specific addition regardless of variant; the
+claim-at-creation variant is preferred precisely because it mints no new name to
+collide with a future Gas City concept.
 
 **The one mechanical detail that needs a decision:** the teammate must be able
 to take over a bead the attended *orchestrator* session reserved. Options:
@@ -237,14 +271,18 @@ The machinery **already exists** and is correct — `create_worktree` /
 failure for forensics, and adoption sweeps orphans (spec §8.5). The only gaps
 are **which agents get it** and **fail-fast when a rig can't support it**:
 
-1. **Default vs opt-in (SPEC-EDIT — §7 Q1).** Today isolation is opt-in per
-   agent (pack.rs default `None`, matching spec §12). #31 asks to make it the
-   default. Flipping the default is a spec §12 edit and is deferred to the
-   operator. This note recommends: **default autonomous dispatch to worktree
-   isolation**, with `isolation = "none"` as an explicit, loud opt-out for
-   agents that intentionally want the live tree — because "autonomous edits
-   landing on `main`" is precisely the hazard #31 reports. But the spec owns the
-   default; this note does not change it.
+1. **Default vs opt-in — APPROVED 2026-07-09 (SPEC §12 EDIT signed off).** Today
+   isolation is opt-in per agent (pack.rs default `None`, matching spec §12).
+   #31 asked to make it the default; **the operator has approved this and signed
+   off on the spec §12 edit it implies.** Approved direction: **autonomous
+   dispatch defaults to worktree isolation**, with `isolation = "none"` as an
+   explicit, loud opt-out for agents that intentionally want the live tree —
+   because "autonomous edits landing on `main`" is precisely the hazard #31
+   reports. The actual §12 spec amendment and the code change land later,
+   serialized through the operator (Phase 2, §9). This note records the decision;
+   it makes no code or spec edit here. Mirror check: worktree-per-worker
+   isolation is consistent with Gas City, which itself events
+   `bead.worktree.reaped` / `bead.worktree.reap_skipped` — not a deviation.
 
 2. **Fail fast when the rig can't support a worktree (ties to #34).**
    `git worktree add -b camp/<bead>` requires a git repo with a base commit; on
@@ -281,28 +319,28 @@ implementation PR, not here**):
   **without** camp needing a remote or a PR host. Remote push / PR creation is
   **explicitly out of scope for v1** (§8) and would be a spec + scope decision
   (§7 Q4).
-- **Fresh / empty repo:** the "always branch + PR" pattern is meaningless with
-  no base and no `main`. Two coherent resolutions, pick one at sign-off (§7 Q3):
-  (a) campd refuses to dispatch code work into such a rig (fail fast at dispatch,
-  as in §4.2.2 — the worktree add fails, `dispatch.failed` is evented, no worker
-  ever runs); or (b) the worker's first commit legitimately establishes the
-  integration branch (an empty repo's first commit belongs on `main`, not a
-  feature branch). Recommended: **(a)** — it is the fail-fast, invariant-5 answer
-  and needs no new worker cleverness; the operator prepares the rig (a base
-  commit) before dispatching code work, the same way #35 prepares `.gitignore`.
-- **Gate `pass` on landable work.** A worker that produced changes it cannot
-  land must not report `pass`. Two paths (§7 Q3):
-  - **Low-risk, no vocabulary change (recommended for v1):** close **`fail`**
-    with a precise reason ("work committed to `camp/<bead>` but the rig has no
-    base/integration branch — cannot land"). Honest, and `fail` is already
-    mirrored. The worktree is kept for forensics (existing behavior), so the
-    work is not lost.
-  - **Clearer but needs sign-off:** introduce a distinct
-    `blocked`/`needs-integration` disposition. **This touches the vocabulary
-    mirror** — Gas City's `outcome` set has no `blocked`, so a camp-additive
-    outcome would not read natively in an exported city and needs spec approval
-    (§7 Q3). Gas City *does* have `skipped`; whether that is the right mirror for
-    "un-integrable" is itself a semantic call for sign-off.
+- **Fresh / empty repo — DECIDED 2026-07-09: fail fast at dispatch.** The
+  "always branch + PR" pattern is meaningless with no base and no `main`. campd
+  **refuses to dispatch** code work into such a rig: `git worktree add` fails,
+  `dispatch.failed` is evented, no worker ever runs and nothing is stranded
+  (§4.2.2). This is the fail-fast, invariant-5 answer and needs no new worker
+  cleverness; the operator prepares the rig (a base commit) before dispatching
+  code work, the same way #35 prepares `.gitignore`. (The rejected alternative —
+  letting the worker's first commit establish the integration branch — would put
+  content judgment in the worker for the empty-repo edge; fail-fast is cleaner
+  and consistent with the `fail`-with-reason gate below.)
+- **Gate `pass` on landable work — DECIDED 2026-07-09: `fail`-with-reason, no
+  new outcome value.** A worker that produced changes it cannot land closes
+  **`fail`** with a precise reason ("work committed to `camp/<bead>` but the rig
+  has no base/integration branch — cannot land"). This is mirror-safe (`fail` is
+  already mirrored) and honest; the worktree is kept for forensics (existing
+  behavior), so the work is not lost. **No `blocked`/`needs-integration` value is
+  added to the `outcome` axis** — camp's `outcome` mirrors Gas City's control
+  `Outcome` (`pass|fail|skipped|missing_root`), which has no `blocked`, and
+  preserving native city export is a hard requirement (vocabulary-mirror
+  invariant). See §7 Q3 for an honest correction to the *rationale* (gc does
+  carry a `blocked` value, but on a *different* axis camp does not model) — the
+  correction does not change this decision.
 
 **campd's role stays mechanical.** campd does not read diffs or judge quality. It
 (i) honors the declared isolation, (ii) fails fast when the rig can't host a
@@ -335,11 +373,11 @@ wants isolation, they dispatch autonomously; if they want to drive it live, they
 accept the supervised-live-tree contract. Making the choice explicit (§4.1) is
 what makes the two contracts coherent instead of a surprise.
 
-**Consequence to confirm at sign-off (§7 Q1):** if isolation becomes the
-*default*, attended slings are a standing exception to that default (they can't
-honor it). The operator must be comfortable that "attended = no worktree
-isolation by design (A2)." This is a documentation + expectation decision, not a
-code contradiction.
+**Consequence — CONFIRMED at Q1 sign-off (2026-07-09):** with isolation now the
+*default* (Q1 APPROVED), attended slings are a standing exception to that default
+(they can't honor it, A2). The operator accepted "attended = no worktree
+isolation by design (A2)"; this is documented, not a code contradiction. Phase 2
+must document this contract prominently so it is not a surprise.
 
 ## 5. Fit with spec §4 decisions and the invariants
 
@@ -351,7 +389,7 @@ code contradiction.
 | Cost proportional to job (§2 inv.2) | Attended reservation = one extra event in the same batch; delivery gate = worker behavior + one git check at dispatch. Tier-0 stays ~3 writes + one spawn. |
 | Nothing hidden (§13) | Reservation, isolation choice, fail-fast dispatch refusal, and every non-`pass` verdict are ledger events with causes. |
 | Fail fast (§2 inv.5, §15.1) | A rig that can't host a worktree fails at dispatch (`dispatch.failed`), never strands work. |
-| Vocabulary mirror (§8.2, §15.2) | Recommended v1 uses only mirrored outcomes (`pass`/`fail`). Any `blocked` outcome is explicitly gated behind sign-off. |
+| Vocabulary mirror (§8.2, §15.2) | DECIDED (Q3): v1 gates un-integrable work as `fail`-with-reason — only mirrored `outcome` values, no new value on that axis. Attended reservation (Q2) reuses the existing additive `bead.claimed`; zero new vocabulary. |
 | A2 teammate cwd (§17, resolved) | Respected: attended work is supervised-live-tree; only autonomous work is isolated. |
 
 ## 6. What this touches when implemented (for reviewers — NOT in this PR)
@@ -362,41 +400,137 @@ code contradiction.
 - `crates/camp-core/src/readiness.rs` — only if the "new field" reservation
   variant (§4.1 alternative) is chosen; the recommended claim-at-creation
   variant needs no query change.
-- `crates/camp-core/src/pack.rs` — only if isolation default flips (§7 Q1).
+- `crates/camp-core/src/pack.rs` — flip the `Isolation` default to worktree
+  (Q1 APPROVED); add the explicit `isolation = "none"` opt-out.
 - `plugin/skills/worker/SKILL.md` + `crates/camp/src/daemon/spawn.rs`
   `WORKER_CONTRACT` — the delivery contract text (kept in lockstep; two copies of
   the worker contract exist today and both lack delivery semantics).
-- `crates/camp/src/cmd/close.rs` + `crates/camp-core/src/vocab.rs` — only if a
-  new disposition is approved (§7 Q3).
+- `crates/camp/src/cmd/close.rs` + `crates/camp-core/src/vocab.rs` — **no change
+  to the outcome vocabulary** (Q3 DECIDED: `fail`-with-reason, no new value). The
+  landability gate is worker-contract text plus a mechanical git check; the close
+  outcome stays within the mirrored set.
+- The spec `docs/design/2026-07-05-gas-camp-design.md` §12 — the isolation-default
+  amendment (Q1 APPROVED). Edited later, serialized through the operator; NOT in
+  this PR.
 
 ## 7. Open questions requiring operator / spec sign-off
 
-Each is crisp and answerable. The first three are the load-bearing ones.
+Each is crisp and answerable. Q1 and Q3 are RESOLVED (operator, 2026-07-09); Q2
+is researched with a recommendation pending the operator's pick; Q4 and Q5
+remain open.
 
-- **Q1 — Default isolation (SPEC §12 EDIT).** Should autonomous dispatch default
-  to worktree isolation (recommended), with `isolation = "none"` as an explicit
-  opt-out? This edits spec §12 (currently worktree is opt-in). Sub-decision:
-  confirm that attended teammates are a documented standing exception to that
-  default because A2 forbids per-teammate cwd (§4.4). **Answerable yes/no + a
-  one-line spec §12 amendment.**
+- **Q1 — Default isolation (SPEC §12 EDIT). RESOLVED 2026-07-09 — APPROVED.**
+  Autonomous dispatch defaults to worktree isolation, with `isolation = "none"`
+  as an explicit opt-out. The operator signed off on the spec §12 edit; the §12
+  amendment and code land later, serialized through the operator (Phase 2).
+  Attended teammates are the documented standing exception (A2 forbids
+  per-teammate cwd, §4.4). Folded into §4.2.
 
-- **Q2 — Reservation mechanism and hand-off.** (a) Reserve via
-  claim-at-creation + a teammate claim-reassignment (recommended, no new
-  vocabulary), or via a new `dispatch = "attended"` bead field (clearer, adds a
-  field)? (b) When an attended teammate never claims, is the bead released to
-  autonomous dispatch — via adoption after the attended session ends (likely
-  free if the reservation is a real claim), an explicit `camp sling --headless
-  <bead>` / release verb, or left for the operator? **Answerable: pick (a)/(b)
-  variant + a release policy.**
+- **Q2 — Reservation mechanism and hand-off. RESEARCHED — recommendation
+  pending operator pick.** See the **Q2 investigation** below for the Gas City
+  findings, verdict, and recommendation. Decision still owned by the operator:
+  (a) reserve via claim-at-creation + a teammate claim-reassignment
+  (**recommended** — mirror-safe, no new vocabulary), or (b) a new
+  `dispatch = "attended"` bead field; and the release policy when an attended
+  teammate never claims (adoption reclaim after the attended session ends is
+  likely free once the reservation is a real claim; an explicit
+  `camp sling --headless <bead>` / release verb; or leave for the operator).
 
-- **Q3 — Delivery gate outcome + fresh-repo policy (possible VOCABULARY/SPEC
-  EDIT).** For un-integrable work, close `fail` with a precise reason (recommended,
-  mirror-safe) or introduce a `blocked`/`needs-integration` outcome (adds a
-  camp-additive outcome value absent from Gas City → breaks "exported history
-  reads natively in a city" unless the spec approves it)? And for a fresh/empty
-  repo: campd refuses to dispatch (fail fast, recommended) or the worker's first
-  commit establishes the integration branch? **Answerable: pick the outcome
-  path and the fresh-repo path.**
+- **Q3 — Delivery gate outcome + fresh-repo policy. RESOLVED 2026-07-09.**
+  Un-integrable work closes **`fail`** with a precise reason (mirror-safe). **No
+  `blocked`/`needs-integration` value is added to the `outcome` axis** —
+  preserving native city export is a hard requirement. Fresh/empty repo →
+  **fail fast at dispatch** (§4.3). Folded into §4.3.
+  - **Honest correction to the rationale (finding, does NOT change the
+    decision).** The Q2 source investigation revealed that Gas City's
+    `internal/beadmeta/values.go` *does* define a `blocked` value — but on a
+    **separate axis** camp does not model: a `WorkOutcome` set
+    (`shipped` / `no-op` / `blocked` / `abandoned`), distinct from the control
+    `Outcome` set (`pass` / `fail` / `skipped` / `missing_root`) that camp's
+    `outcome` mirrors. `crates/camp-core/tests/fixtures/gc-vocab.json` pins only
+    the control-`Outcome` list, which is why it shows "no `blocked`." So the
+    precise, correct rationale is: **camp's `outcome` axis (mirroring gc's
+    control `Outcome`) has no `blocked`, and adding one there would be a
+    redefinition/mismatch that breaks native export** — exactly the operator's
+    conclusion. If camp ever wants a first-class "un-integrable" signal, the
+    **mirror-safe home is a future, additive `WorkOutcome`-style axis
+    (`shipped`/`no-op`/`blocked`/`abandoned`) mirrored verbatim from gc**, never
+    an extra `outcome` value. Flagged for the operator as a future option; not
+    proposed for v1. (AGENTS.md: reference reality and the doc must not silently
+    diverge — hence this correction is recorded rather than buried.)
+
+### Q2 investigation — does camp deviate meaningfully from Gas City?
+
+Investigated against the pinned reference, not from memory: `ci/gc-compat/`
+(`GASCITY_REF` = `12410301884b51131a35e101a335dbaae16cdcb0`, `check_vocab.sh`),
+`crates/camp-core/tests/fixtures/gc-vocab.json`, `crates/camp-core/src/vocab.rs`,
+the spec's vocabulary-mirror/formula-subset/§8.4 sections, and the Gas City
+source at the pinned ref (`internal/events/events.go`,
+`internal/beadmeta/values.go`).
+
+**1. Does Gas City have claiming / reservation / an attended-vs-autonomous
+distinction?**
+- **Claiming: YES.** Gas City workers claim work beads. `bead.claim_rejected`
+  (events.go) fires "when a worker attempts to claim a work bead already
+  live-claimed by a different worker; the claim is rejected as an idempotent
+  no-op rather than fanning out concurrent claims." Gas City tracks an
+  `assignee` (which session holds a bead), referenced by
+  `session.drain_acked_with_assigned_work`. **But Gas City emits no
+  successful-claim event** — there is no `bead.claimed` in gc source.
+- **Reservation (block the autonomous dispatcher so an attended teammate can
+  take a bead): NO analog.** This exists only because camp has an attended
+  surface.
+- **Attended-vs-autonomous distinction: NO.** Gas City has no user-driven /
+  attended session concept and no event classifying a session that way — the
+  fleet is entirely controller-dispatched. This matches the spec: camp's
+  attended teammate is "the one surface exception" (§8.4), a camp premise
+  ("drive from inside Claude Code"), not a Gas City feature.
+
+**2. Gas City HAS claiming — does camp's claim-at-creation match verbatim or
+redefine it?** It is **additive, not a redefinition**, and this is a
+*pre-existing, CI-verified* camp choice the reservation merely reuses:
+- `bead.claimed` is in `CAMP_SPECIFIC_EVENTS` (`vocab.rs:24`). `check_vocab.sh`
+  assertion (b) asserts no `CAMP_SPECIFIC_EVENTS` name appears as a string
+  constant in gc source — so `bead.claimed` is guaranteed absent from Gas City,
+  i.e. additive. It does not collide with, or redefine, gc's `bead.claim_rejected`
+  (a different string with a different meaning).
+- Mechanically, camp's claim is atomic and guarded: the `bead_claimed` fold
+  (`fold.rs:170-188`) transitions only an `open` bead to `in_progress`; a claim
+  on any non-open bead is an `InvalidTransition` rejected inside the one WAL
+  transaction — camp's semantic equivalent of gc's idempotent claim rejection,
+  surfaced as an error rather than a distinct event. (Minor, out-of-scope
+  observation: camp could later mirror `bead.claim_rejected` verbatim as an
+  additive event for the double-claim path — exactly the #29 race — but that is
+  not required here.)
+
+**3. Gas City does NOT have the reservation/attended concept — is camp's
+reservation a permissible additive mechanism, and is it named safely?** Yes.
+- **Claim-at-creation (recommended)** mints **no new name at all** — it reuses
+  the already-additive `bead.claimed` and the existing `in_progress` /
+  `assignee` state, all of which Gas City understands, so there is nothing to
+  collide and export is native.
+- The **`dispatch = "attended"` field alternative** would mint a new
+  camp-specific bead-metadata key. Verified: gc's `internal/beadmeta/values.go`
+  has **no** `dispatch` / `attended` / `autonomous` / `reserved` / `reservation`
+  key today, so the name is currently free — but minting a new top-level
+  beadmeta key is precisely the kind of addition that can collide with a future
+  Gas City key and must be camp-namespaced and scrubbed on export. Strictly less
+  mirror-safe for no functional gain.
+
+**4. Bottom line + recommendation.** **Camp does not deviate meaningfully from
+Gas City.** The attended-vs-autonomous *coordination* is a camp-specific problem
+with no Gas City analog (gc has no attended surface), so any solution is a
+permissible additive camp mechanism. Where the two overlap — *claiming* — camp
+already models a successful claim additively (`bead.claimed`), CI-verified absent
+from Gas City, and the reservation simply reuses it. **Recommendation: option (a),
+claim-at-creation reservation.** It introduces zero new vocabulary, rides camp's
+existing additive claim + the `in_progress`/`assignee` state Gas City understands
+natively, exports cleanly, and cannot collide with a future Gas City concept —
+strictly more mirror-safe than the `dispatch="attended"` field, which adds a new
+namespaced key and an export scrub for no functional benefit. The only follow-on
+detail is the teammate take-over of a bead the attended orchestrator reserved
+(claim reassignment), plus the release policy — both listed under Q2 above for
+the operator's pick.
 
 - **Q4 — What "landed" means / remote scope.** Is v1 "landed" = "committed on
   the bead branch with a base" (recommended; no remote/PR host needed), or does
@@ -426,8 +560,9 @@ gates green (`fmt`, `clippy -D warnings`, `cargo test --workspace`) before push.
 
 ### Phase 1 — Coordination: kill the race (#29)
 
-*Blocked on Q2.* Depends on nothing in the code (uses existing dispatchable
-exclusion).
+*Blocked on Q2 (recommendation: option (a), claim-at-creation; awaiting operator
+pick + release policy).* Depends on nothing in the code (uses existing
+dispatchable exclusion).
 
 - Resolve attended vs autonomous explicitly in `camp sling`; attended writes the
   atomic reservation (§4.1) in the same batch as `bead.created`.
@@ -443,11 +578,13 @@ exclusion).
 
 ### Phase 2 — Isolation contract (#31)
 
-*Blocked on Q1 (default) and #35 (gitignore).* Independent of Phase 1.
+*Q1 APPROVED (2026-07-09); still gated on #35 (gitignore) and the serialized
+spec §12 amendment.* Independent of Phase 1.
 
-- If Q1 = default-on: flip the `Isolation` default and add the explicit
-  `none` opt-out; else document opt-in more loudly. Either way, make running on a
-  live branch **loud** (an event / prominent doc).
+- Flip the `Isolation` default to worktree and add the explicit `none` opt-out
+  (Q1 approved). Make running on a live branch **loud** (an event / prominent
+  doc) for the opt-out case. Land the spec §12 amendment in lockstep (serialized
+  through the operator).
 - Confirm and test the fail-fast-on-unworktree-able-rig path (`dispatch.failed`),
   which the machinery already produces.
 - Document the working-tree contract (autonomous = worktree/`camp/<bead>`;
@@ -460,32 +597,38 @@ exclusion).
 
 ### Phase 3 — Delivery contract + `pass` gate (#34)
 
-*Blocked on Q3, Q4, Q5.* Depends on Phase 2 (the bead branch is the delivery
-vehicle) and #35.
+*Q3 RESOLVED (2026-07-09); still gated on Q4 (remote scope) and Q5 (contract
+unification).* Depends on Phase 2 (the bead branch is the delivery vehicle) and
+#35.
 
 - (Q5) Optionally unify the two worker-contract copies first.
 - Add the delivery contract to the worker skill (+ mechanical floor): commit to
-  the bead branch; define "landed"; handle fresh/empty + no-remote explicitly per
-  Q3/Q4.
-- Implement the `pass` gate per Q3 (recommended: `fail`-with-reason on
-  un-integrable work; or a new disposition if approved — with the vocab + city
-  export test if so).
+  the bead branch; define "landed" (Q3: committed on `camp/<bead>` with a base);
+  fresh/empty repo → fail fast at dispatch (Q3), no worker cleverness.
+- Implement the `pass` gate per Q3 (DECIDED): un-integrable work closes
+  **`fail`-with-reason**; **no new `outcome` value**. The gate is worker-contract
+  text + a mechanical git check.
 - **Test obligations:** (i) a fake worker that commits to a dead-end branch on a
-  no-base rig CANNOT close `pass` (gate rejects / worker closes `fail`); (ii) a
+  no-base rig CANNOT close `pass` (worker closes `fail`-with-reason); (ii) a
   worker that commits to `camp/<bead>` on a rig with a base **can** close `pass`
-  and the branch is reachable/diffable post-close; (iii) if a new outcome is
-  approved, `camp export --city` still emits mirror-valid history (vocabulary
-  test); (iv) worktree kept-on-non-pass so stranded work is recoverable.
+  and the branch is reachable/diffable post-close; (iii) `camp export --city`
+  still emits mirror-valid history — the close vocabulary is unchanged
+  (regression guard on the Q3 decision); (iv) worktree kept-on-non-pass so
+  stranded work is recoverable.
 
 ### Sequencing summary
 
 ```
 #35 (gitignore, parallel) ─┐
                            ├─► Phase 2 (isolation) ─► Phase 3 (delivery)
-Q1 ───────────────────────┘        ▲
-Q2 ─► Phase 1 (coordination)       │  (Phase 1 independent; can land first)
-Q3,Q4,Q5 ──────────────────────────┘► Phase 3
+Q1 APPROVED ───────────────┘        ▲
+Q2 (rec: (a); pending pick) ─► Phase 1 (coordination)   (independent; land first)
+Q3 RESOLVED; Q4,Q5 open ────────────┘► Phase 3
 ```
+
+Status of the gates (2026-07-09): **Q1 APPROVED**, **Q3 RESOLVED**; **Q2**
+researched (recommend option (a) claim-at-creation) — awaiting operator pick +
+release policy; **Q4** (remote scope) and **Q5** (contract unification) open.
 
 Phase 1 (coordination) is the highest-value, lowest-risk first land: it needs no
 new isolation or delivery semantics and directly removes the observed race.
