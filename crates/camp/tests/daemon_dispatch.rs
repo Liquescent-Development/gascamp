@@ -673,6 +673,47 @@ fn a_spawn_failure_with_isolation_keeps_the_worktree() {
     );
 }
 
+/// Phase 2 (dispatch-lifecycle Q1, spec §12): running on the rig's live
+/// tree is an explicit opt-out and it is LOUD — every isolation="none"
+/// dispatch appends dispatch.live_tree naming the path and agent, before
+/// the worker's registry row. Never silent.
+#[test]
+fn an_isolation_none_dispatch_is_loud_in_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 10, "");
+    write_agent(&root, "dev", "isolation: none\n");
+    let _campd = Daemon::spawn(&root, &[]);
+
+    let bead = camp_ok(&root, &["sling", "live tree work"])
+        .trim()
+        .to_owned();
+    wait_until(&root, "the live-tree worker to stop", |e| {
+        count(e, "session.stopped") == 1
+    });
+
+    let events = events_json(&root);
+    let live = events
+        .iter()
+        .find(|e| e["type"] == "dispatch.live_tree")
+        .expect("isolation=none dispatch must event dispatch.live_tree");
+    assert_eq!(live["bead"], bead.as_str());
+    assert_eq!(live["actor"], "campd");
+    assert_eq!(live["data"]["agent"], "dev");
+    // the recorded path is the worker's cwd — the CANONICAL rig path
+    let canon_rig = std::fs::canonicalize(&rig).unwrap();
+    assert_eq!(live["data"]["path"], canon_rig.to_str().unwrap());
+    // loud BEFORE the worker exists: live_tree precedes the registry row
+    let live_seq = seq_of(&events, |e| e["type"] == "dispatch.live_tree");
+    let woke_seq = seq_of(&events, |e| e["type"] == "session.woke");
+    assert!(
+        live_seq < woke_seq,
+        "dispatch.live_tree must precede session.woke: {events:#?}"
+    );
+    // and no worktree machinery ran
+    assert_eq!(count(&events, "bead.worktree.reaped"), 0);
+    assert!(!root.join("worktrees").join(&bead).exists());
+}
+
 /// Routing (decision D) through the daemon: the rig's default_agent
 /// outranks [dispatch].default_agent; session names carry the agent.
 #[test]
