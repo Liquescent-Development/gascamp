@@ -438,10 +438,25 @@ impl Dispatcher {
             .map_err(|e| format!("session name allocation failed: {e}"))?;
         let session_id = spawn::new_session_id();
         let make_worktree = agent.isolation == Isolation::Worktree;
+        // Canonicalize the worker cwd ONCE (Phase 15 e2e finding). Real claude
+        // resolves its cwd via realpath before computing the transcript project
+        // dir (F3), so campd must too — otherwise the registry records, and
+        // patrol watches (spec §10), a path claude never writes whenever the
+        // rig/camp path contains a symlink component (e.g. macOS /var ->
+        // /private/var, or a symlinked repo). Fail fast: a raw-path fallback
+        // would reintroduce the bug. The worktree lifecycle (ensure_worktree /
+        // reap, below) stays in raw terms — same inode via the symlink — while
+        // the worker cwd + transcript use the canonical form claude will see.
         let cwd = if make_worktree {
-            self.camp.worktrees_path().join(&bead.id)
+            // The worktree leaf is created later (ensure_worktree) and does not
+            // exist yet, so canonicalize the camp root (always present) and
+            // append the plain worktrees/<bead> tail.
+            let canon_root = std::fs::canonicalize(&self.camp.root)
+                .map_err(|e| format!("canonicalize camp root {}: {e}", self.camp.root.display()))?;
+            canon_root.join("worktrees").join(&bead.id)
         } else {
-            rig.path.clone()
+            std::fs::canonicalize(&rig.path)
+                .map_err(|e| format!("canonicalize rig cwd {}: {e}", rig.path.display()))?
         };
         let claude_root = spawn::claude_config_root().map_err(|e| format!("{e:#}"))?;
         let transcript = spawn::transcript_path_under(&claude_root, &cwd, &session_id);
