@@ -11,7 +11,7 @@ every action has a cause and `kill -9` never loses history. Its daemon
 work is dispatched to [Claude Code](https://docs.claude.com/en/docs/claude-code)
 workers you can watch, tail, and talk to.
 
-Camp is the local, single-user cousin of [Gas
+Camp is the local, single-user sibling of [Gas
 City](https://github.com/gastownhall/gascity): what **k3s is to k8s** — the
 same six primitives and convergence model, with the heavyweight store (Dolt)
 swapped for one proportionate SQLite file. The compatibility is exact where it
@@ -105,7 +105,7 @@ camp ls --ready                            # demo-1  open  demo  add a --json fl
 camp claim demo-1 --session me             # open -> in_progress
 camp close demo-1 --outcome pass --reason "shipped it"
 camp show demo-1                           # full record + event history
-camp doctor --refold                       # replayed 4 events; 0 drift rows
+camp doctor --refold                       # refold: replayed 4 events; 0 drift rows
 ```
 
 `camp show demo-1` prints the current state and the complete, append-only
