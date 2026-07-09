@@ -24,6 +24,11 @@ pub fn run(camp_flag: Option<&Path>) -> Result<()> {
     .with_context(|| format!("cannot write camp.toml in {}", root.display()))?;
 
     Ledger::open(&root.join("camp.db"))?;
+
+    // When the camp lives inside a git repo, keep its live runtime state
+    // (ledger, socket, logs) out of git; `camp.toml` stays tracked (issue #35).
+    crate::gitignore::ensure_camp_runtime_ignored(&root)?;
+
     println!("initialized camp at {}", root.display());
     Ok(())
 }
