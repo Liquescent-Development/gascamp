@@ -27,6 +27,52 @@ tools-reference), retrieved 2026-07-06.
 | F6 | `--resume` semantics | Same session id (envelope echoes it), **appends to the same transcript file** (observed 28 → 35 lines), full context available (codeword recalled). Forking is a separate explicit flag (`--fork-session`). Registry rows therefore stay valid across nudges — no id churn. | A4-2 (below); sessions.md "Resume a session" |
 | F7 | Ambient config inheritance | A bare `claude -p` inherits the **user's** saved settings: permission allowlists (an unflagged probe ran `git status` via Bash with zero `--allowedTools`), plugins, hooks, default model. Phase 8 must pin worker behavior explicitly per agent definition (`--permission-mode`, `--allowedTools`/`--disallowedTools`, `--model`, `--append-system-prompt`, `--agents`; `--settings`/`--bare` exist for full isolation) or worker capability silently varies per machine. | D4 denied-tool probe series (below) |
 
+### Phase 15 e2e re-verification (2026-07-08, claude `2.1.205`)
+
+The Phase 15 opt-in e2e suite (`make e2e`) ran the F1–F7 facts against real
+claude 2.1.205 (pinned at 2.1.201; Phase 11 re-probed at 2.1.204). Verdicts:
+
+- **F1 — HOLDS.** campd pre-assigned `--session-id`; claude honored it (the
+  transcript file is named by the pre-assigned uuid).
+- **F3 — HOLDS, with a computation refinement (the canary's find).** The munge
+  char-scheme is **unchanged** (every non-alphanumeric char → `-`). But claude
+  **canonicalizes (realpath-resolves) its cwd** before computing the project
+  dir, so campd must canonicalize the *worker* cwd before munging — otherwise
+  the path campd records in the registry (and patrol watches, spec §10) diverges
+  from where claude actually writes whenever the rig/camp cwd contains a symlink
+  component. Observed: with the rig under macOS `tempfile::tempdir()`
+  (`/var/folders/…` — a symlink to `/private/var/folders/…`), claude wrote its
+  transcript to `~/.claude/projects/-private-var-folders-…-rig1/<sid>.jsonl`
+  (its recorded `cwd` was `/private/var/…/rig1`) while campd's raw computation
+  pointed at `~/.claude/projects/-var-folders-…-rig1/` (empty, never written) —
+  so patrol would watch a never-updated path and false-stall a healthy worker.
+  This was latent because the Phase 2 D3 probe used an already-canonical
+  `/private/tmp/…` cwd. **Fix landed in this PR:** `dispatch.rs` canonicalizes
+  the worker cwd once (fail-fast, no raw fallback) and uses it for both the
+  transcript path and the worker's `current_dir`; a deterministic symlink test
+  (`daemon_dispatch.rs::worker_cwd_is_canonicalized_so_patrol_watches_the_real_transcript_path`)
+  guards it. The spec's §10 wording ("a filesystem watch on the path recorded in
+  its registry row") is unchanged — the recorded path is now correct.
+- **F5 — HOLDS.** The worker received its task over the campd-held stream stdin
+  (HeldStream) and executed the full contract (`camp claim`/`show`/`event
+  emit`/`close --outcome pass`), no "command not found".
+- **F7 — HOLDS.** The pinned non-interactive worker (`bypassPermissions` +
+  explicit `--allowedTools`) edited files and ran `camp` with no prompts.
+- **F2 — HOLDS** (captured on the post-fix re-run, 2026-07-09). The stream-json
+  capture carried a `type=="result"` element with `is_error==false`, a
+  `session_id` echoing the pre-assigned id, and `total_cost_usd` / `ttft_ms` /
+  `num_turns` all present (observed Tier-0: `total_cost_usd=0.5878`,
+  `ttft_ms=6481`, `num_turns=16`). Note the envelope is stream-JSONL (one event
+  per line) in HeldStream mode, not the D1 `--output-format json` array — same
+  `result`-element keys, so the parse rule (`type=="result"`) is unchanged.
+- **F4 — HOLDS** (captured on the re-run). The Tier-0 worker's clean exit mapped
+  to `session.stopped` with `exit_code == 0`.
+- **F6** (`--resume`) is out of the happy-path e2e scope.
+
+**Net: F1–F5 and F7 HOLD at claude 2.1.205** (F3 with the campd-canonicalization
+fix landed in this PR; F6 out of scope). No pinned fact drifted beyond the F3
+computation refinement above.
+
 ### Key probe evidence (dispatch)
 
 D1 — envelope shape and success exit (cwd = scratch rig-a):
