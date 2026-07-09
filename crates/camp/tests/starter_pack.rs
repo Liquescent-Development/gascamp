@@ -57,6 +57,34 @@ fn starter_pack_ships_agent_definitions() {
 }
 
 #[test]
+fn starter_dev_agent_scopes_test_first_to_code_changes() {
+    // Regression guard for issue #30: the dev worker's prompt used to
+    // hardcode a blanket "test-first" mandate onto every task, even
+    // non-code ones (e.g. "give this repo a proper README.md"), pushing
+    // the worker to invent tests for documentation.
+    let p = repo_root().join("packs/starter/agents/dev.md");
+    let s = std::fs::read_to_string(&p).expect("dev.md must exist");
+    let lower = s.to_lowercase();
+
+    assert!(
+        !s.contains("implement the change test-first"),
+        "dev.md must not hardcode a blanket, unconditional test-first mandate: {s}"
+    );
+    assert!(
+        lower.contains("code") && s.contains("test-first"),
+        "dev.md must scope the test-first guidance to code changes"
+    );
+    assert!(
+        lower.contains("docs") || lower.contains("documentation"),
+        "dev.md must call out non-code changes (docs/config) as a distinct case"
+    );
+    assert!(
+        lower.contains("verify") || lower.contains("verif"),
+        "dev.md must instruct the worker to verify non-code changes appropriately"
+    );
+}
+
+#[test]
 fn starter_pack_orders_example_exists() {
     let orders = repo_root().join("packs/starter/orders.toml");
     let s = std::fs::read_to_string(&orders).expect("packs/starter/orders.toml must exist");
