@@ -78,7 +78,7 @@ impl OrdersRuntime {
         let config_path = camp_root.join("camp.toml");
         let raw = std::fs::read_to_string(&config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
-        let (config, orders, heap) = compile_and_arm(&raw, now, &tz)?;
+        let (config, orders, heap) = compile_and_arm(&raw, camp_root, now, &tz)?;
         Ok(OrdersRuntime {
             camp_root: camp_root.to_path_buf(),
             tz,
@@ -109,6 +109,15 @@ impl OrdersRuntime {
 
     pub fn order(&self, name: &str) -> Option<&Order> {
         self.orders.iter().find(|o| o.name == name)
+    }
+
+    /// The config last APPLIED (issue #28). `build`/`reload_if_changed`
+    /// keep this root-aware (unlike a bare `CampConfig::parse`), so the
+    /// event loop can push it straight into the dispatcher and graph
+    /// runtime on a hot reload — a routing change (packs, agents, rigs,
+    /// `[dispatch]`) then takes effect without a daemon restart.
+    pub fn config(&self) -> &CampConfig {
+        &self.config
     }
 
     pub fn fire_due(&mut self, now: Timestamp) -> Vec<Fire> {
@@ -181,7 +190,7 @@ impl OrdersRuntime {
         if raw == self.raw {
             return Ok(None);
         }
-        let data = match compile_and_arm(&raw, now, &self.tz) {
+        let data = match compile_and_arm(&raw, &self.camp_root, now, &self.tz) {
             Ok((config, orders, heap)) => {
                 let count = orders.len();
                 self.raw = raw;
@@ -214,10 +223,15 @@ impl OrdersRuntime {
 
 fn compile_and_arm(
     raw: &str,
+    camp_root: &Path,
     now: Timestamp,
     tz: &TimeZone,
 ) -> Result<(CampConfig, Vec<Order>, CronHeap)> {
-    let config = CampConfig::parse(raw).context("parsing camp.toml")?;
+    let mut config = CampConfig::parse(raw).context("parsing camp.toml")?;
+    // Keep the config root-aware — `parse` leaves `root` unset, but pack
+    // resolution (dispatcher routing, issue #28) needs it to resolve
+    // relative pack paths and the local agents/ layer.
+    config.root = Some(camp_root.to_path_buf());
     let orders = compile_orders(&config).context("compiling [[order]] tables")?;
     let mut heap = CronHeap::new(tz.clone());
     for order in &orders {
