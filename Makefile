@@ -4,7 +4,30 @@
 # run in CI. It asserts the spec §14 cost-budget numbers exactly, in
 # --release, single-threaded (so timing/CPU measurements are isolated), and
 # prints each measured value via --nocapture for the PR record.
-.PHONY: perf e2e
+
+# Install prefix — override with `make install PREFIX=/usr/local` (or any
+# writable dir). The binary lands in $(PREFIX)/bin; add that to your PATH.
+PREFIX ?= $(HOME)/.local
+BINDIR := $(PREFIX)/bin
+
+.PHONY: install uninstall perf e2e
+
+# Build the release binary and install `camp` into $(BINDIR), plus the
+# `campd` symlink that argv0 dispatch uses to run the daemon (main.rs keys
+# the daemon path off a "campd" file stem). The symlink is relative so the
+# pair relocates cleanly. Re-running is idempotent.
+install:
+	cargo build --release
+	mkdir -p "$(BINDIR)"
+	install -m 0755 target/release/camp "$(BINDIR)/camp"
+	ln -sf camp "$(BINDIR)/campd"
+	@echo "installed camp + campd to $(BINDIR)"
+	@echo "ensure $(BINDIR) is on your PATH (e.g. export PATH=\"$(BINDIR):\$$PATH\")"
+
+# Remove the binary and the campd symlink from $(BINDIR).
+uninstall:
+	rm -f "$(BINDIR)/camp" "$(BINDIR)/campd"
+	@echo "removed camp + campd from $(BINDIR)"
 
 perf:
 	cargo test --release -p camp-core --test perf_volume -- --ignored --nocapture --test-threads=1
