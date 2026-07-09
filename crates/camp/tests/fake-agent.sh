@@ -15,6 +15,10 @@
 #   FAKE_AGENT_TOUCH      write this file (relative to cwd) to prove where
 #                         the worker ran (worktree tests); written BEFORE
 #                         the claim so ledger-observed claims imply it
+#   FAKE_AGENT_RECORD_BRANCH  write `git branch --show-current` (as seen
+#                         from the worker's own cwd) to this file — the
+#                         Phase 2 isolation evidence; written BEFORE the
+#                         claim, same ordering contract as FAKE_AGENT_TOUCH
 #   FAKE_AGENT_OUTCOME    close outcome, default "pass"
 #   FAKE_AGENT_NUDGE_CLOSE     Phase 11 stream-mode contract: line 1 on
 #                              stdin is the task message; block until a
@@ -38,6 +42,14 @@ set -euo pipefail
 # parallel load.
 if [[ -n "${FAKE_AGENT_TOUCH:-}" ]]; then
   echo "worked in $(pwd)" > "$FAKE_AGENT_TOUCH"
+fi
+
+if [[ -n "${FAKE_AGENT_RECORD_BRANCH:-}" ]]; then
+  # Isolation evidence (Phase 2, dispatch-lifecycle §9 obligation i): the
+  # WORKER records the branch of its own cwd — not the test guessing.
+  # Written BEFORE the claim (issue #44 ordering contract): a
+  # ledger-observed claim implies every proof file already exists.
+  git branch --show-current > "$FAKE_AGENT_RECORD_BRANCH"
 fi
 
 "$CAMP_BIN" claim "$CAMP_BEAD" --session "$CAMP_SESSION"
