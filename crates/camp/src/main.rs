@@ -2,6 +2,7 @@
 
 mod campdir;
 mod daemon;
+mod gitignore;
 mod cmd {
     pub mod adopt;
     pub mod backup;
