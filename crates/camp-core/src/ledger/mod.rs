@@ -802,6 +802,86 @@ mod tests {
         assert_eq!(l.events_range(1, None).unwrap().len(), before);
     }
 
+    /// session.nudged (dispatch-lifecycle Phase 1, #29): log-only record of
+    /// a turn delivered into a session — via the campd-held stdin pipe
+    /// ("stdin") or claude --resume ("resume"). The session must exist
+    /// (fail fast on typos); text must be non-empty; unknown fields and
+    /// unknown vias are rejected (deny_unknown_fields).
+    #[test]
+    fn session_nudged_is_log_only_and_validated() {
+        let (_dir, mut l) = temp_ledger();
+        // a registered session to nudge
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "camp/dev/1", "agent": "dev", "rig": "gc"}),
+        })
+        .unwrap();
+
+        // accepted: stdin and resume
+        for via in ["stdin", "resume"] {
+            l.append(EventInput {
+                kind: EventType::SessionNudged,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({"session": "camp/dev/1", "via": via, "text": "status?"}),
+            })
+            .unwrap();
+        }
+        let before = l.events_range(1, None).unwrap().len();
+        // rejected: unknown session
+        assert!(
+            l.append(EventInput {
+                kind: EventType::SessionNudged,
+                rig: None,
+                actor: "cli".into(),
+                bead: None,
+                data: serde_json::json!({"session": "camp/dev/99", "via": "stdin", "text": "x"}),
+            })
+            .is_err()
+        );
+        // rejected: bogus via
+        assert!(
+            l.append(EventInput {
+                kind: EventType::SessionNudged,
+                rig: None,
+                actor: "cli".into(),
+                bead: None,
+                data: serde_json::json!({"session": "camp/dev/1", "via": "carrier-pigeon", "text": "x"}),
+            })
+            .is_err()
+        );
+        // rejected: blank text
+        assert!(
+            l.append(EventInput {
+                kind: EventType::SessionNudged,
+                rig: None,
+                actor: "cli".into(),
+                bead: None,
+                data: serde_json::json!({"session": "camp/dev/1", "via": "stdin", "text": "  "}),
+            })
+            .is_err()
+        );
+        // rejected: unknown field (deny_unknown_fields)
+        assert!(
+            l.append(EventInput {
+                kind: EventType::SessionNudged,
+                rig: None,
+                actor: "cli".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "camp/dev/1", "via": "stdin", "text": "x", "mode": "attended",
+                }),
+            })
+            .is_err()
+        );
+        // rejections appended nothing (one-transaction event+state property)
+        assert_eq!(l.events_range(1, None).unwrap().len(), before);
+    }
+
     // ---- Phase 11: the adoption registry query ---------------------------
 
     #[test]
