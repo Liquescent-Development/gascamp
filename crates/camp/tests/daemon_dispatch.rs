@@ -202,14 +202,20 @@ fn tier0_sling_runs_the_whole_contract_with_a_causal_trail() {
     let sid = woke_ev["data"]["claude_session_id"].as_str().unwrap();
     assert_eq!(sid.len(), 36, "claude_session_id must be a uuid: {sid}");
     let transcript = woke_ev["data"]["transcript_path"].as_str().unwrap();
-    let munged_rig: String = rig
+    // campd canonicalizes the worker cwd before computing the transcript path
+    // (Phase 15 finding: real claude realpath-resolves its cwd). Assert against
+    // the CANONICAL rig so this genuinely exercises canonicalization — a loose
+    // raw-path substring also matched the buggy raw path on macOS (canonical =
+    // "/private" + raw), which is exactly the trap to avoid.
+    let canon_rig = std::fs::canonicalize(&rig).unwrap();
+    let munged_rig: String = canon_rig
         .to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     assert!(
         transcript.contains(&munged_rig) && transcript.ends_with(&format!("{sid}.jsonl")),
-        "transcript {transcript} must be under the munged rig dir {munged_rig}"
+        "transcript {transcript} must be under the canonical munged rig dir {munged_rig}"
     );
 
     // The milestone's actor is the session name (worker attribution).
@@ -731,5 +737,69 @@ fn an_unroutable_bead_lands_dispatch_failed_and_campd_survives() {
         count(&events_json(&root), "dispatch.failed"),
         2,
         "one per unroutable bead, not per poke"
+    );
+}
+
+/// Phase 15 e2e finding, deterministic on every platform: a rig reached
+/// through a SYMLINK. Real claude realpath-resolves its cwd before computing
+/// its transcript project dir, so campd must canonicalize the worker cwd too —
+/// otherwise the registry records, and patrol watches (spec §10), a path claude
+/// never writes. The transcript path must be under the canonical (resolved)
+/// rig, NOT the symlink path (the symlink leaf name differs from the real one,
+/// so this is a clean red→green — not a `/private`-prefix substring accident).
+#[test]
+fn worker_cwd_is_canonicalized_so_patrol_watches_the_real_transcript_path() {
+    fn munge(p: &str) -> String {
+        p.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real-rig");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = dir.path().join("linked-rig");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let root = dir.path().join(".camp");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("camp.toml"),
+        format!(
+            "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+             [dispatch]\nmax_workers = 2\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
+            link.display(), // the rig path IS a symlink
+            fake_agent(),
+        ),
+    )
+    .unwrap();
+    write_agent(&root, "dev", "");
+    camp_ok(&root, &["events", "--json"]);
+
+    let _campd = Daemon::spawn(&root, &[]);
+    let bead = camp_ok(&root, &["sling", "canon"]).trim().to_owned();
+    wait_until(&root, "worker dispatch", |e| {
+        e.iter()
+            .any(|x| x["type"] == "session.woke" && x["data"]["bead"] == bead.as_str())
+    });
+    let events = events_json(&root);
+    let transcript = events
+        .iter()
+        .find(|e| e["type"] == "session.woke" && e["data"]["bead"] == bead.as_str())
+        .unwrap()["data"]["transcript_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let canon = std::fs::canonicalize(&link).unwrap(); // resolves to `real`
+    assert!(
+        transcript.contains(&munge(&canon.to_string_lossy())),
+        "transcript {transcript} must be under the CANONICAL rig dir {}",
+        munge(&canon.to_string_lossy())
+    );
+    assert!(
+        !transcript.contains(&munge(&link.to_string_lossy())),
+        "transcript {transcript} must NOT use the un-canonicalized symlink path {}",
+        munge(&link.to_string_lossy())
     );
 }

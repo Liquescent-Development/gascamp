@@ -542,16 +542,23 @@ fn run_tier0(root: &Path, rig: &Path) {
     );
 
     // F1 + F3: the transcript is at the campd-computed munged path under the
-    // real claude root, named by the pre-assigned sid.
+    // real claude root, named by the pre-assigned sid. campd canonicalizes the
+    // worker cwd (matching claude's realpath), so compute `expected` from the
+    // CANONICAL rig — otherwise the macOS /var -> /private/var symlink makes the
+    // raw-path expected diverge from where claude actually writes.
     assert_eq!(sid.len(), 36, "F1: claude_session_id is a uuid");
     let claude_root = std::env::var("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".claude"));
+    let canon_rig = std::fs::canonicalize(rig).unwrap();
     let expected = claude_root
         .join("projects")
-        .join(munge(&rig.to_string_lossy()))
+        .join(munge(&canon_rig.to_string_lossy()))
         .join(format!("{sid}.jsonl"));
-    assert_eq!(transcript, expected, "F3: transcript path munge drifted");
+    assert_eq!(
+        transcript, expected,
+        "F3: transcript path munge/canonicalization drifted"
+    );
     assert!(
         transcript.exists(),
         "F1/F3: transcript file must exist at the munged path"
