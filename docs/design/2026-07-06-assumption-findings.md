@@ -58,11 +58,20 @@ claude 2.1.205 (pinned at 2.1.201; Phase 11 re-probed at 2.1.204). Verdicts:
   emit`/`close --outcome pass`), no "command not found".
 - **F7 — HOLDS.** The pinned non-interactive worker (`bypassPermissions` +
   explicit `--allowedTools`) edited files and ran `camp` with no prompts.
-- **F2 / F4 — pending the post-fix re-run.** The first run's teardown deleted
-  the temp camp (ledger + stdout result-envelope capture) before they were read;
-  the post-fix re-run records them (the result envelope's `total_cost_usd` /
-  `ttft_ms` / `num_turns` key-presence for F2, `session.stopped.exit_code == 0`
-  for F4). **F6** (`--resume`) is out of the happy-path e2e scope.
+- **F2 — HOLDS** (captured on the post-fix re-run, 2026-07-09). The stream-json
+  capture carried a `type=="result"` element with `is_error==false`, a
+  `session_id` echoing the pre-assigned id, and `total_cost_usd` / `ttft_ms` /
+  `num_turns` all present (observed Tier-0: `total_cost_usd=0.5878`,
+  `ttft_ms=6481`, `num_turns=16`). Note the envelope is stream-JSONL (one event
+  per line) in HeldStream mode, not the D1 `--output-format json` array — same
+  `result`-element keys, so the parse rule (`type=="result"`) is unchanged.
+- **F4 — HOLDS** (captured on the re-run). The Tier-0 worker's clean exit mapped
+  to `session.stopped` with `exit_code == 0`.
+- **F6** (`--resume`) is out of the happy-path e2e scope.
+
+**Net: F1–F5 and F7 HOLD at claude 2.1.205** (F3 with the campd-canonicalization
+fix landed in this PR; F6 out of scope). No pinned fact drifted beyond the F3
+computation refinement above.
 
 ### Key probe evidence (dispatch)
 
