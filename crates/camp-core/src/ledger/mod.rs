@@ -360,10 +360,7 @@ impl Ledger {
     /// Same woke-provenance join as `live_sessions`; a registered session
     /// without its `session.woke` event is ledger corruption.
     pub fn session_by_name(&self, name: &str) -> Result<Option<SessionRow>, CoreError> {
-        Ok(self
-            .session_rows("s.name = ?1", [name])?
-            .into_iter()
-            .next())
+        Ok(self.session_rows("s.name = ?1", [name])?.into_iter().next())
     }
 
     /// Shared body of `live_sessions` / `session_by_name`: registry rows

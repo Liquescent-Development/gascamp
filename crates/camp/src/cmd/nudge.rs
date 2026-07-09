@@ -77,12 +77,7 @@ fn resume(
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .output()
-        .with_context(|| {
-            format!(
-                "running {} --resume",
-                config.dispatch.command.display()
-            )
-        })?;
+        .with_context(|| format!("running {} --resume", config.dispatch.command.display()))?;
     if !out.status.success() {
         bail!(
             "resume of {session} (claude session {sid}) failed (exit {:?}): {}",

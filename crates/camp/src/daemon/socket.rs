@@ -32,7 +32,10 @@ pub enum Request {
     Adopt,
     /// Deliver one user turn into a live worker's campd-held stdin pipe
     /// (dispatch-lifecycle Phase 1, #29 — the converse verb's live path).
-    Nudge { session: String, text: String },
+    Nudge {
+        session: String,
+        text: String,
+    },
 }
 
 /// One response line. Untagged: variant order matters for deserialization
