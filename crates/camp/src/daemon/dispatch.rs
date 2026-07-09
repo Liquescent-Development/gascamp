@@ -157,6 +157,15 @@ impl Dispatcher {
         }
     }
 
+    /// Swap the routing config on a hot reload (issue #28). Only future
+    /// routing decisions see it — `route`, `pack::resolve_agent`, the rig
+    /// lookup, and the `max_workers` cap all read `self.config` on the next
+    /// `converge`. In-flight children are untouched: each carries its own
+    /// already-resolved spec, so a reload never disturbs running work.
+    pub fn apply_config(&mut self, config: CampConfig) {
+        self.config = config;
+    }
+
     /// Whether campd holds this session as a live child of its own.
     pub fn is_child(&self, session: &str) -> bool {
         self.children.values().any(|w| w.session == session)
@@ -865,20 +874,37 @@ struct CheckChild {
     timed_out: bool,
 }
 
+/// The rig snapshot GraphRuntime keeps (check-script cwd, bond-cook
+/// prefix), built from a config's rigs. One source of truth for `new` and
+/// `apply_config` (issue #28 hot reload).
+fn rig_snapshot(
+    config: &camp_core::config::CampConfig,
+) -> HashMap<String, camp_core::config::RigConfig> {
+    config
+        .rigs
+        .iter()
+        .map(|r| (r.name.clone(), r.clone()))
+        .collect()
+}
+
 impl GraphRuntime {
     pub fn new(camp_root: PathBuf, config: &camp_core::config::CampConfig) -> GraphRuntime {
         GraphRuntime {
             camp_root,
-            rigs: config
-                .rigs
-                .iter()
-                .map(|r| (r.name.clone(), r.clone()))
-                .collect(),
+            rigs: rig_snapshot(config),
             runs: HashMap::new(),
             pending_checks: Vec::new(),
             pending_fanouts: Vec::new(),
             check_children: HashMap::new(),
         }
+    }
+
+    /// Refresh the rig snapshot on a hot reload (issue #28), so check-script
+    /// cwd and bond-cook prefixes follow the same config the dispatcher and
+    /// order scheduler run. In-flight check children keep the cwd they were
+    /// spawned with; only future spawns see the new rigs.
+    pub fn apply_config(&mut self, config: &camp_core::config::CampConfig) {
+        self.rigs = rig_snapshot(config);
     }
 
     /// The cursor-atomic hook: called from CampdProcessor::process for

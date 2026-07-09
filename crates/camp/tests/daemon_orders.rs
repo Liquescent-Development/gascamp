@@ -69,13 +69,21 @@ fn add_order(root: &Path, table: &str) {
 
 /// Spawn campd and block on its readiness line (an OS pipe read).
 fn spawn_campd(root: &Path) -> Child {
-    let mut child = camp_cmd(root)
-        .arg("daemon")
+    spawn_campd_env(root, &[])
+}
+
+/// Spawn campd with extra environment (e.g. CAMP_BIN so a dispatched
+/// fake-agent worker can speak the CLI contract) and block on readiness.
+fn spawn_campd_env(root: &Path, envs: &[(&str, &str)]) -> Child {
+    let mut cmd = camp_cmd(root);
+    cmd.arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::inherit());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
     let stdout = child.stdout.take().unwrap();
     let mut line = String::new();
     BufReader::new(stdout).read_line(&mut line).unwrap();
@@ -84,6 +92,19 @@ fn spawn_campd(root: &Path) -> Child {
         "campd did not come up: {line:?}"
     );
     child
+}
+
+/// The fake agent (spec §16): campd execs this in place of `claude`, so a
+/// dispatch integration test needs no real model.
+fn fake_agent() -> String {
+    format!("{}/tests/fake-agent.sh", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The repo's example starter pack (ships agent "dev"), absolute so it can
+/// be a `packs = [...]` entry from a throwaway camp root.
+fn starter_pack() -> PathBuf {
+    std::fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packs/starter"))
+        .expect("starter pack must exist at repo packs/starter")
 }
 
 fn stop_campd(root: &Path, mut child: Child) {
@@ -349,6 +370,75 @@ fn editing_camp_toml_hot_reloads_with_a_config_changed_event() {
         |d| d["applied"] == true && d["orders"] == 0,
         "re-applied, orders=0",
     );
+    stop_campd(&root, child);
+}
+
+/// Issue #28: a hot reload that adds a pack + `[dispatch] default_agent`
+/// must reach DISPATCH, not just the order scheduler. A bead created after
+/// the reload routes to the newly configured agent with NO daemon restart —
+/// proving the dispatcher (and its pack resolution) runs on the reloaded
+/// config, not the one it was constructed with at campd startup.
+#[test]
+fn a_hot_reload_updates_dispatch_routing_without_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(".camp");
+    std::fs::create_dir_all(&root).unwrap();
+    let rig = dir.path().join("repo");
+    std::fs::create_dir_all(&rig).unwrap();
+
+    // A camp that can SPAWN workers (fake agent) but cannot yet ROUTE: no
+    // pack, no default_agent, so a fresh bead has nowhere to go.
+    let base = format!(
+        "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+         [dispatch]\ncommand = \"{}\"\n",
+        rig.display(),
+        fake_agent(),
+    );
+    std::fs::write(root.join("camp.toml"), &base).unwrap();
+    let child = spawn_campd_env(&root, &[("CAMP_BIN", BIN)]);
+
+    // Before the reload: a fresh task bead cannot be routed — proves the
+    // base config is live and offers no agent.
+    run_ok(&root, &["create", "no route yet"]);
+    let failed = wait_for(&root, "dispatch.failed", Duration::from_secs(10));
+    assert!(
+        failed[0]["data"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no agent"),
+        "expected a routing hole before the reload; got {failed:?}"
+    );
+
+    // Hot-add the starter pack (ships agent "dev") + a default agent. `packs`
+    // is a top-level key, so it must precede every `[table]` header (TOML).
+    let before = last_seq(&root);
+    let reloaded = format!(
+        "packs = [\"{}\"]\n\n[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\n\
+         prefix = \"gc\"\n\n[dispatch]\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
+        starter_pack().display(),
+        rig.display(),
+        fake_agent(),
+    );
+    std::fs::write(root.join("camp.toml"), &reloaded).unwrap();
+    wait_for_config_changed(&root, before, |d| d["applied"] == true, "applied");
+
+    // After the reload, with NO restart: a new bead routes to the pack's
+    // "dev" agent. This exercises BOTH routing-affecting changes — the
+    // dispatcher's [dispatch].default_agent AND pack resolution for the
+    // agent definition — on the reloaded config.
+    let bead = run_ok(&root, &["create", "route me"]).trim().to_owned();
+    let woke = wait_for(&root, "session.woke", Duration::from_secs(10));
+    let for_bead = woke
+        .iter()
+        .find(|e| e["data"]["bead"] == bead.as_str())
+        .unwrap_or_else(|| panic!("no session.woke for {bead}; saw: {woke:?}"));
+    assert_eq!(
+        for_bead["data"]["agent"], "dev",
+        "the hot-reloaded default_agent + pack must route dispatch without a restart"
+    );
+
+    // Let the worker finish so no fake-agent process outlives the daemon.
+    wait_for(&root, "session.stopped", Duration::from_secs(10));
     stop_campd(&root, child);
 }
 
