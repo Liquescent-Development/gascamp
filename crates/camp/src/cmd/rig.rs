@@ -71,7 +71,12 @@ pub fn add(
     })?;
     crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
     append_rig_toml(&config_path, &rig)?;
-    drop(lock_file); // release only after the write has landed
+    // A repo-local camp's runtime state must stay out of git (issue #35). Done
+    // under the same advisory lock as the camp.toml write so concurrent adds
+    // serialize on the shared `.gitignore` too; a no-op when the camp is not
+    // inside a git repo (the common multi-rig case).
+    crate::gitignore::ensure_camp_runtime_ignored(&camp.root)?;
+    drop(lock_file); // release only after the writes have landed
 
     println!("added rig {name} ({prefix}) -> {}", abs.display());
     Ok(())
