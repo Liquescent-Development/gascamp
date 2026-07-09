@@ -11,5 +11,7 @@ below):
 camp nudge $ARGUMENTS
 ```
 
-Session names come from /camp:status or `camp top`. Report the outcome (and
+Session names: /camp:status or `camp top` for live sessions; for an exited
+worker (the resume path), find the name with `camp show <bead>` or in
+`camp events` (the session.woke event's `name`). Report the outcome (and
 any printed reply) to the user.

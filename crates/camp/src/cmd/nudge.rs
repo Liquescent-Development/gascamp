@@ -25,7 +25,11 @@ pub fn run(camp: &CampDir, session: String, text: String) -> Result<()> {
     let config = CampConfig::load(&camp.config_path())?;
     let ledger = Ledger::open(&camp.db_path())?;
     let row = ledger.session_by_name(&session)?.ok_or_else(|| {
-        anyhow!("no session named {session:?} in the registry; `camp top` lists live sessions")
+        anyhow!(
+            "no session named {session:?} in the registry; `camp top` lists live \
+             sessions, and for exited ones the name is in `camp show <bead>` / \
+             `camp events` (the session.woke `name`)"
+        )
     })?;
     drop(ledger); // the resume path re-opens for the append; campd may write meanwhile
 
@@ -40,9 +44,13 @@ pub fn run(camp: &CampDir, session: String, text: String) -> Result<()> {
             },
         )? {
             Some(Response::Nudge { via, .. }) if via == "stdin" => {
+                // Mechanism-honest (assessment findings A/B): the turn is
+                // WRITTEN INTO the held pipe — the worker picks it up at
+                // its next read, and its answer lands in its transcript
+                // (`camp events` records only the session.nudged delivery).
                 println!(
-                    "delivered into {session}'s live turn (held stdin); \
-                     watch `camp events` or its transcript for the reply"
+                    "wrote the turn into {session}'s held stdin (live); the worker \
+                     picks it up at its next read — watch its transcript for the reply"
                 );
                 return Ok(());
             }

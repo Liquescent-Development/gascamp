@@ -169,8 +169,19 @@ fn nudge_delivers_into_a_live_workers_held_stdin() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // Mechanism-honest wording (assessment findings A/B): the message
+    // names the pipe write, not a processed outcome, and points at the
+    // TRANSCRIPT for the reply (camp events records only the delivery).
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("delivered"), "stdout: {stdout}");
+    assert!(stdout.contains("held stdin"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("transcript for the reply"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("`camp events` or"),
+        "camp events must not be named as where the reply appears: {stdout}"
+    );
 
     // The nudge line unblocked the worker: it closes pass and exits.
     wait_until(&root, "the nudged worker to close", |e| {
