@@ -297,9 +297,11 @@ impl Ledger {
         Ok(events)
     }
 
-    /// Live session names, ready-bead count, and open-bead count. `open`
-    /// counts `status='open'` beads (blocked ones included; claimed and
-    /// closed ones not).
+    /// Live session names, ready-task count, and open-task count. Both counts
+    /// are scoped to `type='task'` — the only dispatchable work (issue #36) —
+    /// so `camp top` reflects what campd will pick up, never memory or mail
+    /// beads. `ready` is open and unblocked; `open` counts every open task
+    /// (blocked ones included; claimed and closed ones not).
     pub fn status_summary(&self) -> Result<StatusSummary, CoreError> {
         let mut stmt = self
             .conn
@@ -307,14 +309,8 @@ impl Ledger {
         let live_sessions: Vec<String> = stmt
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        let ready = crate::readiness::ready_beads(&self.conn, None)?.len() as u64;
-        let open: i64 = self.conn.query_row(
-            "SELECT count(*) FROM beads WHERE status = 'open'",
-            [],
-            |r| r.get(0),
-        )?;
-        let open = u64::try_from(open)
-            .map_err(|_| CoreError::Corrupt(format!("negative open-bead count {open}")))?;
+        let ready = crate::readiness::ready_task_count(&self.conn)?;
+        let open = crate::readiness::open_task_count(&self.conn)?;
         Ok(StatusSummary {
             live_sessions,
             ready,
@@ -1850,6 +1846,72 @@ mod tests {
             ledger.status_summary().unwrap(),
             StatusSummary {
                 live_sessions: vec!["camp/dev/1".to_owned()],
+                ready: 1,
+                open: 2
+            }
+        );
+    }
+
+    #[test]
+    fn status_summary_counts_only_task_beads() {
+        // Issue #36: the status surface must reflect dispatchable work.
+        // campd only ever dispatches tasks (`dispatchable_beads` filters
+        // `type='task'`), so memory/mail beads must count as neither ready
+        // nor open — otherwise `camp top` implies pending work that will
+        // never be picked up.
+        let (_dir, mut ledger) = temp_ledger();
+
+        // A camp whose only open bead is a memory bead: 0 ready, 0 open.
+        ledger
+            .append(created(
+                "gc-1",
+                serde_json::json!({"title": "a durable fact", "type": "memory"}),
+            ))
+            .unwrap();
+        // A mail bead is likewise non-dispatchable.
+        ledger
+            .append(created(
+                "gc-2",
+                serde_json::json!({"title": "a note", "type": "mail"}),
+            ))
+            .unwrap();
+        assert_eq!(
+            ledger.status_summary().unwrap(),
+            StatusSummary {
+                live_sessions: vec![],
+                ready: 0,
+                open: 0
+            }
+        );
+
+        // Positive case: an open task bead is counted, ready and open.
+        ledger
+            .append(created(
+                "gc-3",
+                serde_json::json!({"title": "do the thing"}),
+            ))
+            .unwrap();
+        assert_eq!(
+            ledger.status_summary().unwrap(),
+            StatusSummary {
+                live_sessions: vec![],
+                ready: 1,
+                open: 1
+            }
+        );
+
+        // A blocked task counts as open but not ready — guards against a
+        // predicate that just makes every count zero.
+        ledger
+            .append(created(
+                "gc-4",
+                serde_json::json!({"title": "later", "needs": ["gc-3"]}),
+            ))
+            .unwrap();
+        assert_eq!(
+            ledger.status_summary().unwrap(),
+            StatusSummary {
+                live_sessions: vec![],
                 ready: 1,
                 open: 2
             }

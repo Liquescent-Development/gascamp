@@ -69,6 +69,12 @@ fn collect(
 /// A `needs` target counts as unmet unless it exists, is closed, and passed.
 const UNMET_DEP: &str = "(t.id IS NULL OR t.status <> 'closed' OR t.outcome IS NOT 'pass')";
 
+/// Plain work — the only bead type campd dispatches (see `dispatchable_beads`).
+/// The status surface's ready/open counts share this predicate so the snapshot
+/// can never advertise work campd will not pick up: memory and mail beads are
+/// open ledger records, never dispatchable tasks (issue #36).
+const TASK: &str = "b.type = 'task'";
+
 pub fn is_ready(conn: &Connection, bead: &str) -> Result<bool, CoreError> {
     let status: Option<String> = conn
         .query_row("SELECT status FROM beads WHERE id = ?1", [bead], |r| {
@@ -114,7 +120,7 @@ pub fn ready_beads(conn: &Connection, rig: Option<&str>) -> Result<Vec<BeadRow>,
 pub fn dispatchable_beads(conn: &Connection) -> Result<Vec<BeadRow>, CoreError> {
     let sql = format!(
         "SELECT {BEAD_COLS} FROM beads b
-         WHERE b.status = 'open' AND b.type = 'task'
+         WHERE b.status = 'open' AND {TASK}
            AND NOT (b.run_id IS NOT NULL AND b.step_id IS NULL)
            AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.bead = b.id)
            AND NOT EXISTS (
@@ -125,6 +131,36 @@ pub fn dispatchable_beads(conn: &Connection) -> Result<Vec<BeadRow>, CoreError> 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], row_to_bead)?;
     collect(rows)
+}
+
+/// The number of ready TASK beads — the status surface's `ready` count
+/// (`camp top`, spec §7). Same open-and-unblocked rule as `ready_beads`,
+/// narrowed to plain work (`TASK`) so it matches what campd will actually
+/// dispatch: memory and mail beads are never counted (issue #36).
+pub fn ready_task_count(conn: &Connection) -> Result<u64, CoreError> {
+    let sql = format!(
+        "SELECT count(*) FROM beads b
+         WHERE b.status = 'open' AND {TASK}
+           AND NOT EXISTS (
+             SELECT 1 FROM deps d LEFT JOIN beads t ON t.id = d.needs_id
+             WHERE d.bead_id = b.id AND {UNMET_DEP})"
+    );
+    count_nonneg(conn, &sql, "ready-task")
+}
+
+/// The number of open TASK beads — the status surface's `open` count (blocked
+/// ones included; claimed and closed ones not). Task-scoped for the same
+/// reason as `ready_task_count` (issue #36).
+pub fn open_task_count(conn: &Connection) -> Result<u64, CoreError> {
+    let sql = format!("SELECT count(*) FROM beads b WHERE b.status = 'open' AND {TASK}");
+    count_nonneg(conn, &sql, "open-task")
+}
+
+/// Run a `SELECT count(*)` query and convert it to `u64`, surfacing a negative
+/// count — impossible unless the state tables are corrupt — as a hard error.
+fn count_nonneg(conn: &Connection, sql: &str, label: &str) -> Result<u64, CoreError> {
+    let n: i64 = conn.query_row(sql, [], |r| r.get(0))?;
+    u64::try_from(n).map_err(|_| CoreError::Corrupt(format!("negative {label} count {n}")))
 }
 
 /// The dependents of `closed_bead` that its close just made ready — campd's
@@ -281,6 +317,33 @@ mod tests {
             .map(|b| b.id)
             .collect();
         assert_eq!(ready, vec!["gc-1"]);
+    }
+
+    #[test]
+    fn ready_beads_keeps_listing_nontask_beads() {
+        // Caller safety (issue #36): the `camp ls --ready` surface —
+        // `ready_beads` — must keep listing EVERY ready bead, memory and
+        // mail included. Only the status-surface count is task-scoped, so
+        // the task-only predicate lives in `ready_task_count`, never here.
+        let (_d, mut l) = ledger();
+        // a ready memory bead
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "t".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"title": "fact", "type": "memory"}),
+        })
+        .unwrap();
+        // a ready plain task
+        create(&mut l, "gc-2", &[]);
+        let ids: Vec<String> = l
+            .ready_beads(None)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(ids, vec!["gc-1", "gc-2"]);
     }
 
     #[test]
