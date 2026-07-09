@@ -9,6 +9,49 @@
 | Depends on | #35 (`.camp/` gitignore, parallel PR) |
 | Authoritative spec | `docs/design/2026-07-05-gas-camp-design.md` — its §4 decision record is SETTLED |
 
+## Final settled model (2026-07-09) — read this first
+
+All open questions the operator owned are now **SETTLED**. This is the design a
+fresh reader should take away; the deprecated sections below are kept only for
+history. Nothing here is implemented in this PR — the spec §8.4/§12 edits and the
+`WorkOutcome` vocabulary addition are **future implementation, serialized through
+the operator.**
+
+- **One dispatch path (Q6, APPROVED).** `camp sling` and `/camp:sling` are the
+  **same single path**: enqueue a bead → campd dispatches → the worker claims.
+  The slash command no longer spawns a teammate. **Spec §8.4's "attended teammate
+  is the one surface exception" is deleted** (operator signed off; future edit).
+  The #29 race is structurally gone — there is only one spawner.
+- **Talk to work via a converse verb (Q6).** A new uniform `camp` verb sends a
+  turn to any running session (worker or overseer), delivered live over the
+  existing held-stdin pipe or `claude --resume` after the turn (A4) — mirror of
+  Gas City's `gc nudge`/session-message. Interactivity is a runtime/harness
+  capability, never a bespoke dispatch mode. No reservation, no second spawner.
+- **The overseer is the human's own session (Q7, DECIDED).** The human's Claude
+  Code session + camp plugin **is** the interactive overseer (spec §4 made
+  literal). An **optional on-demand pack overseer agent** covers away-mode.
+  **No core standing `named_session`** — that preserves "idle is free / zero
+  agent processes" (spec §8.4). Fuller gc mirror (a core standing session)
+  deferred.
+- **Roles are pack content.** Overseer / coder / committer are **pack-defined**
+  agents (mirroring Gas City's swarm pack), over the six primitives. The camp
+  plugin stays machinery-only (spec §11).
+- **Isolation is pack/agent-declared, default worktree (Q1, APPROVED).** The
+  `isolation=` agent field stays the knob (gc-mirroring: swarm=none,
+  gastown=worktree); autonomous dispatch **defaults to worktree** (spec §12 edit,
+  signed off). #31 fixed: autonomous workers never touch the rig's live branch.
+- **Delivery is pack behavior + a mirrored outcome axis (Q3, REVISED; #34).**
+  *How* work is committed/branched/landed is **pack/prompt content** (a
+  delivery-aware coder + optional committer agent, gc's swarm model).
+  *Whether* it landed is recorded on Gas City's **`WorkOutcome` axis**
+  (`shipped` / `no-op` / `blocked` / `abandoned`), **mirrored verbatim from gc**
+  as a SEPARATE axis from the control `Outcome` (`pass`/`fail`/`skipped`/…).
+  Un-integrable work is `blocked` on the WorkOutcome axis — not shoehorned into
+  `outcome`. campd still fails fast when a rig can't host a worktree.
+- **Still open (operator to close):** **Q4** (is v1 "landed" a local bead branch,
+  or grow remote/PR awareness?) and **Q5** (unify the two worker-contract copies
+  before adding delivery semantics?).
+
 ### Decision log
 
 - **2026-07-09 — Operator APPROVED Q1.** Worktree isolation is the DEFAULT for
@@ -16,27 +59,44 @@
   (the actual §12 change + implementation land later, serialized through the
   operator, per §9). Attended teammates remain the documented exception (A2).
   Folded into §4.2 and §7.
-- **2026-07-09 — Operator DECIDED Q3.** Gate un-integrable work as
-  `fail`-with-reason (mirror-safe). Do NOT add a `blocked`/`needs-integration`
-  value to the `outcome` axis — preserving native city export is a hard
-  requirement. Fresh-repo/no-remote = fail-fast at dispatch. Folded into §4.3
-  and §7. (An honest correction to the *rationale* — gc does have a `blocked`
-  value on a *separate* axis — is recorded in §7 Q3; it does not change the
-  decision.)
+- **2026-07-09 — Q3 EVOLUTION.** *Original* (same day): gate un-integrable work
+  as `fail`-with-reason; no new `outcome` value (mirror-safe, minimal). *Then* the
+  Gas City source study found gc records "blocked" on a separate `WorkOutcome`
+  axis. *Revised & SETTLED* (below): **adopt gc's `WorkOutcome` axis verbatim**
+  instead. See the Q3-REVISED entry.
 - **2026-07-09 — Q2 investigated** against the pinned Gas City reference
   (§7 Q2 investigation). Verdict: **no meaningful deviation from Gas City**;
-  recommend **claim-at-creation reservation**. Pending operator pick.
+  recommended claim-at-creation reservation. **SUPERSEDED by Q6** (no
+  reservation) — retained for history.
 - **2026-07-09 — REFRAME (operator directive), SUPERSEDES the reservation
   approach.** Camp is k3s-to-gc's-k8s: a conformant lighter implementation of the
   SAME model, not a snowflake. Broad Gas City source study (see the **Reframe**
-  section) confirms the operator's premise: Gas City is driven "talk-to-overseer
+  section) confirmed the operator's premise: Gas City is driven "talk-to-overseer
   + converse-with-any-worker" entirely by **pack content** (a `mayor` agent, a
   `committer` agent, `named_session` modes, mail) over **one dispatch path**,
-  with interactivity supplied by the **runtime/harness**. Camp's spec §8.4
-  "attended teammate is the one surface exception" + a reservation is the
-  snowflake to remove. The reservation approach (old §4.1 / §7 Q2) is **marked
-  deprecated below, kept for history.** The §8.4 removal is flagged as an
-  operator/spec open question (§7 Q6) — not edited here.
+  with interactivity supplied by the **runtime/harness**. The reservation
+  approach (old §4.1 / §7 Q2) is **deprecated below, kept for history.**
+- **2026-07-09 — Operator APPROVED Q6 (SETTLED). Mirror Gas City: one dispatch
+  path.** `/camp:sling` == `camp sling` (enqueue only); add a uniform **converse
+  verb** (send a turn to any running session, live over held-stdin or
+  `claude --resume`); overseer/coder/committer are **pack-defined**. **Delete
+  spec §8.4's "attended teammate is the one surface exception"** — operator signed
+  off on the §8.4 edit (future, serialized). #29 fix = one dispatch path +
+  pack/harness converse; **no reservation, no second spawner.** Folded into the
+  Reframe + §7 Q6.
+- **2026-07-09 — Operator DECIDED Q7 (SETTLED). Overseer = the human's Claude
+  Code session + plugin** (spec §4 made literal), with an **optional on-demand
+  pack overseer agent** for away-mode. **No core standing `named_session`
+  overseer** — preserves idle-is-free (idle = zero processes). Tradeoff recorded:
+  fuller gc mirror (a core standing session) deferred. Folded into Reframe + §7 Q7.
+- **2026-07-09 — Operator REVISED Q3 (SETTLED). Adopt Gas City's `WorkOutcome`
+  axis** (`shipped`/`no-op`/`blocked`/`abandoned`), mirrored VERBATIM from gc, as
+  a SEPARATE axis from the control `Outcome` (`pass`/`fail`/`skipped`/`missing_root`).
+  Un-integrable/blocked work is recorded as `blocked` on the WorkOutcome axis, not
+  shoehorned into `outcome`. Future-impl mechanics: pin the WorkOutcome set in
+  `crates/camp-core/tests/fixtures/gc-vocab.json` and validate via
+  `ci/gc-compat/check_vocab.sh` — an additive **mirrored** axis, not a
+  redefinition, so the mirror invariant is preserved. Folded into §4.3 + §7 Q3.
 
 ## Reframe (2026-07-09, operator): pack-first, mirror Gas City — SUPERSEDES §4.1 reservation & the §8.4 exception
 
@@ -131,16 +191,17 @@ exactly what invariant 4 says not to build. Remove it.
 | Git delivery (how/what/when to commit, branch, land) | **Pack** — coder/committer agent prompts (gc's `committer` role). Camp already ships a starter `dev` agent; a delivery-aware prompt (and/or a committer agent) is pack content, not core. |
 | Isolation (worktree/branch) | **Pack/agent-declared** — already the `isolation=` field (gc packs choose per pack: swarm=none, gastown=worktree). The *default* is a core policy (Q1). |
 | Converse with a running worker | **Core verb + harness** — a uniform `camp` "send a turn to a session" verb (mirror of `gc nudge`/session-message), delivered live over the held stdin pipe (already built: `nudge_via_stdin`, dispatch.rs) or via `claude --resume` after the turn (A4). Camp has **no user-facing converse verb today** — this is the one small core surface the drive-experience needs. |
-| Standing/named overseer session | **Core capability (minimal) + pack declaration** — gc's `[[named_session]] mode=always/on_demand`. **Open tension:** a persistent overseer process conflicts with camp's "idle = zero agent processes" (spec §8.4). Likely resolved by "the human's session is the overseer; a persistent pack overseer is opt-in for away-mode." Flagged §7 Q7. |
+| Standing/named overseer session | **SETTLED (Q7): human-session-only; NO core standing session.** The human's Claude Code session + plugin is the overseer; an optional **on-demand pack overseer agent** covers away-mode. Camp does **not** add gc's `[[named_session]] mode=always` core capability — that preserves "idle = zero agent processes" (spec §8.4). Fuller gc mirror (a core standing session) deferred. |
 
-### §8.4 disposition
+### §8.4 disposition — SETTLED (Q6 APPROVED, 2026-07-09)
 
-**Recommend REMOVING the "attended teammate is the one surface exception"
-mechanism** and collapsing to one dispatch path + pack-defined drive +
-a uniform converse verb. This **requires a spec §8.4 edit** (delete the surface
-exception; state that conversing with any worker is a verb over the
-runtime/harness, and the overseer is pack content / the human's own session).
-**Flagged as operator/spec open question §7 Q6 — not edited here.**
+**REMOVE the "attended teammate is the one surface exception" mechanism**;
+collapse to one dispatch path + pack-defined drive + a uniform converse verb.
+The operator **approved the spec §8.4 edit** (delete the surface exception;
+state that conversing with any worker is a verb over the runtime/harness, and
+the overseer is pack content / the human's own session). The §8.4 amendment is
+**future implementation, serialized through the operator — not edited in this
+PR.**
 
 ### Reframed #29 / #31 / #34
 
@@ -158,17 +219,18 @@ runtime/harness, and the overseer is pack content / the human's own session).
   this via `isolation=`. The operator-approved worktree **default** (Q1) is a
   core default policy, fully consistent with mirroring gc — not a snowflake.
   Unchanged.
-- **#34 (delivery) — pack behavior + mirror-safe outcome.** *How* work is
-  committed/branched/landed is **pack/prompt content** (gc's `coder`+`committer`
-  roles), not a core mechanism — so the delivery contract belongs in a
-  starter-pack agent prompt (and optionally a committer agent), mirroring gc.
-  *Whether* it landed: gc expresses this on a **`WorkOutcome` axis
-  (`shipped`/`no-op`/`blocked`/`abandoned`)** distinct from the control `Outcome`
-  (`pass`/`fail`/…) — see §7 Q3. The operator's Q3 decision (gate as
-  `fail`-with-reason, no new `outcome` value) remains valid and minimal; the
-  **more mirror-faithful** option is to adopt gc's `WorkOutcome` axis verbatim
-  (native to city export). Surfaced as a refinement in §7 Q3, not a reversal.
-  campd still fails fast when a rig can't host a worktree (mechanical, core).
+- **#34 (delivery) — SETTLED: pack behavior + the mirrored `WorkOutcome` axis
+  (Q3 REVISED).** *How* work is committed/branched/landed is **pack/prompt
+  content** (gc's `coder`+`committer` roles), not a core mechanism — the delivery
+  contract belongs in a starter-pack agent prompt (and optionally a committer
+  agent), mirroring gc. *Whether* it landed is recorded on Gas City's
+  **`WorkOutcome` axis (`shipped`/`no-op`/`blocked`/`abandoned`)**, **mirrored
+  verbatim from gc** as a SEPARATE axis from the control `Outcome`
+  (`pass`/`fail`/`skipped`/`missing_root`). Un-integrable work is `blocked` on the
+  WorkOutcome axis — not shoehorned into `outcome`. Future-impl: pin the
+  WorkOutcome set in `gc-vocab.json` + validate via `check_vocab.sh` (an additive
+  mirrored axis, mirror invariant preserved). campd still fails fast when a rig
+  can't host a worktree (mechanical, core). See §7 Q3.
 
 ## 0. Scope and constraint
 
@@ -307,15 +369,15 @@ From AGENTS.md and spec §2/§4 — cited so the proposal stays inside the lines
   mechanical git facts, exactly like check-scripts (`check.mode="exec"`).
 - **Fail fast** (inv. 5; spec §15.1). A rig that cannot support the delivery
   workflow must fail at dispatch with a ledger event, not silently strand work.
-- **Vocabulary mirror** (inv. 7; spec §8.2, §15.2). camp's `outcome` values must
-  stay a subset/mirror of Gas City's control `Outcome` set
+- **Vocabulary mirror** (inv. 7; spec §8.2, §15.2). camp's `outcome` values stay
+  a subset/mirror of Gas City's control `Outcome` set
   (`["pass","fail","skipped","missing_root"]`,
-  `crates/camp-core/tests/fixtures/gc-vocab.json`) so exported history reads
-  natively in a city. **camp's `outcome` axis has no `blocked`, and Q3 keeps it
-  that way** (un-integrable work → `fail`-with-reason). Note (Q2 source finding):
-  Gas City *does* define a `blocked` value, but on a separate `WorkOutcome` axis
-  camp does not model — see §7 Q3; it does not license adding `blocked` to the
-  `outcome` axis.
+  `crates/camp-core/tests/fixtures/gc-vocab.json`). **Q3-REVISED (SETTLED): camp
+  adopts Gas City's `WorkOutcome` axis (`shipped`/`no-op`/`blocked`/`abandoned`)
+  VERBATIM as a SEPARATE additive axis** — un-integrable work is `blocked` on
+  WorkOutcome, never shoehorned into `outcome`. Because it mirrors gc's own set,
+  it is additive (not a redefinition) and city export stays native; the future
+  impl pins it in `gc-vocab.json` and validates via `check_vocab.sh`.
 - **Settled §4 / §8.4 that this proposal keeps:** campd is the sole dispatcher
   of autonomous/graph work; the attended teammate is the single surface
   exception; A2 (resolved) — a teammate's cwd is pinned to the parent session's
@@ -337,12 +399,13 @@ there is no race. (2) **Isolation** — an autonomous worker is given a
 camp-managed worktree on a per-bead branch (`camp/<bead>`); the worker never
 touches the rig's live tree; campd refuses to dispatch a worktree into a rig
 that cannot support one (not a git repo / no base commit), failing fast rather
-than stranding work. (3) **Delivery** — the worker skill gains an explicit
-delivery contract (commit to the bead branch; define "landed"), and `pass` is
-gated on landable work — un-integrable work closes `fail`-with-reason (Q3
-DECIDED: mirror-safe, no new outcome value). The three gates compose into one
-honest lifecycle: the operator chose the surface, the work happened in
-isolation, and the outcome tells the truth about whether it can land.
+than stranding work. (3) **Delivery** — *how* work is committed/branched/landed
+is pack/prompt content (a coder + optional committer agent), and *whether* it
+landed is recorded on Gas City's mirrored `WorkOutcome` axis
+(`shipped`/`no-op`/`blocked`/`abandoned`), separate from the control `outcome`
+(Q3-REVISED). The three gates compose into one honest lifecycle: one dispatch
+path chose who does the work, isolation gave it a clean tree, and the WorkOutcome
+tells the truth about whether it landed.
 
 ## 4. Proposed model
 
@@ -482,19 +545,20 @@ implementation PR, not here**):
   code work, the same way #35 prepares `.gitignore`. (The rejected alternative —
   letting the worker's first commit establish the integration branch — would put
   content judgment in the worker for the empty-repo edge; fail-fast is cleaner
-  and consistent with the `fail`-with-reason gate below.)
-- **Gate `pass` on landable work — DECIDED 2026-07-09: `fail`-with-reason, no
-  new outcome value.** A worker that produced changes it cannot land closes
-  **`fail`** with a precise reason ("work committed to `camp/<bead>` but the rig
-  has no base/integration branch — cannot land"). This is mirror-safe (`fail` is
-  already mirrored) and honest; the worktree is kept for forensics (existing
-  behavior), so the work is not lost. **No `blocked`/`needs-integration` value is
-  added to the `outcome` axis** — camp's `outcome` mirrors Gas City's control
-  `Outcome` (`pass|fail|skipped|missing_root`), which has no `blocked`, and
-  preserving native city export is a hard requirement (vocabulary-mirror
-  invariant). See §7 Q3 for an honest correction to the *rationale* (gc does
-  carry a `blocked` value, but on a *different* axis camp does not model) — the
-  correction does not change this decision.
+  and consistent with the WorkOutcome delivery gate below.)
+- **Record delivery on the `WorkOutcome` axis — REVISED & SETTLED 2026-07-09.**
+  *(This supersedes the earlier same-day `fail`-with-reason bullet.)* Whether work
+  landed is recorded on Gas City's **`WorkOutcome` axis
+  (`shipped`/`no-op`/`blocked`/`abandoned`)**, mirrored VERBATIM from gc as a
+  SEPARATE axis from the control `outcome` (`pass`/`fail`/`skipped`/`missing_root`).
+  Un-integrable work is **`blocked`** on WorkOutcome (the worktree is kept for
+  forensics, so nothing is lost); shipped work is **`shipped`**. Because it
+  mirrors gc's own set, it is additive (not a redefinition) and city export stays
+  native — the future impl pins the set in
+  `crates/camp-core/tests/fixtures/gc-vocab.json` and validates via
+  `ci/gc-compat/check_vocab.sh`. *How* the worker commits/branches to reach
+  `shipped` is pack/prompt content (a delivery-aware coder + optional committer
+  agent), mirroring gc's swarm. See §7 Q3 for the full evolution.
 
 **campd's role stays mechanical.** campd does not read diffs or judge quality. It
 (i) honors the declared isolation, (ii) fails fast when the rig can't host a
@@ -554,7 +618,7 @@ must document this contract prominently so it is not a surprise.
 | Cost proportional to job (§2 inv.2) | Attended reservation = one extra event in the same batch; delivery gate = worker behavior + one git check at dispatch. Tier-0 stays ~3 writes + one spawn. |
 | Nothing hidden (§13) | Reservation, isolation choice, fail-fast dispatch refusal, and every non-`pass` verdict are ledger events with causes. |
 | Fail fast (§2 inv.5, §15.1) | A rig that can't host a worktree fails at dispatch (`dispatch.failed`), never strands work. |
-| Vocabulary mirror (§8.2, §15.2) | DECIDED (Q3): v1 gates un-integrable work as `fail`-with-reason — only mirrored `outcome` values, no new value on that axis. Attended reservation (Q2) reuses the existing additive `bead.claimed`; zero new vocabulary. |
+| Vocabulary mirror (§8.2, §15.2) | Q3-REVISED (SETTLED): adopt gc's `WorkOutcome` axis (`shipped`/`no-op`/`blocked`/`abandoned`) VERBATIM as a separate additive mirrored axis — un-integrable work is `blocked`, never a new `outcome` value; pinned in `gc-vocab.json` + `check_vocab.sh`. City export stays native. |
 | A2 teammate cwd (§17, resolved) | Respected: attended work is supervised-live-tree; only autonomous work is isolated. |
 
 ## 6. What this touches when implemented (for reviewers — NOT in this PR)
@@ -583,19 +647,24 @@ must document this contract prominently so it is not a surprise.
 - `plugin/skills/worker/SKILL.md` + `crates/camp/src/daemon/spawn.rs`
   `WORKER_CONTRACT` — the delivery contract text (kept in lockstep; two copies of
   the worker contract exist today and both lack delivery semantics).
-- `crates/camp/src/cmd/close.rs` + `crates/camp-core/src/vocab.rs` — **no change
-  to the outcome vocabulary** (Q3 DECIDED: `fail`-with-reason, no new value). The
-  landability gate is worker-contract text plus a mechanical git check; the close
-  outcome stays within the mirrored set.
-- The spec `docs/design/2026-07-05-gas-camp-design.md` §12 — the isolation-default
+- `crates/camp/src/cmd/close.rs` + `crates/camp-core/src/vocab.rs` +
+  `crates/camp-core/tests/fixtures/gc-vocab.json` + `ci/gc-compat/check_vocab.sh`
+  — **add the `WorkOutcome` axis** (`shipped`/`no-op`/`blocked`/`abandoned`),
+  mirrored verbatim from gc, as a SEPARATE additive axis from `outcome`
+  (Q3-REVISED). The control `outcome` axis is unchanged; the WorkOutcome set is
+  pinned + mirror-validated.
+- The spec `docs/design/2026-07-05-gas-camp-design.md` §8.4 — remove the
+  "attended teammate is the one surface exception"; state one dispatch path + the
+  converse verb + pack-defined drive (Q6 APPROVED). And **§12** — the
+  isolation-default
   amendment (Q1 APPROVED). Edited later, serialized through the operator; NOT in
   this PR.
 
 ## 7. Open questions requiring operator / spec sign-off
 
-Each is crisp and answerable. Q1 and Q3 are RESOLVED (operator, 2026-07-09); Q2
-is researched with a recommendation pending the operator's pick; Q4 and Q5
-remain open.
+Status (2026-07-09): **Q1, Q3, Q6, Q7 are SETTLED** by the operator; **Q2 is
+SUPERSEDED** (retained for history); **Q4 and Q5 remain open** for the operator
+to close.
 
 - **Q1 — Default isolation (SPEC §12 EDIT). RESOLVED 2026-07-09 — APPROVED.**
   Autonomous dispatch defaults to worktree isolation, with `isolation = "none"`
@@ -611,13 +680,22 @@ remain open.
   is unnecessary — Gas City has no attended/autonomous fork; the mirror answer is
   one dispatch path + a converse verb, not a reservation. Replaced by Q6.
 
-- **Q3 — Delivery gate outcome + fresh-repo policy. RESOLVED 2026-07-09.**
-  Un-integrable work closes **`fail`** with a precise reason (mirror-safe). **No
-  `blocked`/`needs-integration` value is added to the `outcome` axis** —
-  preserving native city export is a hard requirement. Fresh/empty repo →
-  **fail fast at dispatch** (§4.3). Folded into §4.3.
-  - **Honest correction to the rationale (finding, does NOT change the
-    decision).** The Q2 source investigation revealed that Gas City's
+- **Q3 — Delivery outcome + fresh-repo policy. REVISED & SETTLED 2026-07-09.**
+  **Final:** adopt Gas City's **`WorkOutcome` axis**
+  (`shipped`/`no-op`/`blocked`/`abandoned`), mirrored VERBATIM, as a SEPARATE axis
+  from the control `Outcome` (`pass`/`fail`/`skipped`/`missing_root`).
+  Un-integrable work is recorded as **`blocked` on the WorkOutcome axis**, not on
+  `outcome`. Fresh/empty repo → **fail fast at dispatch** (§4.3). *How* work is
+  committed/landed is **pack/prompt content** (coder + optional committer agent).
+  Future-impl mechanics: pin the WorkOutcome set in
+  `crates/camp-core/tests/fixtures/gc-vocab.json` and validate via
+  `ci/gc-compat/check_vocab.sh` — an additive **mirrored** axis (not a
+  redefinition), so the mirror invariant is preserved and city export stays
+  native. **Evolution (kept for the record):** the original same-day decision was
+  `fail`-with-reason + no new `outcome` value; the gc-source finding below
+  surfaced the `WorkOutcome` axis, and the operator then revised to adopt it.
+  - **Original rationale (SUPERSEDED by the revision above; kept for history).**
+    The Q2 source investigation revealed that Gas City's
     `internal/beadmeta/values.go` *does* define a `blocked` value — but on a
     **separate axis** camp does not model: a `WorkOutcome` set
     (`shipped` / `no-op` / `blocked` / `abandoned`), distinct from the control
@@ -633,16 +711,14 @@ remain open.
     an extra `outcome` value. Flagged for the operator as a future option; not
     proposed for v1. (AGENTS.md: reference reality and the doc must not silently
     diverge — hence this correction is recorded rather than buried.)
-  - **Reframe refinement (2026-07-09).** Because the whole reframe is "mirror Gas
-    City," the **most** mirror-faithful #34 answer is to adopt gc's `WorkOutcome`
-    axis (`shipped`/`no-op`/`blocked`/`abandoned`) verbatim — it is native to gc
-    and therefore to city export, and it is where gc *does* record "blocked." The
-    operator's `fail`-with-reason decision remains the minimal, subset-conformant
-    v1 choice; adopting the `WorkOutcome` axis is the heavier, fuller-mirror
-    alternative. Presented as a refinement for the operator to weigh, **not** a
-    reversal of the Q3 decision. Either way, *how* work is delivered
-    (commit/branch/land) is pack/prompt content (gc's `committer` role), not
-    core.
+  - **Operator REVISION → SETTLED (2026-07-09).** The operator weighed this and
+    **chose the fuller mirror: adopt gc's `WorkOutcome` axis
+    (`shipped`/`no-op`/`blocked`/`abandoned`) verbatim** — native to gc and to
+    city export, and where gc *does* record "blocked." This supersedes the earlier
+    same-day `fail`-with-reason choice. Un-integrable work is `blocked` on
+    WorkOutcome, a SEPARATE additive mirrored axis from `outcome`; future impl pins
+    it in `gc-vocab.json` + `check_vocab.sh`. *How* work is delivered
+    (commit/branch/land) is pack/prompt content (gc's `committer` role), not core.
 
 ### Q2 investigation — does camp deviate meaningfully from Gas City?
 
@@ -729,30 +805,24 @@ the operator's pick.
   adding delivery semantics, to avoid drift? **Answerable: unify first, or accept
   two synchronized copies.**
 
-- **Q6 — Remove the spec §8.4 "attended teammate is the one surface exception"?
-  (SPEC §8.4 EDIT — the load-bearing reframe decision.)** The Reframe recommends
-  collapsing to **one dispatch path** (campd only) + a **uniform converse verb**
-  (send a turn to any session, live over held-stdin or via `claude --resume`) +
-  **pack-defined drive** (overseer/committer agents), mirroring Gas City, which
-  has no attended/autonomous fork. This deletes the §8.4 surface exception and
-  the reservation idea entirely. **Requires a spec §8.4 edit** (and touches the
-  §4 mental model that "the user drives from inside Claude Code" — now made
-  literal: the human's own session is the interactive overseer). **Answerable:
-  approve the §8.4 removal + the new converse verb; then the §8.4 amendment is
-  drafted and lands serialized through the operator.** This is the question that
-  supersedes Q2 and reshapes Phase 1.
+- **Q6 — Remove the spec §8.4 "attended teammate is the one surface exception"
+  (SPEC §8.4 EDIT). RESOLVED 2026-07-09 — APPROVED.** Collapse to **one dispatch
+  path** (campd only) + a **uniform converse verb** (send a turn to any session,
+  live over held-stdin or via `claude --resume`) + **pack-defined drive**
+  (overseer/coder/committer agents), mirroring Gas City. Deletes the §8.4 surface
+  exception and the reservation idea entirely; makes the §4 mental model literal
+  (the human's own session is the interactive overseer). The operator **approved
+  the §8.4 edit**; the amendment is drafted and lands **serialized through the
+  operator** (future). Supersedes Q2; reshapes Phase 1. Folded into the Reframe.
 
-- **Q7 — Persistent overseer: core `named_session` capability, or human-session-
-  only?** Gas City's overseer is a standing `[[named_session]]` (`mode` =
-  `always`/`on_demand`). Camp's premise is "the human's Claude Code session is
-  the overseer," and "idle = zero agent processes" (spec §8.4) resists a standing
-  daemon-managed agent. Options: (a) **human-session-only** overseer (no core
-  change; a persistent pack overseer is out of scope) — leanest, fits "idle is
-  free"; (b) add a minimal **core standing-session capability** (a pack-declared
-  `on_demand` overseer campd can wake for away-mode), mirroring gc more fully but
-  costing an idle process while active. **Answerable: (a) lean / human-only for
-  v1, or (b) add named sessions.** Recommend **(a)** for v1; (b) as a later,
-  mirror-faithful extension when away-mode planning is wanted.
+- **Q7 — Persistent overseer: core `named_session`, or human-session-only?
+  RESOLVED 2026-07-09 — human-session-only.** The overseer **is** the human's
+  Claude Code session + plugin (spec §4 made literal); an **optional on-demand
+  pack overseer agent** covers away-mode. Camp does **not** add a core standing
+  `[[named_session]] mode=always` capability — that preserves "idle = zero agent
+  processes" (spec §8.4). Tradeoff recorded: the fuller gc mirror (a core standing
+  session) is deferred until away-mode planning demands it. Folded into the
+  Reframe.
 
 ## 8. Explicitly out of scope for v1 (unless sign-off says otherwise)
 
@@ -770,9 +840,10 @@ gates green (`fmt`, `clippy -D warnings`, `cargo test --workspace`) before push.
 
 ### Phase 1 — Coordination: one dispatch path + converse verb (#29) — REFRAMED
 
-*Blocked on Q6 (approve §8.4 removal + the converse verb). Supersedes the
-reservation plan.* Depends on nothing in the code (removes a spawner; adds a
-verb over the existing held-stdin/resume capability).
+*Q6 APPROVED (2026-07-09); gated only on the serialized spec §8.4 amendment.
+Supersedes the deprecated reservation plan.* Depends on nothing else in the code
+(removes a spawner; adds a verb over the existing held-stdin/resume capability).
+Highest-value, lowest-risk — lands first.
 
 - **Remove the second spawner:** `/camp:sling` (`plugin/commands/sling.md`) stops
   spawning an attended teammate; it becomes a thin wrapper over `camp sling`
@@ -814,44 +885,58 @@ spec §12 amendment.* Independent of Phase 1.
   `dispatch.failed`, no worker spawned, no stranded commit; (iii) two concurrent
   autonomous workers on one rig get distinct worktrees (no shared-tree collision).
 
-### Phase 3 — Delivery contract + `pass` gate (#34)
+### Phase 3 — Delivery via pack + the `WorkOutcome` axis (#34) — REVISED
 
-*Q3 RESOLVED (2026-07-09); still gated on Q4 (remote scope) and Q5 (contract
-unification).* Depends on Phase 2 (the bead branch is the delivery vehicle) and
-#35.
+*Q3 REVISED & SETTLED (2026-07-09); still gated on Q4 (remote scope) and Q5
+(contract unification).* Depends on Phase 2 (the bead branch is the delivery
+vehicle) and #35.
 
-- (Q5) Optionally unify the two worker-contract copies first.
-- Add the delivery contract to the worker skill (+ mechanical floor): commit to
-  the bead branch; define "landed" (Q3: committed on `camp/<bead>` with a base);
-  fresh/empty repo → fail fast at dispatch (Q3), no worker cleverness.
-- Implement the `pass` gate per Q3 (DECIDED): un-integrable work closes
-  **`fail`-with-reason**; **no new `outcome` value**. The gate is worker-contract
-  text + a mechanical git check.
+- **Delivery is pack content** (mirror gc's swarm): a delivery-aware `dev`/coder
+  prompt — how to commit to the bead branch, and optionally a dedicated
+  `committer` agent that owns git. Ships in the starter pack; the plugin stays
+  role-free. (Q5) Optionally unify the two worker-contract copies
+  (`plugin/skills/worker/SKILL.md` + the `WORKER_CONTRACT` in `spawn.rs`) first.
+- **Adopt the `WorkOutcome` axis (Q3-revised):** pin gc's set
+  (`shipped`/`no-op`/`blocked`/`abandoned`) in
+  `crates/camp-core/tests/fixtures/gc-vocab.json`, extend the fold/close path to
+  record a `WorkOutcome` **separately** from the control `outcome`, and have
+  `ci/gc-compat/check_vocab.sh` validate it as an additive mirrored axis.
+  Un-integrable work is `blocked` on the WorkOutcome axis. campd still fails fast
+  when a rig can't host a worktree (mechanical).
+- **Spec:** amend §8.4's worker-lifecycle-contract portion for delivery (the
+  §8.4 surface-exception removal is Phase 1); serialized through the operator.
 - **Test obligations:** (i) a fake worker that commits to a dead-end branch on a
-  no-base rig CANNOT close `pass` (worker closes `fail`-with-reason); (ii) a
-  worker that commits to `camp/<bead>` on a rig with a base **can** close `pass`
-  and the branch is reachable/diffable post-close; (iii) `camp export --city`
-  still emits mirror-valid history — the close vocabulary is unchanged
-  (regression guard on the Q3 decision); (iv) worktree kept-on-non-pass so
-  stranded work is recoverable.
+  no-base rig records `blocked` (WorkOutcome), never `shipped`; (ii) a worker that
+  commits to `camp/<bead>` on a rig with a base records `shipped` and the branch
+  is reachable/diffable post-close; (iii) `check_vocab.sh` passes with the added
+  WorkOutcome set (mirror invariant intact) and `camp export --city` emits
+  city-native history including WorkOutcome; (iv) the control `outcome` axis is
+  unchanged (regression guard — WorkOutcome is additive, not a redefinition);
+  (v) worktree kept when work is not `shipped`, so nothing is lost.
 
 ### Sequencing summary
 
 ```
-#35 (gitignore, parallel) ─┐
-                           ├─► Phase 2 (isolation) ─► Phase 3 (delivery)
-Q1 APPROVED ───────────────┘        ▲
-Q6 (§8.4 removal + verb) ─► Phase 1 (one path + converse)  (independent; land first)
-Q3 RESOLVED; Q4,Q5 open ────────────┘► Phase 3
+Q6 APPROVED ─► Phase 1 (one dispatch path + converse verb)   (independent; lands FIRST)
+                    · drop the /camp:sling teammate spawn; add the converse verb
+                    · spec §8.4 surface-exception removal (serialized)
+
+#35 (gitignore) ─┐
+Q1 APPROVED ─────┼─► Phase 2 (isolation default = worktree) ─► Phase 3 (delivery)
+spec §12 edit ───┘                                                    ▲
+Q3 REVISED (WorkOutcome axis) ───────────────────────────────────────┘
+Q4, Q5 open ─────────────────────────────────────────────────────────┘ (close before Phase 3)
 ```
 
-Status of the gates (2026-07-09): **Q1 APPROVED**, **Q3 RESOLVED**; **Q6** (the
-reframe: remove §8.4 exception, one dispatch path + converse verb) is the new
-load-bearing decision replacing the deprecated **Q2** (reservation, superseded);
-**Q7** (persistent overseer — recommend human-session-only for v1), **Q4**
-(remote scope), **Q5** (contract unification) open.
+Status of the gates (2026-07-09): **Q1 APPROVED**, **Q3 REVISED & SETTLED**
+(adopt the `WorkOutcome` axis), **Q6 APPROVED** (one dispatch path + converse
+verb; §8.4 removal), **Q7 SETTLED** (overseer = the human's session; no core
+standing session). **Q2 SUPERSEDED.** Still open for the operator: **Q4** (remote
+scope) and **Q5** (worker-contract unification).
 
-Phase 1 (coordination) is the highest-value, lowest-risk first land: it needs no
-new isolation or delivery semantics and directly removes the observed race.
-Phases 2 and 3 are the isolation→delivery spine and must land in that order
-because the bead branch produced by isolation is what delivery gates on.
+Phase 1 (coordination) is the highest-value, lowest-risk first land: one dispatch
+path + a converse verb, no new isolation/delivery semantics, and it structurally
+removes the #29 race. Phases 2 and 3 are the isolation→delivery spine and must
+land in that order because the bead branch produced by isolation is the delivery
+vehicle. Every spec edit (§8.4, §12) and the WorkOutcome vocabulary addition are
+future implementation, serialized through the operator.
