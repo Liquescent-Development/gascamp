@@ -105,12 +105,18 @@ pub fn parse_agent_file(path: &Path) -> Result<AgentDef, CoreError> {
     };
 
     let isolation = match get_str("isolation")?.as_deref() {
-        None => Isolation::None,
+        None => Isolation::default(),
         Some("worktree") => Isolation::Worktree,
+        // The explicit opt-out (spec §12, dispatch-lifecycle Q1): the
+        // agent intentionally runs on the rig's live tree; dispatch makes
+        // that loud (`dispatch.live_tree`).
+        Some("none") => Isolation::None,
         Some(other) => {
             return Err(pack_err(
                 path,
-                format!("frontmatter key \"isolation\" accepts only \"worktree\", got {other:?}"),
+                format!(
+                    "frontmatter key \"isolation\" accepts only \"worktree\" or \"none\", got {other:?}"
+                ),
             ));
         }
     };
@@ -290,6 +296,18 @@ mod tests {
         let def = parse_agent_file(&dir.path().join("iso.md")).unwrap();
         assert_eq!(def.tools, Some(vec!["Read".to_owned(), "Bash".to_owned()]));
         assert_eq!(def.isolation, Isolation::Worktree);
+    }
+
+    #[test]
+    fn isolation_none_is_an_accepted_explicit_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(
+            dir.path(),
+            "live.md",
+            "---\nname: live\nisolation: none\n---\nWork on the live tree.\n",
+        );
+        let def = parse_agent_file(&dir.path().join("live.md")).unwrap();
+        assert_eq!(def.isolation, Isolation::None);
     }
 
     #[test]
