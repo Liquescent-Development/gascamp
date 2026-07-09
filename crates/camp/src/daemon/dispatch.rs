@@ -171,6 +171,16 @@ impl Dispatcher {
         self.children.values().any(|w| w.session == session)
     }
 
+    /// (rig, bead) of a live child by session — the nudge handler's
+    /// session.nudged enrichment (dispatch-lifecycle Phase 1); None when
+    /// the session is not our child.
+    pub fn child_info(&self, session: &str) -> Option<(String, String)> {
+        self.children
+            .values()
+            .find(|w| w.session == session)
+            .map(|w| (w.rig.clone(), w.bead.clone()))
+    }
+
     /// Write one status-request turn into the session's held stdin
     /// (Decision C: the live nudge path).
     pub fn nudge_via_stdin(&mut self, session: &str, text: &str) -> NudgeOutcome {

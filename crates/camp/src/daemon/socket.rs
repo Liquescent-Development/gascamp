@@ -30,6 +30,9 @@ pub enum Request {
     /// Reconcile the session registry against reality (spec §8.5) — the
     /// same routine campd runs at startup, on demand (Phase 11).
     Adopt,
+    /// Deliver one user turn into a live worker's campd-held stdin pipe
+    /// (dispatch-lifecycle Phase 1, #29 — the converse verb's live path).
+    Nudge { session: String, text: String },
 }
 
 /// One response line. Untagged: variant order matters for deserialization
@@ -54,6 +57,15 @@ pub enum Response {
         released: usize,
         swept: usize,
         kept: usize,
+    },
+    /// Nudge disposition (dispatch-lifecycle Phase 1): via="stdin" means
+    /// the turn is in the held pipe; via="none" means no held pipe for the
+    /// session (released, Null-mode, exited, or not campd's child) — the
+    /// caller converses over the resume path instead. Must precede Ok in
+    /// this untagged enum so {"ok":..,"via":..} resolves here.
+    Nudge {
+        ok: bool,
+        via: String,
     },
     Error {
         ok: bool,
@@ -139,6 +151,18 @@ pub fn request(path: &Path, request: &Request) -> Result<Response> {
     Ok(response)
 }
 
+/// Like `request`, but campd-not-listening is a NORMAL state, not an error
+/// (dispatch-lifecycle Phase 1: the converse verb's resume path; the same
+/// designed degrade as `camp top --statusline`). Only an absent/refusing
+/// socket maps to Ok(None); a campd that accepts and then misbehaves (or
+/// answers an Error line) still surfaces as Err — fail fast.
+pub fn request_if_up(path: &Path, request: &Request) -> Result<Option<Response>> {
+    if UnixStream::connect(path).is_err() {
+        return Ok(None);
+    }
+    self::request(path, request).map(Some)
+}
+
 /// Post-commit poke: fire-and-forget BY DESIGN (spec §7.2 — "if campd is
 /// down, writes still succeed and it catches up from its processed-cursor
 /// on start"). This is the one sanctioned ignore-the-error site in camp;
@@ -185,6 +209,53 @@ mod tests {
     #[test]
     fn unknown_op_is_rejected() {
         assert!(serde_json::from_str::<Request>(r#"{"op":"dance"}"#).is_err());
+    }
+
+    /// The converse verb's wire op (dispatch-lifecycle Phase 1, #29).
+    #[test]
+    fn nudge_wire_format_is_pinned() {
+        assert_eq!(
+            serde_json::to_string(&Request::Nudge {
+                session: "camp/dev/1".into(),
+                text: "status?".into()
+            })
+            .unwrap(),
+            r#"{"op":"nudge","session":"camp/dev/1","text":"status?"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"op":"nudge","session":"s","text":"t"}"#).unwrap(),
+            Request::Nudge {
+                session: "s".into(),
+                text: "t".into()
+            }
+        );
+        // Response: untagged — the Nudge variant must win for {"ok":..,"via":..}
+        assert_eq!(
+            serde_json::to_string(&Response::Nudge {
+                ok: true,
+                via: "stdin".into()
+            })
+            .unwrap(),
+            r#"{"ok":true,"via":"stdin"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Response>(r#"{"ok":true,"via":"none"}"#).unwrap(),
+            Response::Nudge { via, .. } if via == "none"
+        ));
+    }
+
+    /// campd-not-listening is a NORMAL state for the converse verb (the
+    /// resume path) — Ok(None), never an error.
+    #[test]
+    fn request_if_up_returns_none_when_no_daemon_listens() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("campd.sock");
+        // no listener at all
+        assert!(request_if_up(&sock, &Request::Status).unwrap().is_none());
+        // a stale file that refuses connections is also "not up"
+        drop(UnixListener::bind(&sock).unwrap());
+        assert!(request_if_up(&sock, &Request::Status).unwrap().is_none());
     }
 
     #[test]
