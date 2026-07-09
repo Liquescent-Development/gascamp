@@ -268,8 +268,22 @@ pub fn run(
                     if let Some(input) = runtime.reload_if_changed(now)? {
                         // spec §13.4: the config change is itself an event,
                         // applied or rejected.
+                        let applied = input.data["applied"].as_bool() == Some(true);
                         ledger.append(input)?;
                         wake_ledger_work = true;
+                        // Issue #28: an APPLIED reload must reach dispatch,
+                        // not just the order scheduler. Push the new config
+                        // into the dispatcher (routing + max_workers) and
+                        // the graph runtime's rig snapshot BEFORE the settle
+                        // below converges — so a new pack/agent/rig/
+                        // default_agent takes effect with no restart. The
+                        // ledger's `applied:true` already means the runtime
+                        // swapped its state, so this never runs on a rejected
+                        // torn write.
+                        if applied {
+                            dispatcher.apply_config(runtime.config().clone());
+                            graph.apply_config(runtime.config());
+                        }
                     }
                 }
                 token => {
