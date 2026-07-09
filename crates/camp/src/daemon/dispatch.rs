@@ -3592,10 +3592,13 @@ mod tests {
         let (dir, _ledger) = temp_ledger();
         let mut dispatcher = test_dispatcher(dir.path());
         let mut worker = held_cat_worker(dir.path(), "t/dev/1", "gc-1");
-        // the reader is dead while campd still holds the write end
+        // The dead reader: killed and reaped, but retained ONLY as a
+        // plausible dead-worker `child` handle for the Worker row — the
+        // EPIPE the assertion observes comes from the write-shut socket
+        // installed below, not from this cat's pipe.
         worker.child.kill().unwrap();
         worker.child.wait().unwrap();
-        // A killed reader alone cannot make the EPIPE deterministic: a
+        // A killed reader's pipe cannot make the EPIPE deterministic: a
         // sibling test mid-Command::spawn (forked, execve pending)
         // transiently inherits a copy of every fd in this process —
         // including that pipe's read end — which keeps writes succeeding
