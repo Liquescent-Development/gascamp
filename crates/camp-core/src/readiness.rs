@@ -468,4 +468,27 @@ mod tests {
         .unwrap();
         assert!(l.dispatchable_beads().unwrap().is_empty());
     }
+
+    /// Test obligation (iv), dispatch-lifecycle Phase 1 (#29): a freshly
+    /// slung bead (title+assignee, open, unclaimed) is IMMEDIATELY visible
+    /// to campd's dispatchable query — nothing reserves or hides it. One
+    /// dispatch path.
+    #[test]
+    fn a_freshly_slung_bead_is_immediately_dispatchable() {
+        let (_d, mut l) = ledger();
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "cli".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"title": "add a flag", "assignee": "dev"}),
+        })
+        .unwrap();
+        let dispatchable = l.dispatchable_beads().unwrap();
+        assert_eq!(dispatchable.len(), 1);
+        assert_eq!(dispatchable[0].id, "gc-1");
+        assert_eq!(dispatchable[0].assignee.as_deref(), Some("dev"));
+        assert_eq!(dispatchable[0].status, "open");
+        assert_eq!(dispatchable[0].claimed_by, None);
+    }
 }

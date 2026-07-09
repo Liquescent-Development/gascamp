@@ -61,3 +61,21 @@ pub const CAMP_RUN_DISPOSITIONS: &[&str] = &["pass", "hard_fail", "soft_fail"];
 /// fixture carries no failure_class list; this follows the master plan's
 /// wording (`failure_class:"transient"`, gc's key vocabulary) verbatim.
 pub const CAMP_FAILURE_CLASSES: &[&str] = &["transient"];
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Test obligation (iv), dispatch-lifecycle Phase 1 (#29): the
+    /// deprecated reservation design leaked no vocabulary.
+    #[test]
+    fn no_reservation_vocabulary_exists() {
+        for name in GC_MIRRORED_EVENTS.iter().chain(CAMP_SPECIFIC_EVENTS) {
+            assert!(
+                !name.contains("reserv") && !name.contains("attended"),
+                "reservation-era name leaked into the vocabulary: {name}"
+            );
+        }
+    }
+}
