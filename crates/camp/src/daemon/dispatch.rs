@@ -3592,16 +3592,32 @@ mod tests {
         let (dir, _ledger) = temp_ledger();
         let mut dispatcher = test_dispatcher(dir.path());
         let mut worker = held_cat_worker(dir.path(), "t/dev/1", "gc-1");
-        // kill the reader while campd still holds the write end
+        // The dead reader: killed and reaped, but retained ONLY as a
+        // plausible dead-worker `child` handle for the Worker row — the
+        // EPIPE the assertion observes comes from the write-shut socket
+        // installed below, not from this cat's pipe.
         worker.child.kill().unwrap();
         worker.child.wait().unwrap();
+        // A killed reader's pipe cannot make the EPIPE deterministic: a
+        // sibling test mid-Command::spawn (forked, execve pending)
+        // transiently inherits a copy of every fd in this process —
+        // including that pipe's read end — which keeps writes succeeding
+        // and flaked this test under parallel load (issue #44, same fd
+        // physics as SPAWN_PROBE_LOCK's doc). shutdown(2) is a property of
+        // the socket OBJECT, not of fd-table entries, so no inherited copy
+        // can hold the write side open: with a write-shut socket as the
+        // held stdin, the very FIRST nudge must surface the kernel's EPIPE
+        // as Failed. (Peer-side shutdown is not enough — macOS absorbs it.)
+        let (ours, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        ours.shutdown(std::net::Shutdown::Write).unwrap();
+        worker.stdin = Some(std::process::ChildStdin::from(std::os::fd::OwnedFd::from(
+            ours,
+        )));
         dispatcher.children.insert(worker.child.id(), worker);
-        // one write may land in the pipe buffer; the second hits EPIPE
-        let first = dispatcher.nudge_via_stdin("t/dev/1", "status?");
-        let second = dispatcher.nudge_via_stdin("t/dev/1", "status?");
+        let outcome = dispatcher.nudge_via_stdin("t/dev/1", "status?");
         assert!(
-            matches!(second, NudgeOutcome::Failed(_)) || matches!(first, NudgeOutcome::Failed(_)),
-            "a broken pipe must surface as Failed: {first:?} then {second:?}"
+            matches!(outcome, NudgeOutcome::Failed(_)),
+            "a broken pipe must surface as Failed: {outcome:?}"
         );
     }
 

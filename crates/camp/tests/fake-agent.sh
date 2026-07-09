@@ -13,7 +13,8 @@
 #   FAKE_AGENT_HOLD_DIR   after claiming, wait until $DIR/$CAMP_BEAD exists
 #                         (deterministic concurrency tests)
 #   FAKE_AGENT_TOUCH      write this file (relative to cwd) to prove where
-#                         the worker ran (worktree tests)
+#                         the worker ran (worktree tests); written BEFORE
+#                         the claim so ledger-observed claims imply it
 #   FAKE_AGENT_OUTCOME    close outcome, default "pass"
 #   FAKE_AGENT_NUDGE_CLOSE     Phase 11 stream-mode contract: line 1 on
 #                              stdin is the task message; block until a
@@ -29,11 +30,17 @@ set -euo pipefail
 : "${CAMP_BEAD:?fake-agent: CAMP_BEAD must be set by campd}"
 : "${CAMP_SESSION:?fake-agent: CAMP_SESSION must be set by campd}"
 
-"$CAMP_BIN" claim "$CAMP_BEAD" --session "$CAMP_SESSION"
-
+# The cwd proof precedes the claim ON PURPOSE (issue #44): tests wait for
+# bead.claimed in the ledger and then assert this file exists, so the touch
+# must happen-before the claim event — bash program order plus the claim's
+# durable commit make that ordering observable. Touch-after-claim raced the
+# test's ledger poll against this script's scheduling and flaked under
+# parallel load.
 if [[ -n "${FAKE_AGENT_TOUCH:-}" ]]; then
   echo "worked in $(pwd)" > "$FAKE_AGENT_TOUCH"
 fi
+
+"$CAMP_BIN" claim "$CAMP_BEAD" --session "$CAMP_SESSION"
 
 if [[ -n "${FAKE_AGENT_MILESTONE:-}" ]]; then
   "$CAMP_BIN" event emit "$FAKE_AGENT_MILESTONE" --bead "$CAMP_BEAD" --session "$CAMP_SESSION"
