@@ -3358,7 +3358,13 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join("rig")).unwrap();
         std::fs::create_dir_all(root.join("agents")).unwrap();
-        std::fs::write(root.join("agents/dev.md"), "---\nname: dev\n---\nWork.\n").unwrap();
+        // The subject is the respawn queue, not isolation: pin the
+        // live-tree opt-out (spec §12) so the plain-dir rig dispatches.
+        std::fs::write(
+            root.join("agents/dev.md"),
+            "---\nname: dev\nisolation: none\n---\nWork.\n",
+        )
+        .unwrap();
         std::fs::write(
             root.join("camp.toml"),
             format!(

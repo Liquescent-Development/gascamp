@@ -330,9 +330,14 @@ fn scaffold_e2e(dir: &Path, claude: &str) -> (PathBuf, PathBuf, PathBuf) {
     // held stdin (the WORKER_CONTRACT).
     let agents = root.join("agents");
     std::fs::create_dir_all(&agents).unwrap();
+    // Phase 2 note: e2e Tier-0 asserts the work lands in the RIG's live
+    // tree (`toy ls --json` run in the rig) — that is delivery, which is
+    // Phase 3's contract. Until Phase 3 defines "landed" for the worktree
+    // path, e2e pins the explicit live-tree opt-out (spec §12).
     std::fs::write(
         agents.join("dev.md"),
         "---\nname: dev\nmodel: sonnet\npermissionMode: bypassPermissions\n\
+         isolation: none\n\
          tools: Read, Edit, Write, Bash, Grep, Glob\n---\n\
          You are a camp worker. Do the assigned bead with TDD: write the failing \
          test first, then the minimal change to pass it, keeping existing behavior \
@@ -343,6 +348,7 @@ fn scaffold_e2e(dir: &Path, claude: &str) -> (PathBuf, PathBuf, PathBuf) {
     std::fs::write(
         agents.join("reviewer.md"),
         "---\nname: reviewer\nmodel: sonnet\npermissionMode: bypassPermissions\n\
+         isolation: none\n\
          tools: Read, Bash, Grep, Glob\n---\n\
          You are a read-only camp reviewer. Inspect the change (e.g. `git diff`) for \
          the assigned bead, confirm it is sound and existing behavior is intact, then \

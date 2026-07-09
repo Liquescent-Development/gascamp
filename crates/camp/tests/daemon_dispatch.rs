@@ -57,7 +57,12 @@ fn scaffold(dir: &Path, max_workers: usize, rig_extra: &str) -> (PathBuf, PathBu
         ),
     )
     .unwrap();
-    write_agent(&root, "dev", "");
+    // Post-flip (spec §12) the scaffold's dev agent PINS the live-tree
+    // opt-out: these tests exercise worker mechanics (crash, cap, routing,
+    // canonicalization) on the rig cwd, not the isolation contract — which
+    // has its own tests below. Tests about the DEFAULT overwrite dev.md
+    // with write_agent(&root, "dev", "").
+    write_agent(&root, "dev", "isolation: none\n");
     // create the ledger so every verb (and campd) finds it
     camp_ok(&root, &["events", "--json"]);
     (root, rig)
@@ -714,13 +719,265 @@ fn an_isolation_none_dispatch_is_loud_in_the_ledger() {
     assert!(!root.join("worktrees").join(&bead).exists());
 }
 
+/// Phase 2 test obligation (i) (dispatch-lifecycle §9): an autonomous
+/// worker's cwd is a camp worktree on camp/<bead> BY DEFAULT — the agent
+/// declares no isolation key — and never the rig's live branch. The
+/// branch evidence is recorded by the WORKER from inside its own cwd
+/// (`git branch --show-current`, FAKE_AGENT_RECORD_BRANCH).
+#[test]
+fn default_isolation_puts_the_worker_on_a_worktree_branch_never_the_rigs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 10, "");
+    git_rig(&rig);
+    write_agent(&root, "dev", ""); // NO isolation key: the DEFAULT under test
+    let hold = dir.path().join("hold");
+    std::fs::create_dir_all(&hold).unwrap();
+    let _campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_HOLD_DIR", hold.to_str().unwrap()),
+            ("FAKE_AGENT_RECORD_BRANCH", "branch.txt"),
+        ],
+    );
+
+    let bead = camp_ok(&root, &["sling", "default isolation"])
+        .trim()
+        .to_owned();
+    wait_until(&root, "the default-isolated worker to claim", |e| {
+        count(e, "bead.claimed") == 1
+    });
+
+    // The worker recorded its own branch from inside its own cwd BEFORE
+    // claiming (fake-agent ordering contract, issue #44): a ledger-observed
+    // claim implies the proof file already exists.
+    let wt = root.join("worktrees").join(&bead);
+    assert!(
+        wt.join("branch.txt").exists(),
+        "the worker must record its branch before claiming; worktree dir: {}",
+        wt.display()
+    );
+    let worker_branch = std::fs::read_to_string(wt.join("branch.txt"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&rig)
+        .args(["branch", "--show-current"])
+        .output()
+        .unwrap();
+    let rig_branch = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    assert_eq!(worker_branch, format!("camp/{bead}"));
+    assert_eq!(rig_branch, "main");
+    assert_ne!(
+        worker_branch, rig_branch,
+        "obligation (i): the worker's branch must never be the rig's checked-out branch"
+    );
+    assert!(
+        !rig.join("branch.txt").exists(),
+        "nothing may leak onto the rig's live tree"
+    );
+    // the default is not the opt-out: no live-tree event fired
+    assert_eq!(count(&events_json(&root), "dispatch.live_tree"), 0);
+
+    // release: a clean pass reaps the worktree (spec §12)
+    std::fs::write(hold.join(&bead), "go").unwrap();
+    wait_until(&root, "the worktree reap", |e| {
+        count(e, "bead.worktree.reaped") == 1
+    });
+    assert!(!wt.exists());
+}
+
+/// Phase 2 test obligation (ii) (dispatch-lifecycle §9, §4.2.2): a rig
+/// that cannot host a worktree — git-init-only, NO base commit — fails
+/// fast at dispatch: dispatch.failed evented, no worker spawned, no
+/// registry row, nothing stranded. The bead stays open and ready for
+/// after the operator prepares the rig.
+#[test]
+fn a_baseless_rig_fails_fast_at_dispatch_with_no_worker_and_nothing_stranded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 10, "");
+    // git init but NO commit: no base for a worktree branch
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+    ] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&rig)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    write_agent(&root, "dev", ""); // default isolation = worktree
+    let _campd = Daemon::spawn(&root, &[]);
+
+    let bead = camp_ok(&root, &["sling", "cannot isolate here"])
+        .trim()
+        .to_owned();
+    wait_until(&root, "the fail-fast dispatch", |e| {
+        count(e, "dispatch.failed") == 1
+    });
+
+    let events = events_json(&root);
+    let failed = events
+        .iter()
+        .find(|e| e["type"] == "dispatch.failed")
+        .unwrap();
+    assert_eq!(failed["bead"], bead.as_str());
+    assert!(
+        failed["data"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cannot host a worktree"),
+        "reason must carry the refusal: {failed}"
+    );
+    // no worker was ever spawned: no registry row, no claim, no session end
+    for kind in [
+        "session.woke",
+        "bead.claimed",
+        "session.stopped",
+        "session.crashed",
+    ] {
+        assert_eq!(count(&events, kind), 0, "{kind} must not fire");
+    }
+    // nothing stranded: no commit, no camp/<bead> branch, no worktree dir
+    let revs = Command::new("git")
+        .arg("-C")
+        .arg(&rig)
+        .args(["rev-list", "--all", "--count"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&revs.stdout).trim(), "0");
+    let branches = Command::new("git")
+        .arg("-C")
+        .arg(&rig)
+        .args(["branch", "--list"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&branches.stdout).trim(), "");
+    assert!(!root.join("worktrees").join(&bead).exists());
+    // the bead is still open and ready — nothing lost
+    let ls = camp_ok(&root, &["ls", "--ready", "--json"]);
+    let rows: serde_json::Value = serde_json::from_str(&ls).unwrap();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == bead.as_str()),
+        "the bead must remain ready: {rows}"
+    );
+}
+
+/// Obligation (ii), the emptier case: a rig directory that is not a git
+/// repository at all. Same fail-fast contract, same ledger evidence.
+#[test]
+fn a_non_git_rig_fails_fast_at_dispatch_under_default_isolation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 10, ""); // plain dir, no git
+    write_agent(&root, "dev", ""); // default isolation = worktree
+    let _campd = Daemon::spawn(&root, &[]);
+
+    let bead = camp_ok(&root, &["sling", "no repo here"]).trim().to_owned();
+    wait_until(&root, "the fail-fast dispatch", |e| {
+        count(e, "dispatch.failed") == 1
+    });
+
+    let events = events_json(&root);
+    let failed = events
+        .iter()
+        .find(|e| e["type"] == "dispatch.failed")
+        .unwrap();
+    assert_eq!(failed["bead"], bead.as_str());
+    assert!(
+        failed["data"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cannot host a worktree"),
+        "reason: {failed}"
+    );
+    assert_eq!(count(&events, "session.woke"), 0, "no worker spawned");
+    assert!(!rig.join(".git").exists(), "the rig stays untouched");
+    assert!(!root.join("worktrees").join(&bead).exists());
+}
+
+/// Phase 2 test obligation (iii) (dispatch-lifecycle §9): two concurrent
+/// autonomous workers on ONE rig get DISTINCT worktrees on distinct
+/// camp/<bead> branches — no shared-tree collision — and the rig's live
+/// tree is untouched.
+#[test]
+fn two_concurrent_default_workers_get_distinct_worktrees() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 10, "");
+    git_rig(&rig);
+    write_agent(&root, "dev", ""); // default isolation = worktree
+    let hold = dir.path().join("hold");
+    std::fs::create_dir_all(&hold).unwrap();
+    let _campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_HOLD_DIR", hold.to_str().unwrap()),
+            ("FAKE_AGENT_TOUCH", "proof.txt"),
+        ],
+    );
+
+    let b1 = camp_ok(&root, &["sling", "first"]).trim().to_owned();
+    let b2 = camp_ok(&root, &["sling", "second"]).trim().to_owned();
+    wait_until(&root, "both workers to claim", |e| {
+        count(e, "bead.claimed") == 2
+    });
+
+    let wt1 = root.join("worktrees").join(&b1);
+    let wt2 = root.join("worktrees").join(&b2);
+    assert_ne!(wt1, wt2, "distinct beads must get distinct worktrees");
+    // both workers ran in their OWN worktree: proof.txt is written BEFORE
+    // the claim (fake-agent ordering contract, issue #44), so two observed
+    // claims imply both proof files exist.
+    for wt in [&wt1, &wt2] {
+        assert!(
+            wt.join("proof.txt").exists(),
+            "each worker must run in its own worktree ({})",
+            wt.display()
+        );
+    }
+    // each worktree sits on its own camp/<bead> branch
+    for (bead, wt) in [(&b1, &wt1), (&b2, &wt2)] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("camp/{bead}")
+        );
+    }
+    assert!(
+        !rig.join("proof.txt").exists(),
+        "the rig's live tree stays untouched"
+    );
+
+    std::fs::write(hold.join(&b1), "go").unwrap();
+    std::fs::write(hold.join(&b2), "go").unwrap();
+    wait_until(&root, "both reaps", |e| {
+        count(e, "bead.worktree.reaped") == 2
+    });
+}
+
 /// Routing (decision D) through the daemon: the rig's default_agent
 /// outranks [dispatch].default_agent; session names carry the agent.
 #[test]
 fn rig_default_agent_routes_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let (root, _rig) = scaffold(dir.path(), 10, "default_agent = \"rigger\"\n");
-    write_agent(&root, "rigger", "");
+    write_agent(&root, "rigger", "isolation: none\n");
     let _campd = Daemon::spawn(&root, &[]);
     camp_ok(&root, &["sling", "routed"]);
     wait_until(&root, "the routed worker", |e| {
@@ -814,7 +1071,8 @@ fn worker_cwd_is_canonicalized_so_patrol_watches_the_real_transcript_path() {
         ),
     )
     .unwrap();
-    write_agent(&root, "dev", "");
+    // this test asserts the LIVE-TREE (rig cwd) canonicalization branch
+    write_agent(&root, "dev", "isolation: none\n");
     camp_ok(&root, &["events", "--json"]);
 
     let _campd = Daemon::spawn(&root, &[]);

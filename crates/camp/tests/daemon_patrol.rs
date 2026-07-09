@@ -191,7 +191,11 @@ impl Drop for Daemon {
 #[test]
 fn silent_worker_stalls_and_a_nudge_revives_it() {
     let dir = tempfile::tempdir().unwrap();
-    let (root, _rig) = scaffold(dir.path(), "stall_after = \"500ms\"", &[("dev", "")]);
+    let (root, _rig) = scaffold(
+        dir.path(),
+        "stall_after = \"500ms\"",
+        &[("dev", "isolation: none\n")],
+    );
     let _campd = Daemon::spawn(
         &root,
         &dir.path().join("claude-home"),
@@ -242,7 +246,7 @@ fn an_unresponsive_worker_is_restarted_and_the_bead_rehooked() {
     let (root, _rig) = scaffold(
         dir.path(),
         "stall_after = \"500ms\"\nrestart_budget = 1",
-        &[("dev", "")],
+        &[("dev", "isolation: none\n")],
     );
     let _campd = Daemon::spawn(
         &root,
@@ -303,7 +307,7 @@ fn ladder_exhaustion_emits_and_stops() {
     let (root, _rig) = scaffold(
         dir.path(),
         "stall_after = \"400ms\"\nrestart_budget = 0",
-        &[("dev", "")],
+        &[("dev", "isolation: none\n")],
     );
     let campd = Daemon::spawn(
         &root,
@@ -354,7 +358,10 @@ fn kill9_campd_then_adopt_reconciles_exactly() {
     let (root, rig) = scaffold(
         dir.path(),
         "stall_after = \"10s\"", // long: no stalls during the window
-        &[("iso", "isolation: worktree\n"), ("dev", "")],
+        &[
+            ("iso", "isolation: worktree\n"),
+            ("dev", "isolation: none\n"),
+        ],
     );
     git_rig(&rig);
     let claude_home = dir.path().join("claude-home");
@@ -469,7 +476,11 @@ fn kill9_campd_then_adopt_reconciles_exactly() {
 #[test]
 fn transcript_activity_keeps_a_working_agent_unmolested() {
     let dir = tempfile::tempdir().unwrap();
-    let (root, _rig) = scaffold(dir.path(), "stall_after = \"1s\"", &[("dev", "")]);
+    let (root, _rig) = scaffold(
+        dir.path(),
+        "stall_after = \"1s\"",
+        &[("dev", "isolation: none\n")],
+    );
     let _campd = Daemon::spawn(
         &root,
         &dir.path().join("claude-home"),

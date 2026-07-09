@@ -60,7 +60,14 @@ fn scaffold(dir: &Path, max_workers: usize) -> (PathBuf, PathBuf) {
     .unwrap();
     let agents = root.join("agents");
     std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(agents.join("dev.md"), "---\nname: dev\n---\nDo the work.\n").unwrap();
+    // graph tests exercise check loops / fan-out mechanics on the rig cwd;
+    // the isolation contract (spec §12 default) has its own tests in
+    // daemon_dispatch.rs — pin the opt-out explicitly.
+    std::fs::write(
+        agents.join("dev.md"),
+        "---\nname: dev\nisolation: none\n---\nDo the work.\n",
+    )
+    .unwrap();
     camp_ok(&root, &["events", "--json"]); // create the ledger
     (root, rig)
 }

@@ -230,10 +230,36 @@ pub fn spawn(spec: &SpawnSpec) -> Result<Child> {
         .with_context(|| format!("spawning {}", spec.argv[0].to_string_lossy()))
 }
 
+/// A worktree needs a base: a git repository whose HEAD resolves to a
+/// commit (spec §12 fail-fast). Modern git (2.42+) auto-infers `--orphan`
+/// on an unborn HEAD and would happily create a baseless worktree —
+/// precisely the stranded-work hazard the dispatch contract forbids — so
+/// the refusal is an explicit mechanical check, never delegated to
+/// `git worktree add` failing. Also catches "not a git repository at all"
+/// through the same rev-parse.
+fn ensure_worktree_base(rig_path: &Path) -> Result<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(rig_path)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .output()
+        .context("running git rev-parse")?;
+    if !out.status.success() {
+        bail!(
+            "rig {} cannot host a worktree (no git repository with a base commit): {}",
+            rig_path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// `git worktree add -b camp/<bead> <camp>/worktrees/<bead>` (decision H).
 /// A pre-existing directory or branch fails fast — bead ids are unique and
-/// Phase 8 never respawns a bead.
+/// Phase 8 never respawns a bead. A rig with no base commit is refused
+/// before any side effect (spec §12 fail-fast).
 pub fn create_worktree(rig_path: &Path, worktrees_dir: &Path, bead_id: &str) -> Result<PathBuf> {
+    ensure_worktree_base(rig_path)?;
     std::fs::create_dir_all(worktrees_dir)
         .with_context(|| format!("creating {}", worktrees_dir.display()))?;
     let dir = worktrees_dir.join(bead_id);
@@ -524,6 +550,57 @@ mod tests {
         );
         remove_worktree(&rig, &wt).unwrap();
         assert!(!wt.exists());
+    }
+
+    /// Phase 2 (spec §12 fail-fast): a rig without a base commit cannot
+    /// host a worktree. Modern git (2.42+) auto-infers `--orphan` on an
+    /// unborn HEAD and would happily create a baseless worktree — the
+    /// stranded-work hazard the dispatch contract forbids — so the check
+    /// must be explicit, not delegated to `git worktree add` failing.
+    /// Covers both obligation-(ii) shapes: git-init-only and not-a-repo.
+    #[test]
+    fn create_worktree_refuses_a_rig_without_a_base_commit() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let worktrees = dir.path().join("worktrees");
+
+        // git-init-only: a repo with an unborn HEAD (no base commit)
+        let baseless = dir.path().join("baseless");
+        std::fs::create_dir_all(&baseless).unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&baseless)
+            .args(["init", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let err = create_worktree(&baseless, &worktrees, "gc-1").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot host a worktree"),
+            "got: {err:#}"
+        );
+        assert!(!worktrees.join("gc-1").exists(), "no residue on refusal");
+        let branches = Command::new("git")
+            .arg("-C")
+            .arg(&baseless)
+            .args(["branch", "--list"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&branches.stdout).trim(),
+            "",
+            "no camp/<bead> branch may be created on a baseless rig"
+        );
+
+        // not a git repository at all
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let err = create_worktree(&plain, &worktrees, "gc-2").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot host a worktree"),
+            "got: {err:#}"
+        );
+        assert!(!worktrees.join("gc-2").exists(), "no residue on refusal");
     }
 
     // ---- Phase 11: stream mode (Decision C, probe P2) + worktree reuse ---
