@@ -13,7 +13,8 @@ use crate::daemon::socket::Request;
 /// `bead.created` with the routed agent stamped as assignee, then a poke
 /// that auto-starts campd if needed — sling promises dispatch, so a
 /// fire-and-forget poke is not enough (Phase 8 plan decision P). campd
-/// does the spawning; the attended-teammate surface is Phase 12.
+/// does the spawning; there is no second dispatch path (dispatch-lifecycle
+/// Phase 1, #29).
 ///
 /// `camp sling --formula <name> [--rig r]` (spec §8.2, Phase 9 plan
 /// Decision 7): cook `<camp>/formulas/<name>.toml` into `<camp>/runs/`

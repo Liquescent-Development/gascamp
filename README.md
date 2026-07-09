@@ -152,10 +152,12 @@ From that session:
 /camp:adopt                                     # reconcile the session registry against reality
 ```
 
-`/camp:sling` hands the bead to a **real Claude Code worker** that follows the
-plugin's **worker skill** (recall → claim → work → emit milestones → remember →
-close → exit) and, when you're present, spawns it as a teammate you can talk to
-mid-run. That one step needs an authenticated `claude` CLI and a routable agent
+`/camp:sling` hands the bead to a **real Claude Code worker** dispatched by
+campd that follows the plugin's **worker skill** (recall → claim → work → emit
+milestones → remember → close → exit). Talk to it mid-run with
+`camp nudge <session> "<message>"`, or attach any time with
+`claude --resume <session-id>`.
+That one step needs an authenticated `claude` CLI and a routable agent
 — see [The AI step](#the-ai-step). `/camp:status`, `/camp:events`, and `/camp:adopt` are free
 and need neither.
 

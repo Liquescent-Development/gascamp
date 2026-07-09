@@ -75,6 +75,34 @@ fn flags_in(scan: &str) -> Vec<String> {
     out
 }
 
+/// Test obligation (iii), dispatch-lifecycle Phase 1 (#29, Q6): /camp:sling
+/// and `camp sling` are the SAME single path. The wrapper's executable
+/// surface is exactly one `camp sling` invocation, and the markdown carries
+/// no second-spawner instruction (no teammate spawn). The CLI's behavior is
+/// pinned by cli_sling.rs; this proves the wrapper adds nothing to it.
+#[test]
+fn sling_wrapper_is_a_thin_wrapper_with_no_second_spawner() {
+    let md = std::fs::read_to_string(plugin_dir().join("commands/sling.md")).unwrap();
+    let scan = scannable(&md);
+    let executable: Vec<&str> = scan
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("camp "))
+        .collect();
+    assert_eq!(
+        executable,
+        vec!["camp sling $ARGUMENTS"],
+        "the wrapper must invoke `camp sling` once and nothing else"
+    );
+    let lower = md.to_lowercase();
+    for banned in ["teammate", "spawn the", "as a teammate", "worker` skill"] {
+        assert!(
+            !lower.contains(banned),
+            "sling.md must not instruct a second spawner (found {banned:?})"
+        );
+    }
+}
+
 #[test]
 fn every_command_wrapper_uses_only_real_cli_flags() {
     let commands = plugin_dir().join("commands");

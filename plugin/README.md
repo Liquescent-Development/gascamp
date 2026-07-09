@@ -13,7 +13,7 @@ scripting surface is identical to the terminal's (spec §13 guarantee 6).
 
 | Command | Wraps | Does |
 |---|---|---|
-| `/sling` | `camp sling` | Create work — a Tier-0 bead or a `--formula` run. Attended, it also spawns the bead's pack agent as a teammate (spec §8.4). |
+| `/sling` | `camp sling` | Create work — a Tier-0 bead or a `--formula` run. Enqueue only; campd is the sole dispatcher (spec §8.4). |
 | `/status` | `camp top` | Fleet snapshot: live sessions, ready/open beads. |
 | `/adopt` | `camp adopt` | Reconcile the session registry against reality. |
 | `/events` | `camp events` | Print the event log — the whole story. |
