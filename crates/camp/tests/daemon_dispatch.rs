@@ -803,3 +803,89 @@ fn worker_cwd_is_canonicalized_so_patrol_watches_the_real_transcript_path() {
         munge(&link.to_string_lossy())
     );
 }
+
+/// Phase 15 review MEDIUM: the WORKTREE-isolation branch of the cwd
+/// canonicalization must have its own regression coverage. Worktree cwd =
+/// canonicalize(camp.root)/worktrees/<bead>; here the camp is reached through a
+/// SYMLINKED root, so a revert of that branch to the raw
+/// `self.camp.worktrees_path().join(bead)` would make patrol watch a path claude
+/// never writes. Deterministic on every platform (the symlink leaf name differs
+/// from the real one — not a `/private`-prefix substring accident).
+#[test]
+fn worktree_worker_cwd_is_canonicalized_on_a_symlinked_camp_root() {
+    fn munge(p: &str) -> String {
+        p.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // Real camp under `real/`, reached via the symlink `link/` -> `real/`.
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let rig = real.join("repo");
+    std::fs::create_dir_all(&rig).unwrap();
+    git_rig(&rig); // worktree isolation needs a git repo
+
+    let real_root = real.join(".camp");
+    std::fs::create_dir_all(&real_root).unwrap();
+    std::fs::write(
+        real_root.join("camp.toml"),
+        format!(
+            "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+             [dispatch]\nmax_workers = 2\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
+            rig.display(),
+            fake_agent(),
+        ),
+    )
+    .unwrap();
+    let agents = real_root.join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("dev.md"),
+        "---\nname: dev\nisolation: worktree\n---\nDo the work.\n",
+    )
+    .unwrap();
+
+    // Reach the camp through a symlink: campd's self.camp.root is the symlink
+    // spelling; canonicalize must resolve it for the worktree cwd.
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let linked_root = link.join(".camp");
+    camp_ok(&linked_root, &["events", "--json"]); // create the ledger via the symlink spelling
+
+    let _campd = Daemon::spawn(&linked_root, &[]);
+    let bead = camp_ok(&linked_root, &["sling", "isolated canon"])
+        .trim()
+        .to_owned();
+    wait_until(&linked_root, "worktree worker dispatch", |e| {
+        e.iter()
+            .any(|x| x["type"] == "session.woke" && x["data"]["bead"] == bead.as_str())
+    });
+    let events = events_json(&linked_root);
+    let transcript = events
+        .iter()
+        .find(|e| e["type"] == "session.woke" && e["data"]["bead"] == bead.as_str())
+        .unwrap()["data"]["transcript_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Worker cwd = canonicalize(camp.root)/worktrees/<bead> (resolves link ->
+    // real, and /var -> /private/var on macOS).
+    let canon_cwd = std::fs::canonicalize(&linked_root)
+        .unwrap()
+        .join("worktrees")
+        .join(&bead);
+    assert!(
+        transcript.contains(&munge(&canon_cwd.to_string_lossy())),
+        "worktree transcript {transcript} must be under the CANONICAL worktree cwd {}",
+        munge(&canon_cwd.to_string_lossy())
+    );
+    let raw_cwd = linked_root.join("worktrees").join(&bead);
+    assert!(
+        !transcript.contains(&munge(&raw_cwd.to_string_lossy())),
+        "worktree transcript {transcript} must NOT use the un-canonicalized symlink spelling {}",
+        munge(&raw_cwd.to_string_lossy())
+    );
+}

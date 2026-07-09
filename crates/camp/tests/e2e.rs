@@ -797,14 +797,26 @@ fn assert_no_orphans(sids: &[String]) {
     for sid in sids {
         loop {
             let found = Command::new("pgrep").arg("-f").arg(sid).output().unwrap();
-            let alive =
-                found.status.success() && !String::from_utf8_lossy(&found.stdout).trim().is_empty();
-            if !alive {
+            let pids: Vec<String> = String::from_utf8_lossy(&found.stdout)
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
+            if pids.is_empty() {
                 break;
             }
+            // The process-group kill missed this worker (claude can setsid-
+            // detach out of campd's group). REAP it directly so the fuse
+            // actually stops the spend, not merely reports it — then loop until
+            // pgrep confirms it is gone.
+            for pid in &pids {
+                let _ = Command::new("kill").args(["-KILL", pid]).status();
+            }
+            eprintln!(
+                "[e2e] WARNING: reaped detached worker(s) {pids:?} for session {sid} (escaped the process group)"
+            );
             assert!(
                 Instant::now() < deadline,
-                "worker for session {sid} survived teardown group-kill (orphaned spend risk)"
+                "worker(s) for session {sid} survived teardown and could not be reaped within 15 s (orphaned spend risk)"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
