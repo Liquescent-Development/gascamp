@@ -2423,6 +2423,8 @@ mod tests {
             assignee: assignee.map(str::to_owned),
             claimed_by: None,
             outcome: None,
+            work_outcome: None,
+            dispatch_failure: None,
             labels: vec![],
             created_ts: "2026-07-07T00:00:00Z".into(),
             updated_ts: "2026-07-07T00:00:00Z".into(),

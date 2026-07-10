@@ -21,6 +21,13 @@ pub struct BeadRow {
     pub assignee: Option<String>,
     pub claimed_by: Option<String>,
     pub outcome: Option<String>,
+    /// Phase 3 (#48 finding 2): the WorkOutcome axis on closed beads —
+    /// what became of the work itself (gc vocabulary, fold-validated).
+    pub work_outcome: Option<String>,
+    /// Phase 3 (#48 finding 2): a fail-fast dispatch's reason, folded from
+    /// dispatch.failed and cleared by a later session.woke/claim. The
+    /// marker informs the list surface; it never gates dispatchability.
+    pub dispatch_failure: Option<String>,
     pub labels: Vec<String>,
     pub created_ts: String,
     pub updated_ts: String,
@@ -34,7 +41,7 @@ pub struct ListFilter<'a> {
 }
 
 const BEAD_COLS: &str = "id, rig, type, title, status, assignee, claimed_by, outcome, \
-                         labels, created_ts, updated_ts";
+                         labels, created_ts, updated_ts, work_outcome, dispatch_failure";
 
 fn row_to_bead(row: &rusqlite::Row<'_>) -> rusqlite::Result<BeadRow> {
     let labels_json: String = row.get(8)?;
@@ -50,6 +57,8 @@ fn row_to_bead(row: &rusqlite::Row<'_>) -> rusqlite::Result<BeadRow> {
         assignee: row.get(5)?,
         claimed_by: row.get(6)?,
         outcome: row.get(7)?,
+        work_outcome: row.get(11)?,
+        dispatch_failure: row.get(12)?,
         labels,
         created_ts: row.get(9)?,
         updated_ts: row.get(10)?,

@@ -31,6 +31,12 @@ pub fn run(camp: &CampDir, bead: String) -> Result<()> {
     if let Some(o) = &row.outcome {
         println!("outcome  {o}");
     }
+    if let Some(wo) = &row.work_outcome {
+        println!("work     {wo}");
+    }
+    if let Some(df) = &row.dispatch_failure {
+        println!("dispatch-failed  {df}");
+    }
     if !row.labels.is_empty() {
         println!("labels   {}", row.labels.join(", "));
     }

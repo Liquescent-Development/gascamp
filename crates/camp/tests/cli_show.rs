@@ -51,6 +51,33 @@ fn show_reports_state_and_history() {
         .stdout(predicates::str::contains("bead.claimed"));
 }
 
+/// Phase 3 (#48 finding 2): `camp show` prints the work axis on a closed
+/// bead — the honest record of what became of the work itself.
+#[test]
+fn show_prints_the_work_outcome() {
+    let dir = camp_with_bead();
+    camp()
+        .current_dir(dir.path())
+        .args([
+            "close",
+            "gc-1",
+            "--outcome",
+            "fail",
+            "--work-outcome",
+            "blocked",
+            "--reason",
+            "cannot land",
+        ])
+        .assert()
+        .success();
+    camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("work     blocked"));
+}
+
 #[test]
 fn show_of_unknown_bead_errors() {
     let dir = camp_with_bead();

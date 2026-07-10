@@ -180,6 +180,12 @@ fn bead_claimed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
                  WHERE id = ?3",
                 params![p.session, event.ts, id],
             )?;
+            // Phase 3 (#48 finding 2): a claim means the work is under way
+            // — the fail-fast dispatch marker no longer describes reality.
+            conn.execute(
+                "UPDATE beads SET dispatch_failure = NULL WHERE id = ?1 AND dispatch_failure IS NOT NULL",
+                [id],
+            )?;
             Ok(())
         }
         Some(status) => Err(CoreError::InvalidTransition {
@@ -596,14 +602,21 @@ struct DispatchFailed {
     reason: String,
 }
 
-/// `dispatch.failed` is log-only: campd could not dispatch a ready bead
-/// (unresolvable agent, missing rig, worktree failure). campd has no
-/// caller, so the error lands here (invariant 5); Phase 8 plan decision F.
+/// `dispatch.failed`: campd could not dispatch a ready bead (unresolvable
+/// agent, missing rig, worktree failure). campd has no caller, so the
+/// error lands here (invariant 5); Phase 8 plan decision F. Phase 3 (#48
+/// finding 2): no longer log-only — the fail-fast reason folds onto the
+/// bead (`beads.dispatch_failure`) so `camp ls` can mark work that looks
+/// ready but will not dispatch. Cleared by a later session.woke/claim.
 fn dispatch_failed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     let bead = required_bead(event)?;
     known_bead(conn, bead)?;
     let p: DispatchFailed = payload(event)?;
     non_empty(event, "reason", &p.reason)?;
+    conn.execute(
+        "UPDATE beads SET dispatch_failure = ?1, updated_ts = ?2 WHERE id = ?3",
+        params![p.reason, event.ts, bead],
+    )?;
     Ok(())
 }
 
@@ -858,6 +871,14 @@ fn session_woke(conn: &Connection, event: &Event) -> Result<(), CoreError> {
             event.ts,
         ],
     )?;
+    // Phase 3 (#48 finding 2): a woke naming the bead means a dispatch
+    // succeeded — the fail-fast marker no longer describes reality.
+    if let Some(bead) = &p.bead {
+        conn.execute(
+            "UPDATE beads SET dispatch_failure = NULL WHERE id = ?1 AND dispatch_failure IS NOT NULL",
+            [bead],
+        )?;
+    }
     Ok(())
 }
 

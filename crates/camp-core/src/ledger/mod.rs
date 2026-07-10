@@ -1896,6 +1896,81 @@ mod tests {
         }
     }
 
+    /// Issue #48 finding 2 (dispatch-lifecycle Phase 3): a fail-fast
+    /// dispatch is a bead-level fact the list can show — dispatch.failed
+    /// folds into beads.dispatch_failure (the reason), cleared by a later
+    /// session.woke or claim for that bead. The dispatchable query is
+    /// untouched: the marker informs, it never gates.
+    #[test]
+    fn dispatch_failed_marks_the_bead_and_dispatch_or_claim_clears_it() {
+        let (_dir, mut l) = temp_ledger();
+        let marker = |l: &Ledger, id: &str| -> Option<String> {
+            l.conn
+                .query_row(
+                    "SELECT dispatch_failure FROM beads WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let failed = |l: &mut Ledger, id: &str, data: serde_json::Value| {
+            l.append(EventInput {
+                kind: EventType::DispatchFailed,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some(id.into()),
+                data,
+            })
+        };
+
+        // the marker folds on ...
+        seeded_bead(&mut l, "gc-1");
+        let reason = "rig gc cannot host a worktree (no base commit)";
+        failed(&mut l, "gc-1", serde_json::json!({"reason": reason})).unwrap();
+        assert_eq!(marker(&l, "gc-1").as_deref(), Some(reason));
+        // ... and a later successful dispatch (session.woke naming the
+        // bead) clears it
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"name": "t/dev/1", "agent": "dev", "bead": "gc-1"}),
+        })
+        .unwrap();
+        assert_eq!(marker(&l, "gc-1"), None, "session.woke clears the marker");
+
+        // a claim clears it too
+        seeded_bead(&mut l, "gc-2");
+        failed(&mut l, "gc-2", serde_json::json!({"reason": reason})).unwrap();
+        assert_eq!(marker(&l, "gc-2").as_deref(), Some(reason));
+        l.append(input(
+            EventType::BeadClaimed,
+            Some("gc"),
+            Some("gc-2"),
+            serde_json::json!({"session": "t/dev/2"}),
+        ))
+        .unwrap();
+        assert_eq!(marker(&l, "gc-2"), None, "bead.claimed clears the marker");
+
+        // fail fast (regression pins): an unknown bead and an unknown
+        // payload key are both rejected
+        assert!(
+            failed(&mut l, "gc-404", serde_json::json!({"reason": reason})).is_err(),
+            "dispatch.failed on an unknown bead must fail fast"
+        );
+        seeded_bead(&mut l, "gc-3");
+        assert!(
+            failed(
+                &mut l,
+                "gc-3",
+                serde_json::json!({"reason": reason, "extra": 1})
+            )
+            .is_err(),
+            "unknown payload keys must be rejected (deny_unknown_fields)"
+        );
+    }
+
     /// PR #18 review finding 1: bd v1.0.4 silently SKIPS memory records
     /// with an empty value and REJECTS a whole import over an empty-title
     /// issue line — so an empty title must never enter the ledger at all
