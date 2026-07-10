@@ -385,6 +385,27 @@ fn a_hot_reload_updates_dispatch_routing_without_a_restart() {
     std::fs::create_dir_all(&root).unwrap();
     let rig = dir.path().join("repo");
     std::fs::create_dir_all(&rig).unwrap();
+    // The starter pack's dev agent follows the flipped worktree DEFAULT
+    // (spec §12), so the rig must be able to host a worktree.
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+        vec!["config", "commit.gpgsign", "false"],
+        vec!["commit", "--allow-empty", "-m", "init"],
+    ] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&rig)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 
     // A camp that can SPAWN workers (fake agent) but cannot yet ROUTE: no
     // pack, no default_agent, so a fresh bead has nowhere to go.

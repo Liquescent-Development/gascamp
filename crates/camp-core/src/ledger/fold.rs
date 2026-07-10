@@ -32,6 +32,7 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::WorktreeKept => worktree_kept(conn, event),
         EventType::BeadWorktreeReaped => bead_worktree_reaped(conn, event),
         EventType::DispatchFailed => dispatch_failed(conn, event),
+        EventType::DispatchLiveTree => dispatch_live_tree(conn, event),
         EventType::CheckPassed => check_passed(conn, event),
         EventType::CheckFailed => check_failed(conn, event),
         EventType::RunFinalized => run_finalized(conn, event),
@@ -536,6 +537,26 @@ fn dispatch_failed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     known_bead(conn, bead)?;
     let p: DispatchFailed = payload(event)?;
     non_empty(event, "reason", &p.reason)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchLiveTree {
+    path: String,
+    agent: String,
+}
+
+/// `dispatch.live_tree` is log-only (spec §12, dispatch-lifecycle Q1):
+/// campd dispatched an autonomous worker onto the rig's live tree because
+/// the agent explicitly declared `isolation = "none"`. The opt-out is
+/// LOUD — running on the live tree is a ledger fact, never silent.
+fn dispatch_live_tree(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let bead = required_bead(event)?;
+    known_bead(conn, bead)?;
+    let p: DispatchLiveTree = payload(event)?;
+    non_empty(event, "path", &p.path)?;
+    non_empty(event, "agent", &p.agent)?;
     Ok(())
 }
 
