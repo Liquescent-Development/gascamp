@@ -9,6 +9,37 @@ fn camp() -> Command {
 }
 
 fn camp_with_bead() -> tempfile::TempDir {
+    camp_with_bead_in(|_| ())
+}
+
+/// Run git in `repo` with hermetic identity/signing (a global
+/// commit.gpgsign=true must not stall tests — spawn.rs::git_rig precedent).
+fn git(repo: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// camp init + one rig + one bead (gc-1), with the rig prepared by
+/// `prepare` (git init / commits) BEFORE any session registers against it.
+fn camp_with_bead_in(prepare: impl Fn(&std::path::Path)) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
@@ -17,6 +48,7 @@ fn camp_with_bead() -> tempfile::TempDir {
         .success();
     let rig_dir = dir.path().join("repo");
     std::fs::create_dir_all(&rig_dir).unwrap();
+    prepare(&rig_dir);
     camp()
         .current_dir(dir.path())
         .args(["rig", "add"])
@@ -30,6 +62,41 @@ fn camp_with_bead() -> tempfile::TempDir {
         .assert()
         .success();
     dir
+}
+
+fn based_rig(repo: &std::path::Path) {
+    git(repo, &["init", "-b", "main"]);
+    git(repo, &["commit", "--allow-empty", "-m", "init"]);
+}
+
+fn baseless_rig(repo: &std::path::Path) {
+    git(repo, &["init", "-b", "main"]); // unborn HEAD: no commit
+}
+
+/// Register + claim gc-1 for `camp/dev/1` against rig `gascity` — the
+/// woke's `base` is whatever the rig had at this moment.
+fn register_and_claim(dir: &std::path::Path) {
+    camp()
+        .current_dir(dir)
+        .args([
+            "session",
+            "register",
+            "--name",
+            "camp/dev/1",
+            "--agent",
+            "dev",
+            "--rig",
+            "gascity",
+            "--session-id",
+            "7bd2befc-b018-4080-8738-429d541b3646",
+        ])
+        .assert()
+        .success();
+    camp()
+        .current_dir(dir)
+        .args(["claim", "gc-1", "--session", "camp/dev/1"])
+        .assert()
+        .success();
 }
 
 #[test]
@@ -270,6 +337,195 @@ fn close_help_documents_every_flag_the_worker_skill_advertises() {
             "camp close --help must document {flag}"
         );
     }
+}
+
+// ---- Task 7: the shipped gate — mechanical git facts ---------------------
+
+/// Obligation (i), CLI half (#34's exact scenario): a dead-end root commit
+/// on a baseless rig can NEVER close shipped — there was no dispatch-time
+/// base, so nothing can have landed. The honest close is fail+blocked, and
+/// that is what the ledger records.
+#[test]
+fn shipped_is_rejected_without_a_dispatch_base_and_blocked_records() {
+    let dir = camp_with_bead_in(baseless_rig);
+    register_and_claim(dir.path());
+    let rig = dir.path().join("repo");
+    // the stray dead-end commit (what #34's worker did)
+    git(&rig, &["checkout", "-b", "add-readme"]);
+    std::fs::write(rig.join("README.md"), "readme\n").unwrap();
+    git(&rig, &["add", "README.md"]);
+    git(&rig, &["commit", "-m", "dead-end readme"]);
+    let sha = git(&rig, &["rev-parse", "HEAD"]);
+
+    camp()
+        .current_dir(dir.path())
+        .args([
+            "close",
+            "gc-1",
+            "--outcome",
+            "pass",
+            "--work-outcome",
+            "shipped",
+            "--work-commit",
+            &sha,
+            "--work-branch",
+            "add-readme",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no dispatch-time base"));
+    // the rejected close appended NOTHING
+    let out = camp()
+        .current_dir(dir.path())
+        .args(["events", "--json"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("bead.closed"));
+
+    camp()
+        .current_dir(dir.path())
+        .args([
+            "close",
+            "gc-1",
+            "--outcome",
+            "fail",
+            "--work-outcome",
+            "blocked",
+            "--reason",
+            "no base; the branch cannot land",
+        ])
+        .assert()
+        .success();
+    let events = String::from_utf8_lossy(
+        &camp()
+            .current_dir(dir.path())
+            .args(["events", "--json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
+    assert!(events.contains(r#""work_outcome":"blocked""#), "{events}");
+    assert!(
+        !events.contains(r#""work_outcome":"shipped""#),
+        "never shipped: {events}"
+    );
+}
+
+/// Obligation (ii), CLI half: on a based rig, a commit that descends from
+/// the dispatch-time base and is reachable on its branch closes shipped.
+#[test]
+fn shipped_verifies_reachable_and_based_then_records() {
+    let dir = camp_with_bead_in(based_rig);
+    register_and_claim(dir.path());
+    let rig = dir.path().join("repo");
+    git(&rig, &["checkout", "-b", "camp/gc-1"]);
+    std::fs::write(rig.join("work.txt"), "the change\n").unwrap();
+    git(&rig, &["add", "work.txt"]);
+    git(&rig, &["commit", "-m", "the work"]);
+    let sha = git(&rig, &["rev-parse", "HEAD"]);
+
+    camp()
+        .current_dir(dir.path())
+        .args([
+            "close",
+            "gc-1",
+            "--outcome",
+            "pass",
+            "--reason",
+            "done",
+            "--work-outcome",
+            "shipped",
+            "--work-commit",
+            &sha,
+            "--work-branch",
+            "camp/gc-1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("closed gc-1 (pass, shipped)"));
+    let events = String::from_utf8_lossy(
+        &camp()
+            .current_dir(dir.path())
+            .args(["events", "--json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
+    assert!(events.contains(r#""work_outcome":"shipped""#), "{events}");
+    assert!(events.contains(&sha), "{events}");
+}
+
+/// The gate is fact-checking, not vibes: a wrong branch, an unbased orphan
+/// commit, a flag-shaped value, and an unclaimed bead each fail with a
+/// message naming the failed fact — and nothing is appended.
+#[test]
+fn shipped_rejects_unreachable_unbased_flag_shaped_and_unclaimed_facts() {
+    let dir = camp_with_bead_in(based_rig);
+    register_and_claim(dir.path());
+    let rig = dir.path().join("repo");
+    let head = git(&rig, &["rev-parse", "HEAD"]);
+    // `--flag=value` form: clap's default hyphen handling would intercept
+    // a bare `-x` VALUE at the parser (usage error), but the `=` form
+    // passes it straight through — the exact path gc's injection guard
+    // exists for, and camp's guard must catch it, not clap.
+    let close_shipped = |commit: &str, branch: &str| {
+        camp()
+            .current_dir(dir.path())
+            .args([
+                "close",
+                "gc-1",
+                "--outcome",
+                "pass",
+                "--work-outcome",
+                "shipped",
+                &format!("--work-commit={commit}"),
+                &format!("--work-branch={branch}"),
+            ])
+            .output()
+            .unwrap()
+    };
+    // unreachable: a branch that does not exist
+    let out = close_shipped(&head, "no-such-branch");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not reachable on"));
+    // unbased: an orphan branch on a based rig shares no history
+    git(&rig, &["checkout", "--orphan", "lone"]);
+    git(&rig, &["commit", "--allow-empty", "-m", "orphan"]);
+    let orphan = git(&rig, &["rev-parse", "HEAD"]);
+    git(&rig, &["checkout", "main"]);
+    let out = close_shipped(&orphan, "lone");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("shares no history with"));
+    // flag-shaped values are rejected outright (gc's injection guard)
+    let out = close_shipped("-x", "main");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("must not begin with '-'"));
+    // an unclaimed bead has no session, hence no base to verify against
+    camp()
+        .current_dir(dir.path())
+        .args(["create", "second", "--rig", "gascity"])
+        .assert()
+        .success();
+    let out = camp()
+        .current_dir(dir.path())
+        .args([
+            "close",
+            "gc-2",
+            "--outcome",
+            "pass",
+            "--work-outcome",
+            "shipped",
+            "--work-commit",
+            &head,
+            "--work-branch",
+            "main",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no claiming session"));
 }
 
 #[test]
