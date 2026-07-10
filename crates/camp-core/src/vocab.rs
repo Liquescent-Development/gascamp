@@ -46,6 +46,16 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
 /// — gc's own word for exactly this).
 pub const CAMP_OUTCOMES: &[&str] = &["pass", "fail", "skipped"];
 
+/// Values `bead.closed` accepts for `work_outcome` — Gas City's WorkOutcome
+/// axis (`gc.work_outcome`, ADR-0009 at the pinned ref), mirrored VERBATIM
+/// as a SEPARATE, additive axis from the control `outcome` (dispatch-
+/// lifecycle Q3, REVISED & SETTLED 2026-07-09). Un-integrable work is
+/// `blocked` here, never a new control-outcome value. Only `shipped`
+/// carries an artifact (a commit on the work branch); the "shipped requires
+/// a reachable, based commit" rule is owned by the `camp close` gate, not
+/// declared here — exactly gc's division (values.go vs cmd/gc).
+pub const CAMP_WORK_OUTCOMES: &[&str] = &["shipped", "no-op", "blocked", "abandoned"];
+
 /// Values `bead.closed` accepts for `final_disposition` (retry exhaustion,
 /// Phase 9) — a strict subset of gc's, and exactly gc's legal
 /// `on_exhausted` values. A close NEVER carries "pass": the run-level pass

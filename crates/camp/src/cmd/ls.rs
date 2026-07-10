@@ -25,7 +25,17 @@ pub fn run(
         println!("{}", serde_json::to_string(&beads)?);
     } else {
         for b in &beads {
-            println!("{}\t{}\t{}\t{}", b.id, b.status, b.rig, b.title);
+            // Phase 3 (#48 finding 2): the work axis on closed beads
+            // (`closed:blocked`) and the fail-fast dispatch marker on open
+            // ones (`open:dispatch-failed`) are list-level facts.
+            let status = match (&b.work_outcome, &b.dispatch_failure) {
+                (Some(wo), _) => format!("{}:{}", b.status, wo),
+                (None, Some(_)) if b.status != "closed" => {
+                    format!("{}:dispatch-failed", b.status)
+                }
+                _ => b.status.clone(),
+            };
+            println!("{}\t{}\t{}\t{}", b.id, status, b.rig, b.title);
         }
     }
     Ok(())

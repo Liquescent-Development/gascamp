@@ -83,6 +83,9 @@ Consequences camp's exporter encodes:
 | `rig` | `metadata."camp.rig"` | always |
 | `run_id` / `step_id` | `metadata."camp.run_id"` / `metadata."camp.step_id"` | when set |
 | `outcome` (`pass`/`fail`) | `metadata."gc.outcome"` | when set; camp values are valid gc vocabulary |
+| `work_outcome` (`shipped`/`no-op`/`blocked`/`abandoned`) | `metadata."gc.work_outcome"` | when set; gc's WorkOutcome vocabulary verbatim |
+| `work_commit` | `metadata."gc.work_commit"` | when set (only `shipped` carries an artifact) |
+| `work_branch` | `metadata."gc.work_branch"` | when set (only `shipped` carries an artifact) |
 | *(no source yet — see below)* | `metadata."gc.final_disposition"` | defined; emitted once camp records one; legal values `hard_fail`/`soft_fail` |
 | `close_reason` | `close_reason` | when set |
 | `closed_ts` | `closed_at` | RFC3339, when set |

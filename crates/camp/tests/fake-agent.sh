@@ -27,6 +27,14 @@
 #   FAKE_AGENT_TOUCH_TRANSCRIPT_LOOP  Phase 11: N iterations of appending
 #                              to $CAMP_TRANSCRIPT every 250 ms after the
 #                              claim — a working agent's heartbeat
+#   FAKE_AGENT_DELIVERY   Phase 3 delivery modes (obligations i/ii/vi):
+#                         "ship" = commit on the dispatched branch, close
+#                         pass+shipped with the real commit/branch facts;
+#                         "deadend" = the #34 scenario — root commit on a
+#                         stray branch of a baseless rig, shipped MUST be
+#                         rejected (exit 96 if the gate accepts), then
+#                         close fail+blocked; "blocked" = commit, then
+#                         close fail+blocked (worktree/branch kept)
 set -euo pipefail
 
 : "${CAMP_BIN:?fake-agent: CAMP_BIN must point at the camp binary}"
@@ -101,6 +109,47 @@ if [[ -n "${FAKE_AGENT_NUDGE_CLOSE:-}" ]]; then
   # fall through to the close — the revival the master plan demands.
   read -r _task_line
   read -r _nudge_line
+fi
+
+# Phase 3 delivery modes (dispatch-lifecycle §9 obligations i/ii/vi).
+# GITC pins identity/hermeticity for commits made by the fake worker.
+GITC=(-c user.email=fake@agent -c user.name=fake-agent -c commit.gpgsign=false)
+if [[ "${FAKE_AGENT_DELIVERY:-}" = "ship" ]]; then
+  # Obligation (ii): commit on the branch campd dispatched us onto
+  # (camp/<bead> in a worktree) and close shipped with the real facts.
+  git "${GITC[@]}" commit --allow-empty -m "fake ship for $CAMP_BEAD"
+  ship_commit="$(git rev-parse HEAD)"
+  ship_branch="$(git rev-parse --abbrev-ref HEAD)"
+  "$CAMP_BIN" close "$CAMP_BEAD" --outcome pass --reason "shipped by fake agent" \
+    --work-outcome shipped --work-commit "$ship_commit" --work-branch "$ship_branch"
+  exit 0
+fi
+if [[ "${FAKE_AGENT_DELIVERY:-}" = "deadend" ]]; then
+  # Obligation (i): the #34 scenario — a root commit on a stray branch of
+  # a baseless rig. The shipped close MUST be rejected by the gate; the
+  # honest record is fail+blocked. If the gate ever accepts, exit 96 so
+  # the test fails loudly (never silence the hole).
+  git "${GITC[@]}" checkout -b add-readme
+  echo "readme" > README.md
+  git "${GITC[@]}" add README.md
+  git "${GITC[@]}" commit -m "dead-end readme"
+  dead_commit="$(git rev-parse HEAD)"
+  if "$CAMP_BIN" close "$CAMP_BEAD" --outcome pass --reason "should be rejected" \
+       --work-outcome shipped --work-commit "$dead_commit" --work-branch add-readme; then
+    echo "fake-agent: THE SHIPPED GATE ACCEPTED A DEAD-END COMMIT" >&2
+    exit 96
+  fi
+  "$CAMP_BIN" close "$CAMP_BEAD" --outcome fail \
+    --reason "no base: the branch cannot land" --work-outcome blocked
+  exit 0
+fi
+if [[ "${FAKE_AGENT_DELIVERY:-}" = "blocked" ]]; then
+  # Obligation (vi): committed-but-unlandable work closes blocked; the
+  # worktree and bead branch must survive for forensics.
+  git "${GITC[@]}" commit --allow-empty -m "half-done work for $CAMP_BEAD"
+  "$CAMP_BIN" close "$CAMP_BEAD" --outcome fail \
+    --reason "cannot land: blocked by fake scenario" --work-outcome blocked
+  exit 0
 fi
 
 # Close spec (Phase 9): FAKE_AGENT_PLAN names a file whose FIRST line is

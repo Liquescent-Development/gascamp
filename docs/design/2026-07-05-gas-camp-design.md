@@ -205,6 +205,12 @@ camp/                      # ~/camps/<name>/ (multi-rig) or <repo>/.camp/ (singl
   worktrees/               # camp-managed worktrees (per agent isolation flag)
 ```
 
+The ledger schema is versioned (`schema_version` in `meta`; v2 as of the
+dispatch-lifecycle delivery phase — the WorkOutcome/delivery columns);
+opening a db with a different schema version is a hard error, never an
+auto-upgrade — re-init the camp (`camp backup`/`camp export` preserve
+history).
+
 ### 7.2. The event log
 
 One append-only `events` table is simultaneously the bead store's history
@@ -469,12 +475,29 @@ reuse is premature optimization; noted as a future option if spawn latency
 ever dominates.
 
 **Worker lifecycle contract** (the worker skill, shipped by the camp
-plugin): claim → work → emit milestones (`camp event emit`) → close with
-outcome → exit. Workers run under the permission mode and tool allowlist
-their agent definition declares. `campd`-spawned workers run
-non-interactively: anything the agent definition has not pre-allowed fails
-fast (and lands in the ledger) rather than hanging on a prompt no one
-will answer.
+plugin — the ONE contract source; campd's spawn prompt embeds the same
+file): claim → work → **deliver** → emit milestones (`camp event emit`) →
+close on both axes → exit. *Deliver:* work that changes a rig ships as a
+commit on the branch the worker was dispatched onto — `camp/<bead>` in a
+camp worktree (§12); the local bead branch, reachable and diffable, is the
+deliverable. v1 has no remote push, PR/MR, or merge step. *Close on both
+axes:* the control `outcome` (`pass`/`fail`/`skipped`) plus, for concrete
+work, the **WorkOutcome axis** — `shipped`/`no-op`/`blocked`/`abandoned`,
+Gas City's `gc.work_outcome` vocabulary mirrored verbatim (§15.2) as a
+separate, additive axis. `shipped` is mechanically gated by `camp close`:
+the named branch must be a real local branch, and the named commit must be
+reachable on it, descend from the session's dispatch-time base (recorded
+in `session.woke`), and not BE that base — shipped asserts at least one
+commit of new work; an unverifiable `shipped` is rejected, never recorded. Un-integrable work
+closes `fail` + `blocked` — its worktree and bead branch are kept, so
+nothing is lost. Workers run under the permission mode and tool allowlist
+their agent definition declares — **including resume turns**: `camp nudge`
+and patrol resume re-apply the model/permission-mode/allowedTools pins
+recorded at spawn (a session keeps its birth capability envelope; sessions
+registered without pins — the operator's own — resume under their own
+settings). `campd`-spawned workers run non-interactively: anything the
+agent definition has not pre-allowed fails fast (and lands in the ledger)
+rather than hanging on a prompt no one will answer.
 
 ### 8.5. Adoption
 
@@ -612,7 +635,8 @@ mypack/
   the reason, no worker is spawned, and nothing is stranded — the operator
   prepares the rig (a base commit) before dispatching code work.
 - The working-tree contract in one line: autonomous work happens on
-  `camp/<bead>`, reaped on clean pass, kept on failure; attended work —
+  `camp/<bead>`, reaped on clean pass, kept on failure; the bead branch is
+  the deliverable and outlives the reap (§8.4 delivery); attended work —
   the operator driving from their own session — is the documented standing
   exception (assumption A2, §17: a teammate's cwd is pinned to the parent
   session's directory, so worktree isolation is structurally unavailable
@@ -692,6 +716,9 @@ Three concrete contracts, each CI-enforced in the implementation plan:
 2. **Vocabulary mirror:** event type names and outcome metadata
    (`outcome`, `final_disposition`) match Gas City's where the concept
    exists; camp-specific names are additive, never redefinitions.
+   `work_outcome` mirrors gc's WorkOutcome set verbatim:
+   `shipped`/`no-op`/`blocked`/`abandoned` (pinned in gc-vocab.json,
+   CI-checked).
 3. **Agent definitions are Claude Code files**, which Gas City's Claude
    provider can drive — a camp pack's roles are reusable as city
    configuration with a thin `pack.toml` wrapper.

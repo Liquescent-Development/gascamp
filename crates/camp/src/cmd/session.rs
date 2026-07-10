@@ -41,6 +41,12 @@ struct WokeData<'a> {
     bead: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worktree: Option<&'a str>,
+    /// The rig's base commit at registration (Phase 3, Q4): the same
+    /// dispatch-time fact campd records, so the shipped gate has a descent
+    /// reference for attended sessions too. Absent without `--rig` or when
+    /// the rig has no base commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<&'a str>,
 }
 
 /// The `session.stopped` payload (mirrors the fold's `SessionEnd`).
@@ -117,6 +123,16 @@ pub fn register(
         return Ok(());
     }
 
+    // Phase 3 (Q4): record the rig's base commit at registration, exactly
+    // as campd does at dispatch. An unconfigured --rig name errors through
+    // config.rig — fail fast.
+    let base = match rig.as_deref() {
+        Some(r) => {
+            let config = camp_core::config::CampConfig::load(&camp.config_path())?;
+            crate::daemon::spawn::rig_base(&config.rig(r)?.path)
+        }
+        None => None,
+    };
     let data = serde_json::to_value(WokeData {
         name: &name,
         agent: &agent,
@@ -126,6 +142,7 @@ pub fn register(
         pid,
         bead: bead.as_deref(),
         worktree: worktree.as_deref(),
+        base: base.as_deref(),
     })?;
     let seq = ledger.append(EventInput {
         kind: EventType::SessionWoke,

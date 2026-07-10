@@ -109,6 +109,12 @@ struct Prep {
     agent_name: String,
     rig_path: PathBuf,
     make_worktree: bool,
+    /// The rig's base commit at dispatch time (None: non-repo/unborn HEAD)
+    /// — recorded in session.woke; the shipped gate's descent reference.
+    base: Option<String>,
+    /// The F7 pins as spawned (model, permission_mode, comma-joined
+    /// allowedTools) — recorded in session.woke; re-applied on resume.
+    pins: (Option<String>, Option<String>, Option<String>),
 }
 
 /// Decision D: assignee → rig default_agent → [dispatch].default_agent.
@@ -592,6 +598,12 @@ impl Dispatcher {
                 rig.path.display()
             ));
         }
+        let base = spawn::rig_base(&rig.path);
+        let pins = (
+            agent.model.clone(),
+            agent.permission_mode.clone(),
+            agent.tools.as_ref().map(|t| t.join(",")),
+        );
         let session_name = ledger
             .next_session_name(&self.config.camp.name, &agent.name)
             .map_err(|e| format!("session name allocation failed: {e}"))?;
@@ -638,6 +650,8 @@ impl Dispatcher {
             agent_name: agent.name,
             rig_path: rig.path.clone(),
             make_worktree,
+            base,
+            pins,
         })
     }
 
@@ -689,6 +703,22 @@ impl Dispatcher {
         });
         if let Some(wt) = &worktree {
             woke["worktree"] = serde_json::json!(wt);
+        }
+        // Phase 3: the dispatch-time base (the shipped gate's descent
+        // reference) and the F7 pins (re-applied on resume turns) ride the
+        // woke JSON like `worktree` — no sessions-table schema change.
+        if let Some(base) = &prep.base {
+            woke["base"] = serde_json::json!(base);
+        }
+        let (model, permission_mode, allowed_tools) = &prep.pins;
+        if let Some(m) = model {
+            woke["model"] = serde_json::json!(m);
+        }
+        if let Some(p) = permission_mode {
+            woke["permission_mode"] = serde_json::json!(p);
+        }
+        if let Some(t) = allowed_tools {
+            woke["allowed_tools"] = serde_json::json!(t);
         }
         ledger.append(EventInput {
             kind: EventType::SessionWoke,
@@ -2393,6 +2423,8 @@ mod tests {
             assignee: assignee.map(str::to_owned),
             claimed_by: None,
             outcome: None,
+            work_outcome: None,
+            dispatch_failure: None,
             labels: vec![],
             created_ts: "2026-07-07T00:00:00Z".into(),
             updated_ts: "2026-07-07T00:00:00Z".into(),

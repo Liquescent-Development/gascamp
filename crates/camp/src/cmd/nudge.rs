@@ -73,15 +73,11 @@ fn resume(
         anyhow!("session {session:?} has no recorded claude session id; cannot resume it")
     })?;
     let cwd = resume_cwd(config, row)?;
-    // Same argv shape as patrol's nudge-resume (daemon/patrol.rs) — one
-    // command vocabulary for resuming a session.
+    // Same argv vocabulary as patrol's nudge-resume (spawn::resume_argv):
+    // the recorded F7 pins ride every resume turn (#48 finding 1).
+    let pins = spawn_pins(row);
     let out = std::process::Command::new(&config.dispatch.command)
-        .arg("-p")
-        .arg("--resume")
-        .arg(sid)
-        .arg(text)
-        .arg("--output-format")
-        .arg("json")
+        .args(crate::daemon::spawn::resume_argv(sid, text, &pins))
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .output()
@@ -106,6 +102,17 @@ fn resume(
     })?;
     println!("{reply}");
     Ok(())
+}
+
+/// The registry row's recorded F7 pins as spawn's resume vocabulary
+/// (issue #48 finding 1): None fields = registered without pins = a bare
+/// resume, a recorded absence.
+fn spawn_pins(row: &SessionRow) -> crate::daemon::spawn::ResumePins {
+    crate::daemon::spawn::ResumePins {
+        model: row.model.clone(),
+        permission_mode: row.permission_mode.clone(),
+        allowed_tools: row.allowed_tools.clone(),
+    }
 }
 
 /// The session's recorded working directory — where claude computes the
