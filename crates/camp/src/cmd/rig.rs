@@ -69,7 +69,7 @@ pub fn add(
         bead: None,
         data: serde_json::json!({ "path": abs, "prefix": prefix }),
     })?;
-    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
+    crate::daemon::socket::poke_best_effort(camp, seq);
     append_rig_toml(&config_path, &rig)?;
     // A repo-local camp's runtime state must stay out of git (issue #35). Done
     // under the same advisory lock as the camp.toml write so concurrent adds

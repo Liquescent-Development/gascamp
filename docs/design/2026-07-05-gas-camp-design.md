@@ -153,15 +153,28 @@ agent definitions.
 
 ### campd lifecycle
 
-- **Liveness is the socket, per the no-status-files principle:** `campd`
-  serves a unix socket at `<camp>/campd.sock`. Alive means the socket
-  accepts; a stale socket file that refuses connections is removed and the
-  daemon restarted. No pidfiles, no lockfiles-as-status.
-- **Auto-start:** any `camp` verb that needs the daemon connects; on
-  failure it spawns `campd` (detached), logs the spawn as an event, and
-  retries once. `camp stop` shuts it down. An optional launchd agent (shipped
-  as an example plist, not installed by default) starts `campd` at login for
-  users who want orders firing without first running a `camp` command.
+- **Liveness is an answered request, per the no-status-files principle:**
+  `campd` serves a unix socket at `<camp>/campd.sock`. Alive means a
+  request on the socket gets a response — an event-loop round-trip (e.g.
+  the status op), never a bare connect: the kernel's listen backlog
+  accepts connections even while the event loop is wedged, so
+  accept-ability only proves a listener exists. A stale socket file that
+  refuses connections is removed and the daemon restarted. A socket that
+  accepts but does not answer within the CLI's request timeout is a
+  wedged daemon: the verb fails loudly, naming the pid recorded in the
+  ledger's `campd.started` event — `kill -9` it (a supported shutdown)
+  and rerun the verb. No pidfiles, no lockfiles-as-status.
+  (Bind-conflict detection — may a second campd start? — still keys on
+  accept-ability alone: a wedged daemon owns its socket until the
+  operator kills it; auto-replacing it would hide the wedge.)
+- **Auto-start:** any `camp` verb that needs the daemon sends its request
+  — the request is the liveness probe, on the same connection. Only a
+  refused/absent socket triggers the spawn: `campd` starts detached, the
+  spawn is logged as an event, and the request retries exactly once. An
+  unanswered request is a loud error, never a second daemon. `camp stop`
+  shuts it down. An optional launchd agent (shipped as an example plist,
+  not installed by default) starts `campd` at login for users who want
+  orders firing without first running a `camp` command.
 - **Crash-only design:** `campd` holds no exclusive state. On start it
   opens the ledger, processes any events past its cursor, runs adoption
   (§8.5), and continues. `kill -9` is a supported shutdown method.
@@ -190,7 +203,7 @@ tables; **sling** is `camp sling`;
 ```
 camp/                      # ~/camps/<name>/ (multi-rig) or <repo>/.camp/ (single rig)
   camp.toml                # rigs, packs, orders, caps, stall thresholds
-  campd.sock               # daemon socket (liveness = accepts connections)
+  campd.sock               # daemon socket (liveness = answers requests; §5)
   camp.db                  # THE ledger (SQLite, WAL mode): append-only events
                            #   table (seq-numbered — the bus and the audit),
                            #   current beads + deps, session registry, memory,

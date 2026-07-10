@@ -4,6 +4,7 @@
 //! readiness on stdout, and sleeps on the socket.
 
 pub mod autostart;
+pub mod bounded;
 pub mod cursor;
 pub mod dispatch;
 pub mod event_loop;
@@ -74,12 +75,16 @@ pub fn run(camp: &CampDir) -> Result<()> {
         .set_nonblocking(true)
         .context("setting the SIGCHLD pipe non-blocking")?;
 
+    // The pid rides campd.started (issue #55): the ONE pid source that
+    // survives a wedge — a wedged campd cannot answer the status op, and
+    // there are no pidfiles (spec §5). Recorded after the bind wins, so
+    // the last campd.started always names the socket's current holder.
     ledger.append(EventInput {
         kind: EventType::CampdStarted,
         rig: None,
         actor: "campd".into(),
         bead: None,
-        data: serde_json::json!({}),
+        data: serde_json::json!({ "pid": std::process::id() }),
     })?;
 
     // Declared automation must parse or campd refuses to start (fail
@@ -299,6 +304,15 @@ mod tests {
         let events = ledger.events_range(1, None).unwrap();
         let types: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(types, vec!["campd.started", "campd.stopped"]);
+        // Issue #55: campd.started records the daemon's pid — the one pid
+        // source that survives a wedge (a wedged campd cannot answer the
+        // status op), read back by the CLI's CampdUnresponsive error.
+        assert_eq!(
+            events[0].data["pid"],
+            serde_json::json!(std::process::id()),
+            "campd.started must carry the daemon pid: {:?}",
+            events[0].data
+        );
         assert_eq!(
             ledger.cursor(cursor::CAMPD_CURSOR).unwrap(),
             1,

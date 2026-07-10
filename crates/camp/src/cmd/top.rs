@@ -28,7 +28,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
 /// exiting 0 — visible degradation, not silence (spec §11). The plugin's
 /// statusline snippet is a thin wrapper over this.
 pub fn statusline(camp: &CampDir) -> Result<()> {
-    match socket::request(&camp.socket_path(), &Request::Status) {
+    match socket::request(camp, &Request::Status) {
         Ok(Response::Status { summary, red, .. }) => {
             println!(
                 "▲{} ●{} ✖{}",

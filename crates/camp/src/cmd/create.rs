@@ -50,7 +50,7 @@ pub fn run(
         bead: Some(id.clone()),
         data,
     })?;
-    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
+    crate::daemon::socket::poke_best_effort(camp, seq);
     println!("{id}");
     Ok(())
 }

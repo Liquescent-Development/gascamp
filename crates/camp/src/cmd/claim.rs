@@ -14,7 +14,7 @@ pub fn run(camp: &CampDir, bead: String, session: String) -> Result<()> {
         bead: Some(bead.clone()),
         data: serde_json::json!({ "session": session }),
     })?;
-    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
+    crate::daemon::socket::poke_best_effort(camp, seq);
     println!("claimed {bead}");
     Ok(())
 }
