@@ -153,6 +153,125 @@ fn output_json_embeds_the_file_and_stdin() {
     assert_eq!(data["output"]["n"], 3);
 }
 
+// ---- Phase 3 (#34): the WorkOutcome axis at the CLI --------------------
+
+/// Phase 3 (#34): the WorkOutcome axis at the CLI. no-op/blocked/abandoned
+/// need no git facts — accepted here; shipped is gated (Task 7 tests).
+#[test]
+fn close_records_a_no_op_work_outcome() {
+    let dir = camp_with_bead();
+    camp()
+        .current_dir(dir.path())
+        .args([
+            "close",
+            "gc-1",
+            "--outcome",
+            "pass",
+            "--work-outcome",
+            "no-op",
+            "--reason",
+            "already satisfied",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("closed gc-1 (pass, no-op)"));
+}
+
+#[test]
+fn close_rejects_incoherent_axis_pairings_at_the_prompt() {
+    let dir = camp_with_bead();
+    // the #34 lie: pass over blocked work — rejected before any append
+    camp()
+        .current_dir(dir.path())
+        .args([
+            "close",
+            "gc-1",
+            "--outcome",
+            "pass",
+            "--work-outcome",
+            "blocked",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("requires --outcome fail"));
+    // artifact flags without the axis
+    camp()
+        .current_dir(dir.path())
+        .args([
+            "close",
+            "gc-1",
+            "--outcome",
+            "pass",
+            "--work-commit",
+            "deadbeef",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--work-outcome shipped"));
+    // clap vocabulary: an unknown work outcome is a usage error
+    camp()
+        .current_dir(dir.path())
+        .args([
+            "close",
+            "gc-1",
+            "--outcome",
+            "pass",
+            "--work-outcome",
+            "delivered",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+/// Obligation (iv): a close WITHOUT the new flags appends a payload with
+/// exactly the v1 keys — the control axis and its event shape are
+/// unchanged, byte for byte.
+#[test]
+fn a_plain_close_payload_is_byte_identical_to_v1() {
+    let dir = camp_with_bead();
+    camp()
+        .current_dir(dir.path())
+        .args(["close", "gc-1", "--outcome", "pass", "--reason", "done"])
+        .assert()
+        .success();
+    let data = close_event_data(&dir);
+    let mut keys: Vec<&str> = data
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["outcome", "reason"]);
+}
+
+/// Decision 10 lockstep: every close flag the worker skill advertises is a
+/// real flag — the contract text and the CLI cannot drift.
+#[test]
+fn close_help_documents_every_flag_the_worker_skill_advertises() {
+    let out = camp().args(["close", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&out.stdout).to_string();
+    let skill = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugin/skills/worker/SKILL.md"),
+    )
+    .unwrap();
+    for flag in [
+        "--work-outcome",
+        "--work-commit",
+        "--work-branch",
+        "--transient",
+        "--output-json",
+    ] {
+        assert!(skill.contains(flag), "worker skill should advertise {flag}");
+        assert!(
+            help.contains(flag),
+            "camp close --help must document {flag}"
+        );
+    }
+}
+
 #[test]
 fn malformed_output_json_fails_fast_naming_the_source() {
     let dir = camp_with_bead();
