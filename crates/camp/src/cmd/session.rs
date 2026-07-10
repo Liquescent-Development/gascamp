@@ -129,7 +129,7 @@ pub fn register(
     let base = match rig.as_deref() {
         Some(r) => {
             let config = camp_core::config::CampConfig::load(&camp.config_path())?;
-            crate::daemon::spawn::rig_base(&config.rig(r)?.path)
+            crate::daemon::spawn::rig_base(&config.rig(r)?.path, config.dispatch.exec_timeout()?)?
         }
         None => None,
     };
@@ -151,7 +151,7 @@ pub fn register(
         bead,
         data,
     })?;
-    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
+    crate::daemon::socket::poke_best_effort(camp, seq);
     Ok(())
 }
 
@@ -195,6 +195,6 @@ pub fn end(
         bead: None,
         data,
     })?;
-    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
+    crate::daemon::socket::poke_best_effort(camp, seq);
     Ok(())
 }

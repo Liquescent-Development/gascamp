@@ -49,6 +49,14 @@ pub struct DispatchConfig {
     /// Camp-wide sling routing default (spec §8.1); rigs may override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_agent: Option<String>,
+    /// Bound on any subprocess campd runs inline on its single-threaded
+    /// event loop — git worktree ops, adoption probes (issue #55). A hung
+    /// one is killed at this deadline and surfaces as an error instead of
+    /// wedging the daemon. A jiff-friendly duration string, strictly
+    /// positive; a bound on the loop's worst-case stall, not a wakeup
+    /// (invariant 1).
+    #[serde(default = "default_exec_timeout")]
+    pub exec_timeout: String,
 }
 
 fn default_max_workers() -> usize {
@@ -59,12 +67,17 @@ fn default_command() -> PathBuf {
     PathBuf::from("claude")
 }
 
+fn default_exec_timeout() -> String {
+    "60s".to_owned()
+}
+
 impl Default for DispatchConfig {
     fn default() -> Self {
         DispatchConfig {
             max_workers: default_max_workers(),
             command: default_command(),
             default_agent: None,
+            exec_timeout: default_exec_timeout(),
         }
     }
 }
@@ -72,6 +85,20 @@ impl Default for DispatchConfig {
 impl DispatchConfig {
     fn is_default(&self) -> bool {
         *self == DispatchConfig::default()
+    }
+
+    /// `exec_timeout` resolved to a std Duration for deadline arithmetic.
+    /// Validated at parse, so an Err here means the config was built by
+    /// hand — still surfaced, never defaulted (invariant 5).
+    pub fn exec_timeout(&self) -> Result<std::time::Duration, CoreError> {
+        let d = crate::patrol::parse_duration(&self.exec_timeout)
+            .map_err(|e| CoreError::Config(format!("[dispatch] exec_timeout: {e}")))?;
+        std::time::Duration::try_from(d).map_err(|e| {
+            CoreError::Config(format!(
+                "[dispatch] exec_timeout {:?}: {e}",
+                self.exec_timeout
+            ))
+        })
     }
 }
 
@@ -166,6 +193,9 @@ impl CampConfig {
         // Same law for [patrol]: a typo'd threshold must not become dead
         // config (validation only; campd resolves the typed values later).
         crate::patrol::PatrolConfig::from_section(&cfg.patrol)?;
+        // And for [dispatch] exec_timeout (issue #55): the subprocess
+        // bound must resolve or the config is refused.
+        cfg.dispatch.exec_timeout()?;
         Ok(cfg)
     }
 
@@ -228,6 +258,42 @@ prefix = "gc"
     fn missing_rig_is_unknown_rig() {
         let cfg = CampConfig::parse("[camp]\nname=\"d\"\n").unwrap();
         assert!(matches!(cfg.rig("nope"), Err(CoreError::UnknownRig(n)) if n == "nope"));
+    }
+
+    /// Issue #55: every subprocess campd runs inline on its event loop is
+    /// bounded by `[dispatch] exec_timeout` — defaulted, overridable
+    /// (visible config, the fake-agent precedent), resolved to a std
+    /// Duration for the deadline arithmetic.
+    #[test]
+    fn dispatch_exec_timeout_defaults_and_resolves() {
+        let cfg = CampConfig::parse("[camp]\nname=\"d\"\n").unwrap();
+        assert_eq!(cfg.dispatch.exec_timeout, "60s");
+        assert_eq!(
+            cfg.dispatch.exec_timeout().unwrap(),
+            std::time::Duration::from_secs(60)
+        );
+        let cfg =
+            CampConfig::parse("[camp]\nname=\"d\"\n[dispatch]\nexec_timeout = \"2s\"\n").unwrap();
+        assert_eq!(
+            cfg.dispatch.exec_timeout().unwrap(),
+            std::time::Duration::from_secs(2)
+        );
+    }
+
+    /// A typo'd exec_timeout must not become dead config (the max_workers
+    /// / [patrol] law): rejected at parse, naming the key.
+    #[test]
+    fn dispatch_exec_timeout_rejects_zero_negative_and_junk_at_parse() {
+        for bad in ["0s", "-5s", "banana"] {
+            let err = CampConfig::parse(&format!(
+                "[camp]\nname=\"d\"\n[dispatch]\nexec_timeout = \"{bad}\"\n"
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("exec_timeout"),
+                "{bad:?}: the error must name the failing key: {err}"
+            );
+        }
     }
 
     #[test]

@@ -14,13 +14,15 @@ use crate::config::PatrolSection;
 use crate::error::CoreError;
 
 /// Parse a strictly positive friendly duration ("10m", "90s", "300ms").
+/// Section-agnostic (issue #55: `[dispatch] exec_timeout` and agent
+/// frontmatter `stall_after` reuse it) — callers add their own key label.
 pub fn parse_duration(s: &str) -> Result<SignedDuration, CoreError> {
     let d: SignedDuration = s
         .parse()
-        .map_err(|e| CoreError::Config(format!("[patrol] duration {s:?} does not parse: {e}")))?;
+        .map_err(|e| CoreError::Config(format!("duration {s:?} does not parse: {e}")))?;
     if d.is_negative() || d.is_zero() {
         return Err(CoreError::Config(format!(
-            "[patrol] duration {s:?} must be strictly positive"
+            "duration {s:?} must be strictly positive"
         )));
     }
     Ok(d)
@@ -36,10 +38,16 @@ pub struct PatrolConfig {
 
 impl PatrolConfig {
     pub fn from_section(section: &PatrolSection) -> Result<PatrolConfig, CoreError> {
+        fn labeled(
+            key: &str,
+            result: Result<SignedDuration, CoreError>,
+        ) -> Result<SignedDuration, CoreError> {
+            result.map_err(|e| CoreError::Config(format!("[patrol] {key}: {e}")))
+        }
         Ok(PatrolConfig {
-            stall_after: parse_duration(&section.stall_after)?,
+            stall_after: labeled("stall_after", parse_duration(&section.stall_after))?,
             restart_budget: section.restart_budget,
-            release_grace: parse_duration(&section.release_grace)?,
+            release_grace: labeled("release_grace", parse_duration(&section.release_grace))?,
         })
     }
 }
@@ -182,10 +190,40 @@ mod tests {
         for bad in ["0s", "-5m", "", "banana", "10"] {
             let err = parse_duration(bad).unwrap_err();
             assert!(
-                err.to_string().contains("patrol"),
-                "{bad:?}: error must locate the [patrol] duration: {err}"
+                err.to_string().contains("duration"),
+                "{bad:?}: the error must say what failed: {err}"
+            );
+            assert!(
+                !err.to_string().contains("patrol"),
+                "{bad:?}: parse_duration is section-agnostic (issue #55: [dispatch] \
+                 exec_timeout and agent stall_after reuse it); the section label is \
+                 the caller's to add: {err}"
             );
         }
+    }
+
+    /// The section label moved to the caller: from_section still locates
+    /// the failing [patrol] key for the operator.
+    #[test]
+    fn from_section_labels_the_failing_patrol_key() {
+        let section = PatrolSection {
+            stall_after: "banana".into(),
+            ..PatrolSection::default()
+        };
+        let err = PatrolConfig::from_section(&section).unwrap_err();
+        assert!(
+            err.to_string().contains("[patrol] stall_after"),
+            "got: {err}"
+        );
+        let section = PatrolSection {
+            release_grace: "0s".into(),
+            ..PatrolSection::default()
+        };
+        let err = PatrolConfig::from_section(&section).unwrap_err();
+        assert!(
+            err.to_string().contains("[patrol] release_grace"),
+            "got: {err}"
+        );
     }
 
     #[test]

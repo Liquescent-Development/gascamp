@@ -1,7 +1,11 @@
 //! The campd socket protocol (master plan Phase 7, pinned): newline-delimited
-//! JSON over `<camp>/campd.sock`. Liveness IS the socket (spec §5): alive
-//! means it accepts; a stale file that refuses connections is unlinked and
-//! rebound; a live listener makes a second daemon refuse to start.
+//! JSON over `<camp>/campd.sock`. Liveness is an ANSWERED REQUEST (spec §5
+//! as amended by issue #55): alive means an event-loop round-trip, because
+//! the kernel's listen backlog accepts connections even when the loop is
+//! wedged. Bind-conflict detection is the narrower accept test: a stale
+//! file that refuses connections is unlinked and rebound; a live listener
+//! makes a second daemon refuse to start (wedged or not — replacing a
+//! wedged daemon is the operator's kill -9, never a silent takeover).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -12,6 +16,8 @@ use anyhow::{Context, Result, bail};
 use camp_core::Seq;
 use camp_core::ledger::StatusSummary;
 use serde::{Deserialize, Serialize};
+
+use crate::campdir::CampDir;
 
 /// One request line. Internally tagged on `op`; an unknown op is a parse
 /// error (there is no wildcard arm to hide behind).
@@ -90,7 +96,10 @@ pub enum Response {
 /// loser ends up live but orphaned on an unlinked inode (split brain). The
 /// lock releases on drop / process exit, so a crash never wedges startup
 /// (crash-only, spec §5). The lock file is a serialization primitive, not
-/// status: liveness stays "the socket accepts" — no pidfiles, no
+/// status: bind-conflict detection stays "the socket accepts" (a wedged
+/// daemon still owns its socket — issue #55 puts liveness-for-service at
+/// an answered request, but replacing a stuck daemon is the operator's
+/// kill -9, never a silent takeover here) — no pidfiles, no
 /// lockfiles-as-status.
 pub fn bind_or_replace(path: &Path) -> Result<UnixListener> {
     // Literally `<socket>.lock` (campd.sock.lock) — appended, not
@@ -130,13 +139,63 @@ pub fn bind_or_replace(path: &Path) -> Result<UnixListener> {
     }
 }
 
-/// Send one request, read one response line. The timeouts bound a single
-/// CLI operation against a wedged daemon — they are not wakeups; the
-/// daemon's own poll timeout stays None (invariant 1).
-pub fn request(path: &Path, request: &Request) -> Result<Response> {
-    let stream = UnixStream::connect(path)
+/// How long one CLI request may wait on campd before the CLI declares
+/// the daemon wedged (issue #55). A bound on one operation, not a wakeup
+/// — the daemon's own poll timeout stays None (invariant 1). Because
+/// every daemon-needing verb sends a real request, every operator
+/// interaction doubles as an event-loop liveness probe at zero standing
+/// cost.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The wedge shape (issue #55): the kernel's listen backlog accepted the
+/// connection — that happens even when the event loop never runs accept —
+/// but no response line arrived within REQUEST_TIMEOUT. Typed so callers
+/// (the auto-start path) can tell "something owns the socket but does not
+/// serve it" from "nothing is running"; only the latter may auto-start.
+#[derive(Debug)]
+pub struct CampdUnresponsive {
+    /// From the ledger's last campd.started event; None when no recorded
+    /// start carries one (a pre-#55 ledger, or no ledger at all).
+    pub campd_pid: Option<u32>,
+    pub socket: std::path::PathBuf,
+}
+
+impl std::fmt::Display for CampdUnresponsive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secs = REQUEST_TIMEOUT.as_secs();
+        match self.campd_pid {
+            Some(pid) => write!(
+                f,
+                "campd (pid {pid}, per the ledger's last campd.started) accepted the \
+                 connection but sent no response within {secs}s — its event loop is \
+                 wedged or stuck in one long operation; `kill -9 {pid}` is a supported \
+                 shutdown (crash-only: the ledger keeps the whole story), then rerun \
+                 the verb to start a fresh campd"
+            ),
+            None => write!(
+                f,
+                "campd accepted the connection but sent no response within {secs}s — \
+                 its event loop is wedged or stuck in one long operation (pid unknown: \
+                 no campd.started event records one; `lsof {}` finds the holder); \
+                 kill -9 it — a supported shutdown (crash-only: the ledger keeps the \
+                 whole story) — then rerun the verb to start a fresh campd",
+                self.socket.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CampdUnresponsive {}
+
+/// Send one request, read one response line. REQUEST_TIMEOUT bounds the
+/// operation against a wedged daemon — not a wakeup; the daemon's own
+/// poll timeout stays None (invariant 1). A timeout surfaces as the
+/// actionable `CampdUnresponsive` error naming the campd pid (issue #55).
+pub fn request(camp: &CampDir, request: &Request) -> Result<Response> {
+    let path = camp.socket_path();
+    let stream = UnixStream::connect(&path)
         .with_context(|| format!("connecting to campd at {}", path.display()))?;
-    request_on(stream, request)
+    request_on(stream, request).map_err(|e| mark_wedge(camp, e))
 }
 
 /// Like `request`, but campd-not-listening is a NORMAL state, not an error
@@ -148,9 +207,10 @@ pub fn request(path: &Path, request: &Request) -> Result<Response> {
 /// Only an absent/refusing socket maps to Ok(None); a campd that accepts
 /// and then misbehaves (or answers an Error line) still surfaces as Err —
 /// fail fast.
-pub fn request_if_up(path: &Path, request: &Request) -> Result<Option<Response>> {
+pub fn request_if_up(camp: &CampDir, request: &Request) -> Result<Option<Response>> {
     use std::io::ErrorKind;
-    let stream = match UnixStream::connect(path) {
+    let path = camp.socket_path();
+    let stream = match UnixStream::connect(&path) {
         Ok(stream) => stream,
         Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
             return Ok(None);
@@ -159,14 +219,50 @@ pub fn request_if_up(path: &Path, request: &Request) -> Result<Option<Response>>
             return Err(e).with_context(|| format!("connecting to campd at {}", path.display()));
         }
     };
-    request_on(stream, request).map(Some)
+    request_on(stream, request)
+        .map(Some)
+        .map_err(|e| mark_wedge(camp, e))
+}
+
+/// Reclassify a timed-out request as the actionable wedge error (issue
+/// #55): the root cause of a read/write deadline is the raw io error
+/// (WouldBlock on macOS, TimedOut elsewhere) — cryptic and inactionable
+/// ("Resource temporarily unavailable"). Everything else passes through
+/// untouched.
+fn mark_wedge(camp: &CampDir, err: anyhow::Error) -> anyhow::Error {
+    use std::io::ErrorKind;
+    let timed_out = err
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut));
+    if !timed_out {
+        return err;
+    }
+    anyhow::Error::new(CampdUnresponsive {
+        campd_pid: last_recorded_campd_pid(camp),
+        socket: camp.socket_path(),
+    })
+}
+
+/// The pid from the ledger's last campd.started event — recorded at every
+/// daemon start precisely because a WEDGED campd cannot be asked (the
+/// status op is the only other place its pid lives). Option, not Result:
+/// this decorates an error that is already being reported; a ledger that
+/// cannot yield the pid downgrades the message to "pid unknown" (stated,
+/// not silent), never masks the wedge.
+fn last_recorded_campd_pid(camp: &CampDir) -> Option<u32> {
+    let ledger = camp_core::ledger::Ledger::open_read_only(&camp.db_path()).ok()?;
+    let starts = ledger
+        .events_of_type(camp_core::event::EventType::CampdStarted)
+        .ok()?;
+    u32::try_from(starts.last()?.data.get("pid")?.as_u64()?).ok()
 }
 
 /// The shared request body: one line out, one line back, on an
 /// already-open connection.
 fn request_on(mut stream: UnixStream, request: &Request) -> Result<Response> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+    stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
     let mut line = serde_json::to_string(request)?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;
@@ -187,8 +283,8 @@ fn request_on(mut stream: UnixStream, request: &Request) -> Result<Response> {
 /// down, writes still succeed and it catches up from its processed-cursor
 /// on start"). This is the one sanctioned ignore-the-error site in camp;
 /// a poke never auto-starts the daemon.
-pub fn poke_best_effort(path: &Path, seq: Seq) {
-    let _ = request(path, &Request::Poke { seq });
+pub fn poke_best_effort(camp: &CampDir, seq: Seq) {
+    let _ = request(camp, &Request::Poke { seq });
 }
 
 #[cfg(test)]
@@ -277,7 +373,10 @@ mod tests {
 
         let _no_spawns = crate::daemon::spawn_probe_guard();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("campd.sock");
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        let path = camp.socket_path();
         let listener = UnixListener::bind(&path).unwrap();
         let accepts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&accepts);
@@ -298,12 +397,77 @@ mod tests {
             }
         });
 
-        let response = request_if_up(&path, &Request::Status).unwrap();
+        let response = request_if_up(&camp, &Request::Status).unwrap();
         assert!(matches!(response, Some(Response::Ok { ok: true })));
         assert_eq!(
             accepts.load(Ordering::SeqCst),
             1,
             "request_if_up must open exactly ONE connection (no separate liveness probe)"
+        );
+    }
+
+    /// Issue #55 scope 2: a campd whose event loop never serves the
+    /// request fails the CLI verb loudly WITHIN ITS BOUND — naming the
+    /// campd pid recorded in the ledger and the kill -9 remedy — never
+    /// hangs. The bare bound listener IS the wedge simulator: its kernel
+    /// backlog accepts the connect, but nothing ever reads or answers,
+    /// exactly like a daemon stuck mid-syscall.
+    #[test]
+    fn a_wedged_campd_fails_the_request_loudly_within_its_bound() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        // the ledger knows the daemon's pid: campd.started records it
+        let mut ledger = camp_core::ledger::Ledger::open(&camp.db_path()).unwrap();
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::CampdStarted,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({ "pid": 424242 }),
+            })
+            .unwrap();
+        drop(ledger);
+        let _wedged = UnixListener::bind(camp.socket_path()).unwrap();
+
+        let start = std::time::Instant::now();
+        let err = request(&camp, &Request::Status).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < REQUEST_TIMEOUT * 2 + Duration::from_secs(2),
+            "bounded, never a hang: took {elapsed:?}"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("424242"), "must name the campd pid: {msg}");
+        assert!(msg.contains("kill -9"), "must name the remedy: {msg}");
+        assert!(
+            err.downcast_ref::<CampdUnresponsive>().is_some(),
+            "typed, so the auto-start path can tell a wedge from a refusal: {msg}"
+        );
+    }
+
+    /// The pid-unknown flavor (no campd.started carries one — e.g. a
+    /// pre-#55 ledger): still loud, still bounded, still actionable; the
+    /// missing pid is stated, never silently omitted.
+    #[test]
+    fn a_wedged_campd_without_a_recorded_pid_is_still_actionable() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        drop(camp_core::ledger::Ledger::open(&camp.db_path()).unwrap()); // empty ledger
+        let _wedged = UnixListener::bind(camp.socket_path()).unwrap();
+
+        let err = request(&camp, &Request::Status).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("kill -9"), "must name the remedy: {msg}");
+        assert!(
+            msg.contains("pid unknown"),
+            "the missing pid must be stated: {msg}"
         );
     }
 
@@ -313,12 +477,14 @@ mod tests {
     fn request_if_up_returns_none_when_no_daemon_listens() {
         let _no_spawns = crate::daemon::spawn_probe_guard();
         let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("campd.sock");
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
         // no listener at all
-        assert!(request_if_up(&sock, &Request::Status).unwrap().is_none());
+        assert!(request_if_up(&camp, &Request::Status).unwrap().is_none());
         // a stale file that refuses connections is also "not up"
-        drop(UnixListener::bind(&sock).unwrap());
-        assert!(request_if_up(&sock, &Request::Status).unwrap().is_none());
+        drop(UnixListener::bind(camp.socket_path()).unwrap());
+        assert!(request_if_up(&camp, &Request::Status).unwrap().is_none());
     }
 
     #[test]

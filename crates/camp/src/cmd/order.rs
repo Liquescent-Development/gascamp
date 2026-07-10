@@ -117,7 +117,7 @@ pub fn run_order(camp: &CampDir, name: &str) -> Result<()> {
     };
     let mut ledger = Ledger::open(&camp.db_path())?;
     let seq = ledger.append(fired_input(&order.name, &FireCause::Manual))?;
-    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
+    crate::daemon::socket::poke_best_effort(camp, seq);
     println!(
         "fired order {} (seq {seq}); campd cooks and dispatches it",
         order.name

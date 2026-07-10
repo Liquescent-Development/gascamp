@@ -37,7 +37,7 @@ pub fn run(camp: &CampDir, session: String, text: String) -> Result<()> {
         // campd-not-listening is a normal state (on-demand daemon), and a
         // fresh campd holds no pipes — Ok(None) routes to resume (A4).
         match socket::request_if_up(
-            &camp.socket_path(),
+            camp,
             &Request::Nudge {
                 session: session.clone(),
                 text: text.clone(),

@@ -29,6 +29,6 @@ pub fn run(
         bead,
         data: serde_json::json!({ "text": text }),
     })?;
-    crate::daemon::socket::poke_best_effort(&camp.socket_path(), seq);
+    crate::daemon::socket::poke_best_effort(camp, seq);
     Ok(())
 }
