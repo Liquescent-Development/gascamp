@@ -2041,3 +2041,43 @@ If the harness demotes it to background, poll `gh pr checks` with cheap foregrou
 4. **Coherence rule strictness** (blocked/abandoned ⇒ `fail` exactly): campd's finalization `skipped` closes never carry a work outcome, so `skipped` needs no pairing rule. If a future control flow wants `skipped`+axis, that is a one-line fold change with a vocab test.
 5. **Obligation-(vi) reading** (decision 8): "kept when not shipped" is satisfied via coherence (blocked/abandoned ⇒ fail ⇒ kept) with the dispose rule unchanged; a `no-op` pass still reaps (nothing to lose; spec §12 "reaped on clean pass" unchanged). Pinned by the Task 8 blocked-keeps test.
 6. **Task 2 advertises flags Task 5 implements** (decision 10, kickoff order b-before-c honored): drift-proofed by Task 5's `--help` lockstep test; both land in this one PR.
+
+## Execution notes (deviations found while executing, 2026-07-10)
+
+All plan assertions landed unweakened; every deviation below is a mechanical
+adaptation, recorded per the Phase 1/2 precedent.
+
+1. **Test-module locations (T4, T10):** `fold.rs` has no `#[cfg(test)]`
+   module — fold behavior is tested from `ledger/mod.rs`'s tests module, so
+   the coherence test and the dispatch_failed marker test live there, in that
+   module's `temp_ledger`/`seeded_bead` idiom.
+2. **B2 sweep found one extra pin (T4):** besides the required
+   `mod.rs:2921` update, the broadened grep surfaced `assert_eq!(version, "1")`
+   in the schema-creation test (`ledger/mod.rs:~1387`) — updated to `"2"`.
+3. **rustfmt line-wraps (T1)** of one plan-verbatim assert; folded into the
+   Task 1 commit via backup-protected autosquash rebase before anything was
+   pushed.
+4. **Clap hyphen-value bypass (T7):** the flag-injection test passes
+   `--work-commit=-x` in `=`-joined form — clap's own hyphen handling would
+   otherwise reject at the parser and camp's guard (the subject under test)
+   would never fire. Documented at the helper.
+5. **T8's three daemon tests passed on first run** — sanctioned by the plan's
+   own Step 3 note (Tasks 1–7 had landed all mechanics; the tests are the
+   binding end-to-end pins). No assertion was touched.
+6. **T11 golden premise:** export_golden/export_city keep their own fixtures
+   (the unit `seed` change did not reach them); export_golden's gc-1 close was
+   extended with the shipped axis and the golden regenerated
+   (`UPDATE_EXPORT_GOLDEN=1`, diff verified to the one line). export_city
+   asserts order translation/pack layout, not bead metadata — unmodified.
+7. **T9 fixtures:** cli_nudge gained a `write_agent` helper (daemon_dispatch's
+   idiom); the patrol resume-pins extension uses the plan's bare-shape branch
+   (its pipeless fixture records no pins).
+8. **T12 e2e Step 4:** real claude (2.1.206) present; one authorized
+   `make e2e` attempt died in the test's own scaffold before any worker
+   spawned (zero API spend): the machine-wide broken ssh-agent signing hit
+   e2e's `git_init_commit`, which lacks `-c commit.gpgsign=false`. Fallback
+   `cargo test -p camp --test e2e`: 5 passed, 1 ignored (`e2e_full` stays
+   operator-gated). Possible one-line follow-up for the lead, out of scope
+   here.
+9. **T6 spawn test** carries `spawn_probe_guard()` — the file's mandatory
+   idiom for process-spawning tests (macOS fd-inheritance flake guard).
