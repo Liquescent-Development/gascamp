@@ -30,6 +30,9 @@ camp claim <bead> --session <name>
 This moves the bead `open → in_progress` and attributes it to you. If the
 claim fails (already claimed, unknown bead), stop — do not do the work twice.
 
+Then read it: `camp show <bead>` — the title, description, and history are
+the task.
+
 ## 3. work — do the task
 
 Make the change. You run under the tools and permission mode your agent

@@ -11,23 +11,41 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{Context, Result, bail};
 use camp_core::pack::AgentDef;
 
-/// The worker-contract instructions (spec §8.4: claim → milestones →
-/// close → exit). `{bead}` and `{session}` are substituted per spawn; the
-/// richer worker *skill* is Phase 12 pack content — this is the mechanical
-/// floor every campd-spawned worker gets.
-const WORKER_CONTRACT: &str = "You are a Gas Camp worker session working exactly one bead.\n\
-Contract, in order:\n\
-1. Claim it: run `camp claim {bead} --session {session}`\n\
-2. Read it: `camp show {bead}`\n\
-3. Do the work in the current directory.\n\
-4. As you hit milestones, record them: `camp event emit \"<one line>\" --bead {bead} --session {session}`\n\
-5. Close it: `camp close {bead} --outcome pass --reason \"<one line>\"` (or --outcome fail)\n\
-6. Exit. Do not start unrelated work. CAMP_DIR is already set for the camp CLI.\n";
+/// The ONE worker-contract source (dispatch-lifecycle Phase 3, Q5): the
+/// worker skill shipped by the plugin. Embedded at compile time so the
+/// mechanical floor campd injects and the skill a plugin user reads can
+/// never drift — obligation (v) pins the equality by test.
+const WORKER_SKILL: &str = include_str!("../../../../plugin/skills/worker/SKILL.md");
+
+/// The skill body: frontmatter stripped. The skill uses `<bead>`/`<name>`
+/// placeholders as documentation; task_prompt binds them per spawn.
+fn skill_body() -> String {
+    let mut lines = WORKER_SKILL.lines();
+    // A malformed skill (no frontmatter fence) is a build defect, caught
+    // by the tests below — fall through to the full text rather than
+    // panicking in library code.
+    if lines.next() != Some("---") {
+        return WORKER_SKILL.to_owned();
+    }
+    lines
+        .skip_while(|l| *l != "---")
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 fn task_prompt(bead_id: &str, session_name: &str) -> String {
-    WORKER_CONTRACT
-        .replace("{bead}", bead_id)
-        .replace("{session}", session_name)
+    let bound = skill_body()
+        .replace("<bead>", bead_id)
+        .replace("<name>", session_name);
+    // .trim(): symmetric with the obligation-(v) test's expectation (N4) —
+    // leading/trailing blank lines around the body never desynchronize the
+    // "prompt ends with the transformed body" equality.
+    format!(
+        "You are Gas Camp worker session {session_name}, dispatched to work exactly one bead: {bead_id}. \
+         CAMP_DIR is already set for the camp CLI; do not start unrelated work.\n\n{}",
+        bound.trim()
+    )
 }
 
 /// Every non-ASCII-alphanumeric CHARACTER becomes one '-' — Claude Code's
@@ -361,6 +379,55 @@ mod tests {
             stall_after: None,
             prompt: "Implement with TDD.".into(),
         }
+    }
+
+    /// Obligation (v), dispatch-lifecycle Phase 3 (Q5): ONE worker-contract
+    /// source. The task prompt every campd worker receives is the worker
+    /// skill's body verbatim (frontmatter stripped, <bead>/<name> bound),
+    /// behind a two-line mechanical preamble. The transform is recomputed
+    /// here independently from the file, so a divergent second copy in Rust
+    /// cannot survive this assertion.
+    #[test]
+    fn the_task_prompt_is_the_worker_skill_verbatim() {
+        let skill = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../plugin/skills/worker/SKILL.md"),
+        )
+        .unwrap();
+        // frontmatter: first line is "---", body starts after the next "---" line
+        let mut lines = skill.lines();
+        assert_eq!(
+            lines.next(),
+            Some("---"),
+            "skill must open with frontmatter"
+        );
+        let body: String = lines
+            .by_ref()
+            .skip_while(|l| *l != "---")
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Symmetric trim on BOTH sides (plan-review r2, N4): the impl embeds
+        // `bound.trim()`, so the expectation trims identically — a leading
+        // blank line after the frontmatter fence cannot desynchronize them.
+        let expected = body
+            .replace("<bead>", "gc-9")
+            .replace("<name>", "t/dev/9")
+            .trim()
+            .to_owned();
+        let prompt = task_prompt("gc-9", "t/dev/9");
+        assert!(
+            prompt.ends_with(&expected),
+            "prompt must end with the transformed skill body;\nprompt tail: {}",
+            &prompt[prompt.len().saturating_sub(200)..]
+        );
+        let preamble = prompt.strip_suffix(expected.as_str()).unwrap();
+        assert!(preamble.contains("gc-9") && preamble.contains("t/dev/9"));
+        assert!(preamble.contains("CAMP_DIR"));
+        assert!(
+            preamble.lines().filter(|l| !l.trim().is_empty()).count() <= 2,
+            "the preamble is mechanical binding only, not a second contract: {preamble:?}"
+        );
     }
 
     /// Exit criterion pinned as a test: real-claude spawn arguments match
