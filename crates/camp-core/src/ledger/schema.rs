@@ -1,7 +1,8 @@
-//! Schema v1 for camp.db (spec §7.1/§7.4). One WAL-mode SQLite file: the
+//! Schema v2 for camp.db (spec §7.1/§7.4). One WAL-mode SQLite file: the
 //! append-only `events` table (history + bus) plus the state tables that are
 //! a fold of it. All tables are STRICT; opening a db with a different schema
-//! version is a hard error — no auto-upgrade in v1.
+//! version is a hard error — no auto-upgrade in v1 (a v1 db re-inits;
+//! `camp backup`/`camp export` preserve history).
 
 use std::path::Path;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use rusqlite::Connection;
 
 use crate::error::CoreError;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// State tables only — everything `refold` rebuilds from the event log.
 /// (`cursors` is consumer bookkeeping, `meta`/`events` are not fold-derived.)
@@ -26,6 +27,10 @@ CREATE TABLE beads (
   claimed_by   TEXT,
   outcome      TEXT CHECK (outcome IN ('pass','fail','skipped')),
   close_reason TEXT,
+  work_outcome     TEXT CHECK (work_outcome IN ('shipped','no-op','blocked','abandoned')),
+  work_commit      TEXT,
+  work_branch      TEXT,
+  dispatch_failure TEXT,
   labels       TEXT NOT NULL DEFAULT '[]',
   run_id       TEXT,
   step_id      TEXT,
@@ -70,7 +75,7 @@ CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 ) STRICT;
-INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+INSERT INTO meta (key, value) VALUES ('schema_version', '2');
 
 CREATE TABLE events (
   seq   INTEGER PRIMARY KEY AUTOINCREMENT,

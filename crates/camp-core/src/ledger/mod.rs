@@ -1384,7 +1384,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "1");
+        assert_eq!(version, "2");
     }
 
     fn input(
@@ -1760,6 +1760,98 @@ mod tests {
             other => panic!("expected InvalidEventData, got {other:?}"),
         }
         assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+    }
+
+    /// Dispatch-lifecycle Phase 3 (#34, Q3): the WorkOutcome axis on
+    /// bead.closed — additive, separate from the control outcome, coherence
+    /// fold-enforced. Pure shape rules only: the git facts (reachable,
+    /// based) are gated in `camp close`, never here — refold replays events
+    /// after worktrees are gone, so a fold that shelled to git would be
+    /// nondeterministic.
+    #[test]
+    fn bead_closed_records_the_work_outcome_axis_with_coherence() {
+        let (_dir, mut ledger) = temp_ledger();
+        let close = |l: &mut Ledger, id: &str, data: serde_json::Value| {
+            l.append(input(EventType::BeadClosed, Some("gc"), Some(id), data))
+        };
+        let cols = |l: &Ledger, id: &str| -> (Option<String>, Option<String>, Option<String>) {
+            l.conn
+                .query_row(
+                    "SELECT work_outcome, work_commit, work_branch FROM beads WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+
+        // ACCEPTED shapes, one bead each — and the columns fold through:
+        seeded_bead(&mut ledger, "gc-1");
+        close(
+            &mut ledger,
+            "gc-1",
+            serde_json::json!({
+                "outcome": "pass", "work_outcome": "shipped",
+                "work_commit": "c0ffee", "work_branch": "camp/gc-1"}),
+        )
+        .unwrap();
+        assert_eq!(
+            cols(&ledger, "gc-1"),
+            (
+                Some("shipped".into()),
+                Some("c0ffee".into()),
+                Some("camp/gc-1".into())
+            )
+        );
+        seeded_bead(&mut ledger, "gc-2");
+        close(
+            &mut ledger,
+            "gc-2",
+            serde_json::json!({"outcome": "pass", "work_outcome": "no-op"}),
+        )
+        .unwrap();
+        assert_eq!(cols(&ledger, "gc-2"), (Some("no-op".into()), None, None));
+        seeded_bead(&mut ledger, "gc-3");
+        close(
+            &mut ledger,
+            "gc-3",
+            serde_json::json!({"outcome": "fail", "work_outcome": "blocked", "reason": "no base"}),
+        )
+        .unwrap();
+        assert_eq!(cols(&ledger, "gc-3"), (Some("blocked".into()), None, None));
+        seeded_bead(&mut ledger, "gc-4");
+        close(
+            &mut ledger,
+            "gc-4",
+            serde_json::json!({"outcome": "fail", "work_outcome": "abandoned", "reason": "obsolete"}),
+        )
+        .unwrap();
+        seeded_bead(&mut ledger, "gc-5");
+        close(&mut ledger, "gc-5", serde_json::json!({"outcome": "pass"})).unwrap(); // the v1 shape
+        assert_eq!(cols(&ledger, "gc-5"), (None, None, None));
+
+        // REJECTED shapes — each on a fresh OPEN bead so the rejection is
+        // the payload's, not a double-close:
+        let rejected: &[serde_json::Value] = &[
+            serde_json::json!({"outcome": "pass", "work_outcome": "blocked"}), // the #34 lie
+            serde_json::json!({"outcome": "fail", "work_outcome": "shipped",
+                               "work_commit": "c", "work_branch": "b"}),
+            serde_json::json!({"outcome": "pass", "work_outcome": "shipped"}),
+            serde_json::json!({"outcome": "pass", "work_outcome": "shipped", "work_commit": "c"}),
+            serde_json::json!({"outcome": "pass", "work_outcome": "no-op",
+                               "work_commit": "c", "work_branch": "b"}),
+            serde_json::json!({"outcome": "fail", "work_outcome": "blocked",
+                               "work_commit": "c", "work_branch": "b"}),
+            serde_json::json!({"outcome": "pass", "work_outcome": "delivered"}), // not pinned
+            serde_json::json!({"outcome": "pass", "work_commit": "c"}), // artifact without axis
+        ];
+        for (i, data) in rejected.iter().enumerate() {
+            let id = format!("gc-9{i}");
+            seeded_bead(&mut ledger, &id);
+            assert!(
+                close(&mut ledger, &id, data.clone()).is_err(),
+                "must reject: {data}"
+            );
+        }
     }
 
     /// PR #18 review finding 1: bd v1.0.4 silently SKIPS memory records
@@ -2918,7 +3010,7 @@ mod tests {
         match Ledger::open(&path) {
             Err(CoreError::UnsupportedSchema { found, supported }) => {
                 assert_eq!(found, 999);
-                assert_eq!(supported, 1);
+                assert_eq!(supported, 2);
             }
             Err(other) => panic!("expected UnsupportedSchema, got {other:?}"),
             Ok(_) => panic!("open must fail on schema_version 999"),

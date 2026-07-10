@@ -251,6 +251,14 @@ struct BeadClosed {
     #[serde(default)]
     #[allow(dead_code)]
     output: Option<serde_json::Value>,
+    /// Phase 3 (#34, Q3): Gas City's WorkOutcome axis, mirrored verbatim —
+    /// a SEPARATE additive axis from the control `outcome`.
+    #[serde(default)]
+    work_outcome: Option<String>,
+    #[serde(default)]
+    work_commit: Option<String>,
+    #[serde(default)]
+    work_branch: Option<String>,
 }
 
 fn bead_closed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
@@ -295,6 +303,55 @@ fn bead_closed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
             )));
         }
     }
+    match p.work_outcome.as_deref() {
+        None => {
+            if p.work_commit.is_some() || p.work_branch.is_some() {
+                return Err(bad(
+                    "work_commit/work_branch require work_outcome \"shipped\"".to_owned(),
+                ));
+            }
+        }
+        Some(wo) => {
+            if !crate::vocab::CAMP_WORK_OUTCOMES.contains(&wo) {
+                return Err(bad(format!(
+                    "work_outcome {wo:?} is not in camp's vocabulary {:?}",
+                    crate::vocab::CAMP_WORK_OUTCOMES
+                )));
+            }
+            // Coherence (the #34 gate): shipped/no-op assert success,
+            // blocked/abandoned assert the work did NOT land — `pass` over
+            // un-integrable work is exactly the lie this rejects.
+            // Deliberately STRICTER than gc, which keeps WorkOutcome and
+            // the control Outcome disjoint and uncoupled (values.go); camp
+            // couples them. Mirror-safe: names/values stay verbatim, and
+            // export emits only gc-valid pairings.
+            let wants_pass = matches!(wo, "shipped" | "no-op");
+            if wants_pass && p.outcome != "pass" {
+                return Err(bad(format!(
+                    "work_outcome {wo:?} requires outcome \"pass\", got {:?}",
+                    p.outcome
+                )));
+            }
+            if !wants_pass && p.outcome != "fail" {
+                return Err(bad(format!(
+                    "work_outcome {wo:?} requires outcome \"fail\", got {:?}",
+                    p.outcome
+                )));
+            }
+            // Only shipped carries an artifact (gc values.go, verbatim).
+            let has_artifact = p.work_commit.is_some() && p.work_branch.is_some();
+            if wo == "shipped" && !has_artifact {
+                return Err(bad(
+                    "work_outcome \"shipped\" requires work_commit and work_branch".to_owned(),
+                ));
+            }
+            if wo != "shipped" && (p.work_commit.is_some() || p.work_branch.is_some()) {
+                return Err(bad(format!(
+                    "work_outcome {wo:?} must not carry work_commit/work_branch (only shipped has an artifact)"
+                )));
+            }
+        }
+    }
     match bead_status(conn, id)?.as_deref() {
         None => Err(CoreError::UnknownBead(id.to_owned())),
         Some("closed") => Err(CoreError::InvalidTransition {
@@ -304,9 +361,18 @@ fn bead_closed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         Some(_) => {
             conn.execute(
                 "UPDATE beads SET status = 'closed', outcome = ?1, close_reason = ?2,
-                                  closed_ts = ?3, updated_ts = ?3
-                 WHERE id = ?4",
-                params![p.outcome, p.reason, event.ts, id],
+                                  work_outcome = ?3, work_commit = ?4, work_branch = ?5,
+                                  closed_ts = ?6, updated_ts = ?6
+                 WHERE id = ?7",
+                params![
+                    p.outcome,
+                    p.reason,
+                    p.work_outcome,
+                    p.work_commit,
+                    p.work_branch,
+                    event.ts,
+                    id
+                ],
             )?;
             if let Some(reason) = p.reason.as_deref()
                 && !reason.is_empty()

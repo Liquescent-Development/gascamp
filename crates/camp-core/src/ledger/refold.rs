@@ -32,7 +32,8 @@ const STATE_TABLES: &[TableSpec] = &[
     TableSpec {
         name: "beads",
         cols: "id, rig, type, title, description, status, assignee, claimed_by, outcome, \
-               close_reason, labels, run_id, step_id, created_ts, updated_ts, closed_ts",
+               close_reason, work_outcome, work_commit, work_branch, dispatch_failure, \
+               labels, run_id, step_id, created_ts, updated_ts, closed_ts",
         key: "id",
     },
     TableSpec {
