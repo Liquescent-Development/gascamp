@@ -510,7 +510,12 @@ recorded at spawn (a session keeps its birth capability envelope; sessions
 registered without pins — the operator's own — resume under their own
 settings). `campd`-spawned workers run non-interactively: anything the
 agent definition has not pre-allowed fails fast (and lands in the ledger)
-rather than hanging on a prompt no one will answer.
+rather than hanging on a prompt no one will answer. The deliverable
+coordinates a worker records at a `shipped` close are surfaced first-class by
+`camp show` (with a `git -C <rig-path> show <commit>` pointer) and are
+awaitable via `camp show --wait` — the operator reads the outcome without
+reconstructing it. The operator's own contract for driving all of this is the
+plugin's `operator` skill, the mirror of the worker skill.
 
 ### 8.5. Adoption
 
@@ -679,6 +684,17 @@ Each of these is a testable guarantee, not a vibe:
    history and reports drift.
 6. Every verb works identically from slash commands and the `camp` CLI —
    the session is the control plane, not a privileged client.
+
+**The read surface is quiet and awaitable.** `camp show <bead>` renders one
+bead's state and history; `--json` emits the same as one machine-readable
+object (parity with `events`/`ls`), and a `shipped` bead promotes its
+deliverable coordinates — `branch` and `commit`, plus a `git -C <rig-path>
+show <commit>` pointer — to first-class fields, so the result needs no git
+archaeology. `camp show <bead> --wait` blocks until the bead reaches a closed
+status and then renders it; it sleeps on a `notify` file-watch of the ledger
+(no polling, per §2's idle-is-free principle), emits no events, and does not
+autostart campd — a pure observer of ground truth that works whether campd is
+up or down.
 
 ## 14. Cost budget
 
