@@ -75,7 +75,9 @@ plan for learning a result is "something will wake me," your plan is
 the report reaches the party waiting on it: if your harness returns
 your final message to the parent, that final message is the report; if
 you are a teammate whose plain-text output nobody receives, you MUST
-SendMessage it. Text printed in your own turn is not a delivered report
+SendMessage it (for substantial output, the Rule 2 pointer message —
+"done, report at <path>" — is itself the transmission: the file is the
+payload, the send is the delivery). Text printed in your own turn is not a delivered report
 — a tested agent verified its result in-turn, "wrote" the report as
 plain output, went idle, and the finished deliverable stayed invisible
 until the lead pinged it. When unsure which channel applies,
