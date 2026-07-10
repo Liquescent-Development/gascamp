@@ -2,10 +2,24 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **APPROVAL NOTE:** _pending — the plan gate. Record date, verdict, non-blocking
-> notes, and reviewer-accepted deviations here in the first execution commit._
+> **APPROVAL NOTE:** date 2026-07-10 · verdict: **APPROVE** (r2, fresh pass,
+> relayed by the team lead — after one REJECT round whose blocking findings
+> B1–B3 were false premises about current code/spec, fixed in r2; the
+> reviewer verified every fix at source and confirmed the r2 delta maps 1:1
+> to findings with everything previously verified-correct untouched).
+> Non-blocking notes folded into this first execution commit: (1) the model
+> attribution was dropped from the r1 revision-history line (reviewer
+> identity is not verifiable from here; this note is the authoritative
+> record); (2) risk note 1 corrected — the schema-v2 hard-error flag to the
+> operator was raised by the TEAM LEAD in a status update, not by the
+> reviewer, and no operator acknowledgment exists yet; operative statement
+> unchanged (proceed on the current settled basis; any operator directive
+> supersedes, relayed by the lead immediately if it arrives).
+> Reviewer-accepted deviations: none beyond the decisions recorded in
+> "Settled design decisions" (committer-in/overseer-out; schema v2;
+> camp-stricter coherence coupling; resume-pins re-application).
 >
-> **Revision history:** r2 (2026-07-09) — plan-review REJECT round (Opus 4.8)
+> **Revision history:** r2 (2026-07-09) — plan-review REJECT round
 > fixed three false premises about current code/spec, none design-level:
 > **B1** Task 10 re-added the already-existing `dispatch.failed` fold arm/
 > struct/fn (fold.rs:35/:529/:536) — now MODIFIES the existing log-only fn
@@ -2021,7 +2035,7 @@ If the harness demotes it to background, poll `gh pr checks` with cheap foregrou
 
 ## Known risks / notes for the plan reviewer
 
-1. **Schema v2 (decision 2)** hard-errors existing camp.db files at open. The no-auto-upgrade rule lives in code (`schema.rs:3-4` module doc; `verify_schema_version` → `CoreError::UnsupportedSchema`), not in the spec — so Task 12 adds the one-line spec statement of the policy (B3). Pre-1.0, single-operator; `camp backup`/`camp export` preserve history. The reviewer has flagged the hard-error to the operator in parallel; this plan proceeds on the current settled basis and any operator directive supersedes.
+1. **Schema v2 (decision 2)** hard-errors existing camp.db files at open. The no-auto-upgrade rule lives in code (`schema.rs:3-4` module doc; `verify_schema_version` → `CoreError::UnsupportedSchema`), not in the spec — so Task 12 adds the one-line spec statement of the policy (B3). Pre-1.0, single-operator; `camp backup`/`camp export` preserve history. The team lead flagged the hard-error to the operator in a status update (no operator acknowledgment yet); this plan proceeds on the current settled basis (schema-v2 hard-error, fail-fast, no auto-upgrade) and any operator directive supersedes, relayed by the lead immediately if it arrives.
 2. **No overseer agent (decision 9)** — the kickoff's "optionally" is exercised as skip, with rationale. Veto = one added pack file, no code.
 3. **`--model/--permission-mode/--allowedTools` alongside `--resume`** (decision 6): standard `-p` flags; mechanically pinned by stub-argv tests; real-claude behavior is `make e2e` territory (local-only by decision). If the operator wants a live probe before merge, it is one `claude -p --resume <sid> --allowedTools Read "hi"` against any session.
 4. **Coherence rule strictness** (blocked/abandoned ⇒ `fail` exactly): campd's finalization `skipped` closes never carry a work outcome, so `skipped` needs no pairing rule. If a future control flow wants `skipped`+axis, that is a one-line fold change with a vocab test.
