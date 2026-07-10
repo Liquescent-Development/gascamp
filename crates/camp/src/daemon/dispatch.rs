@@ -202,8 +202,13 @@ fn write_bounded(
 }
 
 /// Wait (bounded) for the sender to become writable using a throwaway
-/// poll. Spurious or empty wakes return Ok — the caller's deadline check
-/// governs termination.
+/// poll. Spurious, empty, or SIGNAL-INTERRUPTED wakes return Ok — the
+/// caller's deadline check governs termination. The Interrupted arm is
+/// load-bearing (review residual on PR #51): mio's Poll::poll returns
+/// EINTR without retrying, and campd's SA_RESTART SIGCHLD handler never
+/// restarts poll/kevent (signal(7)) — so any worker exiting during this
+/// ≤2s wait would otherwise fail the nudge and cost a HEALTHY worker its
+/// held pipe (torn line + unearned EOF).
 fn wait_writable(
     sender: &mut mio::unix::pipe::Sender,
     timeout: std::time::Duration,
@@ -212,7 +217,10 @@ fn wait_writable(
     let mut events = mio::Events::with_capacity(4);
     poll.registry()
         .register(sender, mio::Token(0), mio::Interest::WRITABLE)?;
-    let waited = poll.poll(&mut events, Some(timeout));
+    let waited = match poll.poll(&mut events, Some(timeout)) {
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(()),
+        result => result,
+    };
     let deregistered = poll.registry().deregister(sender);
     waited?;
     deregistered?;
