@@ -21,6 +21,7 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::SessionWoke => session_woke(conn, event),
         EventType::SessionStopped => session_ended(conn, event, "stopped"),
         EventType::SessionCrashed => session_ended(conn, event, "crashed"),
+        EventType::SessionNudged => session_nudged(conn, event),
         EventType::RigAdded => rig_added(event),
         EventType::CampdAutostarted => campd_autostarted(event),
         EventType::RunCooked => run_cooked(event),
@@ -775,6 +776,47 @@ fn session_woke(conn: &Connection, event: &Event) -> Result<(), CoreError> {
             event.ts,
         ],
     )?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionNudged {
+    session: String,
+    via: String,
+    text: String,
+}
+
+const NUDGE_VIAS: &[&str] = &["stdin", "resume"];
+
+/// `session.nudged` is log-only (dispatch-lifecycle Phase 1, #29): a turn
+/// was delivered into a session's conversation — live over the campd-held
+/// stdin pipe, or via `claude --resume` after the turn (A4). The named
+/// session must exist (fail fast on typos, like worker.milestone's bead);
+/// the text must be non-blank (it is the delivered turn — the audit record
+/// is worthless without it, same rule as bead.created's title).
+fn session_nudged(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let p: SessionNudged = payload(event)?;
+    if p.text.trim().is_empty() {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: "text must be non-empty".to_owned(),
+        });
+    }
+    if !NUDGE_VIAS.contains(&p.via.as_str()) {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: format!("unknown via {:?} (stdin|resume)", p.via),
+        });
+    }
+    let known: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE name = ?1)",
+        [&p.session],
+        |r| r.get(0),
+    )?;
+    if !known {
+        return Err(CoreError::UnknownSession(p.session));
+    }
     Ok(())
 }
 

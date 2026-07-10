@@ -1,6 +1,6 @@
 ---
 name: worker
-description: Use when you are a camp worker (spawned by campd or slung as a teammate) assigned a bead — the claim → work → milestones → remember → close lifecycle contract that makes your work durable and visible in the camp ledger.
+description: Use when you are a camp worker (spawned by campd) assigned a bead — the claim → work → milestones → remember → close lifecycle contract that makes your work durable and visible in the camp ledger.
 ---
 
 # Camp worker lifecycle contract
@@ -11,8 +11,7 @@ resumable, and visible in `camp top` / `/status` — every step is one `camp`
 CLI call, identical to what a human would run.
 
 Your session name is your identity in the ledger. Use the same
-`--session <name>` on every call (campd passes it to you; if you were slung
-as a teammate, use the name you were given).
+`--session <name>` on every call (campd passes it to you).
 
 ## 1. recall — reuse what the camp already knows
 

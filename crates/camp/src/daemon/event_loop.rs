@@ -533,6 +533,55 @@ fn drain_lines(
                     eprintln!("campd: adopt settle failed: {e:#}");
                 }
             }
+            Ok(Request::Nudge { session, text }) => {
+                // The converse verb's live path (dispatch-lifecycle Phase 1,
+                // #29). Deliver → record → respond: the injected turn is a
+                // ledger fact (invariant 3), and a post-delivery append
+                // failure surfaces to the caller (invariant 5) — the ledger
+                // must not claim what was not delivered, and the caller must
+                // not believe what the ledger does not hold. No held pipe is
+                // NOT an error: via="none" routes the caller to the resume
+                // path (A4).
+                use super::dispatch::NudgeOutcome;
+                let response = match dispatcher.nudge_via_stdin(&session, &text) {
+                    NudgeOutcome::Delivered => {
+                        let (rig, bead) = dispatcher
+                            .child_info(&session)
+                            .map(|(r, b)| (Some(r), Some(b)))
+                            .unwrap_or((None, None));
+                        match ledger.append(EventInput {
+                            kind: EventType::SessionNudged,
+                            rig,
+                            actor: "campd".into(),
+                            bead,
+                            data: serde_json::json!({
+                                "session": session, "via": "stdin", "text": text,
+                            }),
+                        }) {
+                            Ok(_) => Response::Nudge {
+                                ok: true,
+                                via: "stdin".into(),
+                            },
+                            Err(e) => Response::Error {
+                                ok: false,
+                                error: format!(
+                                    "turn delivered into {session} but recording \
+                                     session.nudged failed: {e}"
+                                ),
+                            },
+                        }
+                    }
+                    NudgeOutcome::NoPipe => Response::Nudge {
+                        ok: true,
+                        via: "none".into(),
+                    },
+                    NudgeOutcome::Failed(e) => Response::Error {
+                        ok: false,
+                        error: format!("stdin nudge of {session} failed: {e}"),
+                    },
+                };
+                respond(&mut conn.stream, &response)?;
+            }
             Err(e) => {
                 respond(
                     &mut conn.stream,

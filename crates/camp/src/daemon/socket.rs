@@ -30,6 +30,12 @@ pub enum Request {
     /// Reconcile the session registry against reality (spec §8.5) — the
     /// same routine campd runs at startup, on demand (Phase 11).
     Adopt,
+    /// Deliver one user turn into a live worker's campd-held stdin pipe
+    /// (dispatch-lifecycle Phase 1, #29 — the converse verb's live path).
+    Nudge {
+        session: String,
+        text: String,
+    },
 }
 
 /// One response line. Untagged: variant order matters for deserialization
@@ -54,6 +60,15 @@ pub enum Response {
         released: usize,
         swept: usize,
         kept: usize,
+    },
+    /// Nudge disposition (dispatch-lifecycle Phase 1): via="stdin" means
+    /// the turn is in the held pipe; via="none" means no held pipe for the
+    /// session (released, Null-mode, exited, or not campd's child) — the
+    /// caller converses over the resume path instead. Must precede Ok in
+    /// this untagged enum so {"ok":..,"via":..} resolves here.
+    Nudge {
+        ok: bool,
+        via: String,
     },
     Error {
         ok: bool,
@@ -119,8 +134,37 @@ pub fn bind_or_replace(path: &Path) -> Result<UnixListener> {
 /// CLI operation against a wedged daemon — they are not wakeups; the
 /// daemon's own poll timeout stays None (invariant 1).
 pub fn request(path: &Path, request: &Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(path)
+    let stream = UnixStream::connect(path)
         .with_context(|| format!("connecting to campd at {}", path.display()))?;
+    request_on(stream, request)
+}
+
+/// Like `request`, but campd-not-listening is a NORMAL state, not an error
+/// (dispatch-lifecycle Phase 1: the converse verb's resume path; the same
+/// designed degrade as `camp top --statusline`). Liveness is judged on the
+/// SAME connection that carries the request — a separate probe connect
+/// would leave a window where campd stops between probe and request and
+/// the designed degrade becomes a hard error (PR #51 review finding 1).
+/// Only an absent/refusing socket maps to Ok(None); a campd that accepts
+/// and then misbehaves (or answers an Error line) still surfaces as Err —
+/// fail fast.
+pub fn request_if_up(path: &Path, request: &Request) -> Result<Option<Response>> {
+    use std::io::ErrorKind;
+    let stream = match UnixStream::connect(path) {
+        Ok(stream) => stream,
+        Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("connecting to campd at {}", path.display()));
+        }
+    };
+    request_on(stream, request).map(Some)
+}
+
+/// The shared request body: one line out, one line back, on an
+/// already-open connection.
+fn request_on(mut stream: UnixStream, request: &Request) -> Result<Response> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut line = serde_json::to_string(request)?;
@@ -185,6 +229,96 @@ mod tests {
     #[test]
     fn unknown_op_is_rejected() {
         assert!(serde_json::from_str::<Request>(r#"{"op":"dance"}"#).is_err());
+    }
+
+    /// The converse verb's wire op (dispatch-lifecycle Phase 1, #29).
+    #[test]
+    fn nudge_wire_format_is_pinned() {
+        assert_eq!(
+            serde_json::to_string(&Request::Nudge {
+                session: "camp/dev/1".into(),
+                text: "status?".into()
+            })
+            .unwrap(),
+            r#"{"op":"nudge","session":"camp/dev/1","text":"status?"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"op":"nudge","session":"s","text":"t"}"#).unwrap(),
+            Request::Nudge {
+                session: "s".into(),
+                text: "t".into()
+            }
+        );
+        // Response: untagged — the Nudge variant must win for {"ok":..,"via":..}
+        assert_eq!(
+            serde_json::to_string(&Response::Nudge {
+                ok: true,
+                via: "stdin".into()
+            })
+            .unwrap(),
+            r#"{"ok":true,"via":"stdin"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Response>(r#"{"ok":true,"via":"none"}"#).unwrap(),
+            Response::Nudge { via, .. } if via == "none"
+        ));
+    }
+
+    /// Review finding 1 (PR #51): liveness must be judged on the SAME
+    /// connection that carries the request. A separate probe connect left
+    /// a window where campd stops between probe and request, turning the
+    /// designed degrade (Ok(None) → resume path) into a hard error. The
+    /// accept queue is FIFO, so by the time the request is answered every
+    /// earlier probe connection has been accepted and counted.
+    #[test]
+    fn request_if_up_uses_a_single_connection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("campd.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        // Serve every connection: count it, answer any request line with a
+        // plain ok. The thread parks in accept() after the test's last
+        // connection; the test process exits regardless (harness-only).
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut line = String::new();
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(clone) => clone,
+                    Err(_) => continue,
+                });
+                if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    let _ = stream.write_all(b"{\"ok\":true}\n");
+                }
+            }
+        });
+
+        let response = request_if_up(&path, &Request::Status).unwrap();
+        assert!(matches!(response, Some(Response::Ok { ok: true })));
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "request_if_up must open exactly ONE connection (no separate liveness probe)"
+        );
+    }
+
+    /// campd-not-listening is a NORMAL state for the converse verb (the
+    /// resume path) — Ok(None), never an error.
+    #[test]
+    fn request_if_up_returns_none_when_no_daemon_listens() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("campd.sock");
+        // no listener at all
+        assert!(request_if_up(&sock, &Request::Status).unwrap().is_none());
+        // a stale file that refuses connections is also "not up"
+        drop(UnixListener::bind(&sock).unwrap());
+        assert!(request_if_up(&sock, &Request::Status).unwrap().is_none());
     }
 
     #[test]
