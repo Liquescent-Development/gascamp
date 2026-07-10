@@ -513,6 +513,19 @@ impl Dispatcher {
                 }
             }
         } else {
+            // The explicit live-tree opt-out (spec §12, dispatch-lifecycle
+            // Q1): make it LOUD — a ledger fact before the registry row,
+            // never a silent default (invariant 3).
+            ledger.append(EventInput {
+                kind: EventType::DispatchLiveTree,
+                rig: Some(bead.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(bead.id.clone()),
+                data: serde_json::json!({
+                    "path": prep.spec.cwd,
+                    "agent": prep.agent_name,
+                }),
+            })?;
             None
         };
 
@@ -3345,7 +3358,13 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join("rig")).unwrap();
         std::fs::create_dir_all(root.join("agents")).unwrap();
-        std::fs::write(root.join("agents/dev.md"), "---\nname: dev\n---\nWork.\n").unwrap();
+        // The subject is the respawn queue, not isolation: pin the
+        // live-tree opt-out (spec §12) so the plain-dir rig dispatches.
+        std::fs::write(
+            root.join("agents/dev.md"),
+            "---\nname: dev\nisolation: none\n---\nWork.\n",
+        )
+        .unwrap();
         std::fs::write(
             root.join("camp.toml"),
             format!(

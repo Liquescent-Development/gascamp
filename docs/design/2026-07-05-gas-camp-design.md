@@ -582,12 +582,31 @@ mypack/
 - Beads carry their rig; bead IDs get per-rig prefixes (`gc-142`,
   `t3-17`) — one ledger, scoped queries, Gas City's namespacing idea
   without a shared database.
-- Dispatch sets the worker's cwd to the rig — or to a camp-managed worktree
-  under `<camp>/worktrees/` when the agent definition sets
-  `isolation = "worktree"`. Worktrees are removed on clean close and kept
-  (with an event) on failure for forensics; the Gas Town worktree-cleanup
+- Dispatch sets the worker's cwd to a camp-managed worktree under
+  `<camp>/worktrees/<bead>` on a fresh `camp/<bead>` branch — worktree
+  isolation is the DEFAULT for autonomous dispatch (decision 2026-07-09,
+  dispatch-lifecycle design Q1): an autonomous worker never runs on the
+  rig's live branch. Worktrees are removed on clean close and kept (with
+  an event) on failure for forensics; the Gas Town worktree-cleanup
   lessons (leaked worktrees from crashed agents) are addressed by adoption
   (§8.5) sweeping orphaned worktrees against the registry.
+- The opt-out is explicit and loud: an agent that intentionally wants the
+  live tree declares `isolation = "none"`, and every live-tree dispatch
+  appends a `dispatch.live_tree` event naming the path and agent — running
+  on the live tree is always visible in the ledger, never silent.
+- Fail fast when a rig cannot host a worktree (not a git repository, or no
+  base commit — checked mechanically via `git rev-parse --verify
+  HEAD^{commit}`, since modern git would otherwise auto-infer `--orphan`
+  and create a baseless worktree): dispatch appends `dispatch.failed` with
+  the reason, no worker is spawned, and nothing is stranded — the operator
+  prepares the rig (a base commit) before dispatching code work.
+- The working-tree contract in one line: autonomous work happens on
+  `camp/<bead>`, reaped on clean pass, kept on failure; attended work —
+  the operator driving from their own session — is the documented standing
+  exception (assumption A2, §17: a teammate's cwd is pinned to the parent
+  session's directory, so worktree isolation is structurally unavailable
+  there), supervised on the operator's live tree, where the operator owns
+  integration (dispatch-lifecycle design §4.4).
 - Cross-rig workers default to campd-spawned headless sessions (one attach
   away) regardless of how assumption A2 (§17) resolves for teammates.
 

@@ -1077,6 +1077,55 @@ mod tests {
         }
     }
 
+    /// Phase 2 (dispatch-lifecycle Q1): `dispatch.live_tree` is the LOUD
+    /// marker that campd dispatched a worker onto the rig's live tree
+    /// because the agent explicitly declared `isolation = "none"`.
+    /// Log-only, but the payload is validated like every other event.
+    #[test]
+    fn dispatch_live_tree_is_log_only_and_validates_payload() {
+        let (_dir, mut l) = temp_ledger();
+        seeded_bead(&mut l, "gc-1");
+        // the happy shape appends
+        l.append(EventInput {
+            kind: EventType::DispatchLiveTree,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"path": "/code/rig", "agent": "dev"}),
+        })
+        .unwrap();
+        // missing bead is an error
+        assert!(
+            l.append(EventInput {
+                kind: EventType::DispatchLiveTree,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({"path": "/p", "agent": "dev"}),
+            })
+            .is_err(),
+            "dispatch.live_tree without a bead must fail"
+        );
+        // empty path, empty agent, and unknown fields are all rejected
+        for data in [
+            serde_json::json!({"path": "", "agent": "dev"}),
+            serde_json::json!({"path": "/p", "agent": ""}),
+            serde_json::json!({"path": "/p", "agent": "dev", "extra": 1}),
+        ] {
+            assert!(
+                l.append(EventInput {
+                    kind: EventType::DispatchLiveTree,
+                    rig: Some("gc".into()),
+                    actor: "campd".into(),
+                    bead: Some("gc-1".into()),
+                    data: data.clone(),
+                })
+                .is_err(),
+                "invalid payload must be rejected: {data}"
+            );
+        }
+    }
+
     #[test]
     fn dispatch_failed_requires_bead_and_reason() {
         let (_dir, mut l) = temp_ledger();

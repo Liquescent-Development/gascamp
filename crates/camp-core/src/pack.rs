@@ -15,10 +15,15 @@ use yaml_rust2::{Yaml, YamlLoader};
 use crate::config::CampConfig;
 use crate::error::CoreError;
 
+/// Where a dispatched worker's tree lives (spec §12). Worktree is the
+/// DEFAULT for autonomous dispatch (dispatch-lifecycle Q1, approved
+/// 2026-07-09): workers never run on the rig's live branch unless the
+/// agent explicitly declares `isolation = "none"` — and that opt-out is
+/// loud (`dispatch.live_tree`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Isolation {
-    #[default]
     None,
+    #[default]
     Worktree,
 }
 
@@ -105,12 +110,18 @@ pub fn parse_agent_file(path: &Path) -> Result<AgentDef, CoreError> {
     };
 
     let isolation = match get_str("isolation")?.as_deref() {
-        None => Isolation::None,
+        None => Isolation::default(),
         Some("worktree") => Isolation::Worktree,
+        // The explicit opt-out (spec §12, dispatch-lifecycle Q1): the
+        // agent intentionally runs on the rig's live tree; dispatch makes
+        // that loud (`dispatch.live_tree`).
+        Some("none") => Isolation::None,
         Some(other) => {
             return Err(pack_err(
                 path,
-                format!("frontmatter key \"isolation\" accepts only \"worktree\", got {other:?}"),
+                format!(
+                    "frontmatter key \"isolation\" accepts only \"worktree\" or \"none\", got {other:?}"
+                ),
             ));
         }
     };
@@ -247,7 +258,9 @@ mod tests {
             ])
         );
         assert_eq!(def.permission_mode.as_deref(), Some("acceptEdits"));
-        assert_eq!(def.isolation, Isolation::None);
+        // Phase 2 (dispatch-lifecycle Q1): no isolation key = the DEFAULT,
+        // which is worktree.
+        assert_eq!(def.isolation, Isolation::Worktree);
         assert_eq!(def.prompt, "Implement the change with TDD.");
     }
 
@@ -289,6 +302,26 @@ mod tests {
         );
         let def = parse_agent_file(&dir.path().join("iso.md")).unwrap();
         assert_eq!(def.tools, Some(vec!["Read".to_owned(), "Bash".to_owned()]));
+        assert_eq!(def.isolation, Isolation::Worktree);
+    }
+
+    #[test]
+    fn isolation_none_is_an_accepted_explicit_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(
+            dir.path(),
+            "live.md",
+            "---\nname: live\nisolation: none\n---\nWork on the live tree.\n",
+        );
+        let def = parse_agent_file(&dir.path().join("live.md")).unwrap();
+        assert_eq!(def.isolation, Isolation::None);
+    }
+
+    #[test]
+    fn isolation_defaults_to_worktree_when_undeclared() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(dir.path(), "d.md", "---\nname: d\n---\nWork.\n");
+        let def = parse_agent_file(&dir.path().join("d.md")).unwrap();
         assert_eq!(def.isolation, Isolation::Worktree);
     }
 

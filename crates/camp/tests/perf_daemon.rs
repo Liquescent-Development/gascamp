@@ -53,7 +53,11 @@ fn scaffold(dir: &Path, max_workers: usize, rig_extra: &str) -> (PathBuf, PathBu
         ),
     )
     .unwrap();
-    write_agent(&root, "dev", "");
+    // perf measures the spec §14 dispatch floor; `git worktree add` in the
+    // measured path would change what the numbers mean. Pin the live-tree
+    // opt-out — post-flip, perf measures the opt-out path (recorded as a
+    // non-blocking note in the Phase 2 plan).
+    write_agent(&root, "dev", "isolation: none\n");
     // create the ledger so every verb (and campd) finds it
     camp_ok(&root, &["events", "--json"]);
     (root, rig)

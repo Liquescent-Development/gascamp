@@ -31,6 +31,7 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "worker.milestone",
     "worktree.kept",
     "dispatch.failed",
+    "dispatch.live_tree",
     "check.passed",
     "check.failed",
     "run.finalized",
