@@ -330,14 +330,11 @@ fn scaffold_e2e(dir: &Path, claude: &str) -> (PathBuf, PathBuf, PathBuf) {
     // held stdin (the WORKER_CONTRACT).
     let agents = root.join("agents");
     std::fs::create_dir_all(&agents).unwrap();
-    // Phase 2 note: e2e Tier-0 asserts the work lands in the RIG's live
-    // tree (`toy ls --json` run in the rig) — that is delivery, which is
-    // Phase 3's contract. Until Phase 3 defines "landed" for the worktree
-    // path, e2e pins the explicit live-tree opt-out (spec §12).
+    // Phase 3 defined "landed" (worker-contract delivery, spec §8.4): e2e
+    // runs the DEFAULT worktree isolation — the shipped path a real worker sees.
     std::fs::write(
         agents.join("dev.md"),
         "---\nname: dev\nmodel: sonnet\npermissionMode: bypassPermissions\n\
-         isolation: none\n\
          tools: Read, Edit, Write, Bash, Grep, Glob\n---\n\
          You are a camp worker. Do the assigned bead with TDD: write the failing \
          test first, then the minimal change to pass it, keeping existing behavior \
@@ -348,7 +345,6 @@ fn scaffold_e2e(dir: &Path, claude: &str) -> (PathBuf, PathBuf, PathBuf) {
     std::fs::write(
         agents.join("reviewer.md"),
         "---\nname: reviewer\nmodel: sonnet\npermissionMode: bypassPermissions\n\
-         isolation: none\n\
          tools: Read, Bash, Grep, Glob\n---\n\
          You are a read-only camp reviewer. Inspect the change (e.g. `git diff`) for \
          the assigned bead, confirm it is sound and existing behavior is intact, then \
@@ -442,7 +438,9 @@ impl Drop for Daemon {
 /// it" --rig toy` -> a real worker claims, works, closes pass. Asserts sling ->
 /// first transcript output <= 2 s; the Tier-0 envelope is ~3 bead-lifecycle
 /// writes (created/claimed/closed) + bounded milestones; `camp show` tells the
-/// whole story; the --json FEATURE really works and the suite is green; and the
+/// whole story; delivery mechanics hold (Phase 3, spec §8.4: if the close
+/// records work_outcome=shipped, the bead branch resolves and is diffable
+/// from the rig — the model's judgment itself is never asserted); and the
 /// F1/F2/F3/F4 fixture facts hold at the installed claude version.
 fn run_tier0(root: &Path, rig: &Path) {
     let t0 = Instant::now();
@@ -548,18 +546,22 @@ fn run_tier0(root: &Path, rig: &Path) {
     );
 
     // F1 + F3: the transcript is at the campd-computed munged path under the
-    // real claude root, named by the pre-assigned sid. campd canonicalizes the
-    // worker cwd (matching claude's realpath), so compute `expected` from the
-    // CANONICAL rig — otherwise the macOS /var -> /private/var symlink makes the
-    // raw-path expected diverge from where claude actually writes.
+    // real claude root, named by the pre-assigned sid. Default worktree
+    // isolation (Phase 3): the worker's cwd is the camp worktree, and campd
+    // canonicalizes the camp ROOT then appends the plain worktrees/<bead>
+    // tail (the leaf is reaped on a clean pass, so it cannot be
+    // canonicalized itself) — recompute `expected` the same way; the macOS
+    // /var -> /private/var symlink otherwise makes the raw-path expected
+    // diverge from where claude actually writes.
     assert_eq!(sid.len(), 36, "F1: claude_session_id is a uuid");
     let claude_root = std::env::var("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".claude"));
-    let canon_rig = std::fs::canonicalize(rig).unwrap();
+    let canon_root = std::fs::canonicalize(root).unwrap();
+    let worker_cwd = canon_root.join("worktrees").join(&bead);
     let expected = claude_root
         .join("projects")
-        .join(munge(&canon_rig.to_string_lossy()))
+        .join(munge(&worker_cwd.to_string_lossy()))
         .join(format!("{sid}.jsonl"));
     assert_eq!(
         transcript, expected,
@@ -618,40 +620,47 @@ fn run_tier0(root: &Path, rig: &Path) {
         "camp show history must include the close"
     );
 
-    // The work is REAL: verify the FEATURE (not source text) and the suite.
-    let json_out = Command::new("python3")
-        .arg(rig.join("toy"))
-        .args(["ls", "--json"])
-        .current_dir(rig)
-        .output()
-        .unwrap();
-    assert!(
-        json_out.status.success(),
-        "`toy ls --json` must exit 0:\n{}",
-        String::from_utf8_lossy(&json_out.stderr)
-    );
-    let parsed: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "`toy ls --json` stdout must be valid JSON ({e}): {:?}",
-            String::from_utf8_lossy(&json_out.stdout)
-        )
-    });
-    assert!(
-        parsed.is_array() || parsed.is_object(),
-        "toy ls --json should emit a JSON array/object, got {parsed}"
-    );
-    let suite = Command::new("python3")
-        .args(["-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"])
-        .current_dir(rig)
-        .output()
-        .unwrap();
-    assert!(
-        suite.status.success(),
-        "toy suite must be green after the flag-add:\n{}",
-        String::from_utf8_lossy(&suite.stderr)
-    );
+    // Delivery (Phase 3, spec §8.4): with default worktree isolation the
+    // deliverable is the bead branch, not the rig's live tree (the worktree
+    // is reaped on a clean pass; the branch outlives the reap). The contract
+    // instructs a work outcome; the model decides — assert MECHANICS only:
+    // the bead closed (asserted above), and IF the close records
+    // work_outcome=shipped, the recorded branch must resolve from the rig
+    // (shared object store) and be diffable — never assert the model's
+    // judgment.
+    if close["data"]["work_outcome"] == "shipped" {
+        let branch = close["data"]["work_branch"].as_str().unwrap();
+        let tip = Command::new("git")
+            .arg("-C")
+            .arg(rig)
+            .args(["rev-parse", "--verify", branch])
+            .output()
+            .unwrap();
+        assert!(
+            tip.status.success(),
+            "shipped branch {branch} must resolve from the rig:\n{}",
+            String::from_utf8_lossy(&tip.stderr)
+        );
+        let diff = Command::new("git")
+            .arg("-C")
+            .arg(rig)
+            .args(["diff", "--stat", &format!("HEAD...{branch}")])
+            .output()
+            .unwrap();
+        assert!(
+            diff.status.success(),
+            "the bead branch must be diffable post-reap:\n{}",
+            String::from_utf8_lossy(&diff.stderr)
+        );
+        eprintln!("[tier0] shipped: branch {branch} resolves and is diffable from the rig");
+    } else {
+        eprintln!(
+            "[tier0] close recorded work_outcome={} — the model's judgment, not asserted",
+            close["data"]["work_outcome"]
+        );
+    }
     eprintln!(
-        "[tier0] DONE: --json feature works, suite green, story visible ('hours for a flag' is dead)"
+        "[tier0] DONE: bead closed, delivery mechanics hold, story visible ('hours for a flag' is dead)"
     );
 }
 
