@@ -132,6 +132,102 @@ fn show_promotes_shipped_deliverable_coordinates() {
     assert_eq!(v["work_outcome"], "shipped");
 }
 
+/// `build_deliverable` fails fast when a `shipped` close records no
+/// coordinates — the fold accepted `work_outcome = shipped` onto the row,
+/// but there is nothing to promote (the field-by-field `?` in
+/// `build_deliverable` names the missing key rather than rendering blanks).
+///
+/// `ledger::fold::bead_closed` itself now rejects a raw `shipped` append
+/// with no `work_commit`/`work_branch` (`InvalidEventData`), so that state
+/// can no longer arise through the normal write path — this guards against
+/// stored history predating that check (or any future drift), the same
+/// belt-and-suspenders motive `cli_doctor.rs`'s `tamper()` helper serves for
+/// `doctor --refold`. We reach it the same way: append a *valid* shipped
+/// close through the ledger, then overwrite that event's stored `data` row
+/// directly (bypassing `Ledger::append`, the only way past the fold's own
+/// gate) to strip the coordinates back out.
+#[test]
+fn show_of_shipped_bead_missing_coordinates_errors() {
+    let dir = camp_with_bead();
+    let db_path = dir.path().join(".camp/camp.db");
+    {
+        let mut ledger = camp_core::ledger::Ledger::open(&db_path).unwrap();
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::BeadClosed,
+                rig: Some("gascity".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "outcome": "pass",
+                    "work_outcome": "shipped",
+                    "work_branch": "camp/gc-1",
+                    "work_commit": "b1d59a2df83a060382ee78b5546cd2f858e3702f",
+                }),
+            })
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let rows = conn
+        .execute(
+            "UPDATE events SET data = '{\"outcome\":\"pass\",\"work_outcome\":\"shipped\"}' \
+             WHERE bead = 'gc-1' AND type = 'bead.closed'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "expected exactly one bead.closed event to tamper");
+    drop(conn);
+    camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "shipped close for gc-1 records no work_branch",
+        ));
+}
+
+/// `build_deliverable` resolves the rig path via `CampConfig::rig`, the
+/// same lookup `camp close` uses. If the bead's rig has since dropped out
+/// of camp.toml, that lookup — not the fold — is where the error surfaces.
+#[test]
+fn show_of_shipped_bead_with_unknown_rig_errors() {
+    let dir = camp_with_bead();
+    {
+        let mut ledger =
+            camp_core::ledger::Ledger::open(&dir.path().join(".camp/camp.db")).unwrap();
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::BeadClosed,
+                rig: Some("gascity".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "outcome": "pass",
+                    "work_outcome": "shipped",
+                    "work_branch": "camp/gc-1",
+                    "work_commit": "b1d59a2df83a060382ee78b5546cd2f858e3702f",
+                }),
+            })
+            .unwrap();
+    }
+    // Drop the `gascity` rig stanza from camp.toml — the file stays valid
+    // TOML, it simply no longer names the rig the bead points at.
+    std::fs::write(
+        dir.path().join(".camp/camp.toml"),
+        "[camp]\nname = \"dev\"\n",
+    )
+    .unwrap();
+    camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains("unknown rig \"gascity\""));
+}
+
 #[test]
 fn show_of_unknown_bead_errors() {
     let dir = camp_with_bead();
