@@ -27,6 +27,10 @@ pub struct BeadRow {
     /// Phase 3 (#48 finding 2): a fail-fast dispatch's reason, folded from
     /// dispatch.failed and cleared by a later session.woke/claim. The
     /// marker informs the list surface; it never gates dispatchability.
+    /// Retry semantics (assessment finding A): campd's in-memory failed
+    /// set suppresses re-dispatch for its lifetime — fixing the cause is
+    /// not enough; a campd restart retries (once per restart). `camp show`
+    /// states this next to the reason.
     pub dispatch_failure: Option<String>,
     pub labels: Vec<String>,
     pub created_ts: String,
