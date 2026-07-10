@@ -67,7 +67,13 @@ fleet-wide badge. This plugin does not wire the fleet badge there, because the
 schema and semantics differ; a purpose-built per-teammate row would be a
 separate script.
 
-## Worker skill
+## Skills
 
-`skills/worker/SKILL.md` is the worker lifecycle contract a pack worker
-follows: recall → claim → work → emit milestones → remember → close → exit.
+`skills/worker/SKILL.md` is the lifecycle contract a campd-spawned pack
+worker follows: recall → claim → work → emit milestones → remember → close →
+exit.
+
+`skills/operator/SKILL.md` is its mirror for the human's own control-plane
+session: campd is the sole dispatcher, the `camp/<bead>` branch is the
+deliverable, and the operator reads camp output and reports a concise summary
+(and awaits with `camp show --wait`) rather than thrashing raw output.

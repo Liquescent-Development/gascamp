@@ -15,3 +15,7 @@ Watch progress with /camp:status or `camp top`. To converse with the running
 worker, use /camp:nudge (`camp nudge <session> "<message>"`) — delivered live
 into its current turn, or via `claude --resume` after the turn if it has
 exited. Report the created bead id (or run id) to the user.
+
+Driving the camp from this session? The `operator` skill is your contract:
+campd is the sole dispatcher, the `camp/<bead>` branch is the deliverable,
+and you read camp output and summarize it — never paste raw walls.
