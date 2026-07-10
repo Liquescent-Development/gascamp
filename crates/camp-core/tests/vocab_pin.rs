@@ -15,6 +15,7 @@ use camp_core::vocab;
 struct GcVocab {
     events: Vec<String>,
     outcome: Vec<String>,
+    work_outcome: Vec<String>,
     final_disposition: Vec<String>,
     on_exhausted: Vec<String>,
 }
@@ -96,4 +97,27 @@ fn outcome_vocabulary_is_a_strict_subset_of_gc() {
             "camp run disposition {value:?} is not gc vocabulary"
         );
     }
+}
+
+/// Q3 (REVISED, SETTLED): camp adopts Gas City's WorkOutcome axis VERBATIM
+/// — the full set, exact spelling and order, mirrored (not a subset, not a
+/// superset). Values verified against gascity internal/beadmeta/values.go
+/// at the pinned ref (gc.work_outcome, ADR-0009).
+#[test]
+fn work_outcome_axis_mirrors_gc_verbatim() {
+    let gc = gc();
+    let gc_work: Vec<&str> = gc.work_outcome.iter().map(String::as_str).collect();
+    assert_eq!(vocab::CAMP_WORK_OUTCOMES, gc_work.as_slice());
+}
+
+/// Obligation (iv): adopting the WorkOutcome axis changes NOTHING on the
+/// control axis — the exact v1 sets, pinned.
+#[test]
+fn control_outcome_axis_is_unchanged() {
+    assert_eq!(vocab::CAMP_OUTCOMES, ["pass", "fail", "skipped"]);
+    assert_eq!(vocab::CAMP_FINAL_DISPOSITIONS, ["hard_fail", "soft_fail"]);
+    assert_eq!(
+        vocab::CAMP_RUN_DISPOSITIONS,
+        ["pass", "hard_fail", "soft_fail"]
+    );
 }
