@@ -109,6 +109,37 @@ pub fn user_message(text: &str) -> String {
     line
 }
 
+/// F7 pins as recorded on the session's woke event — the values the resume
+/// paths re-apply (issue #48 finding 1, resolved in dispatch-lifecycle
+/// Phase 3; the decision record is the plan doc + spec §8.4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumePins {
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub allowed_tools: Option<String>,
+}
+
+/// The ONE resume argv vocabulary (`camp nudge` resume + patrol
+/// nudge-resume): `-p --resume <sid> <text> --output-format json` plus the
+/// recorded F7 pins. NOT --append-system-prompt: the conversation already
+/// embodies the role prompt.
+pub fn resume_argv(sid: &str, text: &str, pins: &ResumePins) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = ["-p", "--resume", sid, text, "--output-format", "json"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let mut push = |flag: &str, value: &Option<String>| {
+        if let Some(v) = value {
+            argv.push(OsString::from(flag));
+            argv.push(OsString::from(v));
+        }
+    };
+    push("--model", &pins.model);
+    push("--permission-mode", &pins.permission_mode);
+    push("--allowedTools", &pins.allowed_tools);
+    argv
+}
+
 pub struct SpawnSpec {
     pub session_name: String,
     pub claude_session_id: String,
@@ -849,6 +880,58 @@ mod tests {
         assert!(
             err.to_string().contains("residue"),
             "plain dir must fail fast: {err:#}"
+        );
+    }
+
+    /// Issue #48 finding 1 (DECIDED, Phase 3): a resume turn re-applies the F7
+    /// pins recorded at spawn — a session keeps its birth capability envelope;
+    /// resuming under ambient user settings would silently widen a pinned
+    /// worker's tools. Pins absent (the operator's own registered session) =
+    /// a bare resume: a recorded absence, not a fallback. The role prompt
+    /// (--append-system-prompt) is NOT re-applied — the conversation already
+    /// embodies it.
+    #[test]
+    fn resume_argv_reapplies_recorded_pins_and_only_those() {
+        let pins = ResumePins {
+            model: Some("sonnet".into()),
+            permission_mode: Some("acceptEdits".into()),
+            allowed_tools: Some("Read,Edit,Bash".into()),
+        };
+        let argv: Vec<String> = resume_argv("sid-1", "status?", &pins)
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "-p",
+                "--resume",
+                "sid-1",
+                "status?",
+                "--output-format",
+                "json",
+                "--model",
+                "sonnet",
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                "Read,Edit,Bash",
+            ]
+        );
+        let bare: Vec<String> = resume_argv("sid-1", "status?", &ResumePins::default())
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            bare,
+            vec![
+                "-p",
+                "--resume",
+                "sid-1",
+                "status?",
+                "--output-format",
+                "json"
+            ]
         );
     }
 
