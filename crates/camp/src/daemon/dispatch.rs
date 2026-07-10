@@ -54,8 +54,12 @@ struct Worker {
     /// already-ended rejection would wedge the pid forever.
     end_recorded: bool,
     /// The held stream-json stdin (Decision C). Dropping it is the release
-    /// EOF; `None` after release (or for Null-mode spawns).
-    stdin: Option<std::process::ChildStdin>,
+    /// EOF; `None` after release (or for Null-mode spawns). A mio pipe
+    /// Sender rather than a raw ChildStdin so nudge writes can be BOUNDED
+    /// (non-blocking + waitable, PR #51 review finding 2) — an unbounded
+    /// blocking write into a full pipe would wedge campd's single-threaded
+    /// event loop.
+    stdin: Option<mio::unix::pipe::Sender>,
     /// Set when campd released this worker (bead closed, stdin dropped):
     /// its exit reaps as session.stopped with this reason — campd
     /// initiated the termination of a worker whose work was done (C2).
@@ -145,6 +149,84 @@ fn classify(status: ExitStatus) -> (EventType, Option<i64>, Option<i64>) {
     }
 }
 
+/// How long one nudge write may take before campd declares the worker's
+/// stdin wedged (PR #51 review finding 2). A bound on the event loop's
+/// worst-case stall, not a wakeup — nothing ticks while no nudge runs.
+const NUDGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bounded write of one stream-json line into a worker's held stdin:
+/// non-blocking writes; on WouldBlock, wait for writability with the
+/// REMAINING deadline via a throwaway poll (mio, already the event-loop
+/// substrate). Past the deadline the write fails TimedOut — the caller
+/// owns the torn-pipe consequence (a partial line may be buffered).
+fn write_bounded(
+    sender: &mut mio::unix::pipe::Sender,
+    bytes: &[u8],
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::io::{ErrorKind, Write as _};
+    sender.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut written = 0;
+    while written < bytes.len() {
+        match sender.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "worker stdin accepted zero bytes",
+                ));
+            }
+            Ok(n) => written += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        format!(
+                            "worker stdin stayed full past the {}s nudge write deadline \
+                             (the worker is not reading its pipe)",
+                            timeout.as_secs()
+                        ),
+                    ));
+                }
+                // Ok on writable OR on a spurious/timeout wake: the loop
+                // re-tries the write and re-checks the deadline, so a
+                // spurious wake costs one extra syscall, never a wedge.
+                wait_writable(sender, deadline - now)?;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    sender.flush()
+}
+
+/// Wait (bounded) for the sender to become writable using a throwaway
+/// poll. Spurious, empty, or SIGNAL-INTERRUPTED wakes return Ok — the
+/// caller's deadline check governs termination. The Interrupted arm is
+/// load-bearing (review residual on PR #51): mio's Poll::poll returns
+/// EINTR without retrying, and campd's SA_RESTART SIGCHLD handler never
+/// restarts poll/kevent (signal(7)) — so any worker exiting during this
+/// ≤2s wait would otherwise fail the nudge and cost a HEALTHY worker its
+/// held pipe (torn line + unearned EOF).
+fn wait_writable(
+    sender: &mut mio::unix::pipe::Sender,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let mut poll = mio::Poll::new()?;
+    let mut events = mio::Events::with_capacity(4);
+    poll.registry()
+        .register(sender, mio::Token(0), mio::Interest::WRITABLE)?;
+    let waited = match poll.poll(&mut events, Some(timeout)) {
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(()),
+        result => result,
+    };
+    let deregistered = poll.registry().deregister(sender);
+    waited?;
+    deregistered?;
+    Ok(())
+}
+
 impl Dispatcher {
     pub fn new(camp: CampDir, config: CampConfig) -> Dispatcher {
         Dispatcher {
@@ -171,10 +253,26 @@ impl Dispatcher {
         self.children.values().any(|w| w.session == session)
     }
 
+    /// (rig, bead) of a live child by session — the nudge handler's
+    /// session.nudged enrichment (dispatch-lifecycle Phase 1); None when
+    /// the session is not our child.
+    pub fn child_info(&self, session: &str) -> Option<(String, String)> {
+        self.children
+            .values()
+            .find(|w| w.session == session)
+            .map(|w| (w.rig.clone(), w.bead.clone()))
+    }
+
     /// Write one status-request turn into the session's held stdin
-    /// (Decision C: the live nudge path).
+    /// (Decision C: the live nudge path). The write is BOUNDED (PR #51
+    /// review finding 2): Request::Nudge made this operator-triggerable
+    /// over the socket, and an unbounded blocking write into the full pipe
+    /// of a worker that stopped reading would wedge campd's single-threaded
+    /// event loop — no dispatch, no SIGCHLD reaping — until it drained. On
+    /// a bounded failure the pipe may hold a torn partial line, so it is
+    /// dropped: no later turn can interleave garbage, and the worker sees
+    /// EOF after draining (the release shape).
     pub fn nudge_via_stdin(&mut self, session: &str, text: &str) -> NudgeOutcome {
-        use std::io::Write as _;
         let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
             return NudgeOutcome::NoPipe;
         };
@@ -182,12 +280,12 @@ impl Dispatcher {
             return NudgeOutcome::NoPipe;
         };
         let line = spawn::user_message(text);
-        match stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| stdin.flush())
-        {
+        match write_bounded(stdin, line.as_bytes(), NUDGE_WRITE_TIMEOUT) {
             Ok(()) => NudgeOutcome::Delivered,
-            Err(e) => NudgeOutcome::Failed(format!("stdin write failed: {e}")),
+            Err(e) => {
+                worker.stdin = None; // torn pipe: never write after a failed line
+                NudgeOutcome::Failed(format!("stdin write failed: {e}"))
+            }
         }
     }
 
@@ -301,7 +399,7 @@ impl Dispatcher {
             .stdout(std::process::Stdio::from(out))
             .spawn()
             .unwrap_or_else(|e| panic!("spawning cat: {e}"));
-        let stdin = child.stdin.take();
+        let stdin = child.stdin.take().map(mio::unix::pipe::Sender::from);
         let pid = child.id();
         self.children.insert(
             pid,
@@ -319,6 +417,58 @@ impl Dispatcher {
             },
         );
         pid
+    }
+
+    /// Test scaffolding (review finding 2, PR #51): a live held-stdin
+    /// worker that NEVER reads its pipe (`sleep`), so writes into it fill
+    /// the OS buffer and stall — the wedge shape the bounded nudge write
+    /// must survive.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    pub(crate) fn test_insert_held_sleeper(
+        &mut self,
+        dir: &std::path::Path,
+        session: &str,
+        bead: &str,
+    ) -> u32 {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawning sleep: {e}"));
+        let stdin = child.stdin.take().map(mio::unix::pipe::Sender::from);
+        let pid = child.id();
+        self.children.insert(
+            pid,
+            Worker {
+                child,
+                session: session.to_owned(),
+                bead: bead.to_owned(),
+                rig: "gc".into(),
+                rig_path: dir.to_path_buf(),
+                worktree: None,
+                end_recorded: false,
+                stdin,
+                released: None,
+                patrol_kill: None,
+            },
+        );
+        pid
+    }
+
+    /// Test scaffolding: kill a worker child and reap the OS process (no
+    /// ledger effects — cleanup only).
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    pub(crate) fn test_kill_and_wait(&mut self, pid: u32) {
+        let worker = self
+            .children
+            .get_mut(&pid)
+            .unwrap_or_else(|| panic!("no worker at pid {pid}"));
+        let _ = worker.child.kill();
+        let _ = worker.child.wait();
     }
 
     /// Test scaffolding: block until the given worker child exits.
@@ -554,11 +704,20 @@ impl Dispatcher {
                 // held pipe (P2). A write failure means the worker never
                 // got its task — kill it and land the failure in the
                 // ledger like any other spawn failure (decision F).
-                let mut stdin = child.stdin.take();
+                let mut stdin = child.stdin.take().map(mio::unix::pipe::Sender::from);
                 if let Some(pipe) = stdin.as_mut() {
                     use std::io::Write as _;
                     let task = spawn::task_message(&bead.id, &prep.spec.session_name);
-                    if let Err(e) = pipe.write_all(task.as_bytes()).and_then(|()| pipe.flush()) {
+                    // Explicitly BLOCKING for the task: the pipe is fresh
+                    // and empty, the task always fits the OS buffer, and
+                    // blocking semantics here predate finding 2 (only the
+                    // nudge path is operator-triggerable). Later nudges go
+                    // through write_bounded, which flips to non-blocking.
+                    if let Err(e) = pipe
+                        .set_nonblocking(false)
+                        .and_then(|()| pipe.write_all(task.as_bytes()))
+                        .and_then(|()| pipe.flush())
+                    {
                         let _ = child.kill();
                         let _ = child.wait();
                         ledger.append(EventInput {
@@ -2177,6 +2336,53 @@ mod tests {
         }
     }
 
+    /// Review finding 2 (PR #51): a nudge write into a full pipe of a
+    /// worker that is not reading must fail BOUNDED, never wedge campd's
+    /// single-threaded event loop (Request::Nudge made this path
+    /// operator-triggerable over the socket). After the bounded failure
+    /// the pipe may hold a torn partial line, so it must be dropped — a
+    /// later nudge sees NoPipe (resume path), never interleaved garbage.
+    #[test]
+    fn a_full_stdin_pipe_fails_the_nudge_bounded_instead_of_wedging_campd() {
+        // NOTE: do NOT hold spawn_probe_guard here — test_insert_held_sleeper
+        // acquires it per call, and the guard mutex is non-reentrant, so a
+        // test-level hold would self-deadlock (same rule as
+        // a_cap_full_patrol_respawn_queues_and_retries_when_a_slot_frees).
+        let dir = tempfile::tempdir().unwrap();
+        let config = CampConfig::parse("[camp]\nname = \"t\"\n").unwrap();
+        let mut dispatcher = Dispatcher::new(
+            CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            config,
+        );
+        // a held child that NEVER reads its stdin
+        let pid = dispatcher.test_insert_held_sleeper(dir.path(), "t/dev/1", "gc-1");
+
+        // far larger than any OS pipe buffer: the write cannot complete
+        let big = "x".repeat(2 * 1024 * 1024);
+        let started = std::time::Instant::now();
+        let outcome = dispatcher.nudge_via_stdin("t/dev/1", &big);
+        assert!(
+            matches!(outcome, NudgeOutcome::Failed(_)),
+            "a full pipe must fail the nudge: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the nudge write must be bounded, not a wedge ({}s)",
+            started.elapsed().as_secs()
+        );
+        // the torn pipe is dead: no later turn may interleave into it
+        assert!(
+            matches!(
+                dispatcher.nudge_via_stdin("t/dev/1", "again"),
+                NudgeOutcome::NoPipe
+            ),
+            "after a failed write the pipe must be dropped (NoPipe)"
+        );
+        dispatcher.test_kill_and_wait(pid);
+    }
+
     fn bead(assignee: Option<&str>) -> BeadRow {
         BeadRow {
             id: "gc-1".into(),
@@ -3329,7 +3535,7 @@ mod tests {
             .stdout(std::process::Stdio::from(out))
             .spawn()
             .unwrap();
-        let stdin = child.stdin.take();
+        let stdin = child.stdin.take().map(mio::unix::pipe::Sender::from);
         Worker {
             child,
             session: session.to_owned(),
@@ -3629,9 +3835,9 @@ mod tests {
         // as Failed. (Peer-side shutdown is not enough — macOS absorbs it.)
         let (ours, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
         ours.shutdown(std::net::Shutdown::Write).unwrap();
-        worker.stdin = Some(std::process::ChildStdin::from(std::os::fd::OwnedFd::from(
-            ours,
-        )));
+        worker.stdin = Some(mio::unix::pipe::Sender::from(
+            std::process::ChildStdin::from(std::os::fd::OwnedFd::from(ours)),
+        ));
         dispatcher.children.insert(worker.child.id(), worker);
         let outcome = dispatcher.nudge_via_stdin("t/dev/1", "status?");
         assert!(

@@ -50,6 +50,8 @@ pub struct SessionRow {
     pub spawned_ts: String,
     pub woke_actor: String,
     pub worktree: Option<String>,
+    /// `live` / `stopped` / `crashed` (the sessions table CHECK set).
+    pub status: String,
 }
 
 impl Ledger {
@@ -350,18 +352,40 @@ impl Ledger {
     /// attended session (spec §10). Such phantom-live rows are expected;
     /// bounded reaping is a deferred follow-up (see `patrol::adopt`).
     pub fn live_sessions(&self) -> Result<Vec<SessionRow>, CoreError> {
-        let mut stmt = self.conn.prepare(
+        self.session_rows("s.status = 'live'", [])
+    }
+
+    /// One registry row by name, any status (dispatch-lifecycle Phase 1:
+    /// the converse verb must reach exited sessions for the resume path).
+    /// Same woke-provenance join as `live_sessions`; a registered session
+    /// without its `session.woke` event is ledger corruption.
+    pub fn session_by_name(&self, name: &str) -> Result<Option<SessionRow>, CoreError> {
+        Ok(self.session_rows("s.name = ?1", [name])?.into_iter().next())
+    }
+
+    /// Shared body of `live_sessions` / `session_by_name`: registry rows
+    /// matching `where_clause` (a fixed, camp-authored predicate — values
+    /// always arrive through `params`, never interpolated), each joined
+    /// with its `session.woke` provenance (actor + worktree audit field).
+    fn session_rows<P: rusqlite::Params>(
+        &self,
+        where_clause: &str,
+        params: P,
+    ) -> Result<Vec<SessionRow>, CoreError> {
+        let sql = format!(
             "SELECT s.name, s.agent, s.rig, s.claude_session_id, s.transcript_path,
                     s.pid, s.bead, s.spawned_ts,
                     (SELECT e.actor FROM events e WHERE e.type = 'session.woke'
                       AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
                     (SELECT json_extract(e.data, '$.worktree') FROM events e
                       WHERE e.type = 'session.woke'
-                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1)
-             FROM sessions s WHERE s.status = 'live' ORDER BY s.name",
-        )?;
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
+                    s.status
+             FROM sessions s WHERE {where_clause} ORDER BY s.name"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<(SessionRow, Option<String>)> = stmt
-            .query_map([], |r| {
+            .query_map(params, |r| {
                 let woke_actor: Option<String> = r.get(8)?;
                 Ok((
                     SessionRow {
@@ -375,6 +399,7 @@ impl Ledger {
                         spawned_ts: r.get(7)?,
                         woke_actor: String::new(), // filled below after the NULL check
                         worktree: r.get(9)?,
+                        status: r.get(10)?,
                     },
                     woke_actor,
                 ))
@@ -387,7 +412,7 @@ impl Ledger {
                     Ok(row)
                 }
                 None => Err(CoreError::Corrupt(format!(
-                    "live session {:?} has no session.woke event",
+                    "session {:?} has no session.woke event",
                     row.name
                 ))),
             })
@@ -802,6 +827,86 @@ mod tests {
         assert_eq!(l.events_range(1, None).unwrap().len(), before);
     }
 
+    /// session.nudged (dispatch-lifecycle Phase 1, #29): log-only record of
+    /// a turn delivered into a session — via the campd-held stdin pipe
+    /// ("stdin") or claude --resume ("resume"). The session must exist
+    /// (fail fast on typos); text must be non-empty; unknown fields and
+    /// unknown vias are rejected (deny_unknown_fields).
+    #[test]
+    fn session_nudged_is_log_only_and_validated() {
+        let (_dir, mut l) = temp_ledger();
+        // a registered session to nudge
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "camp/dev/1", "agent": "dev", "rig": "gc"}),
+        })
+        .unwrap();
+
+        // accepted: stdin and resume
+        for via in ["stdin", "resume"] {
+            l.append(EventInput {
+                kind: EventType::SessionNudged,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({"session": "camp/dev/1", "via": via, "text": "status?"}),
+            })
+            .unwrap();
+        }
+        let before = l.events_range(1, None).unwrap().len();
+        // rejected: unknown session
+        assert!(
+            l.append(EventInput {
+                kind: EventType::SessionNudged,
+                rig: None,
+                actor: "cli".into(),
+                bead: None,
+                data: serde_json::json!({"session": "camp/dev/99", "via": "stdin", "text": "x"}),
+            })
+            .is_err()
+        );
+        // rejected: bogus via
+        assert!(
+            l.append(EventInput {
+                kind: EventType::SessionNudged,
+                rig: None,
+                actor: "cli".into(),
+                bead: None,
+                data: serde_json::json!({"session": "camp/dev/1", "via": "carrier-pigeon", "text": "x"}),
+            })
+            .is_err()
+        );
+        // rejected: blank text
+        assert!(
+            l.append(EventInput {
+                kind: EventType::SessionNudged,
+                rig: None,
+                actor: "cli".into(),
+                bead: None,
+                data: serde_json::json!({"session": "camp/dev/1", "via": "stdin", "text": "  "}),
+            })
+            .is_err()
+        );
+        // rejected: unknown field (deny_unknown_fields)
+        assert!(
+            l.append(EventInput {
+                kind: EventType::SessionNudged,
+                rig: None,
+                actor: "cli".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "camp/dev/1", "via": "stdin", "text": "x", "mode": "attended",
+                }),
+            })
+            .is_err()
+        );
+        // rejections appended nothing (one-transaction event+state property)
+        assert_eq!(l.events_range(1, None).unwrap().len(), before);
+    }
+
     // ---- Phase 11: the adoption registry query ---------------------------
 
     #[test]
@@ -874,6 +979,54 @@ mod tests {
         assert_eq!(w1.worktree.as_deref(), Some("/camps/t/worktrees/gc-1"));
         assert!(w1.pid.is_none());
         assert_eq!(w1.spawned_ts, "2026-07-05T21:14:03Z");
+    }
+
+    /// The converse verb's registry lookup (dispatch-lifecycle Phase 1):
+    /// any session by name, ANY status — an exited worker must be findable
+    /// for the resume path — carrying claude_session_id, rig, bead,
+    /// worktree, status.
+    #[test]
+    fn session_by_name_finds_live_and_ended_rows_with_provenance() {
+        let (_dir, mut l) = temp_ledger();
+        seeded_bead(&mut l, "gc-1");
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({
+                "name": "t/dev/1", "agent": "dev", "rig": "gc",
+                "claude_session_id": "7bd2befc-b018-4080-8738-429d541b3646",
+                "transcript_path": "/home/u/.claude/projects/-code-gc/x.jsonl",
+                "bead": "gc-1", "worktree": "/camps/t/worktrees/gc-1",
+            }),
+        })
+        .unwrap();
+
+        let live = l.session_by_name("t/dev/1").unwrap().expect("row exists");
+        assert_eq!(live.status, "live");
+        assert_eq!(live.agent, "dev");
+        assert_eq!(live.woke_actor, "campd");
+
+        l.append(EventInput {
+            kind: EventType::SessionStopped,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "t/dev/1", "exit_code": 0}),
+        })
+        .unwrap();
+
+        let row = l.session_by_name("t/dev/1").unwrap().expect("row exists");
+        assert_eq!(row.status, "stopped", "ended rows stay findable");
+        assert_eq!(
+            row.claude_session_id.as_deref(),
+            Some("7bd2befc-b018-4080-8738-429d541b3646")
+        );
+        assert_eq!(row.rig.as_deref(), Some("gc"));
+        assert_eq!(row.bead.as_deref(), Some("gc-1"));
+        assert_eq!(row.worktree.as_deref(), Some("/camps/t/worktrees/gc-1"));
+        assert!(l.session_by_name("nobody/here/9").unwrap().is_none());
     }
 
     // ---- Phase 11 events (agent.stalled, patrol.degraded) + crash cause --

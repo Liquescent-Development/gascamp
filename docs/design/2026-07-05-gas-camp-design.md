@@ -68,8 +68,8 @@ Four principles, each falsifiable. Violations are bugs, not trade-offs.
 - Packs: user-designed roles, formulas, and orders as configuration
 - Parallel workflows: dependency-gated graphs with fan-out, verification
   loops, and bounded retries
-- Every agent reachable for introspection *and* conversation — live when
-  attended, by resume when not, by transcript forever
+- Every agent reachable for introspection *and* conversation — live while
+  it runs (`camp nudge`), by resume after it exits, by transcript forever
 - One control plane: the user drives everything from inside a Claude Code
   session (slash commands), with the `camp` CLI as the identical scripting
   surface
@@ -135,7 +135,7 @@ agent definitions.
                          │      talk to any worker
                  ┌───────▼────────┐
                  │  YOUR SESSION  │  /sling /status /adopt /events
-                 │  (+ teammates) │  Tier-0 workers spawn here, in view
+                 │ (the overseer) │  converse with any worker: camp nudge
                  └───┬────────────┘
                      │ camp CLI / hooks          headless workers
                      │                        ┌────────────────────┐
@@ -170,7 +170,7 @@ agent definitions.
 
 | Gas City primitive | Camp realization | Claude Code feature used |
 |---|---|---|
-| **Agent** (WHO) | a Claude Code agent definition file in a pack — frontmatter (model, tools, permissions) + prompt | agent definitions; teammates (spawned while you are present); headless-but-present sessions (campd-dispatched) |
+| **Agent** (WHO) | a Claude Code agent definition file in a pack — frontmatter (model, tools, permissions) + prompt | agent definitions; headless-but-present sessions (campd-dispatched; converse via `camp nudge` / `claude --resume`) |
 | **Bead** (WHAT) | a ledger record — append-only event history plus current state; tasks, mail, and memory are all beads differing by `type`; dependencies are `needs` edges; ready = open ∧ no open blockers | — (camp-owned ledger) |
 | **Formula** (HOW) | a TOML file, strict subset of Gas City formula v2 (§8.2); cooking materializes a run into the ledger | worker sessions execute step beads |
 | **Rig** (WHERE) | a registered repo path; beads carry a rig; dispatch sets cwd or worktree | per-session cwd; worktree isolation |
@@ -286,11 +286,12 @@ transcript path, spawn time, and status. "Every agent reachable for
 introspection and conversation" then degrades gracefully and never to
 "gone":
 
-1. live attended worker → a teammate in your TUI: talk in place;
-2. live campd-dispatched worker → transcript tailable now, or attach with
-   `claude --resume <session-id>`;
-3. exited worker → resume the session by ID and converse;
-4. long gone → the transcript file persists.
+1. live worker → send a turn into its running conversation:
+   `camp nudge <session> "<message>"` (campd-held stdin, live); tail its
+   transcript now, or attach with `claude --resume <session-id>`;
+2. exited worker → resume the session by ID and converse (`camp nudge`
+   delivers via `claude --resume`);
+3. long gone → the transcript file persists.
 
 ### 7.5. Why not Dolt/bd — and the alternatives considered
 
@@ -336,7 +337,7 @@ tiering is designed until real usage shows it is needed.
 
 ```
 you:   /sling add a --json flag to `gc ls`, TDD it
-camp:  gc-142 open → worker gc-dev-1 (teammate)
+camp:  gc-142 open → worker gc/dev/1 (campd-dispatched; converse: camp nudge gc/dev/1 "…")
 ```
 
 One ledger write (`bead.created`), one worker spawn, done. The worker
@@ -433,24 +434,34 @@ milestones in the ledger, streams a transcript you can tail live, and can
 be conversed with. Camp runs nothing hidden; some things start
 *minimized*.
 
-- **`campd` dispatches all graph work** — formula steps, orders, patrol
-  respawns — whether or not you are watching, because forward progress
-  must not depend on a user session existing. These workers are
+- **`campd` dispatches all work** — Tier-0 beads, formula steps, orders,
+  patrol respawns — whether or not you are watching, because forward
+  progress must not depend on a user session existing. These workers are
   **headless-but-present**: `claude -p` with a recorded session ID, the
   pack agent's prompt/tools/permission configuration, and cwd or worktree
   per the bead's rig. Minimized windows, not hidden ones — `/status` (and
   `camp top`) lists them live, their transcripts tail in real time, and
   attaching to any of them — a full conversation with its entire context —
   is one keystroke (`claude --resume <id>`).
-- **The one surface exception:** attended Tier-0 sling spawns the worker
-  as a **teammate inside your session**, because when you are sitting
-  right there, in-place conversation beats even a one-keystroke attach.
-  (Assumption A1, §17, covers teammate-interaction mechanics; the fallback
-  is headless + instant attach — a UX tweak, not a structural change.)
+- **There is no second spawner.** `/camp:sling` and `camp sling` are the
+  same single path: enqueue a bead → `campd` dispatches → the worker
+  claims. Conversing with any running session — worker or overseer — is a
+  uniform verb, `camp nudge <session> "<message>"` (mirror of Gas City's
+  `gc nudge`/session-message): delivered live over the worker's campd-held
+  stdin pipe, or via `claude --resume` after its current turn (assumption
+  A4, §17); every delivered turn is a `session.nudged` ledger event.
+  Interactivity is a runtime/harness capability, never a dispatch mode.
+  The interactive overseer is the human's own Claude Code session + camp
+  plugin (the §4 mental model made literal); persistent overseer / coder /
+  committer roles are pack content over the six primitives (§11), mirroring
+  Gas City's swarm pack. *(History: v1 shipped an "attended teammate is the
+  one surface exception" here; removed 2026-07-09 — it was a second spawner
+  racing campd (#29) with no Gas City analog. Decision record:
+  docs/design/2026-07-09-dispatch-lifecycle.md, Q6.)*
 
-Put differently: the *dispatcher* for graph work is always `campd`, and
-the *surface* a worker's conversation starts on varies with whether you
-were present when it spawned — never with whether you may see it.
+Put differently: `campd` is the only dispatcher, for Tier-0 and graph work
+alike. How you talk to a worker — live nudge, resume, transcript — never
+changes who spawned it or whether you may see it.
 
 No warm pools in v1: workers spawn per bead and exit on close, so an idle
 camp has zero agent processes. At ~2 s spawn cost and ≤10 concurrency, warm
@@ -540,7 +551,7 @@ Three mechanisms, all push, all mechanical:
    `event:agent.stalled` can sling an investigator formula. `campd`
    notices; it never diagnoses.
 
-Attended teammates are in the user's face already; patrol only annotates
+Attended sessions (the operator's own) are in the user's face already; patrol only annotates
 (`agent.stalled` event + statusline badge), never kills a session inside
 the user's TUI.
 

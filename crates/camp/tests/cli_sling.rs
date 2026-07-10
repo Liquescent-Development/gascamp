@@ -243,3 +243,53 @@ fn sling_rejects_formula_combined_with_a_title() {
     let out = camp(&root, &["sling", "some title", "--formula", "one-step"]);
     assert!(!out.status.success());
 }
+
+/// Test obligation (iv), dispatch-lifecycle Phase 1: no reservation state.
+/// A sling writes ONE bead.created whose payload is exactly {title,
+/// assignee} — no dispatch/reserved/attended key — and the bead is born
+/// open and unclaimed (claim-at-creation was the DEPRECATED design).
+#[test]
+fn sling_creates_an_open_unclaimed_bead_with_no_reservation_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = scaffold(dir.path(), Some("dev"), None);
+    write_agent(&root, "dev");
+    let out = camp(&root, &["sling", "reservation guard"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bead = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    stop_campd(&root);
+
+    let events = events_json(&root);
+    let created = events
+        .iter()
+        .find(|e| e["type"] == "bead.created")
+        .expect("sling appends bead.created");
+    let keys: std::collections::BTreeSet<&str> = created["data"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["assignee", "title"].into_iter().collect(),
+        "payload is exactly title+assignee"
+    );
+    // The event log is append-only truth: no reservation event may exist.
+    for e in &events {
+        let ty = e["type"].as_str().unwrap();
+        assert!(
+            !ty.contains("reserv") && !ty.contains("attended"),
+            "no reservation vocabulary may appear in the ledger: {ty}"
+        );
+    }
+    // Born open and unclaimed: the only claim path is a worker's own
+    // `camp claim` (the scaffold's command is `true` — it never claims).
+    let ledger = camp_core::ledger::Ledger::open_read_only(&root.join("camp.db")).unwrap();
+    let row = ledger.get_bead(&bead).unwrap().expect("bead exists");
+    assert_eq!(row.status, "open");
+    assert_eq!(row.claimed_by, None);
+}

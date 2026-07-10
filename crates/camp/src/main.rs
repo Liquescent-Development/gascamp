@@ -15,6 +15,7 @@ mod cmd {
     pub mod export;
     pub mod init;
     pub mod ls;
+    pub mod nudge;
     pub mod order;
     pub mod recall;
     pub mod remember;
@@ -169,6 +170,15 @@ enum Command {
         /// Cook <camp>/formulas/<name>.toml into a run (spec §8.2)
         #[arg(long, value_name = "NAME")]
         formula: Option<String>,
+    },
+    /// Send a turn to any running or exited session (the converse verb):
+    /// live over campd's held stdin when possible, else `claude --resume`
+    /// after its current turn
+    Nudge {
+        /// Session registry name (see `camp top`)
+        session: String,
+        /// The message to deliver
+        text: String,
     },
     /// Show a bead's current state and full event history
     Show {
@@ -493,6 +503,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::sling::run(&camp, title, agent, rig, formula)
+        }
+        Command::Nudge { session, text } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::nudge::run(&camp, session, text)
         }
         Command::Show { bead } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
