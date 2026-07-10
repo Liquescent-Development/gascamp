@@ -76,6 +76,17 @@ fn scaffold(dir: &Path, command: &str) -> (PathBuf, PathBuf) {
     (root, rig)
 }
 
+/// Rewrite the scaffolded `dev` agent with extra frontmatter (the
+/// daemon_dispatch `write_agent` idiom). `isolation: none` stays — these
+/// rigs are bare dirs (no git base for the worktree default).
+fn write_agent(root: &Path, front_extra: &str) {
+    std::fs::write(
+        root.join("agents/dev.md"),
+        format!("---\nname: dev\nisolation: none\n{front_extra}---\nDo the work.\n"),
+    )
+    .unwrap();
+}
+
 fn events_json(root: &Path) -> Vec<serde_json::Value> {
     camp_ok(root, &["events", "--json"])
         .lines()
@@ -221,6 +232,12 @@ fn nudge_delivers_into_a_live_workers_held_stdin() {
 fn nudge_resumes_an_exited_worker_and_prints_the_reply() {
     let dir = tempfile::tempdir().unwrap();
     let (root, rig) = scaffold(dir.path(), &claude_or_agent());
+    // Phase 3 (#48 finding 1): the agent declares F7 pins; the woke records
+    // them; the resume below must re-apply them.
+    write_agent(
+        &root,
+        "model: sonnet\npermissionMode: acceptEdits\ntools: Read, Edit, Bash\n",
+    );
     {
         let _campd = Daemon::spawn(&root, &[("FAKE_AGENT", &fake_agent())]);
         let bead = camp_ok(&root, &["sling", "run and exit"]).trim().to_owned();
@@ -262,6 +279,11 @@ fn nudge_resumes_an_exited_worker_and_prints_the_reply() {
         "resume argv must carry the recorded claude session id: {logged}"
     );
     assert!(logged.contains("how did it go?"), "log: {logged}");
+    assert!(
+        logged.contains("--permission-mode"),
+        "resume must re-apply the recorded pins: {logged}"
+    );
+    assert!(logged.contains("--allowedTools"), "log: {logged}");
     let cwd_line = logged
         .lines()
         .find(|l| l.starts_with("cwd:"))
@@ -327,6 +349,11 @@ fn nudge_reaches_a_live_attended_session_via_resume() {
             .unwrap()
             .contains("--resume 0e0e0e0e"),
         "the attended session resumes by its registered claude session id"
+    );
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        !logged.contains("--allowedTools") && !logged.contains("--permission-mode"),
+        "a session registered without pins resumes bare (its settings are its own): {logged}"
     );
 }
 

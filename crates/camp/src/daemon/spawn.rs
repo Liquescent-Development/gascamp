@@ -11,23 +11,41 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{Context, Result, bail};
 use camp_core::pack::AgentDef;
 
-/// The worker-contract instructions (spec §8.4: claim → milestones →
-/// close → exit). `{bead}` and `{session}` are substituted per spawn; the
-/// richer worker *skill* is Phase 12 pack content — this is the mechanical
-/// floor every campd-spawned worker gets.
-const WORKER_CONTRACT: &str = "You are a Gas Camp worker session working exactly one bead.\n\
-Contract, in order:\n\
-1. Claim it: run `camp claim {bead} --session {session}`\n\
-2. Read it: `camp show {bead}`\n\
-3. Do the work in the current directory.\n\
-4. As you hit milestones, record them: `camp event emit \"<one line>\" --bead {bead} --session {session}`\n\
-5. Close it: `camp close {bead} --outcome pass --reason \"<one line>\"` (or --outcome fail)\n\
-6. Exit. Do not start unrelated work. CAMP_DIR is already set for the camp CLI.\n";
+/// The ONE worker-contract source (dispatch-lifecycle Phase 3, Q5): the
+/// worker skill shipped by the plugin. Embedded at compile time so the
+/// mechanical floor campd injects and the skill a plugin user reads can
+/// never drift — obligation (v) pins the equality by test.
+const WORKER_SKILL: &str = include_str!("../../../../plugin/skills/worker/SKILL.md");
+
+/// The skill body: frontmatter stripped. The skill uses `<bead>`/`<name>`
+/// placeholders as documentation; task_prompt binds them per spawn.
+fn skill_body() -> String {
+    let mut lines = WORKER_SKILL.lines();
+    // A malformed skill (no frontmatter fence) is a build defect, caught
+    // by the tests below — fall through to the full text rather than
+    // panicking in library code.
+    if lines.next() != Some("---") {
+        return WORKER_SKILL.to_owned();
+    }
+    lines
+        .skip_while(|l| *l != "---")
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 fn task_prompt(bead_id: &str, session_name: &str) -> String {
-    WORKER_CONTRACT
-        .replace("{bead}", bead_id)
-        .replace("{session}", session_name)
+    let bound = skill_body()
+        .replace("<bead>", bead_id)
+        .replace("<name>", session_name);
+    // .trim(): symmetric with the obligation-(v) test's expectation (N4) —
+    // leading/trailing blank lines around the body never desynchronize the
+    // "prompt ends with the transformed body" equality.
+    format!(
+        "You are Gas Camp worker session {session_name}, dispatched to work exactly one bead: {bead_id}. \
+         CAMP_DIR is already set for the camp CLI; do not start unrelated work.\n\n{}",
+        bound.trim()
+    )
 }
 
 /// Every non-ASCII-alphanumeric CHARACTER becomes one '-' — Claude Code's
@@ -89,6 +107,37 @@ pub fn user_message(text: &str) -> String {
     .to_string();
     line.push('\n');
     line
+}
+
+/// F7 pins as recorded on the session's woke event — the values the resume
+/// paths re-apply (issue #48 finding 1, resolved in dispatch-lifecycle
+/// Phase 3; the decision record is the plan doc + spec §8.4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumePins {
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub allowed_tools: Option<String>,
+}
+
+/// The ONE resume argv vocabulary (`camp nudge` resume + patrol
+/// nudge-resume): `-p --resume <sid> <text> --output-format json` plus the
+/// recorded F7 pins. NOT --append-system-prompt: the conversation already
+/// embodies the role prompt.
+pub fn resume_argv(sid: &str, text: &str, pins: &ResumePins) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = ["-p", "--resume", sid, text, "--output-format", "json"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let mut push = |flag: &str, value: &Option<String>| {
+        if let Some(v) = value {
+            argv.push(OsString::from(flag));
+            argv.push(OsString::from(v));
+        }
+    };
+    push("--model", &pins.model);
+    push("--permission-mode", &pins.permission_mode);
+    push("--allowedTools", &pins.allowed_tools);
+    argv
 }
 
 pub struct SpawnSpec {
@@ -254,6 +303,26 @@ fn ensure_worktree_base(rig_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The rig's base commit at this moment — `git rev-parse --verify
+/// HEAD^{commit}` — or None when the rig has none (non-repo / unborn
+/// HEAD). Recorded in session.woke as the dispatch-time `base`: the
+/// mechanical reference the `camp close` shipped gate verifies descent
+/// from (using the rig's LATER HEAD would let a live-tree worker on a
+/// baseless rig self-certify its own dead-end commit as based).
+pub fn rig_base(rig_path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(rig_path)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!sha.is_empty()).then_some(sha)
+}
+
 /// `git worktree add -b camp/<bead> <camp>/worktrees/<bead>` (decision H).
 /// A pre-existing directory or branch fails fast — bead ids are unique and
 /// Phase 8 never respawns a bead. A rig with no base commit is refused
@@ -361,6 +430,55 @@ mod tests {
             stall_after: None,
             prompt: "Implement with TDD.".into(),
         }
+    }
+
+    /// Obligation (v), dispatch-lifecycle Phase 3 (Q5): ONE worker-contract
+    /// source. The task prompt every campd worker receives is the worker
+    /// skill's body verbatim (frontmatter stripped, <bead>/<name> bound),
+    /// behind a two-line mechanical preamble. The transform is recomputed
+    /// here independently from the file, so a divergent second copy in Rust
+    /// cannot survive this assertion.
+    #[test]
+    fn the_task_prompt_is_the_worker_skill_verbatim() {
+        let skill = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../plugin/skills/worker/SKILL.md"),
+        )
+        .unwrap();
+        // frontmatter: first line is "---", body starts after the next "---" line
+        let mut lines = skill.lines();
+        assert_eq!(
+            lines.next(),
+            Some("---"),
+            "skill must open with frontmatter"
+        );
+        let body: String = lines
+            .by_ref()
+            .skip_while(|l| *l != "---")
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Symmetric trim on BOTH sides (plan-review r2, N4): the impl embeds
+        // `bound.trim()`, so the expectation trims identically — a leading
+        // blank line after the frontmatter fence cannot desynchronize them.
+        let expected = body
+            .replace("<bead>", "gc-9")
+            .replace("<name>", "t/dev/9")
+            .trim()
+            .to_owned();
+        let prompt = task_prompt("gc-9", "t/dev/9");
+        assert!(
+            prompt.ends_with(&expected),
+            "prompt must end with the transformed skill body;\nprompt tail: {}",
+            &prompt[prompt.len().saturating_sub(200)..]
+        );
+        let preamble = prompt.strip_suffix(expected.as_str()).unwrap();
+        assert!(preamble.contains("gc-9") && preamble.contains("t/dev/9"));
+        assert!(preamble.contains("CAMP_DIR"));
+        assert!(
+            preamble.lines().filter(|l| !l.trim().is_empty()).count() <= 2,
+            "the preamble is mechanical binding only, not a second contract: {preamble:?}"
+        );
     }
 
     /// Exit criterion pinned as a test: real-claude spawn arguments match
@@ -558,6 +676,30 @@ mod tests {
         assert!(!wt.exists());
     }
 
+    /// The dispatch-time base (Phase 3, Q4): the mechanical fact "what commit
+    /// was this rig on when the work was dispatched" — the reference the
+    /// shipped gate verifies descent from. None on an unborn HEAD or a
+    /// non-repo (the same shapes ensure_worktree_base refuses).
+    #[test]
+    fn rig_base_resolves_head_and_is_none_without_one() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let rig = git_rig(dir.path());
+        let base = rig_base(&rig).expect("a committed rig has a base");
+        assert_eq!(base.len(), 40, "full sha: {base}");
+
+        let bare = dir.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(rig_base(&bare).is_none(), "not a repo");
+        Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["init", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(rig_base(&bare).is_none(), "unborn HEAD");
+    }
+
     /// Phase 2 (spec §12 fail-fast): a rig without a base commit cannot
     /// host a worktree. Modern git (2.42+) auto-infers `--orphan` on an
     /// unborn HEAD and would happily create a baseless worktree — the
@@ -738,6 +880,58 @@ mod tests {
         assert!(
             err.to_string().contains("residue"),
             "plain dir must fail fast: {err:#}"
+        );
+    }
+
+    /// Issue #48 finding 1 (DECIDED, Phase 3): a resume turn re-applies the F7
+    /// pins recorded at spawn — a session keeps its birth capability envelope;
+    /// resuming under ambient user settings would silently widen a pinned
+    /// worker's tools. Pins absent (the operator's own registered session) =
+    /// a bare resume: a recorded absence, not a fallback. The role prompt
+    /// (--append-system-prompt) is NOT re-applied — the conversation already
+    /// embodies it.
+    #[test]
+    fn resume_argv_reapplies_recorded_pins_and_only_those() {
+        let pins = ResumePins {
+            model: Some("sonnet".into()),
+            permission_mode: Some("acceptEdits".into()),
+            allowed_tools: Some("Read,Edit,Bash".into()),
+        };
+        let argv: Vec<String> = resume_argv("sid-1", "status?", &pins)
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "-p",
+                "--resume",
+                "sid-1",
+                "status?",
+                "--output-format",
+                "json",
+                "--model",
+                "sonnet",
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                "Read,Edit,Bash",
+            ]
+        );
+        let bare: Vec<String> = resume_argv("sid-1", "status?", &ResumePins::default())
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            bare,
+            vec![
+                "-p",
+                "--resume",
+                "sid-1",
+                "status?",
+                "--output-format",
+                "json"
+            ]
         );
     }
 

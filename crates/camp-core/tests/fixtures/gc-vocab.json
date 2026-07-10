@@ -82,6 +82,7 @@
     "emergency.acked"
   ],
   "outcome": ["pass", "fail", "skipped", "missing_root"],
+  "work_outcome": ["shipped", "no-op", "blocked", "abandoned"],
   "final_disposition": [
     "pass",
     "hard_fail",

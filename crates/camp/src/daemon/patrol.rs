@@ -63,6 +63,11 @@ struct Tracked {
     /// tempdirs/symlinked homes would otherwise never match (macOS /var →
     /// /private/var). Set at apply_tracking; used to unwatch.
     watch_key: Option<PathBuf>,
+    /// F7 pins as recorded on the woke event (Phase 3, #48 finding 1) —
+    /// re-applied on the nudge-resume path; None = a bare resume.
+    model: Option<String>,
+    permission_mode: Option<String>,
+    allowed_tools: Option<String>,
 }
 
 /// Shared with the notify callback thread (the orders-watch mold, plus a
@@ -343,6 +348,9 @@ impl PatrolRuntime {
                 owned,
                 base_threshold: None,
                 watch_key: None,
+                model: data["model"].as_str().map(str::to_owned),
+                permission_mode: data["permission_mode"].as_str().map(str::to_owned),
+                allowed_tools: data["allowed_tools"].as_str().map(str::to_owned),
             }),
         });
     }
@@ -381,6 +389,9 @@ impl PatrolRuntime {
                 owned,
                 base_threshold: None,
                 watch_key: None,
+                model: row.model.clone(),
+                permission_mode: row.permission_mode.clone(),
+                allowed_tools: row.allowed_tools.clone(),
             }),
         });
     }
@@ -802,13 +813,15 @@ impl PatrolRuntime {
             let log = std::fs::File::create(&log_path)
                 .with_context(|| format!("creating {}", log_path.display()))?;
             let log_err = log.try_clone().context("cloning the nudge log handle")?;
+            // One resume argv vocabulary (spawn::resume_argv): the F7 pins
+            // recorded at spawn ride the resume too (#48 finding 1).
+            let pins = crate::daemon::spawn::ResumePins {
+                model: tracked.model.clone(),
+                permission_mode: tracked.permission_mode.clone(),
+                allowed_tools: tracked.allowed_tools.clone(),
+            };
             let mut cmd = std::process::Command::new(&self.camp_config.dispatch.command);
-            cmd.arg("-p")
-                .arg("--resume")
-                .arg(sid)
-                .arg(&text)
-                .arg("--output-format")
-                .arg("json")
+            cmd.args(crate::daemon::spawn::resume_argv(sid, &text, &pins))
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::from(log))
@@ -1992,6 +2005,10 @@ mod tests {
         assert!(
             args.contains("wt-gc-2"),
             "the resume child runs in the worker's worktree: {args}"
+        );
+        assert!(
+            !args.contains("--allowedTools") && !args.contains("--permission-mode"),
+            "a woke without pins resumes bare (a recorded absence): {args}"
         );
     }
 

@@ -58,7 +58,7 @@ if [ -z "$gc_names" ]; then
   exit 2
 fi
 
-pin_names="$(jq -r '.events[], .outcome[], .final_disposition[], .on_exhausted[]' "$pin_file" | sort -u)"
+pin_names="$(jq -r '.events[], .outcome[], .work_outcome[], .final_disposition[], .on_exhausted[]' "$pin_file" | sort -u)"
 if [ -z "$pin_names" ]; then
   echo "check_vocab: gc-vocab.json gc lists are empty — pin is broken" >&2
   exit 2

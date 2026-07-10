@@ -442,6 +442,32 @@ fn git_rig(rig: &Path) {
     }
 }
 
+/// Run git in `repo` with hermetic identity/signing (a global
+/// commit.gpgsign=true must not stall tests — spawn.rs::git_rig precedent),
+/// returning trimmed stdout.
+fn git(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
 /// Master plan: "worktree created/removed on pass". The worker runs in the
 /// worktree (proven by FAKE_AGENT_TOUCH landing there), and a clean pass
 /// reaps it with the gc-mirrored event.
@@ -1186,6 +1212,127 @@ fn worktree_worker_cwd_is_canonicalized_on_a_symlinked_camp_root() {
         !transcript.contains(&munge(&raw_cwd.to_string_lossy())),
         "worktree transcript {transcript} must NOT use the un-canonicalized symlink spelling {}",
         munge(&raw_cwd.to_string_lossy())
+    );
+}
+
+// ---- Phase 3 (#34): delivery obligations i/ii/vi through the full path ---
+
+/// Obligation (ii) + the (vi)-complement, dispatch-lifecycle Phase 3
+/// (#34, Q4): through the REAL dispatch path — worktree default,
+/// camp/<bead> branch — a shipping worker records work_outcome=shipped,
+/// the worktree is reaped (clean pass), and the bead branch OUTLIVES the
+/// reap: reachable and diffable from the rig. The branch is the
+/// deliverable.
+#[test]
+fn a_worktree_worker_ships_on_the_bead_branch_and_the_branch_outlives_the_reap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 4, "");
+    git_rig(&rig); // the rig must be a COMMITTED git repo
+    write_agent(&root, "dev", ""); // default isolation = worktree (Phase 2)
+    let _daemon = Daemon::spawn(&root, &[("FAKE_AGENT_DELIVERY", "ship")]);
+
+    let bead = camp_ok(&root, &["sling", "ship it", "--agent", "dev"])
+        .trim()
+        .to_owned();
+    wait_until(&root, "closed and reaped", |e| {
+        count(e, "bead.closed") == 1 && count(e, "bead.worktree.reaped") == 1
+    });
+
+    let events = events_json(&root);
+    let closed = events.iter().find(|e| e["type"] == "bead.closed").unwrap();
+    assert_eq!(closed["data"]["work_outcome"], "shipped");
+    assert_eq!(closed["data"]["work_branch"], format!("camp/{bead}"));
+    let branch_tip = git(&rig, &["rev-parse", &format!("camp/{bead}")]);
+    assert_eq!(
+        closed["data"]["work_commit"],
+        branch_tip.as_str(),
+        "the recorded commit IS the bead branch's tip"
+    );
+
+    // the worktree is gone (clean pass), the branch is not:
+    let wt = root.join("worktrees").join(&bead);
+    assert!(!wt.exists(), "reaped worktree must be removed");
+    // reachable + diffable FROM THE RIG (shared object store):
+    let diff = Command::new("git")
+        .arg("-C")
+        .arg(&rig)
+        .args(["diff", "--stat", &format!("HEAD...camp/{bead}")])
+        .output()
+        .unwrap();
+    assert!(
+        diff.status.success(),
+        "the bead branch must be diffable post-reap: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+}
+
+/// Obligation (i), dispatch-lifecycle Phase 3 (#34): the original defect,
+/// end to end — a baseless rig (isolation="none" is the only way a worker
+/// reaches one; the loud opt-out), a dead-end root commit — and the ledger
+/// records blocked. `shipped` appears NOWHERE; the gate held (a gate hole
+/// makes the fake agent exit 96, which would surface as a crashed session
+/// before the blocked close ever lands).
+#[test]
+fn a_dead_end_worker_on_a_baseless_rig_records_blocked_never_shipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 4, "");
+    // make the rig BASELESS: git init -b main, NO commit (the Phase 2
+    // dispatch-failed test's shape)
+    git(&rig, &["init", "-b", "main"]);
+    write_agent(&root, "dev", "isolation: none\n"); // the loud opt-out
+    let _daemon = Daemon::spawn(&root, &[("FAKE_AGENT_DELIVERY", "deadend")]);
+
+    let _bead = camp_ok(
+        &root,
+        &["sling", "give this repo a README", "--agent", "dev"],
+    );
+    wait_until(&root, "blocked close", |e| count(e, "bead.closed") == 1);
+
+    let events = events_json(&root);
+    let closed = events.iter().find(|e| e["type"] == "bead.closed").unwrap();
+    assert_eq!(closed["data"]["outcome"], "fail");
+    assert_eq!(closed["data"]["work_outcome"], "blocked");
+    let all = serde_json::to_string(&events).unwrap();
+    assert!(
+        !all.contains(r#""work_outcome":"shipped""#),
+        "never shipped: {all}"
+    );
+    assert_eq!(
+        count(&events, "dispatch.live_tree"),
+        1,
+        "the opt-out was loud"
+    );
+    let _ = rig; // rig asserted only through the worker's own commits
+}
+
+/// Obligation (vi): work that is not shipped loses nothing — a blocked
+/// close keeps the worktree (worktree.kept via the existing not-pass rule,
+/// which the fold's coherence gate guarantees for blocked/abandoned) AND
+/// the camp/<bead> branch with the worker's commit stays reachable.
+#[test]
+fn a_blocked_close_keeps_the_worktree_and_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 4, "");
+    git_rig(&rig); // committed git rig, as in the ship test
+    write_agent(&root, "dev", "");
+    let _daemon = Daemon::spawn(&root, &[("FAKE_AGENT_DELIVERY", "blocked")]);
+
+    let bead = camp_ok(&root, &["sling", "doomed work", "--agent", "dev"])
+        .trim()
+        .to_owned();
+    wait_until(&root, "blocked close kept the tree", |e| {
+        count(e, "bead.closed") == 1 && count(e, "worktree.kept") == 1
+    });
+
+    let events = events_json(&root);
+    assert_eq!(count(&events, "bead.worktree.reaped"), 0, "must NOT reap");
+    let wt = root.join("worktrees").join(&bead);
+    assert!(wt.exists(), "worktree kept for forensics");
+    let subject = git(&rig, &["log", "-1", "--format=%s", &format!("camp/{bead}")]);
+    assert_eq!(
+        subject,
+        format!("half-done work for {bead}"),
+        "the worker's commit survives on the kept branch"
     );
 }
 

@@ -140,6 +140,16 @@ enum Command {
         /// Structured step output: a JSON file path, or "-" for stdin
         #[arg(long, value_name = "FILE")]
         output_json: Option<String>,
+        /// Work outcome (gc's WorkOutcome axis, verbatim): what became of
+        /// the work itself — separate from the control outcome
+        #[arg(long, value_parser = ["shipped", "no-op", "blocked", "abandoned"])]
+        work_outcome: Option<String>,
+        /// The commit that satisfies the bead (required with --work-outcome shipped)
+        #[arg(long, value_name = "SHA")]
+        work_commit: Option<String>,
+        /// The branch the commit lives on (required with --work-outcome shipped)
+        #[arg(long, value_name = "BRANCH")]
+        work_branch: Option<String>,
     },
     /// List beads
     Ls {
@@ -482,9 +492,22 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             reason,
             transient,
             output_json,
+            work_outcome,
+            work_commit,
+            work_branch,
         } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
-            cmd::close::run(&camp, bead, outcome, reason, transient, output_json)
+            cmd::close::run(
+                &camp,
+                bead,
+                outcome,
+                reason,
+                transient,
+                output_json,
+                work_outcome,
+                work_commit,
+                work_branch,
+            )
         }
         Command::Ls {
             ready,

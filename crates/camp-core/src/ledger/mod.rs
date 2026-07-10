@@ -50,6 +50,15 @@ pub struct SessionRow {
     pub spawned_ts: String,
     pub woke_actor: String,
     pub worktree: Option<String>,
+    /// The rig's base commit at dispatch time (Phase 3, Q4) — the shipped
+    /// gate's descent reference; None when the rig had none (non-repo /
+    /// unborn HEAD) or the woke predates Phase 3.
+    pub base: Option<String>,
+    /// F7 pins as spawned (Phase 3, #48 finding 1) — re-applied on resume
+    /// turns; None = registered without pins, resumes bare.
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub allowed_tools: Option<String>,
     /// `live` / `stopped` / `crashed` (the sessions table CHECK set).
     pub status: String,
 }
@@ -380,6 +389,18 @@ impl Ledger {
                     (SELECT json_extract(e.data, '$.worktree') FROM events e
                       WHERE e.type = 'session.woke'
                       AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
+                    (SELECT json_extract(e.data, '$.base') FROM events e
+                      WHERE e.type = 'session.woke'
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
+                    (SELECT json_extract(e.data, '$.model') FROM events e
+                      WHERE e.type = 'session.woke'
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
+                    (SELECT json_extract(e.data, '$.permission_mode') FROM events e
+                      WHERE e.type = 'session.woke'
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
+                    (SELECT json_extract(e.data, '$.allowed_tools') FROM events e
+                      WHERE e.type = 'session.woke'
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
                     s.status
              FROM sessions s WHERE {where_clause} ORDER BY s.name"
         );
@@ -399,7 +420,11 @@ impl Ledger {
                         spawned_ts: r.get(7)?,
                         woke_actor: String::new(), // filled below after the NULL check
                         worktree: r.get(9)?,
-                        status: r.get(10)?,
+                        base: r.get(10)?,
+                        model: r.get(11)?,
+                        permission_mode: r.get(12)?,
+                        allowed_tools: r.get(13)?,
+                        status: r.get(14)?,
                     },
                     woke_actor,
                 ))
@@ -924,6 +949,9 @@ mod tests {
                 "claude_session_id": "7bd2befc-b018-4080-8738-429d541b3646",
                 "transcript_path": "/home/u/.claude/projects/-code-gc/x.jsonl",
                 "bead": "gc-1", "worktree": "/camps/t/worktrees/gc-1",
+                "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "model": "sonnet", "permission_mode": "acceptEdits",
+                "allowed_tools": "Read,Edit,Bash",
             }),
         })
         .unwrap();
@@ -962,6 +990,11 @@ mod tests {
         assert_eq!(rows[0].woke_actor, "hook:session-start");
         assert!(rows[0].claude_session_id.is_none());
         assert!(rows[0].worktree.is_none());
+        // Phase 3: no dispatch-time base / F7 pins on a minimal woke
+        assert!(rows[0].base.is_none());
+        assert!(rows[0].model.is_none());
+        assert!(rows[0].permission_mode.is_none());
+        assert!(rows[0].allowed_tools.is_none());
         let w1 = &rows[1];
         assert_eq!(w1.name, "t/dev/1");
         assert_eq!(w1.agent, "dev");
@@ -977,6 +1010,15 @@ mod tests {
         assert_eq!(w1.bead.as_deref(), Some("gc-1"));
         assert_eq!(w1.woke_actor, "campd");
         assert_eq!(w1.worktree.as_deref(), Some("/camps/t/worktrees/gc-1"));
+        // Phase 3: the dispatch-time base and F7 pins round-trip through
+        // the woke-JSON join (no sessions-table schema change)
+        assert_eq!(
+            w1.base.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(w1.model.as_deref(), Some("sonnet"));
+        assert_eq!(w1.permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(w1.allowed_tools.as_deref(), Some("Read,Edit,Bash"));
         assert!(w1.pid.is_none());
         assert_eq!(w1.spawned_ts, "2026-07-05T21:14:03Z");
     }
@@ -1384,7 +1426,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "1");
+        assert_eq!(version, "2");
     }
 
     fn input(
@@ -1760,6 +1802,173 @@ mod tests {
             other => panic!("expected InvalidEventData, got {other:?}"),
         }
         assert_eq!(count(&ledger, "SELECT count(*) FROM events"), 1);
+    }
+
+    /// Dispatch-lifecycle Phase 3 (#34, Q3): the WorkOutcome axis on
+    /// bead.closed — additive, separate from the control outcome, coherence
+    /// fold-enforced. Pure shape rules only: the git facts (reachable,
+    /// based) are gated in `camp close`, never here — refold replays events
+    /// after worktrees are gone, so a fold that shelled to git would be
+    /// nondeterministic.
+    #[test]
+    fn bead_closed_records_the_work_outcome_axis_with_coherence() {
+        let (_dir, mut ledger) = temp_ledger();
+        let close = |l: &mut Ledger, id: &str, data: serde_json::Value| {
+            l.append(input(EventType::BeadClosed, Some("gc"), Some(id), data))
+        };
+        let cols = |l: &Ledger, id: &str| -> (Option<String>, Option<String>, Option<String>) {
+            l.conn
+                .query_row(
+                    "SELECT work_outcome, work_commit, work_branch FROM beads WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+
+        // ACCEPTED shapes, one bead each — and the columns fold through:
+        seeded_bead(&mut ledger, "gc-1");
+        close(
+            &mut ledger,
+            "gc-1",
+            serde_json::json!({
+                "outcome": "pass", "work_outcome": "shipped",
+                "work_commit": "c0ffee", "work_branch": "camp/gc-1"}),
+        )
+        .unwrap();
+        assert_eq!(
+            cols(&ledger, "gc-1"),
+            (
+                Some("shipped".into()),
+                Some("c0ffee".into()),
+                Some("camp/gc-1".into())
+            )
+        );
+        seeded_bead(&mut ledger, "gc-2");
+        close(
+            &mut ledger,
+            "gc-2",
+            serde_json::json!({"outcome": "pass", "work_outcome": "no-op"}),
+        )
+        .unwrap();
+        assert_eq!(cols(&ledger, "gc-2"), (Some("no-op".into()), None, None));
+        seeded_bead(&mut ledger, "gc-3");
+        close(
+            &mut ledger,
+            "gc-3",
+            serde_json::json!({"outcome": "fail", "work_outcome": "blocked", "reason": "no base"}),
+        )
+        .unwrap();
+        assert_eq!(cols(&ledger, "gc-3"), (Some("blocked".into()), None, None));
+        seeded_bead(&mut ledger, "gc-4");
+        close(
+            &mut ledger,
+            "gc-4",
+            serde_json::json!({"outcome": "fail", "work_outcome": "abandoned", "reason": "obsolete"}),
+        )
+        .unwrap();
+        seeded_bead(&mut ledger, "gc-5");
+        close(&mut ledger, "gc-5", serde_json::json!({"outcome": "pass"})).unwrap(); // the v1 shape
+        assert_eq!(cols(&ledger, "gc-5"), (None, None, None));
+
+        // REJECTED shapes — each on a fresh OPEN bead so the rejection is
+        // the payload's, not a double-close:
+        let rejected: &[serde_json::Value] = &[
+            serde_json::json!({"outcome": "pass", "work_outcome": "blocked"}), // the #34 lie
+            serde_json::json!({"outcome": "fail", "work_outcome": "shipped",
+                               "work_commit": "c", "work_branch": "b"}),
+            serde_json::json!({"outcome": "pass", "work_outcome": "shipped"}),
+            serde_json::json!({"outcome": "pass", "work_outcome": "shipped", "work_commit": "c"}),
+            serde_json::json!({"outcome": "pass", "work_outcome": "no-op",
+                               "work_commit": "c", "work_branch": "b"}),
+            serde_json::json!({"outcome": "fail", "work_outcome": "blocked",
+                               "work_commit": "c", "work_branch": "b"}),
+            serde_json::json!({"outcome": "pass", "work_outcome": "delivered"}), // not pinned
+            serde_json::json!({"outcome": "pass", "work_commit": "c"}), // artifact without axis
+        ];
+        for (i, data) in rejected.iter().enumerate() {
+            let id = format!("gc-9{i}");
+            seeded_bead(&mut ledger, &id);
+            assert!(
+                close(&mut ledger, &id, data.clone()).is_err(),
+                "must reject: {data}"
+            );
+        }
+    }
+
+    /// Issue #48 finding 2 (dispatch-lifecycle Phase 3): a fail-fast
+    /// dispatch is a bead-level fact the list can show — dispatch.failed
+    /// folds into beads.dispatch_failure (the reason), cleared by a later
+    /// session.woke or claim for that bead. The dispatchable query is
+    /// untouched: the marker informs, it never gates.
+    #[test]
+    fn dispatch_failed_marks_the_bead_and_dispatch_or_claim_clears_it() {
+        let (_dir, mut l) = temp_ledger();
+        let marker = |l: &Ledger, id: &str| -> Option<String> {
+            l.conn
+                .query_row(
+                    "SELECT dispatch_failure FROM beads WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let failed = |l: &mut Ledger, id: &str, data: serde_json::Value| {
+            l.append(EventInput {
+                kind: EventType::DispatchFailed,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some(id.into()),
+                data,
+            })
+        };
+
+        // the marker folds on ...
+        seeded_bead(&mut l, "gc-1");
+        let reason = "rig gc cannot host a worktree (no base commit)";
+        failed(&mut l, "gc-1", serde_json::json!({"reason": reason})).unwrap();
+        assert_eq!(marker(&l, "gc-1").as_deref(), Some(reason));
+        // ... and a later successful dispatch (session.woke naming the
+        // bead) clears it
+        l.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({"name": "t/dev/1", "agent": "dev", "bead": "gc-1"}),
+        })
+        .unwrap();
+        assert_eq!(marker(&l, "gc-1"), None, "session.woke clears the marker");
+
+        // a claim clears it too
+        seeded_bead(&mut l, "gc-2");
+        failed(&mut l, "gc-2", serde_json::json!({"reason": reason})).unwrap();
+        assert_eq!(marker(&l, "gc-2").as_deref(), Some(reason));
+        l.append(input(
+            EventType::BeadClaimed,
+            Some("gc"),
+            Some("gc-2"),
+            serde_json::json!({"session": "t/dev/2"}),
+        ))
+        .unwrap();
+        assert_eq!(marker(&l, "gc-2"), None, "bead.claimed clears the marker");
+
+        // fail fast (regression pins): an unknown bead and an unknown
+        // payload key are both rejected
+        assert!(
+            failed(&mut l, "gc-404", serde_json::json!({"reason": reason})).is_err(),
+            "dispatch.failed on an unknown bead must fail fast"
+        );
+        seeded_bead(&mut l, "gc-3");
+        assert!(
+            failed(
+                &mut l,
+                "gc-3",
+                serde_json::json!({"reason": reason, "extra": 1})
+            )
+            .is_err(),
+            "unknown payload keys must be rejected (deny_unknown_fields)"
+        );
     }
 
     /// PR #18 review finding 1: bd v1.0.4 silently SKIPS memory records
@@ -2918,7 +3127,7 @@ mod tests {
         match Ledger::open(&path) {
             Err(CoreError::UnsupportedSchema { found, supported }) => {
                 assert_eq!(found, 999);
-                assert_eq!(supported, 1);
+                assert_eq!(supported, 2);
             }
             Err(other) => panic!("expected UnsupportedSchema, got {other:?}"),
             Ok(_) => panic!("open must fail on schema_version 999"),

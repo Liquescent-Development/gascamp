@@ -40,6 +40,11 @@ pub struct ExportBead {
     pub created_ts: String,
     pub updated_ts: String,
     pub closed_ts: Option<String>,
+    /// Phase 3 (#34, Q3): the WorkOutcome axis — exported as gc's native
+    /// metadata keys (gc.work_outcome / gc.work_commit / gc.work_branch).
+    pub work_outcome: Option<String>,
+    pub work_commit: Option<String>,
+    pub work_branch: Option<String>,
 }
 
 pub(crate) fn export_beads(conn: &Connection) -> Result<Vec<ExportBead>, CoreError> {
@@ -53,10 +58,12 @@ pub(crate) fn export_beads(conn: &Connection) -> Result<Vec<ExportBead>, CoreErr
         needs_by_bead.entry(bead_id).or_default().push(needs_id);
     }
 
+    // The three work-axis columns are appended LAST so the existing
+    // column indices stay stable.
     let mut stmt = conn.prepare(
         "SELECT id, rig, type, title, description, status, assignee, claimed_by,
                 outcome, close_reason, labels, run_id, step_id, created_ts,
-                updated_ts, closed_ts
+                updated_ts, closed_ts, work_outcome, work_commit, work_branch
          FROM beads ORDER BY rowid",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -82,6 +89,9 @@ pub(crate) fn export_beads(conn: &Connection) -> Result<Vec<ExportBead>, CoreErr
             created_ts: row.get(13)?,
             updated_ts: row.get(14)?,
             closed_ts: row.get(15)?,
+            work_outcome: row.get(16)?,
+            work_commit: row.get(17)?,
+            work_branch: row.get(18)?,
         })
     })?;
     let mut beads = Vec::new();
@@ -197,6 +207,17 @@ pub fn bd_record(bead: &ExportBead) -> Result<BdRecord, CoreError> {
     }
     if let Some(outcome) = &bead.outcome {
         metadata.insert("gc.outcome".into(), outcome.clone().into());
+    }
+    // Phase 3 (#34, obligation iii): the WorkOutcome axis rides gc's own
+    // metadata keys, verbatim (beadmeta/keys.go at the pinned ref).
+    if let Some(wo) = &bead.work_outcome {
+        metadata.insert("gc.work_outcome".into(), wo.clone().into());
+    }
+    if let Some(c) = &bead.work_commit {
+        metadata.insert("gc.work_commit".into(), c.clone().into());
+    }
+    if let Some(b) = &bead.work_branch {
+        metadata.insert("gc.work_branch".into(), b.clone().into());
     }
     let dependencies = bead
         .needs
@@ -715,7 +736,10 @@ mod tests {
             ledger,
             EventType::BeadClosed,
             "gc-1",
-            serde_json::json!({"outcome": "pass", "reason": "shipped the widget"}),
+            serde_json::json!({"outcome": "pass", "reason": "shipped the widget",
+                "work_outcome": "shipped",
+                "work_commit": "1111111111111111111111111111111111111111",
+                "work_branch": "camp/gc-1"}),
         );
         append(
             ledger,
@@ -836,6 +860,9 @@ mod tests {
             created_ts: TS.into(),
             updated_ts: TS.into(),
             closed_ts: Some(TS.into()),
+            work_outcome: Some("shipped".into()),
+            work_commit: Some("1111111111111111111111111111111111111111".into()),
+            work_branch: Some("camp/gc-1".into()),
         }
     }
 
@@ -858,7 +885,32 @@ mod tests {
             created_ts: TS.into(),
             updated_ts: TS.into(),
             closed_ts: None,
+            work_outcome: None,
+            work_commit: None,
+            work_branch: None,
         }
+    }
+
+    /// Obligation (iii), Phase 3: the export is city-NATIVE for the work
+    /// axis — gc's own metadata keys, verbatim (beadmeta/keys.go at the
+    /// pinned ref): gc.work_outcome / gc.work_commit / gc.work_branch.
+    #[test]
+    fn work_outcome_axis_exports_as_gc_native_metadata() {
+        let mut bead = full_bead();
+        bead.work_outcome = Some("shipped".into());
+        bead.work_commit = Some("1111111111111111111111111111111111111111".into());
+        bead.work_branch = Some("camp/gc-1".into());
+        let line = jsonl_line(&bd_record(&bead).unwrap()).unwrap();
+        for needle in [
+            r#""gc.work_outcome":"shipped""#,
+            r#""gc.work_commit":"1111111111111111111111111111111111111111""#,
+            r#""gc.work_branch":"camp/gc-1""#,
+        ] {
+            assert!(line.contains(needle), "{line}");
+        }
+        // a bead without the axis emits NONE of the keys (additive)
+        let plain = jsonl_line(&bd_record(&minimal_bead()).unwrap()).unwrap();
+        assert!(!plain.contains("gc.work_"), "{plain}");
     }
 
     #[test]
@@ -866,7 +918,7 @@ mod tests {
         let line = jsonl_line(&bd_record(&full_bead()).unwrap()).unwrap();
         assert_eq!(
             line,
-            r#"{"_type":"issue","id":"gc-1","title":"implement widget","description":"the change","status":"closed","priority":2,"issue_type":"task","assignee":"dev","created_at":"2026-07-05T21:14:03Z","updated_at":"2026-07-05T21:14:03Z","closed_at":"2026-07-05T21:14:03Z","close_reason":"shipped the widget","labels":["cli"],"dependencies":[{"issue_id":"gc-1","depends_on_id":"gc-0","type":"blocks"}],"metadata":{"camp.claimed_by":"camp/dev/1","camp.rig":"gc","gc.outcome":"pass"}}"#
+            r#"{"_type":"issue","id":"gc-1","title":"implement widget","description":"the change","status":"closed","priority":2,"issue_type":"task","assignee":"dev","created_at":"2026-07-05T21:14:03Z","updated_at":"2026-07-05T21:14:03Z","closed_at":"2026-07-05T21:14:03Z","close_reason":"shipped the widget","labels":["cli"],"dependencies":[{"issue_id":"gc-1","depends_on_id":"gc-0","type":"blocks"}],"metadata":{"camp.claimed_by":"camp/dev/1","camp.rig":"gc","gc.outcome":"pass","gc.work_branch":"camp/gc-1","gc.work_commit":"1111111111111111111111111111111111111111","gc.work_outcome":"shipped"}}"#
         );
     }
 

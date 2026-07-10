@@ -9,6 +9,7 @@ plugin ships zero roles; roles live in packs like this one.
 packs/starter/
   agents/dev.md            # a Claude Code agent definition (role)
   agents/reviewer.md       # another role — review-only tool set
+  agents/committer.md      # owns git — turns verified worktree work into a commit on the bead branch
   formulas/guarded-change.toml   # a formula (Gas City formula-v2 subset)
   orders.toml              # example scheduled / event-triggered orders
 ```

@@ -25,6 +25,27 @@ fn worker_skill_documents_every_lifecycle_verb() {
     }
 }
 
+/// Dispatch-lifecycle Phase 3 (#34): the unified contract carries the
+/// delivery semantics — commit to the bead branch, record the WorkOutcome
+/// axis (gc vocabulary verbatim), no remote in v1.
+#[test]
+fn worker_skill_carries_the_delivery_contract() {
+    let s = worker_skill();
+    for needle in [
+        "camp/<bead>",
+        "--work-outcome",
+        "--work-commit",
+        "--work-branch",
+        "shipped",
+        "no-op",
+        "blocked",
+        "abandoned",
+        "never push",
+    ] {
+        assert!(s.contains(needle), "worker skill must state `{needle}`");
+    }
+}
+
 #[test]
 fn worker_skill_has_skill_frontmatter() {
     let s = worker_skill();

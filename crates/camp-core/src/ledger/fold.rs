@@ -180,6 +180,12 @@ fn bead_claimed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
                  WHERE id = ?3",
                 params![p.session, event.ts, id],
             )?;
+            // Phase 3 (#48 finding 2): a claim means the work is under way
+            // — the fail-fast dispatch marker no longer describes reality.
+            conn.execute(
+                "UPDATE beads SET dispatch_failure = NULL WHERE id = ?1 AND dispatch_failure IS NOT NULL",
+                [id],
+            )?;
             Ok(())
         }
         Some(status) => Err(CoreError::InvalidTransition {
@@ -251,6 +257,14 @@ struct BeadClosed {
     #[serde(default)]
     #[allow(dead_code)]
     output: Option<serde_json::Value>,
+    /// Phase 3 (#34, Q3): Gas City's WorkOutcome axis, mirrored verbatim —
+    /// a SEPARATE additive axis from the control `outcome`.
+    #[serde(default)]
+    work_outcome: Option<String>,
+    #[serde(default)]
+    work_commit: Option<String>,
+    #[serde(default)]
+    work_branch: Option<String>,
 }
 
 fn bead_closed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
@@ -295,6 +309,55 @@ fn bead_closed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
             )));
         }
     }
+    match p.work_outcome.as_deref() {
+        None => {
+            if p.work_commit.is_some() || p.work_branch.is_some() {
+                return Err(bad(
+                    "work_commit/work_branch require work_outcome \"shipped\"".to_owned(),
+                ));
+            }
+        }
+        Some(wo) => {
+            if !crate::vocab::CAMP_WORK_OUTCOMES.contains(&wo) {
+                return Err(bad(format!(
+                    "work_outcome {wo:?} is not in camp's vocabulary {:?}",
+                    crate::vocab::CAMP_WORK_OUTCOMES
+                )));
+            }
+            // Coherence (the #34 gate): shipped/no-op assert success,
+            // blocked/abandoned assert the work did NOT land — `pass` over
+            // un-integrable work is exactly the lie this rejects.
+            // Deliberately STRICTER than gc, which keeps WorkOutcome and
+            // the control Outcome disjoint and uncoupled (values.go); camp
+            // couples them. Mirror-safe: names/values stay verbatim, and
+            // export emits only gc-valid pairings.
+            let wants_pass = matches!(wo, "shipped" | "no-op");
+            if wants_pass && p.outcome != "pass" {
+                return Err(bad(format!(
+                    "work_outcome {wo:?} requires outcome \"pass\", got {:?}",
+                    p.outcome
+                )));
+            }
+            if !wants_pass && p.outcome != "fail" {
+                return Err(bad(format!(
+                    "work_outcome {wo:?} requires outcome \"fail\", got {:?}",
+                    p.outcome
+                )));
+            }
+            // Only shipped carries an artifact (gc values.go, verbatim).
+            let has_artifact = p.work_commit.is_some() && p.work_branch.is_some();
+            if wo == "shipped" && !has_artifact {
+                return Err(bad(
+                    "work_outcome \"shipped\" requires work_commit and work_branch".to_owned(),
+                ));
+            }
+            if wo != "shipped" && (p.work_commit.is_some() || p.work_branch.is_some()) {
+                return Err(bad(format!(
+                    "work_outcome {wo:?} must not carry work_commit/work_branch (only shipped has an artifact)"
+                )));
+            }
+        }
+    }
     match bead_status(conn, id)?.as_deref() {
         None => Err(CoreError::UnknownBead(id.to_owned())),
         Some("closed") => Err(CoreError::InvalidTransition {
@@ -304,9 +367,18 @@ fn bead_closed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         Some(_) => {
             conn.execute(
                 "UPDATE beads SET status = 'closed', outcome = ?1, close_reason = ?2,
-                                  closed_ts = ?3, updated_ts = ?3
-                 WHERE id = ?4",
-                params![p.outcome, p.reason, event.ts, id],
+                                  work_outcome = ?3, work_commit = ?4, work_branch = ?5,
+                                  closed_ts = ?6, updated_ts = ?6
+                 WHERE id = ?7",
+                params![
+                    p.outcome,
+                    p.reason,
+                    p.work_outcome,
+                    p.work_commit,
+                    p.work_branch,
+                    event.ts,
+                    id
+                ],
             )?;
             if let Some(reason) = p.reason.as_deref()
                 && !reason.is_empty()
@@ -530,14 +602,21 @@ struct DispatchFailed {
     reason: String,
 }
 
-/// `dispatch.failed` is log-only: campd could not dispatch a ready bead
-/// (unresolvable agent, missing rig, worktree failure). campd has no
-/// caller, so the error lands here (invariant 5); Phase 8 plan decision F.
+/// `dispatch.failed`: campd could not dispatch a ready bead (unresolvable
+/// agent, missing rig, worktree failure). campd has no caller, so the
+/// error lands here (invariant 5); Phase 8 plan decision F. Phase 3 (#48
+/// finding 2): no longer log-only — the fail-fast reason folds onto the
+/// bead (`beads.dispatch_failure`) so `camp ls` can mark work that looks
+/// ready but will not dispatch. Cleared by a later session.woke/claim.
 fn dispatch_failed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     let bead = required_bead(event)?;
     known_bead(conn, bead)?;
     let p: DispatchFailed = payload(event)?;
     non_empty(event, "reason", &p.reason)?;
+    conn.execute(
+        "UPDATE beads SET dispatch_failure = ?1, updated_ts = ?2 WHERE id = ?3",
+        params![p.reason, event.ts, bead],
+    )?;
     Ok(())
 }
 
@@ -743,6 +822,22 @@ struct SessionWoke {
     #[serde(default)]
     #[allow(dead_code)]
     worktree: Option<String>,
+    /// Phase 3: dispatch-time facts, audit-only in the fold — read back via
+    /// the woke-JSON join in session_rows (sessions DDL unchanged): the
+    /// rig's base commit at dispatch (the shipped gate's reference) and the
+    /// F7 pins (re-applied on resume turns).
+    #[serde(default)]
+    #[allow(dead_code)]
+    base: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    permission_mode: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    allowed_tools: Option<String>,
 }
 
 fn session_woke(conn: &Connection, event: &Event) -> Result<(), CoreError> {
@@ -776,6 +871,14 @@ fn session_woke(conn: &Connection, event: &Event) -> Result<(), CoreError> {
             event.ts,
         ],
     )?;
+    // Phase 3 (#48 finding 2): a woke naming the bead means a dispatch
+    // succeeded — the fail-fast marker no longer describes reality.
+    if let Some(bead) = &p.bead {
+        conn.execute(
+            "UPDATE beads SET dispatch_failure = NULL WHERE id = ?1 AND dispatch_failure IS NOT NULL",
+            [bead],
+        )?;
+    }
     Ok(())
 }
 

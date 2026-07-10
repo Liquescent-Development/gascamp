@@ -85,6 +85,24 @@ fn starter_dev_agent_scopes_test_first_to_code_changes() {
 }
 
 #[test]
+fn starter_dev_agent_carries_the_delivery_contract() {
+    let dev = std::fs::read_to_string(repo_root().join("packs/starter/agents/dev.md")).unwrap();
+    for needle in ["camp/", "work outcome", "shipped", "blocked", "never push"] {
+        assert!(dev.contains(needle), "dev agent must state `{needle}`");
+    }
+}
+
+#[test]
+fn starter_pack_ships_a_committer_role_and_the_plugin_still_ships_none() {
+    let committer =
+        std::fs::read_to_string(repo_root().join("packs/starter/agents/committer.md")).unwrap();
+    assert!(committer.contains("name: committer"));
+    assert!(committer.contains("git"));
+    // the role-free-plugin policy is enforced by plugin_policy.rs; this is
+    // the positive control that the new role landed in the PACK.
+}
+
+#[test]
 fn starter_pack_orders_example_exists() {
     let orders = repo_root().join("packs/starter/orders.toml");
     let s = std::fs::read_to_string(&orders).expect("packs/starter/orders.toml must exist");

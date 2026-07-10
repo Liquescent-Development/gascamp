@@ -82,7 +82,10 @@ fn export_fixture(dir: &Path) -> (PathBuf, String) {
         &mut ledger,
         EventType::BeadClosed,
         "gc-1",
-        serde_json::json!({"outcome": "pass", "reason": "shipped the widget"}),
+        serde_json::json!({"outcome": "pass", "reason": "shipped the widget",
+            "work_outcome": "shipped",
+            "work_commit": "1111111111111111111111111111111111111111",
+            "work_branch": "camp/gc-1"}),
     );
     // open + blocked
     append(
@@ -226,6 +229,14 @@ fn beads_jsonl_parses_line_by_line_and_field_maps_exactly() {
     assert_eq!(gc1["close_reason"], "shipped the widget");
     assert_eq!(gc1["labels"], serde_json::json!(["cli"]));
     assert_eq!(gc1["metadata"]["gc.outcome"], "pass");
+    // Phase 3, obligation (iii): the WorkOutcome axis exports as gc's own
+    // metadata keys, verbatim (beadmeta/keys.go at the pinned ref).
+    assert_eq!(gc1["metadata"]["gc.work_outcome"], "shipped");
+    assert_eq!(
+        gc1["metadata"]["gc.work_commit"],
+        "1111111111111111111111111111111111111111"
+    );
+    assert_eq!(gc1["metadata"]["gc.work_branch"], "camp/gc-1");
     assert_eq!(gc1["metadata"]["camp.rig"], "gc");
     assert_eq!(gc1["metadata"]["camp.claimed_by"], "camp/dev/1");
     assert!(
