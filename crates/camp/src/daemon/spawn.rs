@@ -295,6 +295,12 @@ pub fn create_worktree(rig_path: &Path, worktrees_dir: &Path, bead_id: &str) -> 
 /// branch is camp/<bead> — the same bead's earlier generation, partial
 /// work preserved. Anything else keeps the fail-fast residue error.
 pub fn ensure_worktree(rig_path: &Path, worktrees_dir: &Path, bead_id: &str) -> Result<PathBuf> {
+    // Defense-in-depth (PR #52 review finding 1): the base check runs on
+    // the REUSE path too. Reuse implies a prior base-checked creation,
+    // but a rig whose repository was gutted since must still fail fast
+    // here — never hand a worker a broken tree. (The create path checks
+    // again inside create_worktree; one extra rev-parse is noise.)
+    ensure_worktree_base(rig_path)?;
     let dir = worktrees_dir.join(bead_id);
     if !dir.exists() {
         return create_worktree(rig_path, worktrees_dir, bead_id);
@@ -732,6 +738,28 @@ mod tests {
         assert!(
             err.to_string().contains("residue"),
             "plain dir must fail fast: {err:#}"
+        );
+    }
+
+    /// PR #52 review finding 1 (defense-in-depth): the REUSE path checks
+    /// the base too. Reuse implies a prior base-checked creation, but a
+    /// rig whose repository was gutted since (.git deleted) must still
+    /// fail fast — never hand a worker a broken tree.
+    #[test]
+    fn ensure_worktree_reuse_refuses_a_rig_gutted_since_creation() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let rig = git_rig(dir.path());
+        let worktrees = dir.path().join("worktrees");
+        let wt = ensure_worktree(&rig, &worktrees, "gc-9").unwrap();
+        assert!(wt.join(".git").exists());
+
+        // gut the rig: the worktree dir remains, the repository is gone
+        std::fs::remove_dir_all(rig.join(".git")).unwrap();
+        let err = ensure_worktree(&rig, &worktrees, "gc-9").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot host a worktree"),
+            "reuse on a gutted rig must fail the base check: {err:#}"
         );
     }
 }

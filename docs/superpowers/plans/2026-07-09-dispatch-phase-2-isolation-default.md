@@ -588,8 +588,8 @@ fn a_baseless_rig_fails_fast_at_dispatch_with_no_worker_and_nothing_stranded() {
         failed["data"]["reason"]
             .as_str()
             .unwrap()
-            .contains("git worktree add failed"),
-        "reason must carry the git failure: {failed}"
+            .contains("cannot host a worktree"),
+        "reason must carry the refusal: {failed}"
     );
     // no worker was ever spawned: no registry row, no claim, no session end
     for kind in [
@@ -656,7 +656,7 @@ fn a_non_git_rig_fails_fast_at_dispatch_under_default_isolation() {
         failed["data"]["reason"]
             .as_str()
             .unwrap()
-            .contains("git worktree add failed"),
+            .contains("cannot host a worktree"),
         "reason: {failed}"
     );
     assert_eq!(count(&events, "session.woke"), 0, "no worker spawned");
