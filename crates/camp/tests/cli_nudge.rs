@@ -61,7 +61,16 @@ fn scaffold(dir: &Path, command: &str) -> (PathBuf, PathBuf) {
     .unwrap();
     let agents = root.join("agents");
     std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(agents.join("dev.md"), "---\nname: dev\n---\nDo the work.\n").unwrap();
+    // isolation: none — these tests exercise the converse verb, not the
+    // isolation contract, and the rig is a bare dir (no git base for the
+    // Phase 2 worktree default). The explicit opt-out makes dispatch emit
+    // dispatch.live_tree before session.woke; all assertions here are
+    // per-event-type, so that is inert.
+    std::fs::write(
+        agents.join("dev.md"),
+        "---\nname: dev\nisolation: none\n---\nDo the work.\n",
+    )
+    .unwrap();
     // create the ledger so every verb (and campd) finds it
     camp_ok(&root, &["events", "--json"]);
     (root, rig)
