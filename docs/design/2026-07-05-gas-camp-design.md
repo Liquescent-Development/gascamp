@@ -619,7 +619,7 @@ mypack/
   `/events` slash commands (thin wrappers over the `camp` CLI); lifecycle
   hooks — SessionStart (register/adopt) and SessionEnd (session end),
   plus an optional PostToolUse breadcrumb hook (off by default:
-  patrol watches transcripts instead, §10); the worker skill; an optional
+  patrol watches transcripts instead, §10); the worker and operator skills; an optional
   statusline snippet showing
   a fleet badge (`▲3 ●2 ✖1` — live, ready, red) fed by the `campd` socket.
   It ships **no agent definitions**. Roles are pack content. Same law as
