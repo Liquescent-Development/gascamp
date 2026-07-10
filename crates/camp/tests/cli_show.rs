@@ -78,6 +78,60 @@ fn show_prints_the_work_outcome() {
         .stdout(predicates::str::contains("work     blocked"));
 }
 
+/// A shipped bead promotes branch/commit to first-class fields plus a
+/// copy-paste pointer, in BOTH renderings — no git archaeology (design §6).
+#[test]
+fn show_promotes_shipped_deliverable_coordinates() {
+    let dir = camp_with_bead();
+    // Append a shipped close directly — the fold records the coordinates;
+    // the git gate lives in `camp close`, not the fold.
+    {
+        let mut ledger =
+            camp_core::ledger::Ledger::open(&dir.path().join(".camp/camp.db")).unwrap();
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::BeadClosed,
+                rig: Some("gascity".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "outcome": "pass",
+                    "work_outcome": "shipped",
+                    "work_branch": "camp/gc-1",
+                    "work_commit": "b1d59a2df83a060382ee78b5546cd2f858e3702f",
+                }),
+            })
+            .unwrap();
+    }
+    // Human rendering: branch + commit + the "see:" pointer to the rig.
+    camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("branch   camp/gc-1"))
+        .stdout(predicates::str::contains(
+            "commit   b1d59a2df83a060382ee78b5546cd2f858e3702f",
+        ))
+        .stdout(predicates::str::contains("see: git -C "))
+        .stdout(predicates::str::contains(
+            "show b1d59a2df83a060382ee78b5546cd2f858e3702f",
+        ));
+    // JSON rendering: branch + commit are first-class.
+    let out = camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["branch"], "camp/gc-1");
+    assert_eq!(v["commit"], "b1d59a2df83a060382ee78b5546cd2f858e3702f");
+    assert_eq!(v["work_outcome"], "shipped");
+}
+
 #[test]
 fn show_of_unknown_bead_errors() {
     let dir = camp_with_bead();

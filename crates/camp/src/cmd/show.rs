@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
-use camp_core::event::Event;
+use camp_core::config::CampConfig;
+use camp_core::event::{Event, EventType};
 use camp_core::ledger::Ledger;
 use camp_core::readiness::BeadRow;
 
@@ -49,13 +50,46 @@ fn load_view(camp: &CampDir, bead: &str) -> Result<BeadView> {
         .ok_or_else(|| anyhow!("no such bead: {bead}"))?;
     let ready = ledger.is_ready(bead)?;
     let history = ledger.events_for_bead(bead)?;
-    // Deliverable promotion is wired in Task 2; until then, always None.
-    let deliverable = None;
+    let deliverable = if row.work_outcome.as_deref() == Some("shipped") {
+        Some(build_deliverable(camp, &row, &history)?)
+    } else {
+        None
+    };
     Ok(BeadView {
         row,
         ready,
         history,
         deliverable,
+    })
+}
+
+/// Resolve a shipped bead's deliverable coordinates: branch + commit from
+/// the last `bead.closed` event's data, and the rig path from config (the
+/// same resolution `cmd/close.rs` uses). The commit lives on `camp/<bead>`
+/// in the RIG repo — campd reaps the worktree on close (spec §12), so the
+/// rig repo is the durable location the pointer names.
+fn build_deliverable(camp: &CampDir, row: &BeadRow, history: &[Event]) -> Result<Deliverable> {
+    let closed = history
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventType::BeadClosed)
+        .ok_or_else(|| anyhow!("bead {} is shipped but has no bead.closed event", row.id))?;
+    let field = |key: &str| -> Result<String> {
+        closed
+            .data
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("shipped close for {} records no {key}", row.id))
+    };
+    let branch = field("work_branch")?;
+    let commit = field("work_commit")?;
+    let config = CampConfig::load(&camp.config_path())?;
+    let rig_path = config.rig(&row.rig)?.path.display().to_string();
+    Ok(Deliverable {
+        branch,
+        commit,
+        rig_path,
     })
 }
 
@@ -138,6 +172,11 @@ fn render_json(view: &BeadView) -> Result<()> {
         "created": row.created_ts,
         "updated": row.updated_ts,
         "history": view.history,
+        // Always present (null when not shipped, string when shipped) so
+        // machine consumers get a uniform shape rather than a
+        // sometimes-absent key (Task 1 reviewer note).
+        "branch": null,
+        "commit": null,
     });
     if let Some(d) = &view.deliverable {
         obj["branch"] = serde_json::json!(d.branch);
