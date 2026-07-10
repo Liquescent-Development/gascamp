@@ -9,6 +9,14 @@ Everything here is a thin wrapper over the `camp` CLI, so the session's
 scripting surface is identical to the terminal's (spec §13 guarantee 6).
 `camp` must be on your `PATH`.
 
+## Versioning
+
+Bump `version` in `.claude-plugin/plugin.json` whenever plugin content
+(commands, skills, hooks, statusline) changes. Installed copies are cached by
+version, so an unchanged version can leave a stale plugin in place even after
+`/plugin marketplace update` — bumping the version makes `/plugin` refresh
+reliably.
+
 ## Slash commands
 
 | Command | Wraps | Does |

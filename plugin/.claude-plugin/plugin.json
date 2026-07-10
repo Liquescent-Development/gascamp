@@ -1,7 +1,7 @@
 {
   "name": "camp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Gas Camp control plane for Claude Code — machinery only, zero roles. Thin wrappers over the `camp` CLI, session lifecycle hooks, the worker skill, and a fleet statusline.",
-  "author": { "name": "Gas Camp" },
+  "author": { "name": "Liquescent Development LLC" },
   "keywords": ["gas-camp", "agents", "ledger", "orchestration"]
 }

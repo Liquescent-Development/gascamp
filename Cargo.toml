@@ -5,8 +5,8 @@ members = ["crates/camp-core", "crates/camp"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/richardkiene/gascamp"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Liquescent-Development/gascamp"
 
 [workspace.dependencies]
 camp-core = { path = "crates/camp-core" }

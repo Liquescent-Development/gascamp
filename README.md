@@ -63,7 +63,7 @@ fleets.
 Build the release binary and install it (plus the `campd` symlink) with `make`:
 
 ```sh
-git clone https://github.com/richardkiene/gascamp
+git clone https://github.com/Liquescent-Development/gascamp
 cd gascamp
 make install                 # installs to ~/.local/bin by default
 ```
@@ -109,7 +109,7 @@ commands shell out to `camp`, so the binary MUST be installed and on `PATH` for
 the plugin to do anything:
 
 ```sh
-git clone https://github.com/richardkiene/gascamp
+git clone https://github.com/Liquescent-Development/gascamp
 cd gascamp
 make install                              # -> ~/.local/bin/camp (+ campd symlink)
 export PATH="$HOME/.local/bin:$PATH"      # if it isn't already
@@ -121,7 +121,7 @@ export PATH="$HOME/.local/bin:$PATH"      # if it isn't already
 this repo as a plugin marketplace, install the `camp` plugin, and reload:
 
 ```
-/plugin marketplace add richardkiene/gascamp
+/plugin marketplace add Liquescent-Development/gascamp
 /plugin install camp@gascamp
 /reload-plugins
 ```
@@ -429,7 +429,7 @@ control plane. It is machinery only — it ships **zero roles**:
 Install it from this repo (see the [quickstart](#use-camp-from-inside-claude-code-recommended)):
 
 ```
-/plugin marketplace add richardkiene/gascamp
+/plugin marketplace add Liquescent-Development/gascamp
 /plugin install camp@gascamp
 /reload-plugins
 ```
@@ -511,15 +511,13 @@ make e2e         # opt-in real-`claude` end-to-end run; needs CAMP_E2E=1, an
 
 ## License
 
-Licensed under either of
+Copyright © 2026 Liquescent Development LLC.
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+Licensed under the GNU Affero General Public License v3.0 only
+(`AGPL-3.0-only`) — see [LICENSE](LICENSE).
 
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
+for inclusion in the work shall be licensed under `AGPL-3.0-only`, without any
+additional terms or conditions.
