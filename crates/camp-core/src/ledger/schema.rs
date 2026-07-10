@@ -1,8 +1,8 @@
 //! Schema v2 for camp.db (spec §7.1/§7.4). One WAL-mode SQLite file: the
 //! append-only `events` table (history + bus) plus the state tables that are
 //! a fold of it. All tables are STRICT; opening a db with a different schema
-//! version is a hard error — no auto-upgrade in v1 (a v1 db re-inits;
-//! `camp backup`/`camp export` preserve history).
+//! version is a hard error — no auto-upgrade in v1: the operator re-inits
+//! the camp (`camp backup`/`camp export` preserve history).
 
 use std::path::Path;
 use std::time::Duration;

@@ -8,7 +8,10 @@ pub enum CoreError {
     Json(#[from] serde_json::Error),
     #[error("ledger corrupt: {0}")]
     Corrupt(String),
-    #[error("ledger schema version {found} unsupported (this build supports {supported})")]
+    #[error(
+        "ledger schema version {found} unsupported (this build supports {supported}); \
+         no auto-upgrade — re-init the camp (`camp backup`/`camp export` preserve history)"
+    )]
     UnsupportedSchema { found: i64, supported: i64 },
     #[error("invalid event data for {event_type}: {reason}")]
     InvalidEventData { event_type: String, reason: String },
