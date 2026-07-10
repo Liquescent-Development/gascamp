@@ -4,6 +4,27 @@
 
 > **APPROVAL NOTE:** _pending — the plan gate. Record date, verdict, non-blocking
 > notes, and reviewer-accepted deviations here in the first execution commit._
+>
+> **Revision history:** r2 (2026-07-09) — plan-review REJECT round (Opus 4.8)
+> fixed three false premises about current code/spec, none design-level:
+> **B1** Task 10 re-added the already-existing `dispatch.failed` fold arm/
+> struct/fn (fold.rs:35/:529/:536) — now MODIFIES the existing log-only fn
+> to add the state effect; **B2** Task 4 wrongly claimed
+> `unsupported_schema_version_is_a_hard_error` survives the version bump —
+> it pins `supported == 1` at ledger/mod.rs:2921; now explicitly updated to
+> 2, sweep broadened; **B3** the no-auto-upgrade rule was cited as a spec
+> rule — it lives only in code (schema.rs:3-4 + `verify_schema_version`);
+> rationale re-cited to code + invariant 5, and Task 12 now REQUIRES a
+> one-line spec addition documenting the schema-versioning/hard-error
+> policy. Non-blocking folded in: **N1** readiness edit is one change to
+> `BEAD_COLS` + `row_to_bead` (no per-query edits; dispatchability WHERE
+> untouched); **N2** coherence coupling documented as deliberately stricter
+> than gc's disjoint axes (code comment + decision 3); **N3** unbased-gate
+> error re-worded to "shares no history with" (merge-base tests common
+> ancestry); **N4** task-prompt trim made symmetric between impl and test.
+> Reviewer verified correct (untouched): gc WorkOutcome readings, the
+> dispatch-time-base mechanism, woke-JSON precedent, obligation-(vi)-via-
+> coherence, refold purity, check_vocab extension, committer-in/overseer-out.
 
 **Goal:** Give dispatched work honest delivery semantics: one unified worker contract (single source), a delivery contract shipped as pack/prompt content, and Gas City's `WorkOutcome` axis (`shipped`/`no-op`/`blocked`/`abandoned`) recorded verbatim as a separate, additive axis from the control `outcome` — so `pass` can never again be reported over stranded, un-integrable work (#34).
 
@@ -46,8 +67,8 @@ Checked in a local gascity checkout via `git cat-file -p 12410301...:<file>` —
 ## Settled design decisions this plan implements (with rationale)
 
 1. **One worker-contract source = `plugin/skills/worker/SKILL.md` (Q5).** `spawn.rs` embeds it (`include_str!`), strips the YAML frontmatter, substitutes the skill's own `<bead>`/`<name>` placeholders with the concrete bead id and session name, and prepends a two-line mechanical binding preamble (identity + `CAMP_DIR`). The `WORKER_CONTRACT` const is deleted. Enforcement (obligation v): a test recomputes the transform independently from the file and asserts the spawned task prompt equals preamble + transformed skill body — a divergent second copy cannot exist; a stale const would be dead code (clippy `-D warnings` fails).
-2. **WorkOutcome rides the `bead.closed` payload, folded into `beads` columns; schema v1 → v2.** New OPTIONAL payload fields `work_outcome`/`work_commit`/`work_branch` (additive: old events refold clean); new `beads` columns with a CHECK mirroring the pinned set; `SCHEMA_VERSION` bumps to 2 (spec: "opening a db with a different schema version is a hard error — no auto-upgrade in v1"; pre-1.0 ledgers re-init, `camp backup`/`camp export` preserve history). The axis is NOT required on every close — it is additive (obligation iv: the control axis is unchanged) — but the unified contract instructs every worker to record one, and the coherence rules below make a dishonest pairing impossible.
-3. **Coherence is fold-validated (pure); git facts are CLI-gated (not refold-stable).** Fold rules: `work_outcome` ∈ pinned set; `shipped` requires `work_commit`+`work_branch`, all other cases forbid them (gc: no commit artifact); `shipped`/`no-op` require `outcome=pass`; `blocked`/`abandoned` require `outcome=fail`. This mechanically closes #34's lie: `pass` + `blocked` is rejected in the fold. The git verification (reachable + based) runs in `camp close` BEFORE the append — it can never live in the fold because refold replays events after worktrees/repos are gone (nondeterministic), exactly why gc's gate lives in `cmd/gc`, not its store.
+2. **WorkOutcome rides the `bead.closed` payload, folded into `beads` columns; schema v1 → v2.** New OPTIONAL payload fields `work_outcome`/`work_commit`/`work_branch` (additive: old events refold clean); new `beads` columns with a CHECK mirroring the pinned set; `SCHEMA_VERSION` bumps to 2. The no-auto-upgrade/hard-error rule is a CODE rule, not a spec statement (corrected in plan-review r2, B3 — the spec is silent on schema versioning today): `schema.rs:3-4`'s module doc ("opening a db with a different schema version is a hard error — no auto-upgrade in v1") enforced by `verify_schema_version` → `CoreError::UnsupportedSchema`, and it is the invariant-5 fail-fast answer. Because this is the first bump and it hard-errors every existing camp.db, Task 12 adds a one-line spec statement of the schema-versioning/hard-error policy so the spec does not stay silent on operator-visible breaking behavior (spec and code never silently diverge). Pre-1.0 ledgers re-init; `camp backup`/`camp export` preserve history. The axis is NOT required on every close — it is additive (obligation iv: the control axis is unchanged) — but the unified contract instructs every worker to record one, and the coherence rules below make a dishonest pairing impossible.
+3. **Coherence is fold-validated (pure); git facts are CLI-gated (not refold-stable).** Fold rules: `work_outcome` ∈ pinned set; `shipped` requires `work_commit`+`work_branch`, all other cases forbid them (gc: no commit artifact); `shipped`/`no-op` require `outcome=pass`; `blocked`/`abandoned` require `outcome=fail`. This mechanically closes #34's lie: `pass` + `blocked` is rejected in the fold. The pairing coupling is deliberately STRICTER than gc, whose two axes are disjoint and uncoupled (values.go; its gate does not couple them) — acceptable under invariant 7 because names/values stay verbatim and export emits only gc-valid pairings; a code comment states this (plan-review r2, N2). The git verification (reachable + based) runs in `camp close` BEFORE the append — it can never live in the fold because refold replays events after worktrees/repos are gone (nondeterministic), exactly why gc's gate lives in `cmd/gc`, not its store.
 4. **v1 "landed" (Q4) is mechanically two git facts, verified from the rig path:** (a) *reachable* — `git -C <rig> merge-base --is-ancestor <work_commit> <work_branch>` (gc's rule verbatim; worktree branches resolve from the rig, shared object store); (b) *based* — `git -C <rig> merge-base <base> <work_commit>` succeeds, where `base` is the **dispatch-time base** recorded on the claiming session (decision 5). The rig's *current* HEAD is NOT the base reference: a live-tree worker on a baseless rig moves HEAD itself, which would self-certify a dead-end root commit as based (verified hazard; this is why obligation (i) needs the recorded base). Commit/branch values with a leading `-` are rejected outright (gc's flag-injection guard).
 5. **campd records `base` in `session.woke`** — `git -C <rig> rev-parse --verify HEAD^{commit}` at prepare time; absent when unresolvable (non-repo/unborn HEAD — for worktree agents dispatch fails anyway; for `isolation="none"` the loud opt-out proceeds with no base, making `shipped` impossible on that dispatch — the #34 scenario ends `blocked`, never `shipped`). `camp session register` records the same base when given `--rig`. No sessions-table schema change: `base` (and the F7 pins) ride the woke event JSON exactly like the existing `worktree` field ("schema v1 is frozen" precedent, `fold.rs`), read back via `json_extract` in `session_rows`.
 6. **Resume turns re-apply the pinned F7 config (issue #48 finding 1 — DECIDED: yes).** The pins are recorded AT SPAWN in the woke payload (`model`, `permission_mode`, `allowed_tools` — the exact argv values, tools comma-joined), and both resume sites (`camp nudge` resume, patrol nudge-resume) rebuild argv through one shared `spawn::resume_argv`, appending the recorded pins. Rationale: a session keeps its birth capability envelope — re-resolving the agent at resume time would drift when packs change, and ambient-settings resume (today's behavior) silently widens a pinned worker's tools. Sessions registered without pins (the operator's own attended session) resume bare — a recorded absence (their settings are their own), not a fallback. `--append-system-prompt` is NOT re-applied: the conversation already embodies the role prompt; re-appending duplicates it. The three flags are ordinary claude `-p` flags, valid alongside `--resume`; camp's tests pin the argv mechanically (the stub records it), and `make e2e` (local-only, opt-in) exercises real claude.
@@ -142,16 +163,21 @@ fn the_task_prompt_is_the_worker_skill_verbatim() {
         .skip(1)
         .collect::<Vec<_>>()
         .join("\n");
+    // Symmetric trim on BOTH sides (plan-review r2, N4): the impl embeds
+    // `bound.trim()`, so the expectation trims identically — a leading
+    // blank line after the frontmatter fence cannot desynchronize them.
     let expected = body
         .replace("<bead>", "gc-9")
-        .replace("<name>", "t/dev/9");
+        .replace("<name>", "t/dev/9")
+        .trim()
+        .to_owned();
     let prompt = task_prompt("gc-9", "t/dev/9");
     assert!(
-        prompt.ends_with(expected.trim_end()),
+        prompt.ends_with(&expected),
         "prompt must end with the transformed skill body;\nprompt tail: {}",
         &prompt[prompt.len().saturating_sub(200)..]
     );
-    let preamble = prompt.strip_suffix(expected.trim_end()).unwrap();
+    let preamble = prompt.strip_suffix(expected.as_str()).unwrap();
     assert!(preamble.contains("gc-9") && preamble.contains("t/dev/9"));
     assert!(preamble.contains("CAMP_DIR"));
     assert!(
@@ -196,10 +222,13 @@ fn task_prompt(bead_id: &str, session_name: &str) -> String {
     let bound = skill_body()
         .replace("<bead>", bead_id)
         .replace("<name>", session_name);
+    // .trim(): symmetric with the obligation-(v) test's expectation (N4) —
+    // leading/trailing blank lines around the body never desynchronize the
+    // "prompt ends with the transformed body" equality.
     format!(
         "You are Gas Camp worker session {session_name}, dispatched to work exactly one bead: {bead_id}. \
          CAMP_DIR is already set for the camp CLI; do not start unrelated work.\n\n{}",
-        bound.trim_start()
+        bound.trim()
     )
 }
 ```
@@ -648,6 +677,10 @@ In `bead_closed`, after the `final_disposition` block:
             // Coherence (the #34 gate): shipped/no-op assert success,
             // blocked/abandoned assert the work did NOT land — `pass` over
             // un-integrable work is exactly the lie this rejects.
+            // Deliberately STRICTER than gc, which keeps WorkOutcome and
+            // the control Outcome disjoint and uncoupled (values.go); camp
+            // couples them. Mirror-safe: names/values stay verbatim, and
+            // export emits only gc-valid pairings.
             let wants_pass = matches!(wo, "shipped" | "no-op");
             if wants_pass && p.outcome != "pass" {
                 return Err(bad(format!(
@@ -692,7 +725,7 @@ And extend the UPDATE:
 - [ ] **Step 4: Run the full core suite** (refold property, one-transaction property, doctor, perf-adjacent unit tests all touch this path):
 
 Run: `cargo test -p camp-core`
-Expected: PASS. The `unsupported_schema_version_is_a_hard_error` test still passes (999 ≠ 2). If any test embeds the literal schema version `1`, update it to `2` — search first: `grep -rn "schema_version" crates/ | grep -v "'2'"`.
+Expected: PASS after one required test update (plan-review r2, blocking finding B2): `unsupported_schema_version_is_a_hard_error` (`crates/camp-core/src/ledger/mod.rs:2921`) asserts `assert_eq!(supported, 1)` on the `UnsupportedSchema` error and FAILS after the bump — update that line to `assert_eq!(supported, 2);`. Then sweep for any other embedded version literal before declaring green: `grep -rn "SCHEMA_VERSION\|schema_version\|supported," crates/` and update each hit that pins the old version.
 
 - [ ] **Step 5: Run the camp-bin suite** (fold consumers): `cargo test -p camp`
 Expected: PASS — existing closes carry no work fields (additive; obligation iv).
@@ -1207,7 +1240,7 @@ fn shipped_rejects_unreachable_unbased_flag_shaped_and_unclaimed_facts() {
     git(&rig, &["checkout", "main"]);
     let out = close_shipped(&orphan, "lone");
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("does not descend from"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("shares no history with"));
     // flag-shaped values are rejected outright (gc's injection guard)
     let out = close_shipped("-x", "main");
     assert!(!out.status.success());
@@ -1290,9 +1323,9 @@ fn verify_shipped(camp: &CampDir, bead: &str, commit: &str, branch: &str) -> Res
     }
     if !git(&["merge-base", &base, commit])? {
         bail!(
-            "work_commit {commit} does not descend from the dispatch-time base {base} — \
-             the branch has no path to the rig's integration branch; close it \
-             --work-outcome blocked instead"
+            "work_commit {commit} shares no history with the dispatch-time base {base} \
+             (no merge-base) — the branch has no path to the rig's integration branch; \
+             close it --work-outcome blocked instead"
         );
     }
     Ok(())
@@ -1669,35 +1702,34 @@ fn dispatch_failed_marks_the_bead_and_dispatch_or_claim_clears_it() {
 
 Write it out fully in the module's idiom.
 
-- [ ] **Step 2: Run, watch it fail** (`dispatch.failed` currently has no fold arm — the column stays NULL):
+- [ ] **Step 2: Run, watch it fail.** PREMISE (corrected in plan-review r2, blocking finding B1): `dispatch.failed` is ALREADY folded — the match arm exists at `fold.rs:35`, the `deny_unknown_fields` `DispatchFailed { reason }` struct at ~`fold.rs:529`, and a **log-only** `dispatch_failed` fn at ~`fold.rs:536` (it validates `required_bead`/`known_bead`/`non_empty(reason)` and returns `Ok(())` with no state effect). So the new test COMPILES and fails on its assertion: the column stays NULL because the existing fn writes nothing.
 
 Run: `cargo test -p camp-core dispatch_failed_marks_the_bead`
+Expected: FAIL on the `dispatch_failure == reason` assertion (not a compile error).
 
-- [ ] **Step 3: Implement in `fold.rs`.** Add the match arm `EventType::DispatchFailed => dispatch_failed(conn, event),` plus:
+- [ ] **Step 3: Implement in `fold.rs`.** Do NOT add an arm or a struct — both exist (adding them again is a duplicate-definition compile error). MODIFY the existing `dispatch_failed` fn (~`fold.rs:536`): keep its `required_bead`/`known_bead`/`non_empty` checks, add the state effect, and update its doc comment (it currently says "log-only"):
 
 ```rust
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DispatchFailed {
-    reason: String,
-}
-
-/// dispatch.failed (Phase 3, #48 finding 2): fold the fail-fast reason
-/// onto the bead so `camp ls` can mark work that looks ready but will not
-/// dispatch (e.g. a baseless rig). Cleared by a later session.woke/claim.
+/// `dispatch.failed`: campd could not dispatch a ready bead (unresolvable
+/// agent, missing rig, worktree failure). campd has no caller, so the
+/// error lands here (invariant 5); Phase 8 plan decision F. Phase 3 (#48
+/// finding 2): no longer log-only — the fail-fast reason folds onto the
+/// bead (`beads.dispatch_failure`) so `camp ls` can mark work that looks
+/// ready but will not dispatch. Cleared by a later session.woke/claim.
 fn dispatch_failed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
-    let id = required_bead(event)?;
+    let bead = required_bead(event)?;
+    known_bead(conn, bead)?;
     let p: DispatchFailed = payload(event)?;
-    if bead_status(conn, id)?.is_none() {
-        return Err(CoreError::UnknownBead(id.to_owned()));
-    }
+    non_empty(event, "reason", &p.reason)?;
     conn.execute(
         "UPDATE beads SET dispatch_failure = ?1, updated_ts = ?2 WHERE id = ?3",
-        params![p.reason, event.ts, id],
+        params![p.reason, event.ts, bead],
     )?;
     Ok(())
 }
 ```
+
+(The Step-1 test's unknown-bead and deny_unknown_fields rejection cases already pass through the existing checks — they are regression pins here, not new behavior.)
 
 In `session_woke`, after the sessions upsert, add (the woke's bead means a dispatch succeeded):
 
@@ -1712,7 +1744,7 @@ In `session_woke`, after the sessions upsert, add (the woke's bead means a dispa
 
 and the same two-liner in `bead_claimed` (using the claimed bead id). Note: this makes `SessionWoke.bead` no longer `#[allow(dead_code)]` if it was.
 
-- [ ] **Step 4: Surface it.** `readiness.rs`: add the two fields to `BeadRow`, extend every SELECT that builds it (`ready_beads`, `list_beads`, `get_bead`, the `mine` query — grep for the column list) with `work_outcome, dispatch_failure`. `ls.rs` render:
+- [ ] **Step 4: Surface it.** `readiness.rs`: add the two fields to `BeadRow`, then extend the shared `BEAD_COLS` const (`readiness.rs:36`) and the `row_to_bead` mapper (`readiness.rs:39`) ONCE — every `BeadRow` query (`ready_beads`, `list_beads`, `get_bead`, `dispatchable_beads`) is built from that pair, so they all pick the fields up; no per-query edits. `dispatchable_beads`' WHERE clause is untouched — dispatchability semantics stay exactly as they were (the marker informs, never gates). `ls.rs` render:
 
 ```rust
         for b in &beads {
@@ -1930,7 +1962,7 @@ rather than hanging on a prompt no one will answer.
 - [ ] **Step 2: Consistency edits.**
 - §12, the worktree-contract line: extend "autonomous work happens on `camp/<bead>`, reaped on clean pass, kept on failure" with "; the bead branch is the deliverable and outlives the reap (§8.4 delivery)".
 - The vocabulary-mirror section (§15.2 or wherever `outcome` subsets are enumerated — grep `"skipped"` in the spec): add one line: "`work_outcome` mirrors gc's WorkOutcome set verbatim: `shipped`/`no-op`/`blocked`/`abandoned` (pinned in gc-vocab.json, CI-checked)."
-- §7.1 (ledger schema): if it pins "schema v1"/version 1, amend to v2 with one clause: "(v2 adds the WorkOutcome/delivery columns; opening an older db is a hard error — no auto-upgrade)". If it names no version, add nothing.
+- §7.1 (ledger schema) — REQUIRED, not conditional (plan-review r2, B3: the spec currently says nothing about schema versioning, and it must not stay silent on operator-visible breaking behavior): add one line to the ledger-schema section: "The ledger schema is versioned (`schema_version` in `meta`; v2 as of the dispatch-lifecycle delivery phase — the WorkOutcome/delivery columns); opening a db with a different schema version is a hard error, never an auto-upgrade — re-init the camp (`camp backup`/`camp export` preserve history)."
 
 - [ ] **Step 3: Un-pin e2e.** In `crates/camp/tests/e2e.rs` (~lines 335–351): delete the two `isolation: none\n` lines and the "Until Phase 3 defines 'landed'…" comment; replace the comment with: `// Phase 3 defined "landed" (worker-contract delivery, spec §8.4): e2e\n// runs the DEFAULT worktree isolation — the shipped path a real worker sees.` Adjust any e2e assertion that expected rig-tree artifacts to accept the worktree/bead-branch location (`git -C rig rev-parse camp/<bead>` style — mirror Task 8's assertions). Real-claude closes may or may not record a work outcome (the contract instructs it; the model decides): assert the bead CLOSES and, IF `work_outcome` is present and `shipped`, that the branch resolves — never assert the model's judgment.
 
@@ -1989,7 +2021,7 @@ If the harness demotes it to background, poll `gh pr checks` with cheap foregrou
 
 ## Known risks / notes for the plan reviewer
 
-1. **Schema v2 (decision 2)** hard-errors existing camp.db files at open ("no auto-upgrade in v1" is the spec's own rule). Pre-1.0, single-operator; `camp backup`/`camp export` preserve history. Flagging for explicit reviewer sign-off since it touches every existing camp.
+1. **Schema v2 (decision 2)** hard-errors existing camp.db files at open. The no-auto-upgrade rule lives in code (`schema.rs:3-4` module doc; `verify_schema_version` → `CoreError::UnsupportedSchema`), not in the spec — so Task 12 adds the one-line spec statement of the policy (B3). Pre-1.0, single-operator; `camp backup`/`camp export` preserve history. The reviewer has flagged the hard-error to the operator in parallel; this plan proceeds on the current settled basis and any operator directive supersedes.
 2. **No overseer agent (decision 9)** — the kickoff's "optionally" is exercised as skip, with rationale. Veto = one added pack file, no code.
 3. **`--model/--permission-mode/--allowedTools` alongside `--resume`** (decision 6): standard `-p` flags; mechanically pinned by stub-argv tests; real-claude behavior is `make e2e` territory (local-only by decision). If the operator wants a live probe before merge, it is one `claude -p --resume <sid> --allowedTools Read "hi"` against any session.
 4. **Coherence rule strictness** (blocked/abandoned ⇒ `fail` exactly): campd's finalization `skipped` closes never carry a work outcome, so `skipped` needs no pairing rule. If a future control flow wants `skipped`+axis, that is a one-line fold change with a vocab test.
