@@ -1,6 +1,6 @@
 ---
 name: subagent-hygiene
-description: Use when a session in this repo is waiting on an asynchronous result it did not compute inline — spawning a helper or background agent, OR waiting on CI / a GitHub Actions run / a deploy / any long-running command you backgrounded and expect to be "notified" about — before writing a helper's kickoff prompt, when deciding how a result comes back, when about to end a turn while that work is still running, or when a helper or watch has gone quiet or looks stuck.
+description: Use when a session in this repo is waiting on an asynchronous result it did not compute inline — spawning a helper or background agent, OR waiting on CI / a GitHub Actions run / a deploy / any long-running command you backgrounded and expect to be "notified" about — before writing a helper's kickoff prompt, when deciding how a result comes back, when about to end a turn while that work is still running or counting on a tracked background task / Monitor / completion notification to re-invoke you, or when a helper or watch has gone quiet or looks stuck.
 ---
 
 # Subagent Hygiene
@@ -29,6 +29,16 @@ green I'll do the next step," and neither woke until the human operator
 poked. CI is not a spawned agent, so nobody mapped the callback rule onto
 it — same trap, external signal.
 
+The 2026-07-09/10 dispatch-lifecycle session re-proved it against this
+skill's earlier revision: seven stops across four agents parked on "my
+armed watcher will wake me" — tracked background tasks, heartbeat
+loops, a one-hour Monitor armed on process exit, a `gh pr checks
+--watch` piped through tail — and every single one was confirmed fully
+stopped when resumed ("was stopped (completed)"). One agent finished
+its work, pushed, saw CI go green, then stranded before REPORTING — the
+finished result sat invisible for ~5 hours until the human operator
+noticed. Armed watchers are hints, not wake guarantees.
+
 ## Rules
 
 **1. Never end your turn waiting to be notified of an async result.**
@@ -46,6 +56,34 @@ notify me":
   helper you spawned that will SendMessage you at your explicit agent ID
   when done (an inbound message wakes a stopped session; external
   completion does not).
+- **(c) Stay in-turn and poll.** If the harness demotes your long
+  commands to background tasks (so a blocking foreground wait is
+  unavailable), do NOT end your turn — keep issuing cheap, fast
+  foreground calls in a loop (read the task's output-file tail, check
+  the process) within the SAME turn until the verdict lands. An agent
+  strands only when it ends its turn, never between tool calls; a few
+  dozen cheap polls are nothing against a stranded pipeline.
+
+**Armed watchers are not wake guarantees.** A tracked background task, a
+Monitor until-loop, a heartbeat, a completion notification — each claims
+it will re-invoke you. Treat every such claim as unreliable: if your
+plan for learning a result is "something will wake me," your plan is
+(a), (b), or (c) above — never a stop.
+
+**The report ships in the turn that verified the last result — and
+"ships" means TRANSMITTED, not written.** Work is not delivered until
+the report reaches the party waiting on it: if your harness returns
+your final message to the parent, that final message is the report; if
+you are a teammate whose plain-text output nobody receives, you MUST
+SendMessage it (for substantial output, the Rule 2 pointer message —
+"done, report at <path>" — is itself the transmission: the file is the
+payload, the send is the delivery). Text printed in your own turn is not a delivered report
+— a tested agent verified its result in-turn, "wrote" the report as
+plain output, went idle, and the finished deliverable stayed invisible
+until the lead pinged it. When unsure which channel applies,
+SendMessage: a duplicate report is free; a stranded one cost this
+project ~5 hours. Never park a finished result behind a stop ("I'll
+report once CI settles").
 
 Whenever you wake for any reason, poll every outstanding result directly
 (`gh pr checks`, the helper's status/output) before anything else.
@@ -71,7 +109,12 @@ permissions, do it yourself or ask the lead.
 
 **5. Silent or stuck helper: resume it, don't respawn.** SendMessage
 wakes stopped sessions. Check its transcript/output file first; a
-respawn duplicates work and orphans the original.
+respawn duplicates work and orphans the original. A stop whose final
+message carries waiting or intention language — "watchers will wake
+me," "I'll resume when it completes," "let me check X next" — IS a
+stalled helper: resume it with a direct message immediately; the send
+result tells you whether it was truly stopped, and the message is
+harmless if it wasn't.
 
 ## Kickoff checklist
 
@@ -91,3 +134,8 @@ helper's permission envelope.
 | "The final message will carry the full report" | Substantial output goes to the agreed file; the message says "done, report at <path>". Messages get lost; files don't. |
 | "The helper can just ask for permission" | Escalations route to the top lead and can be lost — the helper wedges. Keep the task in-envelope. |
 | "No answer — I'll spawn a fresh one" | Resume with SendMessage; check its transcript/output file first. |
+| "My tracked background task / Monitor / heartbeat will re-invoke me" | Every such stop in the 2026-07-09/10 session — seven across four agents — was confirmed fully stopped. Foreground-watch, hand the wait to a messaging helper, or poll in-turn; never stop on an armed watcher. |
+| "The harness demotes my foreground calls, so I can't block in-turn" | You don't need to block. Stay alive with cheap, fast polls in a loop — you strand only by ending your turn, never between tool calls. |
+| "I'll deliver the report once CI / the run settles" | The report ships in the same turn as the last verified result. A finished, unreported result idled a pipeline ~5 hours. |
+| "Let me check X next" (as a final message) | That's a stop wearing progress clothing — you stay stopped until someone notices. Finish the deliverable in-turn. |
+| "I wrote the report in my turn output" | Un-sent text is not a delivered report — nobody receives a teammate's plain output. Transmit it: final message (if your harness returns it to the parent) or SendMessage. When unsure, send — duplicates are free. |
