@@ -276,6 +276,11 @@ fn git_init_commit(rig: &Path) {
             "user.email=e2e@camp",
             "-c",
             "user.name=e2e",
+            // hermetic against operator gitconfig (PR #54 review finding
+            // 3): a global commit.gpgsign=true dies on a broken signer
+            // before any worker spawns — same guard as spawn.rs::git_rig.
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-qm",
             "toy baseline",
