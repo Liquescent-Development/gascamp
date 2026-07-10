@@ -809,6 +809,22 @@ struct SessionWoke {
     #[serde(default)]
     #[allow(dead_code)]
     worktree: Option<String>,
+    /// Phase 3: dispatch-time facts, audit-only in the fold — read back via
+    /// the woke-JSON join in session_rows (sessions DDL unchanged): the
+    /// rig's base commit at dispatch (the shipped gate's reference) and the
+    /// F7 pins (re-applied on resume turns).
+    #[serde(default)]
+    #[allow(dead_code)]
+    base: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    permission_mode: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    allowed_tools: Option<String>,
 }
 
 fn session_woke(conn: &Connection, event: &Event) -> Result<(), CoreError> {

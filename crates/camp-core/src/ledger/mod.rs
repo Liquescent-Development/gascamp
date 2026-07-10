@@ -50,6 +50,15 @@ pub struct SessionRow {
     pub spawned_ts: String,
     pub woke_actor: String,
     pub worktree: Option<String>,
+    /// The rig's base commit at dispatch time (Phase 3, Q4) — the shipped
+    /// gate's descent reference; None when the rig had none (non-repo /
+    /// unborn HEAD) or the woke predates Phase 3.
+    pub base: Option<String>,
+    /// F7 pins as spawned (Phase 3, #48 finding 1) — re-applied on resume
+    /// turns; None = registered without pins, resumes bare.
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub allowed_tools: Option<String>,
     /// `live` / `stopped` / `crashed` (the sessions table CHECK set).
     pub status: String,
 }
@@ -380,6 +389,18 @@ impl Ledger {
                     (SELECT json_extract(e.data, '$.worktree') FROM events e
                       WHERE e.type = 'session.woke'
                       AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
+                    (SELECT json_extract(e.data, '$.base') FROM events e
+                      WHERE e.type = 'session.woke'
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
+                    (SELECT json_extract(e.data, '$.model') FROM events e
+                      WHERE e.type = 'session.woke'
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
+                    (SELECT json_extract(e.data, '$.permission_mode') FROM events e
+                      WHERE e.type = 'session.woke'
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
+                    (SELECT json_extract(e.data, '$.allowed_tools') FROM events e
+                      WHERE e.type = 'session.woke'
+                      AND json_extract(e.data, '$.name') = s.name ORDER BY e.seq LIMIT 1),
                     s.status
              FROM sessions s WHERE {where_clause} ORDER BY s.name"
         );
@@ -399,7 +420,11 @@ impl Ledger {
                         spawned_ts: r.get(7)?,
                         woke_actor: String::new(), // filled below after the NULL check
                         worktree: r.get(9)?,
-                        status: r.get(10)?,
+                        base: r.get(10)?,
+                        model: r.get(11)?,
+                        permission_mode: r.get(12)?,
+                        allowed_tools: r.get(13)?,
+                        status: r.get(14)?,
                     },
                     woke_actor,
                 ))
@@ -924,6 +949,9 @@ mod tests {
                 "claude_session_id": "7bd2befc-b018-4080-8738-429d541b3646",
                 "transcript_path": "/home/u/.claude/projects/-code-gc/x.jsonl",
                 "bead": "gc-1", "worktree": "/camps/t/worktrees/gc-1",
+                "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "model": "sonnet", "permission_mode": "acceptEdits",
+                "allowed_tools": "Read,Edit,Bash",
             }),
         })
         .unwrap();
@@ -962,6 +990,11 @@ mod tests {
         assert_eq!(rows[0].woke_actor, "hook:session-start");
         assert!(rows[0].claude_session_id.is_none());
         assert!(rows[0].worktree.is_none());
+        // Phase 3: no dispatch-time base / F7 pins on a minimal woke
+        assert!(rows[0].base.is_none());
+        assert!(rows[0].model.is_none());
+        assert!(rows[0].permission_mode.is_none());
+        assert!(rows[0].allowed_tools.is_none());
         let w1 = &rows[1];
         assert_eq!(w1.name, "t/dev/1");
         assert_eq!(w1.agent, "dev");
@@ -977,6 +1010,15 @@ mod tests {
         assert_eq!(w1.bead.as_deref(), Some("gc-1"));
         assert_eq!(w1.woke_actor, "campd");
         assert_eq!(w1.worktree.as_deref(), Some("/camps/t/worktrees/gc-1"));
+        // Phase 3: the dispatch-time base and F7 pins round-trip through
+        // the woke-JSON join (no sessions-table schema change)
+        assert_eq!(
+            w1.base.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(w1.model.as_deref(), Some("sonnet"));
+        assert_eq!(w1.permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(w1.allowed_tools.as_deref(), Some("Read,Edit,Bash"));
         assert!(w1.pid.is_none());
         assert_eq!(w1.spawned_ts, "2026-07-05T21:14:03Z");
     }

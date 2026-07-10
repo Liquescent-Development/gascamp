@@ -272,6 +272,26 @@ fn ensure_worktree_base(rig_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The rig's base commit at this moment — `git rev-parse --verify
+/// HEAD^{commit}` — or None when the rig has none (non-repo / unborn
+/// HEAD). Recorded in session.woke as the dispatch-time `base`: the
+/// mechanical reference the `camp close` shipped gate verifies descent
+/// from (using the rig's LATER HEAD would let a live-tree worker on a
+/// baseless rig self-certify its own dead-end commit as based).
+pub fn rig_base(rig_path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(rig_path)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!sha.is_empty()).then_some(sha)
+}
+
 /// `git worktree add -b camp/<bead> <camp>/worktrees/<bead>` (decision H).
 /// A pre-existing directory or branch fails fast — bead ids are unique and
 /// Phase 8 never respawns a bead. A rig with no base commit is refused
@@ -623,6 +643,30 @@ mod tests {
         );
         remove_worktree(&rig, &wt).unwrap();
         assert!(!wt.exists());
+    }
+
+    /// The dispatch-time base (Phase 3, Q4): the mechanical fact "what commit
+    /// was this rig on when the work was dispatched" — the reference the
+    /// shipped gate verifies descent from. None on an unborn HEAD or a
+    /// non-repo (the same shapes ensure_worktree_base refuses).
+    #[test]
+    fn rig_base_resolves_head_and_is_none_without_one() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let rig = git_rig(dir.path());
+        let base = rig_base(&rig).expect("a committed rig has a base");
+        assert_eq!(base.len(), 40, "full sha: {base}");
+
+        let bare = dir.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(rig_base(&bare).is_none(), "not a repo");
+        Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["init", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(rig_base(&bare).is_none(), "unborn HEAD");
     }
 
     /// Phase 2 (spec §12 fail-fast): a rig without a base commit cannot
