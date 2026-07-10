@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use assert_cmd::Command;
+use std::time::Instant;
 
 fn camp() -> Command {
     let mut cmd = Command::cargo_bin("camp").unwrap();
@@ -310,4 +311,95 @@ fn show_prints_the_dispatch_failure_with_the_retry_hint() {
         .stdout(predicates::str::contains(
             "campd retries once per restart — after fixing the cause, restart campd",
         ));
+}
+
+/// An already-closed bead returns immediately (no watch armed).
+#[test]
+fn show_wait_returns_immediately_when_already_closed() {
+    let dir = camp_with_bead();
+    camp()
+        .current_dir(dir.path())
+        .args([
+            "close",
+            "gc-1",
+            "--outcome",
+            "fail",
+            "--work-outcome",
+            "blocked",
+            "--reason",
+            "cannot land",
+        ])
+        .assert()
+        .success();
+    let start = Instant::now();
+    camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1", "--wait"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("status   closed"));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "an already-closed bead must not block"
+    );
+}
+
+/// `--wait` blocks on the file-watch and wakes when the bead closes from
+/// another process — event-driven, not returned-early, not a fixed poll.
+#[test]
+fn show_wait_wakes_on_an_external_close() {
+    let dir = camp_with_bead();
+    let path = dir.path().to_path_buf();
+    // Close gc-1 after ~600ms, from a separate process, while --wait blocks.
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        Command::cargo_bin("camp")
+            .unwrap()
+            .env_remove("CAMP_DIR")
+            .current_dir(&path)
+            .args([
+                "close",
+                "gc-1",
+                "--outcome",
+                "fail",
+                "--work-outcome",
+                "blocked",
+                "--reason",
+                "done",
+            ])
+            .assert()
+            .success();
+    });
+    let start = Instant::now();
+    camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1", "--wait"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("status   closed"));
+    let elapsed = start.elapsed();
+    closer.join().unwrap();
+    // Waited for the close (did not return early)…
+    assert!(
+        elapsed >= std::time::Duration::from_millis(400),
+        "must actually wait for the close, elapsed {elapsed:?}"
+    );
+    // …and woke on the event rather than a coarse poll interval.
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "must wake promptly on the watch event, elapsed {elapsed:?}"
+    );
+}
+
+/// `--timeout` bounds the wait and fails fast (never a silent hang).
+#[test]
+fn show_wait_times_out_nonzero() {
+    let dir = camp_with_bead(); // gc-1 stays open
+    camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1", "--wait", "--timeout", "1"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains("timed out"));
 }

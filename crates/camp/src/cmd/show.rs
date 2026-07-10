@@ -1,3 +1,6 @@
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
 use anyhow::{Result, anyhow};
 use camp_core::config::CampConfig;
 use camp_core::event::{Event, EventType};
@@ -24,21 +27,93 @@ pub(crate) struct Deliverable {
     rig_path: String,
 }
 
-/// `camp show <bead> [--json]`: current state plus full event history — the
-/// one sanctioned history read (spec §7.4). Read-only: `show` never writes.
+/// `camp show <bead> [--json] [--wait [--timeout SECONDS]]`: current state
+/// plus full event history (spec §7.4). Read-only: `show` never writes and
+/// never autostarts campd — `--wait` is a pure observer (design §7).
 pub fn run(
     camp: &CampDir,
     bead: String,
     json: bool,
-    _wait: bool,
-    _timeout: Option<u64>,
+    wait: bool,
+    timeout: Option<u64>,
 ) -> Result<()> {
-    let view = load_view(camp, &bead)?;
+    let view = if wait {
+        wait_for_close(camp, &bead, timeout.map(Duration::from_secs))?
+    } else {
+        load_view(camp, &bead)?
+    };
     if json {
         render_json(&view)
     } else {
         render_human(&view);
         Ok(())
+    }
+}
+
+/// Block until `bead` reaches a `closed` status, then return its view.
+///
+/// Sleeps on a `notify` file-watch of the camp directory — WAL commits land
+/// there, so every close wakes us; there is NO poll loop (invariant #1). The
+/// watch is armed BEFORE the re-check, so a close landing between the first
+/// read and arming cannot be missed (arm-before-check). Pure observer: no
+/// ledger writes, no campd dependency — a worker's `camp close` writes the
+/// terminal event to the ledger directly, and we observe that ground truth.
+fn wait_for_close(camp: &CampDir, bead: &str, timeout: Option<Duration>) -> Result<BeadView> {
+    let view = load_view(camp, bead)?; // also validates the bead exists
+    if view.row.status == "closed" {
+        return Ok(view);
+    }
+    let (tx, rx) = mpsc::channel::<()>();
+    let mut watcher = notify::recommended_watcher(move |_res: notify::Result<notify::Event>| {
+        // Any change under the camp dir is a wake; the reload reads ground
+        // truth. One pending wake is enough — a failed send just means a
+        // wake is already queued.
+        let _ = tx.send(());
+    })
+    .map_err(|e| anyhow!("creating the ledger watcher: {e}"))?;
+    notify::Watcher::watch(
+        &mut watcher,
+        &camp.root,
+        notify::RecursiveMode::NonRecursive,
+    )
+    .map_err(|e| anyhow!("watching the camp directory {}: {e}", camp.root.display()))?;
+    // Re-check AFTER arming (closes the arm-before-check race).
+    let view = load_view(camp, bead)?;
+    if view.row.status == "closed" {
+        return Ok(view);
+    }
+    eprintln!("waiting for {bead} to close (Ctrl-C to stop)…");
+    let deadline = timeout.map(|t| Instant::now() + t);
+    loop {
+        match deadline {
+            None => match rx.recv() {
+                // Unbounded: a pure blocking wait on the OS watch — no tick.
+                Ok(()) => {}
+                Err(_) => anyhow::bail!("ledger watcher disconnected while waiting for {bead}"),
+            },
+            Some(d) => {
+                let now = Instant::now();
+                if now >= d {
+                    let view = load_view(camp, bead)?;
+                    anyhow::bail!(
+                        "timed out waiting for {bead} to close — still {} after the timeout",
+                        view.row.status
+                    );
+                }
+                match rx.recv_timeout(d - now) {
+                    Ok(()) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue, // re-eval deadline → bail
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        anyhow::bail!("ledger watcher disconnected while waiting for {bead}")
+                    }
+                }
+            }
+        }
+        let view = load_view(camp, bead)?;
+        if view.row.status == "closed" {
+            return Ok(view);
+        }
+        // Spurious/unrelated fs event (e.g. a -shm touch): keep waiting.
     }
 }
 
