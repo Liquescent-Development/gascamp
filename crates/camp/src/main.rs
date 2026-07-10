@@ -194,6 +194,15 @@ enum Command {
     Show {
         /// Bead id
         bead: String,
+        /// Emit the bead's state and history as one JSON object
+        #[arg(long)]
+        json: bool,
+        /// Block until the bead reaches a closed status, then render
+        #[arg(long)]
+        wait: bool,
+        /// With --wait, bound the wait to N seconds (default: unbounded)
+        #[arg(long, value_name = "SECONDS", requires = "wait")]
+        timeout: Option<u64>,
     },
     /// Ranked full-text search over everything, all time
     Search {
@@ -531,9 +540,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::nudge::run(&camp, session, text)
         }
-        Command::Show { bead } => {
+        Command::Show {
+            bead,
+            json,
+            wait,
+            timeout,
+        } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
-            cmd::show::run(&camp, bead)
+            cmd::show::run(&camp, bead, json, wait, timeout)
         }
         Command::Search { query, limit } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;

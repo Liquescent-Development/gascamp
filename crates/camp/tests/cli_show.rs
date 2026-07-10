@@ -90,6 +90,42 @@ fn show_of_unknown_bead_errors() {
         .stderr(predicates::str::contains("no such bead"));
 }
 
+/// `--json` emits ONE object: the bead's state fields plus a `history`
+/// array — the operator's machine read (design §5).
+#[test]
+fn show_json_emits_state_and_history() {
+    let dir = camp_with_bead();
+    camp()
+        .current_dir(dir.path())
+        .args(["claim", "gc-1", "--session", "camp/dev/1"])
+        .assert()
+        .success();
+    let out = camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["bead"], "gc-1");
+    assert_eq!(v["title"], "do the thing");
+    assert_eq!(v["status"], "in_progress");
+    assert_eq!(v["ready"], false);
+    let kinds: Vec<&str> = v["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"bead.created"), "history kinds: {kinds:?}");
+    assert!(kinds.contains(&"bead.claimed"), "history kinds: {kinds:?}");
+    // Not shipped → no deliverable coordinates yet.
+    assert!(v["branch"].is_null());
+    assert!(v["commit"].is_null());
+}
+
 /// PR #54 assessment finding A (operator UX): the dispatch-failed marker
 /// must tell the operator HOW to retry — campd's in-memory failed set
 /// suppresses re-dispatch for its lifetime (plan decision F, by design),
