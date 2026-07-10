@@ -78,9 +78,11 @@ your task was concrete work, the **work outcome**: what became of the work
 itself, Gas City's WorkOutcome vocabulary verbatim.
 
 - `shipped` — you committed a change that satisfies the bead. Name the
-  commit and its branch; camp verifies mechanically that the commit is
-  reachable on that branch and descends from the base you were dispatched
-  on. An unverifiable `shipped` is rejected, never recorded.
+  commit and its branch; camp verifies mechanically that the branch is a
+  real local branch, that the commit is reachable on it and descends from
+  the base you were dispatched on, and that it is NEW work — the base
+  itself never ships (nothing was committed; that is `no-op` or
+  `blocked`). An unverifiable `shipped` is rejected, never recorded.
 - `no-op` — the bead needed no change (already satisfied, duplicate). No
   commit is named.
 - `blocked` — you could not deliver: the change cannot land (no base, no

@@ -485,9 +485,10 @@ axes:* the control `outcome` (`pass`/`fail`/`skipped`) plus, for concrete
 work, the **WorkOutcome axis** — `shipped`/`no-op`/`blocked`/`abandoned`,
 Gas City's `gc.work_outcome` vocabulary mirrored verbatim (§15.2) as a
 separate, additive axis. `shipped` is mechanically gated by `camp close`:
-the named commit must be reachable on the named branch and descend from
-the session's dispatch-time base (recorded in `session.woke`); an
-unverifiable `shipped` is rejected, never recorded. Un-integrable work
+the named branch must be a real local branch, and the named commit must be
+reachable on it, descend from the session's dispatch-time base (recorded
+in `session.woke`), and not BE that base — shipped asserts at least one
+commit of new work; an unverifiable `shipped` is rejected, never recorded. Un-integrable work
 closes `fail` + `blocked` — its worktree and bead branch are kept, so
 nothing is lost. Workers run under the permission mode and tool allowlist
 their agent definition declares — **including resume turns**: `camp nudge`

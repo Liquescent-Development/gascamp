@@ -119,13 +119,19 @@ pub fn run(
 }
 
 /// The shipped gate (dispatch-lifecycle Phase 3, Q4 — #34): "landed" in v1
-/// is a LOCAL fact, mechanically checkable — the commit is reachable on
-/// its branch (gc's work-record gate rule, verbatim) AND descends from the
-/// dispatch-time base recorded on the claiming session's woke event. All
-/// git runs against the rig path: worktrees share the object store, so
-/// bead-branch refs resolve from the rig. gc ships this gate warn-only by
-/// default; camp enforces always (invariant 5 — an unverifiable `shipped`
-/// is rejected, never recorded).
+/// is a LOCAL fact, mechanically checkable, four git facts strong (PR #54
+/// review finding 1 hardened the last three against self-certification):
+/// the named branch is a REAL local branch (a bare commit-ish would pass
+/// ancestry checks — a commit is its own ancestor — and a SHA "branch" is
+/// git-gc-able, voiding branch-outlives-reap); the commit is reachable on
+/// that branch (gc's work-record gate rule); the commit DESCENDS from the
+/// dispatch-time base recorded on the claiming session's woke event; and
+/// the commit is NOT the base itself — shipped asserts at least one commit
+/// of new work (`rev-parse HEAD` on an unchanged tree is exactly #34's
+/// self-certification, on a based rig). All git runs against the rig path:
+/// worktrees share the object store, so bead-branch refs resolve from the
+/// rig. gc ships its gate warn-only by default; camp enforces always
+/// (invariant 5 — an unverifiable `shipped` is rejected, never recorded).
 fn verify_shipped(camp: &CampDir, bead: &str, commit: &str, branch: &str) -> Result<()> {
     for (flag, value) in [("--work-commit", commit), ("--work-branch", branch)] {
         if value.starts_with('-') {
@@ -155,27 +161,67 @@ fn verify_shipped(camp: &CampDir, bead: &str, commit: &str, branch: &str) -> Res
     let config = CampConfig::load(&camp.config_path())?;
     let rig_path = &config.rig(&row.rig)?.path;
     drop(ledger); // reopened by the caller for the append
-    let git = |args: &[&str]| -> Result<bool> {
-        let out = std::process::Command::new("git")
+    let git = |args: &[&str]| -> Result<std::process::Output> {
+        std::process::Command::new("git")
             .arg("-C")
             .arg(rig_path)
             .args(args)
             .output()
-            .with_context(|| format!("running git {args:?}"))?;
-        Ok(out.status.success())
+            .with_context(|| format!("running git {args:?}"))
     };
-    if !git(&["merge-base", "--is-ancestor", commit, branch])? {
+    // The branch must be a real local ref — checked FIRST, so no later
+    // ancestry test can be fed a commit-ish "branch" (its own ancestor).
+    let branch_ref = format!("refs/heads/{branch}");
+    if !git(&["rev-parse", "--verify", "--quiet", &branch_ref])?
+        .status
+        .success()
+    {
+        bail!(
+            "work_branch {branch:?} is not a local branch in rig {} — shipped work \
+             lives on a real branch that outlives the worktree",
+            row.rig
+        );
+    }
+    // Resolve the commit to its full sha (an abbreviated base must not
+    // slip past the new-work equality check below).
+    let resolved = git(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{commit}^{{commit}}"),
+    ])?;
+    if !resolved.status.success() {
+        bail!(
+            "work_commit {commit:?} does not name a commit in rig {}",
+            row.rig
+        );
+    }
+    let commit = String::from_utf8_lossy(&resolved.stdout).trim().to_owned();
+    if !git(&["merge-base", "--is-ancestor", &commit, &branch_ref])?
+        .status
+        .success()
+    {
         bail!(
             "work_commit {commit} is not reachable on work_branch {branch:?} in rig {} — \
              shipped must name the commit as it exists on its branch",
             row.rig
         );
     }
-    if !git(&["merge-base", &base, commit])? {
+    if commit == base {
         bail!(
-            "work_commit {commit} shares no history with the dispatch-time base {base} \
-             (no merge-base) — the branch has no path to the rig's integration branch; \
-             close it --work-outcome blocked instead"
+            "work_commit {commit} IS the dispatch-time base — shipped requires at least \
+             one commit of new work; record --work-outcome no-op (nothing was needed) or \
+             blocked instead"
+        );
+    }
+    if !git(&["merge-base", "--is-ancestor", &base, &commit])?
+        .status
+        .success()
+    {
+        bail!(
+            "work_commit {commit} does not descend from the dispatch-time base {base} — \
+             the work has no path from the state it was dispatched on; close it \
+             --work-outcome blocked instead"
         );
     }
     Ok(())

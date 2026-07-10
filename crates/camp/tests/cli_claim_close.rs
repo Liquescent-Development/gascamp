@@ -486,18 +486,24 @@ fn shipped_rejects_unreachable_unbased_flag_shaped_and_unclaimed_facts() {
             .output()
             .unwrap()
     };
-    // unreachable: a branch that does not exist
+    // a branch name that is not a real local ref (PR #54 review finding 1:
+    // this must fail as a missing REF, before any ancestry test could be
+    // fooled by a commit-ish)
     let out = close_shipped(&head, "no-such-branch");
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not reachable on"));
-    // unbased: an orphan branch on a based rig shares no history
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not a local branch"));
+    // unbased: an orphan branch on a based rig does not descend from the base
     git(&rig, &["checkout", "--orphan", "lone"]);
     git(&rig, &["commit", "--allow-empty", "-m", "orphan"]);
     let orphan = git(&rig, &["rev-parse", "HEAD"]);
     git(&rig, &["checkout", "main"]);
     let out = close_shipped(&orphan, "lone");
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("shares no history with"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not descend from"));
+    // unreachable: a real branch that does not contain the commit
+    let out = close_shipped(&head, "lone");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not reachable on"));
     // flag-shaped values are rejected outright (gc's injection guard)
     let out = close_shipped("-x", "main");
     assert!(!out.status.success());
@@ -547,4 +553,93 @@ fn malformed_output_json_fails_fast_naming_the_source() {
         .args(["close", "gc-1", "--outcome", "pass"])
         .assert()
         .success();
+}
+
+/// PR #54 review finding 1 (HIGH): the gate must reject SELF-CERTIFICATION
+/// on a based rig — shipped requires at least one commit of NEW work that
+/// DESCENDS from the dispatch-time base, on a REAL local branch. A worker
+/// that committed nothing (work_commit == the base, or an ancestor of it)
+/// and a SHA passed as the "branch" (a commit is its own ancestor) must
+/// each fail — otherwise the ledger records shipped for zero delivered
+/// work, and a bare-SHA "branch" is git-gc-able (nothing outlives the
+/// reap).
+#[test]
+fn shipped_rejects_the_base_itself_ancestors_of_base_and_sha_as_branch() {
+    let dir = camp_with_bead_in(|repo| {
+        based_rig(repo);
+        git(repo, &["commit", "--allow-empty", "-m", "second"]);
+    });
+    register_and_claim(dir.path()); // base = HEAD = the "second" commit
+    let rig = dir.path().join("repo");
+    let base = git(&rig, &["rev-parse", "HEAD"]);
+    let parent = git(&rig, &["rev-parse", "HEAD^"]);
+    let close_shipped = |commit: &str, branch: &str| {
+        camp()
+            .current_dir(dir.path())
+            .args([
+                "close",
+                "gc-1",
+                "--outcome",
+                "pass",
+                "--work-outcome",
+                "shipped",
+                &format!("--work-commit={commit}"),
+                &format!("--work-branch={branch}"),
+            ])
+            .output()
+            .unwrap()
+    };
+
+    // (a) the base itself: `git rev-parse HEAD` on an unchanged tree — the
+    // exact #34 self-certification, now on a BASED rig. No new work.
+    let out = close_shipped(&base, "main");
+    assert!(!out.status.success(), "the base itself must not ship");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("at least one commit of new work"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (a') an abbreviated base sha must not slip past the equality check.
+    let out = close_shipped(&base[..12], "main");
+    assert!(!out.status.success(), "abbreviated base must not ship");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("at least one commit of new work"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (b) an ancestor of the base: older than the dispatch point.
+    let out = close_shipped(&parent, "main");
+    assert!(
+        !out.status.success(),
+        "an ancestor of the base must not ship"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not descend from"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (c) a SHA as the "branch": a commit is its own ancestor, so without
+    // the real-ref requirement the reachability check self-certifies.
+    git(&rig, &["checkout", "-b", "camp/gc-1"]);
+    git(&rig, &["commit", "--allow-empty", "-m", "real work"]);
+    let work = git(&rig, &["rev-parse", "HEAD"]);
+    git(&rig, &["checkout", "main"]);
+    let out = close_shipped(&work, &work);
+    assert!(!out.status.success(), "a SHA is not a branch");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not a local branch"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Control: the same real commit on its real branch ships.
+    let out = close_shipped(&work, "camp/gc-1");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
