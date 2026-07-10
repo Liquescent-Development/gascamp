@@ -40,6 +40,16 @@ definition declares. If campd spawned you, you are **non-interactive**:
 anything your agent definition has not pre-allowed **fails fast** and lands
 in the ledger — do not hang waiting for an approval no one will answer.
 
+**Delivery — work in a git rig ships as a commit, not loose edits.** A
+campd-dispatched autonomous worker runs in a camp-managed worktree on the
+bead branch `camp/<bead>` (spec §12): commit your finished work to that
+branch — the local branch, reachable and diffable, IS the deliverable. Do
+not invent branching policy from unrelated global rules, do not create
+other branches, and never push: v1 has no remote, PR, or merge step. If you
+were dispatched onto the rig's live tree instead (the agent's explicit
+`isolation = "none"` opt-out), commit to the branch checked out for you —
+the operator supervising that tree owns integration.
+
 ## 4. emit milestones — leave a heartbeat and a trail
 
 At each non-trivial step, emit a one-line milestone. This is both the audit
@@ -60,15 +70,39 @@ decision), store it so future workers `recall` it:
 camp remember "<the durable fact>"
 ```
 
-## 6. close — record the outcome
+## 6. close — record the outcome on both axes
 
-Close the bead with its outcome. `pass` on success; `fail` (add `--transient`
-for a retryable/flaky failure) otherwise. Attach structured step output with
+Close the bead with its **control outcome** — `pass` on success, `fail`
+(add `--transient` for a retryable/flaky failure) otherwise — and, whenever
+your task was concrete work, the **work outcome**: what became of the work
+itself, Gas City's WorkOutcome vocabulary verbatim.
+
+- `shipped` — you committed a change that satisfies the bead. Name the
+  commit and its branch; camp verifies mechanically that the commit is
+  reachable on that branch and descends from the base you were dispatched
+  on. An unverifiable `shipped` is rejected, never recorded.
+- `no-op` — the bead needed no change (already satisfied, duplicate). No
+  commit is named.
+- `blocked` — you could not deliver: the change cannot land (no base, no
+  integration path, a missing permission). Close `fail` and say why in
+  `--reason`. Anything you committed stays safe: the worktree and the bead
+  branch are kept.
+- `abandoned` — the work should not proceed (obsolete, superseded). Close
+  `fail` with the reason.
+
+`shipped`/`no-op` ride a `pass`; `blocked`/`abandoned` ride a `fail` —
+camp rejects incoherent pairings. Attach structured step output with
 `--output-json -` when a downstream check needs it.
 
 ```
-camp close <bead> --outcome pass  --reason "<what you did>"
-camp close <bead> --outcome fail  --reason "<why>" [--transient]
+camp close <bead> --outcome pass --reason "<what you did>" \
+  --work-outcome shipped \
+  --work-commit "$(git rev-parse HEAD)" \
+  --work-branch "$(git rev-parse --abbrev-ref HEAD)"
+
+camp close <bead> --outcome pass --reason "<why no change was needed>" --work-outcome no-op
+camp close <bead> --outcome fail --reason "<what blocks landing>" --work-outcome blocked
+camp close <bead> --outcome fail --reason "<why>" [--transient]
 ```
 
 Closing is what dispatches dependents (spec §7.3) — do it as your last act.
