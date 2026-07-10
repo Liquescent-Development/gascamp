@@ -17,6 +17,7 @@ use camp_core::ledger::Ledger;
 use camp_core::pack::{self, Isolation};
 use camp_core::readiness::BeadRow;
 
+use super::bounded::{self, STDIN_WRITE_TIMEOUT};
 use super::spawn::{self, SpawnSpec};
 use crate::campdir::CampDir;
 
@@ -115,6 +116,9 @@ struct Prep {
     /// The F7 pins as spawned (model, permission_mode, comma-joined
     /// allowedTools) — recorded in session.woke; re-applied on resume.
     pins: (Option<String>, Option<String>, Option<String>),
+    /// `[dispatch] exec_timeout` resolved once per dispatch (issue #55):
+    /// the bound on every git subprocess launch() runs on the loop.
+    exec_timeout: std::time::Duration,
 }
 
 /// Decision D: assignee → rig default_agent → [dispatch].default_agent.
@@ -153,84 +157,6 @@ fn classify(status: ExitStatus) -> (EventType, Option<i64>, Option<i64>) {
             status.signal().map(i64::from),
         ),
     }
-}
-
-/// How long one nudge write may take before campd declares the worker's
-/// stdin wedged (PR #51 review finding 2). A bound on the event loop's
-/// worst-case stall, not a wakeup — nothing ticks while no nudge runs.
-const NUDGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Bounded write of one stream-json line into a worker's held stdin:
-/// non-blocking writes; on WouldBlock, wait for writability with the
-/// REMAINING deadline via a throwaway poll (mio, already the event-loop
-/// substrate). Past the deadline the write fails TimedOut — the caller
-/// owns the torn-pipe consequence (a partial line may be buffered).
-fn write_bounded(
-    sender: &mut mio::unix::pipe::Sender,
-    bytes: &[u8],
-    timeout: std::time::Duration,
-) -> std::io::Result<()> {
-    use std::io::{ErrorKind, Write as _};
-    sender.set_nonblocking(true)?;
-    let deadline = std::time::Instant::now() + timeout;
-    let mut written = 0;
-    while written < bytes.len() {
-        match sender.write(&bytes[written..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::WriteZero,
-                    "worker stdin accepted zero bytes",
-                ));
-            }
-            Ok(n) => written += n,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    return Err(std::io::Error::new(
-                        ErrorKind::TimedOut,
-                        format!(
-                            "worker stdin stayed full past the {}s nudge write deadline \
-                             (the worker is not reading its pipe)",
-                            timeout.as_secs()
-                        ),
-                    ));
-                }
-                // Ok on writable OR on a spurious/timeout wake: the loop
-                // re-tries the write and re-checks the deadline, so a
-                // spurious wake costs one extra syscall, never a wedge.
-                wait_writable(sender, deadline - now)?;
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    sender.flush()
-}
-
-/// Wait (bounded) for the sender to become writable using a throwaway
-/// poll. Spurious, empty, or SIGNAL-INTERRUPTED wakes return Ok — the
-/// caller's deadline check governs termination. The Interrupted arm is
-/// load-bearing (review residual on PR #51): mio's Poll::poll returns
-/// EINTR without retrying, and campd's SA_RESTART SIGCHLD handler never
-/// restarts poll/kevent (signal(7)) — so any worker exiting during this
-/// ≤2s wait would otherwise fail the nudge and cost a HEALTHY worker its
-/// held pipe (torn line + unearned EOF).
-fn wait_writable(
-    sender: &mut mio::unix::pipe::Sender,
-    timeout: std::time::Duration,
-) -> std::io::Result<()> {
-    let mut poll = mio::Poll::new()?;
-    let mut events = mio::Events::with_capacity(4);
-    poll.registry()
-        .register(sender, mio::Token(0), mio::Interest::WRITABLE)?;
-    let waited = match poll.poll(&mut events, Some(timeout)) {
-        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(()),
-        result => result,
-    };
-    let deregistered = poll.registry().deregister(sender);
-    waited?;
-    deregistered?;
-    Ok(())
 }
 
 impl Dispatcher {
@@ -286,7 +212,7 @@ impl Dispatcher {
             return NudgeOutcome::NoPipe;
         };
         let line = spawn::user_message(text);
-        match write_bounded(stdin, line.as_bytes(), NUDGE_WRITE_TIMEOUT) {
+        match bounded::write_bounded(stdin, line.as_bytes(), STDIN_WRITE_TIMEOUT) {
             Ok(()) => NudgeOutcome::Delivered,
             Err(e) => {
                 worker.stdin = None; // torn pipe: never write after a failed line
@@ -598,7 +524,16 @@ impl Dispatcher {
                 rig.path.display()
             ));
         }
-        let base = spawn::rig_base(&rig.path);
+        let exec_timeout = self
+            .config
+            .dispatch
+            .exec_timeout()
+            .map_err(|e| e.to_string())?;
+        // A hung/unrunnable git is a dispatch failure (issue #55), never
+        // a silent "no base" — Ok(None) is reserved for an observed
+        // non-repo/unborn HEAD.
+        let base =
+            spawn::rig_base(&rig.path, exec_timeout).map_err(|e| format!("rig base: {e:#}"))?;
         let pins = (
             agent.model.clone(),
             agent.permission_mode.clone(),
@@ -652,6 +587,7 @@ impl Dispatcher {
             make_worktree,
             base,
             pins,
+            exec_timeout,
         })
     }
 
@@ -662,7 +598,12 @@ impl Dispatcher {
         let worktree = if prep.make_worktree {
             // ensure_worktree (Phase 11 Decision H): a patrol respawn
             // reuses the bead's own worktree; residue still fails fast.
-            match spawn::ensure_worktree(&prep.rig_path, &self.camp.worktrees_path(), &bead.id) {
+            match spawn::ensure_worktree(
+                &prep.rig_path,
+                &self.camp.worktrees_path(),
+                &bead.id,
+                prep.exec_timeout,
+            ) {
                 Ok(dir) => Some(dir),
                 Err(e) => {
                     self.failed.insert(bead.id.clone());
@@ -736,17 +677,16 @@ impl Dispatcher {
                 // ledger like any other spawn failure (decision F).
                 let mut stdin = child.stdin.take().map(mio::unix::pipe::Sender::from);
                 if let Some(pipe) = stdin.as_mut() {
-                    use std::io::Write as _;
                     let task = spawn::task_message(&bead.id, &prep.spec.session_name);
-                    // Explicitly BLOCKING for the task: the pipe is fresh
-                    // and empty, the task always fits the OS buffer, and
-                    // blocking semantics here predate finding 2 (only the
-                    // nudge path is operator-triggerable). Later nudges go
-                    // through write_bounded, which flips to non-blocking.
-                    if let Err(e) = pipe
-                        .set_nonblocking(false)
-                        .and_then(|()| pipe.write_all(task.as_bytes()))
-                        .and_then(|()| pipe.flush())
+                    // BOUNDED like every write into a held pipe (issue
+                    // #55; the PR #51 finding 2 discipline). The pipe is
+                    // fresh, so a task that fits the OS buffer succeeds on
+                    // the first write — the deadline only ever fires on a
+                    // task larger than the buffer fed to a worker that
+                    // never started reading, which previously wedged the
+                    // whole event loop.
+                    if let Err(e) =
+                        bounded::write_bounded(pipe, task.as_bytes(), STDIN_WRITE_TIMEOUT)
                     {
                         let _ = child.kill();
                         let _ = child.wait();
@@ -873,6 +813,18 @@ impl Dispatcher {
     }
 
     pub fn reap(&mut self, ledger: &mut Ledger) -> Result<(), ReapFailure> {
+        // The worktree-removal bound (issue #55): resolved before the
+        // sweep; validated at config load, so an Err here is a hand-built
+        // config — surfaced, not defaulted (invariant 5), and no retry
+        // storm can fix it.
+        let exec_timeout = self
+            .config
+            .dispatch
+            .exec_timeout()
+            .map_err(|e| ReapFailure {
+                retryable: false,
+                error: anyhow::Error::new(e).context("resolving [dispatch] exec_timeout"),
+            })?;
         self.reap_aux(ledger)?;
         let mut exited: Vec<(u32, ExitStatus)> = Vec::new();
         for (pid, worker) in &mut self.children {
@@ -932,9 +884,11 @@ impl Dispatcher {
                 worker.end_recorded = true;
             }
             if let Some(worker) = self.children.get(&pid) {
-                Self::dispose_worktree(ledger, worker).map_err(|error| ReapFailure {
-                    retryable: true,
-                    error,
+                Self::dispose_worktree(ledger, worker, exec_timeout).map_err(|error| {
+                    ReapFailure {
+                        retryable: true,
+                        error,
+                    }
                 })?;
             }
             // Every ledger effect landed; now it is safe to forget.
@@ -949,7 +903,11 @@ impl Dispatcher {
     /// Idempotent for retries (finding 1): a closed-pass worktree that is
     /// already gone was removed by a previous attempt whose event append
     /// failed — record the reap rather than re-removing.
-    fn dispose_worktree(ledger: &mut Ledger, worker: &Worker) -> Result<()> {
+    fn dispose_worktree(
+        ledger: &mut Ledger,
+        worker: &Worker,
+        exec_timeout: std::time::Duration,
+    ) -> Result<()> {
         let Some(worktree) = &worker.worktree else {
             return Ok(());
         };
@@ -958,7 +916,7 @@ impl Dispatcher {
             .is_some_and(|b| b.status == "closed" && b.outcome.as_deref() == Some("pass"));
         let (kind, data) = if closed_pass {
             let removal = if worktree.exists() {
-                spawn::remove_worktree(&worker.rig_path, worktree)
+                spawn::remove_worktree(&worker.rig_path, worktree, exec_timeout)
             } else {
                 Ok(()) // already removed by a prior attempt
             };

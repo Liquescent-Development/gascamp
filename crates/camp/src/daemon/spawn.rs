@@ -7,9 +7,12 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use camp_core::pack::AgentDef;
+
+use super::bounded;
 
 /// The ONE worker-contract source (dispatch-lifecycle Phase 3, Q5): the
 /// worker skill shipped by the plugin. Embedded at compile time so the
@@ -286,13 +289,16 @@ pub fn spawn(spec: &SpawnSpec) -> Result<Child> {
 /// the refusal is an explicit mechanical check, never delegated to
 /// `git worktree add` failing. Also catches "not a git repository at all"
 /// through the same rev-parse.
-fn ensure_worktree_base(rig_path: &Path) -> Result<()> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(rig_path)
-        .args(["rev-parse", "--verify", "HEAD^{commit}"])
-        .output()
-        .context("running git rev-parse")?;
+fn ensure_worktree_base(rig_path: &Path, timeout: Duration) -> Result<()> {
+    let out = bounded::output_bounded(
+        Command::new("git").arg("-C").arg(rig_path).args([
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        ]),
+        timeout,
+    )
+    .context("running git rev-parse")?;
     if !out.status.success() {
         bail!(
             "rig {} cannot host a worktree (no git repository with a base commit): {}",
@@ -304,31 +310,42 @@ fn ensure_worktree_base(rig_path: &Path) -> Result<()> {
 }
 
 /// The rig's base commit at this moment — `git rev-parse --verify
-/// HEAD^{commit}` — or None when the rig has none (non-repo / unborn
-/// HEAD). Recorded in session.woke as the dispatch-time `base`: the
-/// mechanical reference the `camp close` shipped gate verifies descent
-/// from (using the rig's LATER HEAD would let a live-tree worker on a
-/// baseless rig self-certify its own dead-end commit as based).
-pub fn rig_base(rig_path: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(rig_path)
-        .args(["rev-parse", "--verify", "HEAD^{commit}"])
-        .output()
-        .ok()?;
+/// HEAD^{commit}` — or None when the rig OBSERVABLY has none (non-repo /
+/// unborn HEAD). Recorded in session.woke as the dispatch-time `base`:
+/// the mechanical reference the `camp close` shipped gate verifies
+/// descent from (using the rig's LATER HEAD would let a live-tree worker
+/// on a baseless rig self-certify its own dead-end commit as based). A
+/// git that cannot run or hangs past the bound is an Err (issue #55) —
+/// mapping it to None would silently record a probe failure as a
+/// baseless rig (invariant 5).
+pub fn rig_base(rig_path: &Path, timeout: Duration) -> Result<Option<String>> {
+    let out = bounded::output_bounded(
+        Command::new("git").arg("-C").arg(rig_path).args([
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        ]),
+        timeout,
+    )
+    .context("running git rev-parse")?;
     if !out.status.success() {
-        return None;
+        return Ok(None);
     }
     let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (!sha.is_empty()).then_some(sha)
+    Ok((!sha.is_empty()).then_some(sha))
 }
 
 /// `git worktree add -b camp/<bead> <camp>/worktrees/<bead>` (decision H).
 /// A pre-existing directory or branch fails fast — bead ids are unique and
 /// Phase 8 never respawns a bead. A rig with no base commit is refused
 /// before any side effect (spec §12 fail-fast).
-pub fn create_worktree(rig_path: &Path, worktrees_dir: &Path, bead_id: &str) -> Result<PathBuf> {
-    ensure_worktree_base(rig_path)?;
+pub fn create_worktree(
+    rig_path: &Path,
+    worktrees_dir: &Path,
+    bead_id: &str,
+    timeout: Duration,
+) -> Result<PathBuf> {
+    ensure_worktree_base(rig_path, timeout)?;
     std::fs::create_dir_all(worktrees_dir)
         .with_context(|| format!("creating {}", worktrees_dir.display()))?;
     let dir = worktrees_dir.join(bead_id);
@@ -341,14 +358,16 @@ pub fn create_worktree(rig_path: &Path, worktrees_dir: &Path, bead_id: &str) -> 
             dir.display()
         );
     }
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(rig_path)
-        .args(["worktree", "add", "-b"])
-        .arg(format!("camp/{bead_id}"))
-        .arg(&dir)
-        .output()
-        .context("running git worktree add")?;
+    let out = bounded::output_bounded(
+        Command::new("git")
+            .arg("-C")
+            .arg(rig_path)
+            .args(["worktree", "add", "-b"])
+            .arg(format!("camp/{bead_id}"))
+            .arg(&dir),
+        timeout,
+    )
+    .context("running git worktree add")?;
     if !out.status.success() {
         bail!(
             "git worktree add failed for {}: {}",
@@ -363,24 +382,31 @@ pub fn create_worktree(rig_path: &Path, worktrees_dir: &Path, bead_id: &str) -> 
 /// existing directory is REUSED iff it is a git worktree whose checked-out
 /// branch is camp/<bead> — the same bead's earlier generation, partial
 /// work preserved. Anything else keeps the fail-fast residue error.
-pub fn ensure_worktree(rig_path: &Path, worktrees_dir: &Path, bead_id: &str) -> Result<PathBuf> {
+pub fn ensure_worktree(
+    rig_path: &Path,
+    worktrees_dir: &Path,
+    bead_id: &str,
+    timeout: Duration,
+) -> Result<PathBuf> {
     // Defense-in-depth (PR #52 review finding 1): the base check runs on
     // the REUSE path too. Reuse implies a prior base-checked creation,
     // but a rig whose repository was gutted since must still fail fast
     // here — never hand a worker a broken tree. (The create path checks
     // again inside create_worktree; one extra rev-parse is noise.)
-    ensure_worktree_base(rig_path)?;
+    ensure_worktree_base(rig_path, timeout)?;
     let dir = worktrees_dir.join(bead_id);
     if !dir.exists() {
-        return create_worktree(rig_path, worktrees_dir, bead_id);
+        return create_worktree(rig_path, worktrees_dir, bead_id, timeout);
     }
     if dir.join(".git").exists() {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(["branch", "--show-current"])
-            .output()
-            .context("running git branch --show-current")?;
+        let out = bounded::output_bounded(
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["branch", "--show-current"]),
+            timeout,
+        )
+        .context("running git branch --show-current")?;
         if out.status.success()
             && String::from_utf8_lossy(&out.stdout).trim() == format!("camp/{bead_id}")
         {
@@ -395,14 +421,16 @@ pub fn ensure_worktree(rig_path: &Path, worktrees_dir: &Path, bead_id: &str) -> 
 
 /// Remove a clean worktree (decision H). The camp/<bead> branch is left
 /// standing — it may hold unpushed work; sweeping is Phase 11 policy.
-pub fn remove_worktree(rig_path: &Path, worktree: &Path) -> Result<()> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(rig_path)
-        .args(["worktree", "remove", "--force"])
-        .arg(worktree)
-        .output()
-        .context("running git worktree remove")?;
+pub fn remove_worktree(rig_path: &Path, worktree: &Path, timeout: Duration) -> Result<()> {
+    let out = bounded::output_bounded(
+        Command::new("git")
+            .arg("-C")
+            .arg(rig_path)
+            .args(["worktree", "remove", "--force"])
+            .arg(worktree),
+        timeout,
+    )
+    .context("running git worktree remove")?;
     if !out.status.success() {
         bail!(
             "git worktree remove failed for {}: {}",
@@ -419,6 +447,10 @@ mod tests {
     use super::*;
     use camp_core::pack::{AgentDef, Isolation};
     use std::process::Command;
+
+    /// Generous test bound: these fixtures exercise git semantics, not
+    /// the deadline (bounded.rs pins the deadline behavior).
+    const TEST_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
     fn full_agent() -> AgentDef {
         AgentDef {
@@ -652,7 +684,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rig = git_rig(dir.path());
         let worktrees = dir.path().join("worktrees");
-        let wt = create_worktree(&rig, &worktrees, "gc-7").unwrap();
+        let wt = create_worktree(&rig, &worktrees, "gc-7", TEST_EXEC_TIMEOUT).unwrap();
         assert_eq!(wt, worktrees.join("gc-7"));
         assert!(wt.join(".git").exists(), "a worktree has a .git link file");
         // fresh branch named for the bead
@@ -666,13 +698,13 @@ mod tests {
         // a second create for the same bead fails fast, hinting that the
         // leftover may be residue of an earlier failed dispatch (PR #14
         // review finding 4)
-        let err = create_worktree(&rig, &worktrees, "gc-7").unwrap_err();
+        let err = create_worktree(&rig, &worktrees, "gc-7", TEST_EXEC_TIMEOUT).unwrap_err();
         assert!(
             err.to_string()
                 .contains("residue of an earlier failed dispatch"),
             "got: {err:#}"
         );
-        remove_worktree(&rig, &wt).unwrap();
+        remove_worktree(&rig, &wt, TEST_EXEC_TIMEOUT).unwrap();
         assert!(!wt.exists());
     }
 
@@ -685,19 +717,27 @@ mod tests {
         let _spawning = crate::daemon::spawn_probe_guard();
         let dir = tempfile::tempdir().unwrap();
         let rig = git_rig(dir.path());
-        let base = rig_base(&rig).expect("a committed rig has a base");
+        let base = rig_base(&rig, TEST_EXEC_TIMEOUT)
+            .unwrap()
+            .expect("a committed rig has a base");
         assert_eq!(base.len(), 40, "full sha: {base}");
 
         let bare = dir.path().join("bare");
         std::fs::create_dir_all(&bare).unwrap();
-        assert!(rig_base(&bare).is_none(), "not a repo");
+        assert!(
+            rig_base(&bare, TEST_EXEC_TIMEOUT).unwrap().is_none(),
+            "not a repo"
+        );
         Command::new("git")
             .arg("-C")
             .arg(&bare)
             .args(["init", "-b", "main"])
             .output()
             .unwrap();
-        assert!(rig_base(&bare).is_none(), "unborn HEAD");
+        assert!(
+            rig_base(&bare, TEST_EXEC_TIMEOUT).unwrap().is_none(),
+            "unborn HEAD"
+        );
     }
 
     /// Phase 2 (spec §12 fail-fast): a rig without a base commit cannot
@@ -722,7 +762,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success());
-        let err = create_worktree(&baseless, &worktrees, "gc-1").unwrap_err();
+        let err = create_worktree(&baseless, &worktrees, "gc-1", TEST_EXEC_TIMEOUT).unwrap_err();
         assert!(
             err.to_string().contains("cannot host a worktree"),
             "got: {err:#}"
@@ -743,7 +783,7 @@ mod tests {
         // not a git repository at all
         let plain = dir.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
-        let err = create_worktree(&plain, &worktrees, "gc-2").unwrap_err();
+        let err = create_worktree(&plain, &worktrees, "gc-2", TEST_EXEC_TIMEOUT).unwrap_err();
         assert!(
             err.to_string().contains("cannot host a worktree"),
             "got: {err:#}"
@@ -861,12 +901,12 @@ mod tests {
         let worktrees = dir.path().join("worktrees");
 
         // absent -> creates (parity with create_worktree)
-        let wt = ensure_worktree(&rig, &worktrees, "gc-7").unwrap();
+        let wt = ensure_worktree(&rig, &worktrees, "gc-7", TEST_EXEC_TIMEOUT).unwrap();
         assert!(wt.join(".git").exists());
 
         // existing valid worktree on camp/<bead> -> reused, work preserved
         std::fs::write(wt.join("partial.txt"), "half-done").unwrap();
-        let again = ensure_worktree(&rig, &worktrees, "gc-7").unwrap();
+        let again = ensure_worktree(&rig, &worktrees, "gc-7", TEST_EXEC_TIMEOUT).unwrap();
         assert_eq!(again, wt);
         assert_eq!(
             std::fs::read_to_string(wt.join("partial.txt")).unwrap(),
@@ -876,7 +916,7 @@ mod tests {
         // a plain directory (not a worktree) -> the residue error, verbatim
         let imposter_dir = worktrees.join("gc-8");
         std::fs::create_dir_all(&imposter_dir).unwrap();
-        let err = ensure_worktree(&rig, &worktrees, "gc-8").unwrap_err();
+        let err = ensure_worktree(&rig, &worktrees, "gc-8", TEST_EXEC_TIMEOUT).unwrap_err();
         assert!(
             err.to_string().contains("residue"),
             "plain dir must fail fast: {err:#}"
@@ -945,12 +985,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rig = git_rig(dir.path());
         let worktrees = dir.path().join("worktrees");
-        let wt = ensure_worktree(&rig, &worktrees, "gc-9").unwrap();
+        let wt = ensure_worktree(&rig, &worktrees, "gc-9", TEST_EXEC_TIMEOUT).unwrap();
         assert!(wt.join(".git").exists());
 
         // gut the rig: the worktree dir remains, the repository is gone
         std::fs::remove_dir_all(rig.join(".git")).unwrap();
-        let err = ensure_worktree(&rig, &worktrees, "gc-9").unwrap_err();
+        let err = ensure_worktree(&rig, &worktrees, "gc-9", TEST_EXEC_TIMEOUT).unwrap_err();
         assert!(
             err.to_string().contains("cannot host a worktree"),
             "reuse on a gutted rig must fail the base check: {err:#}"

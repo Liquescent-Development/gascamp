@@ -916,11 +916,13 @@ impl PatrolRuntime {
         tracked: &Tracked,
         cause_seq: Seq,
     ) -> Result<()> {
+        let exec_timeout = self.camp_config.dispatch.exec_timeout()?;
         let probed = probe_alive(
             tracked.claude_session_id.as_deref(),
             None,
             &dispatcher.known_pids(),
             &self.camp_config.dispatch.command,
+            exec_timeout,
         )?;
         let Some(pid) = probed else {
             // already dead: record the caused crash, no kill
@@ -937,7 +939,7 @@ impl PatrolRuntime {
             })?;
             return Ok(());
         };
-        kill_pid(pid)?;
+        kill_pid(pid, exec_timeout)?;
         // verify the death by observation before recording (LOW 4: never
         // by kill's exit chatter)
         if probe_alive(
@@ -945,6 +947,7 @@ impl PatrolRuntime {
             None,
             &dispatcher.known_pids(),
             &self.camp_config.dispatch.command,
+            exec_timeout,
         )?
         .is_some()
         {
@@ -989,13 +992,15 @@ impl PatrolRuntime {
         let Some(tracked) = self.tracked.get(session).cloned() else {
             return Ok(());
         };
+        let exec_timeout = self.camp_config.dispatch.exec_timeout()?;
         if let Some(pid) = probe_alive(
             tracked.claude_session_id.as_deref(),
             None,
             &dispatcher.known_pids(),
             &self.camp_config.dispatch.command,
+            exec_timeout,
         )? {
-            kill_pid(pid)?;
+            kill_pid(pid, exec_timeout)?;
             // Classification by RE-PROBE (round-2 LOW 4): the stop record
             // rests on observed death, never on kill's exit chatter.
             if probe_alive(
@@ -1003,6 +1008,7 @@ impl PatrolRuntime {
                 None,
                 &dispatcher.known_pids(),
                 &self.camp_config.dispatch.command,
+                exec_timeout,
             )?
             .is_some()
             {
@@ -1074,6 +1080,9 @@ pub fn adopt(
     let camp = crate::campdir::CampDir { root };
     let config = &config;
     let camp = &camp;
+    // Every probe/kill/git subprocess below runs inline on the event loop
+    // and is bounded by [dispatch] exec_timeout (issue #55).
+    let exec_timeout = config.dispatch.exec_timeout()?;
     let mut summary = AdoptSummary::default();
     let now = Timestamp::now();
     for row in ledger.live_sessions()? {
@@ -1107,6 +1116,7 @@ pub fn adopt(
             row.pid,
             &dispatcher.known_pids(),
             &config.dispatch.command,
+            exec_timeout,
         )?;
         match alive {
             None => {
@@ -1134,7 +1144,7 @@ pub fn adopt(
                     // A finished-but-lingering stream worker (P3): the
                     // release rule, non-child flavor. Never applied to
                     // attended sessions (spec §10: never kill in the TUI).
-                    kill_pid(pid)?;
+                    kill_pid(pid, exec_timeout)?;
                     // Classification by RE-PROBE (round-2 LOW 4): only an
                     // observed death earns the stop record; a kill that
                     // did not take is a durable degradation and the row
@@ -1144,6 +1154,7 @@ pub fn adopt(
                         row.pid,
                         &dispatcher.known_pids(),
                         &config.dispatch.command,
+                        exec_timeout,
                     )?
                     .is_some()
                     {
@@ -1178,7 +1189,7 @@ pub fn adopt(
         }
     }
     patrol.apply_tracking(ledger, now)?;
-    sweep_worktrees(ledger, camp, config, &mut summary)?;
+    sweep_worktrees(ledger, camp, config, exec_timeout, &mut summary)?;
     Ok(summary)
 }
 
@@ -1188,6 +1199,7 @@ fn sweep_worktrees(
     ledger: &mut Ledger,
     camp: &crate::campdir::CampDir,
     config: &CampConfig,
+    exec_timeout: std::time::Duration,
     summary: &mut AdoptSummary,
 ) -> Result<()> {
     let worktrees = camp.worktrees_path();
@@ -1228,7 +1240,9 @@ fn sweep_worktrees(
         if bead.outcome.as_deref() == Some("pass") {
             // complete the interrupted decision-H disposition: remove
             let removal = match config.rig(&bead.rig) {
-                Ok(rig) => crate::daemon::spawn::remove_worktree(&rig.path, &entry.path()),
+                Ok(rig) => {
+                    crate::daemon::spawn::remove_worktree(&rig.path, &entry.path(), exec_timeout)
+                }
                 Err(e) => Err(anyhow::anyhow!("rig not configured: {e}")),
             };
             match removal {
@@ -1301,13 +1315,14 @@ pub(super) fn probe_alive(
     pid: Option<i64>,
     exclude: &HashSet<u32>,
     worker_command: &Path,
+    timeout: std::time::Duration,
 ) -> Result<Option<i64>> {
     if let Some(uuid) = claude_session_id {
-        let out = std::process::Command::new("pgrep")
-            .arg("-f")
-            .arg(uuid)
-            .output()
-            .context("running pgrep (required for adoption probes)")?;
+        let out = crate::daemon::bounded::output_bounded(
+            std::process::Command::new("pgrep").arg("-f").arg(uuid),
+            timeout,
+        )
+        .context("running pgrep (required for adoption probes)")?;
         return match out.status.code() {
             Some(0) => {
                 let candidates: Vec<i64> = String::from_utf8_lossy(&out.stdout)
@@ -1320,7 +1335,7 @@ pub(super) fn probe_alive(
                     })
                     .collect();
                 for candidate in candidates {
-                    if pid_runs_command(candidate, worker_command)? {
+                    if pid_runs_command(candidate, worker_command, timeout)? {
                         return Ok(Some(candidate));
                     }
                 }
@@ -1334,10 +1349,11 @@ pub(super) fn probe_alive(
         };
     }
     if let Some(pid) = pid {
-        let out = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "pid="])
-            .output()
-            .context("running ps (required for adoption probes)")?;
+        let out = crate::daemon::bounded::output_bounded(
+            std::process::Command::new("ps").args(["-p", &pid.to_string(), "-o", "pid="]),
+            timeout,
+        )
+        .context("running ps (required for adoption probes)")?;
         if out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
             return Ok(Some(pid));
         }
@@ -1354,14 +1370,15 @@ pub(super) fn probe_alive(
 /// "found dead" — a visible respawn in the ledger — never to killing an
 /// innocent process. A pid that vanished mid-probe is simply not the
 /// worker anymore.
-fn pid_runs_command(pid: i64, worker_command: &Path) -> Result<bool> {
+fn pid_runs_command(pid: i64, worker_command: &Path, timeout: std::time::Duration) -> Result<bool> {
     let Some(want) = worker_command.file_name() else {
         return Ok(false);
     };
-    let out = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .context("running ps (required for adoption probes)")?;
+    let out = crate::daemon::bounded::output_bounded(
+        std::process::Command::new("ps").args(["-p", &pid.to_string(), "-o", "command="]),
+        timeout,
+    )
+    .context("running ps (required for adoption probes)")?;
     if !out.status.success() {
         return Ok(false); // died between pgrep and ps: not observed alive
     }
@@ -1380,12 +1397,14 @@ fn pid_runs_command(pid: i64, worker_command: &Path) -> Result<bool> {
 /// classifies the outcome by RE-PROBING, which is the observation the
 /// ledger record rests on anyway. Only a missing/unrunnable kill binary
 /// is an error (fail fast).
-fn kill_pid(pid: i64) -> Result<()> {
-    std::process::Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .output()
-        .context("running kill")?;
+fn kill_pid(pid: i64, timeout: std::time::Duration) -> Result<()> {
+    crate::daemon::bounded::output_bounded(
+        std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string()),
+        timeout,
+    )
+    .context("running kill")?;
     Ok(())
 }
 
@@ -1398,6 +1417,10 @@ mod tests {
     use camp_core::event::{Event, EventInput, EventType};
     use camp_core::ledger::Ledger;
     use jiff::Timestamp;
+
+    /// Generous test bound: these fixtures exercise probe/kill semantics,
+    /// not the deadline (bounded.rs pins the deadline behavior).
+    const TEST_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     fn ts(s: &str) -> Timestamp {
         s.parse().unwrap()
@@ -2584,7 +2607,8 @@ mod tests {
 
         // gc-20: closed pass, interrupted disposition → removed + reaped
         seeded_bead(&mut ledger, "gc-20");
-        crate::daemon::spawn::ensure_worktree(&rig, &worktrees, "gc-20").unwrap();
+        crate::daemon::spawn::ensure_worktree(&rig, &worktrees, "gc-20", TEST_EXEC_TIMEOUT)
+            .unwrap();
         ledger
             .append(EventInput {
                 kind: EventType::BeadClosed,
@@ -2596,7 +2620,8 @@ mod tests {
             .unwrap();
         // gc-21: closed fail, undisposed → kept with the adopt reason
         seeded_bead(&mut ledger, "gc-21");
-        crate::daemon::spawn::ensure_worktree(&rig, &worktrees, "gc-21").unwrap();
+        crate::daemon::spawn::ensure_worktree(&rig, &worktrees, "gc-21", TEST_EXEC_TIMEOUT)
+            .unwrap();
         ledger
             .append(EventInput {
                 kind: EventType::BeadClosed,
@@ -2608,7 +2633,8 @@ mod tests {
             .unwrap();
         // gc-22: open → awaiting re-dispatch, untouched, no event
         seeded_bead(&mut ledger, "gc-22");
-        crate::daemon::spawn::ensure_worktree(&rig, &worktrees, "gc-22").unwrap();
+        crate::daemon::spawn::ensure_worktree(&rig, &worktrees, "gc-22", TEST_EXEC_TIMEOUT)
+            .unwrap();
         // gc-999: no such bead → never deleted, reported only
         std::fs::create_dir_all(worktrees.join("gc-999")).unwrap();
 
@@ -2706,7 +2732,8 @@ mod tests {
                 Some(uuid),
                 None,
                 &HashSet::new(),
-                std::path::Path::new("claude")
+                std::path::Path::new("claude"),
+                TEST_EXEC_TIMEOUT,
             )
             .unwrap(),
             None,
@@ -2724,6 +2751,7 @@ mod tests {
             None,
             &HashSet::new(),
             std::path::Path::new("claude"),
+            TEST_EXEC_TIMEOUT,
         )
         .unwrap();
         assert_eq!(
@@ -2745,7 +2773,7 @@ mod tests {
     fn kill_pid_never_classifies_by_stderr_text() {
         let _spawning = crate::daemon::spawn_probe_guard();
         assert!(
-            kill_pid(1).is_ok(),
+            kill_pid(1, TEST_EXEC_TIMEOUT).is_ok(),
             "a failed kill is not an error; the caller's re-probe decides"
         );
     }
