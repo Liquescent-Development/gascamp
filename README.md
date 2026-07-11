@@ -302,14 +302,18 @@ does.
 
 ### campd & the daemon model
 
-`campd` is the only standing process, and only while there's work: it watches
-the ledger, dispatches ready work, schedules orders, and arms stall timers —
-all event-driven, never on a tick.
+`campd` watches the ledger, dispatches ready work, schedules orders, and arms
+stall timers — all event-driven, never on a tick. Whether it is *standing*
+depends on supervision: under a host service manager (the `camp init`
+default) it is always-on, restarted by that supervisor across crashes and
+reboots; unsupervised — a container, CI, anywhere with no service manager —
+nothing is standing until you run `camp daemon` yourself, and it exits once
+there's no work left to watch.
 
 ```sh
 camp top                                     # one status snapshot (auto-starts campd)
 camp top --statusline                        # compact fleet badge (▲live ●ready ✖red); never auto-starts
-camp stop                                    # graceful shutdown
+camp stop                                    # graceful shutdown (unsupervised camps only — see below)
 ```
 
 `camp top` output:
@@ -326,6 +330,39 @@ Liveness *is* the socket (`<camp>/campd.sock`) — no pidfiles, no
 lockfiles-as-status. `campd` is crash-only: `kill -9` is a supported shutdown.
 Idle it holds no worker processes and, per invariant 1, targets < 20 MB RSS and
 0.0% CPU (asserted by the local-only `make perf` suite).
+
+#### Supervised campd — `camp service`
+
+campd is a foreground, socket-serving process. On a desktop, `camp init` puts
+it under the host's service manager, so it survives crashes, comes back at
+login, and can be cycled after a binary upgrade:
+
+    camp service install     # macOS: a KeepAlive LaunchAgent in ~/Library/LaunchAgents
+                             # Linux: a Restart=always systemd --user unit
+    camp service status      # the unit's load/run state + campd's liveness answer
+    camp service restart     # cycle the daemon after upgrading the binary
+    camp service stop        # stop campd (the unit stays installed)
+    camp service start       # …and bring it back
+    camp service uninstall   # stop, unload, remove the unit
+    camp service list        # every camp with a managed unit, and its state
+
+`camp init` does this for you when it detects a usable host service manager
+(macOS launchd; Linux systemd `--user`). Where there is none — a container, a
+CI box — it does not fail: it says so on stderr and hands off, and you run
+`camp daemon --camp <dir>` under your own supervisor (the container runtime).
+`camp init --no-service` skips the unit; `camp init --service` insists on one
+and fails loudly if the host cannot provide it.
+
+**On a supervised camp, `camp stop` refuses.** A supervised campd is kept alive
+by its unit (`KeepAlive` / `Restart=always`), so a socket-level stop would be
+undone by the supervisor moments later — and a verb that says "campd stopped"
+about a daemon that is already coming back is lying. `camp stop` therefore
+hard-errors and points you at `camp service stop` (stop it) or `camp service
+uninstall` (un-manage it). On an unsupervised camp — a container, CI, a camp you
+never installed a unit for — `camp stop` behaves exactly as it always has.
+
+There is no registry file: the installed units ARE the registry, and
+`camp service list` reads them.
 
 ### Formulas & graph execution
 
