@@ -24,7 +24,10 @@ impl CampDir {
         self.root.join("campd.sock")
     }
 
-    /// Where a detached campd's stderr lands (never silenced, never hidden).
+    /// Where a supervised campd's stderr lands (never silenced, never
+    /// hidden): the launchd/systemd unit points at this file, and a
+    /// crash-restart loop is visible here. Named by the CampdNotRunning
+    /// error so the operator reading it is one line from the reason.
     pub fn log_path(&self) -> PathBuf {
         self.root.join("campd.log")
     }

@@ -149,9 +149,10 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The wedge shape (issue #55): the kernel's listen backlog accepted the
 /// connection — that happens even when the event loop never runs accept —
-/// but no response line arrived within REQUEST_TIMEOUT. Typed so callers
-/// (the auto-start path) can tell "something owns the socket but does not
-/// serve it" from "nothing is running"; only the latter may auto-start.
+/// but no response line arrived within REQUEST_TIMEOUT. Typed so it is never
+/// confused with `CampdNotRunning` ("nothing is listening"): something owns
+/// THIS socket but does not serve it, and its remedy is `kill -9`, not
+/// "start campd". Two faults, two remedies — the CLI must not flatten them.
 #[derive(Debug)]
 pub struct CampdUnresponsive {
     /// From the ledger's last campd.started event; None when no recorded
@@ -186,6 +187,85 @@ impl std::fmt::Display for CampdUnresponsive {
 }
 
 impl std::error::Error for CampdUnresponsive {}
+
+/// campd is NOT RUNNING: nothing is listening on the socket — it is absent,
+/// or it is a stale file a `kill -9` left behind. The CLI is a PURE CLIENT
+/// (design §4.3: one path — campd is a supervised foreground process, run by
+/// launchd / systemd --user / the container runtime / you), so a
+/// daemon-needing verb turns this into a LOUD, actionable fault and stops.
+/// It never spawns a daemon: a silent respawn hides the real fault (a broken
+/// unit, a crash loop, a camp nobody supervised) and it is exactly the
+/// behavior this phase removes.
+///
+/// Typed so it can be told apart from `CampdUnresponsive` — something owns
+/// the socket but does not serve it. Different fault, different remedy
+/// (`kill -9`, not "start campd"): flattening them would give wrong advice.
+#[derive(Debug)]
+pub struct CampdNotRunning {
+    /// The camp this verb resolved to — a user has several; say which is dark.
+    pub camp_root: std::path::PathBuf,
+    pub socket: std::path::PathBuf,
+    /// Where a supervised campd's stderr lands: a crash-restart loop is
+    /// visible there and nowhere else.
+    pub log: std::path::PathBuf,
+    /// The pid from the ledger's last campd.started — the campd that WAS
+    /// running here (design §3). The only pid source that survives a crash:
+    /// there are no pidfiles (spec §5). None when none ever started.
+    pub last_pid: Option<u32>,
+}
+
+impl std::fmt::Display for CampdNotRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let root = self.camp_root.display();
+        let history = match self.last_pid {
+            Some(pid) => format!(
+                "the last campd here was pid {pid} (the ledger's last campd.started); \
+                 that process is gone"
+            ),
+            None => "no campd has ever started in this camp (no campd.started event in \
+                     the ledger)"
+                .to_owned(),
+        };
+        write!(
+            f,
+            "campd is not running for camp {root} — nothing is listening on {socket}\n  \
+             {history}\n  \
+             the camp CLI never starts campd: it is a supervised service. Bring it up \
+             with one of:\n    \
+             camp service status --camp {root}   # the managed unit's state \
+             (`camp service restart` cycles it)\n    \
+             camp daemon --camp {root}           # run it yourself: container, CI, or a \
+             box with no service manager\n  \
+             if a supervisor is restarting it in a loop, its stderr is in {log}",
+            socket = self.socket.display(),
+            log = self.log.display(),
+        )
+    }
+}
+
+impl std::error::Error for CampdNotRunning {}
+
+/// The daemon-needing verb's request path (design §4.3) — the ONLY way `top`,
+/// `adopt` and `sling` reach campd. Send the request; a campd that is not
+/// running is the loud `CampdNotRunning` error. The CLI never starts one.
+///
+/// Built on `request_if_up`, so liveness is judged on the SAME connection that
+/// carries the request (the PR #51 finding 1 law): exactly one connect, no
+/// bare pre-probe — which would both open a second connection and be fooled by
+/// a wedged daemon's listen backlog. A campd that accepts and then never
+/// answers therefore still surfaces as `CampdUnresponsive`: it owns the
+/// socket, and its remedy is different.
+pub fn require(camp: &CampDir, request: &Request) -> Result<Response> {
+    match request_if_up(camp, request)? {
+        Some(response) => Ok(response),
+        None => Err(anyhow::Error::new(CampdNotRunning {
+            camp_root: camp.root.clone(),
+            socket: camp.socket_path(),
+            log: camp.log_path(),
+            last_pid: last_recorded_campd_pid(camp),
+        })),
+    }
+}
 
 /// Send one request, read one response line. REQUEST_TIMEOUT bounds the
 /// operation against a wedged daemon — not a wakeup; the daemon's own
@@ -528,7 +608,7 @@ mod tests {
         assert!(msg.contains("kill -9"), "must name the remedy: {msg}");
         assert!(
             err.downcast_ref::<CampdUnresponsive>().is_some(),
-            "typed, so the auto-start path can tell a wedge from a refusal: {msg}"
+            "typed, so a wedge is never reported as a down campd: {msg}"
         );
     }
 
@@ -568,6 +648,160 @@ mod tests {
         // a stale file that refuses connections is also "not up"
         drop(UnixListener::bind(camp.socket_path()).unwrap());
         assert!(request_if_up(&camp, &Request::Status).unwrap().is_none());
+    }
+
+    /// Design §4.3 + §3: campd DOWN is a loud, actionable fault — never a
+    /// silent respawn. The error names the camp, the socket, the pid the
+    /// ledger last recorded (the only pid source that survives a crash:
+    /// there are no pidfiles), BOTH remedies, and the daemon's stderr log.
+    /// A `kill -9` leaves a stale socket FILE behind, so "the file exists"
+    /// is not life: a refusing socket is "not running" too.
+    #[test]
+    fn require_reports_a_down_campd_loudly_and_actionably() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        let mut ledger = camp_core::ledger::Ledger::open(&camp.db_path()).unwrap();
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::CampdStarted,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({ "pid": 424242 }),
+            })
+            .unwrap();
+        drop(ledger);
+        // the kill -9 shape: the socket file is there and refuses connections
+        drop(UnixListener::bind(camp.socket_path()).unwrap());
+
+        let err = require(&camp, &Request::Status).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            err.downcast_ref::<CampdNotRunning>().is_some(),
+            "typed, so a down campd is never confused with a wedged one: {msg}"
+        );
+        assert!(msg.contains("campd is not running"), "{msg}");
+        assert!(
+            msg.contains("424242"),
+            "must name the last recorded campd pid: {msg}"
+        );
+        assert!(
+            msg.contains("camp service status"),
+            "must name the supervised remedy: {msg}"
+        );
+        assert!(
+            msg.contains("camp daemon"),
+            "must name the run-it-yourself remedy (containers, CI, no service manager): {msg}"
+        );
+        assert!(
+            msg.contains(&camp.root.display().to_string()),
+            "must name the camp — a user has several: {msg}"
+        );
+        assert!(
+            msg.contains("campd.log"),
+            "must point at the daemon's stderr (a crash loop shows up there): {msg}"
+        );
+    }
+
+    /// The pid-unknown flavor: campd never started in this camp. The absence
+    /// is STATED, never silently omitted (the CampdUnresponsive precedent) —
+    /// "never had one" and "yours died" are different situations.
+    #[test]
+    fn require_states_a_missing_pid_rather_than_omitting_it() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        drop(camp_core::ledger::Ledger::open(&camp.db_path()).unwrap()); // empty ledger
+        // no socket file at all
+
+        let err = require(&camp, &Request::Status).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no campd has ever started"),
+            "the missing pid must be stated: {msg}"
+        );
+        assert!(msg.contains("camp service status"), "{msg}");
+        assert!(msg.contains("camp daemon"), "{msg}");
+    }
+
+    /// Two laws in one test, both inherited from the path this phase deletes.
+    ///
+    /// (1) A WEDGED campd is not a down campd: something owns the socket, and
+    /// its remedy is `kill -9`, not "start campd". `require` must not flatten
+    /// the two — a second daemon would only mask the wedge, and telling the
+    /// operator to start one would be wrong advice.
+    ///
+    /// (2) The request IS the probe (the PR #51 finding 1 law), asserted here
+    /// at the VERB-LEVEL entry point — where the unit test in the module this
+    /// phase deletes asserted it. A bare-connect pre-probe would open a second
+    /// connection AND be fooled by the wedged daemon's kernel backlog, which
+    /// accepts connections its event loop never serves. Counting accepts makes
+    /// that a test failure, not a review catch, if anyone later "optimizes"
+    /// `require`.
+    #[test]
+    fn require_tells_a_wedged_campd_apart_from_a_down_one_on_one_connection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        let mut ledger = camp_core::ledger::Ledger::open(&camp.db_path()).unwrap();
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::CampdStarted,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({ "pid": 424242 }),
+            })
+            .unwrap();
+        drop(ledger);
+        // The wedge simulator: accept (and COUNT) every connection, then hold
+        // it open and serve nothing — exactly a daemon stuck mid-syscall.
+        let listener = UnixListener::bind(camp.socket_path()).unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(stream); // keep it open, answer nothing
+            }
+        });
+
+        let start = std::time::Instant::now();
+        let err = require(&camp, &Request::Status).unwrap_err();
+        assert!(
+            start.elapsed() < REQUEST_TIMEOUT * 2 + Duration::from_secs(2),
+            "bounded, never a hang"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            err.downcast_ref::<CampdUnresponsive>().is_some(),
+            "a wedge stays a wedge: {msg}"
+        );
+        assert!(
+            err.downcast_ref::<CampdNotRunning>().is_none(),
+            "a wedged campd must never be reported as a down one: {msg}"
+        );
+        assert!(
+            msg.contains("kill -9"),
+            "the wedge remedy, unchanged: {msg}"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "exactly ONE connection: the request IS the probe — no bare-connect \
+             pre-probe, which a wedged daemon's listen backlog would fool anyway"
+        );
     }
 
     #[test]
