@@ -278,23 +278,33 @@ pub fn status(supervisor: Option<&dyn Supervisor>, camp: &CampDir) -> Result<Str
     // a bare connect: a wedged campd's listen backlog accepts connections its
     // event loop never serves. This never auto-starts; a campd that accepts
     // and does not answer surfaces as the loud CampdUnresponsive error.
-    match socket::request_if_up(camp, &Request::Status)? {
-        Some(Response::Status {
+    match socket::request_if_up(camp, &Request::Status) {
+        Ok(Some(Response::Status {
             summary,
             red,
             campd_pid,
             ..
-        }) => report.push_str(&format!(
+        })) => report.push_str(&format!(
             "campd: listening (pid {campd_pid}) — {} live sessions, {} ready, {} red\n",
             summary.live_sessions.len(),
             summary.ready,
             red
         )),
-        Some(other) => bail!("unexpected response to status: {other:?}"),
-        None => report.push_str(&format!(
+        Ok(Some(other)) => bail!("unexpected response to status: {other:?}"),
+        Ok(None) => report.push_str(&format!(
             "campd: not listening ({})\n",
             camp.socket_path().display()
         )),
+        // A wedged campd (issue #55: accepts, never answers) must still fail
+        // this command loudly (invariant 5 — never downgrade to `Ok`, a
+        // script must not read exit 0 from a wedged daemon). But the unit
+        // half of the report above is already fully built and true — losing
+        // it to a bare `?` would hide `loaded=true running=true` behind the
+        // campd fault, from the very command whose job is to show both. Fold
+        // the report INTO the error instead: both truths reach the operator,
+        // the campd fault (and its remedy) survives verbatim as the error's
+        // cause, and the non-zero exit is untouched.
+        Err(campd_error) => return Err(campd_error.context(report)),
     }
     Ok(report)
 }
@@ -422,6 +432,7 @@ mod tests {
     use crate::service::launchd::Launchd;
     use crate::service::runner::fake::FakeRunner;
     use crate::service::systemd::Systemd;
+    use std::os::unix::net::UnixListener;
     use std::path::Path;
 
     const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -759,7 +770,20 @@ mod tests {
         let launchd = Launchd::new(units.path().to_path_buf(), 501, &status_runner);
         let report = status(Some(&launchd), &camp).unwrap();
 
-        assert!(report.contains("running"), "the unit's state: {report}");
+        // Finding 2 fix: `report.contains("running")` is near-vacuous — the
+        // report line is `loaded={} running={}`, so a STOPPED unit
+        // (running=false) also contains the substring "running". Assert the
+        // actual state instead, plus the manager's own detail line, so a
+        // broken `launchd::state` parse (e.g. `running` wrongly hardcoded)
+        // fails this test.
+        assert!(
+            report.contains("loaded=true running=true"),
+            "the unit's actual state: {report}"
+        );
+        assert!(
+            report.contains("[state = running]"),
+            "the manager's own detail: {report}"
+        );
         // No campd is listening on this temp camp's socket — and that is a
         // REPORTED state, not an error, and never an auto-start.
         assert!(report.contains("campd: not listening"), "{report}");
@@ -798,6 +822,46 @@ mod tests {
         let report = status(None, &camp).unwrap();
         assert!(report.contains("no host service manager"), "{report}");
         assert!(report.contains("campd: not listening"), "{report}");
+    }
+
+    /// Finding 1 (fix wave 1 review): a WEDGED campd (accepts the
+    /// connection, never answers — the shape `daemon/socket.rs`'s wedge
+    /// tests simulate with a bare bound listener) must not make the
+    /// already-built unit half of the report vanish. `status` must still
+    /// fail loudly (non-zero exit — invariant 5) but the error it returns
+    /// must carry BOTH truths: the unit's loaded/running state AND the
+    /// campd fault text, remedy included.
+    #[test]
+    fn status_keeps_the_unit_half_when_campd_is_wedged() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        install(&launchd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        let status_runner =
+            FakeRunner::new(vec![FakeRunner::ok("service = {\n\tstate = running\n}\n")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &status_runner);
+
+        // The wedge simulator (daemon/socket.rs, issue #55): a bound
+        // listener whose kernel backlog accepts the connection but whose
+        // event loop never answers — exactly a campd stuck mid-syscall.
+        let _wedged = UnixListener::bind(camp.socket_path()).unwrap();
+
+        let err = status(Some(&launchd), &camp).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("loaded=true running=true"),
+            "the unit half must survive a wedged campd: {msg}"
+        );
+        assert!(
+            msg.contains("wedged") && msg.contains("kill -9"),
+            "the campd fault must still be reported, with its remedy: {msg}"
+        );
     }
 
     #[test]
