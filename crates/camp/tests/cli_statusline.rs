@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! camp top --statusline (Phase 12): the fleet badge `▲live ●ready ✖red`.
-//! A read-only socket query that does NOT auto-start campd; when campd is
-//! down it degrades to empty stdout + a visible stderr note (exit 0) —
-//! visible degradation, not silence (spec §11).
+//! A read-only socket query; when campd is down it degrades to empty stdout
+//! plus a visible stderr note (exit 0) — visible degradation, not silence
+//! (spec §11), and the one daemon-needing surface that does not fail loudly.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
@@ -70,7 +70,7 @@ fn statusline_degrades_visibly_when_campd_is_down() {
     let dir = tempfile::tempdir().unwrap();
     let root = init_camp(dir.path());
 
-    // campd is NOT running; --statusline must NOT auto-start it.
+    // campd is NOT running; --statusline must still exit 0 with an empty badge.
     let out = camp(&root, &["top", "--statusline"]);
     assert!(out.status.success(), "must exit 0 (fire-and-forget)");
     assert!(
@@ -87,7 +87,7 @@ fn statusline_degrades_visibly_when_campd_is_down() {
     let sock = root.join("campd.sock");
     assert!(
         !sock.exists() || UnixStream::connect(&sock).is_err(),
-        "--statusline must never auto-start campd"
+        "--statusline must never start campd"
     );
 }
 

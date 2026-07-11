@@ -114,9 +114,8 @@ fn run_hook(
     run_script(&format!("hooks/{script}"), stdin, camp_dir, extra_env)
 }
 
-/// A real campd child; stopped on drop. SessionStart runs `camp adopt`,
-/// which connects to a running campd (rather than auto-starting a
-/// detached one in the test).
+/// A real campd child; stopped on drop. SessionStart runs `camp adopt`, which
+/// is a pure client: it needs this daemon up, and fails loudly without it.
 struct Daemon {
     child: Child,
 }
@@ -254,7 +253,7 @@ fn statusline_snippet_renders_the_badge_when_campd_is_up() {
 fn statusline_snippet_degrades_visibly_when_campd_is_down() {
     let dir = tempfile::tempdir().unwrap();
     let root = init_camp(dir.path());
-    // no campd running; the snippet must not auto-start one
+    // no campd running; the snippet must degrade, not start one
     let out = run_script(
         "statusline/statusline.sh",
         &fixture("statusline.json"),

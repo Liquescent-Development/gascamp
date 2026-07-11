@@ -4,8 +4,8 @@ use crate::campdir::CampDir;
 use crate::daemon::socket::{self, Request, Response};
 use crate::service::{self, Supervisor, SystemProbe, SystemRunner};
 
-/// `camp stop`: graceful daemon shutdown over the socket. Never auto-starts
-/// (stopping nothing is an error, not a no-op).
+/// `camp stop`: graceful daemon shutdown over the socket. Stopping nothing is
+/// an error, not a no-op — the CLI never starts campd, so it never un-stops it.
 ///
 /// On a SUPERVISED camp it refuses instead (operator decision, 2026-07-10):
 /// the supervisor's KeepAlive / Restart=always would bring campd straight back,
@@ -138,9 +138,9 @@ mod tests {
     ///
     /// Keyed on the unit FILE merely existing, `camp stop` instead refused and
     /// sent the operator to `camp service stop`, which (see the twin test in
-    /// cmd::service) did nothing and reported success — so a campd that any
-    /// auto-starting verb or a hand-run `camp daemon` had left listening could
-    /// not be stopped by ANY camp verb.
+    /// cmd::service) did nothing and reported success — so a campd that a
+    /// hand-run `camp daemon` (or, before it was removed, the CLI-spawn path)
+    /// had left listening could not be stopped by ANY camp verb.
     #[test]
     fn stop_does_the_socket_stop_when_the_unit_is_installed_but_not_loaded() {
         let camp_dir = tempfile::tempdir().unwrap();

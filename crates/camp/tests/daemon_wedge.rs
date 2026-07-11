@@ -6,7 +6,9 @@
 //!
 //!   1. a CLI verb against the wedged daemon fails LOUDLY within its
 //!      bound (never hangs), naming the campd pid and the kill -9 remedy;
-//!   2. the wedge never triggers auto-start (something owns the socket);
+//!   2. the CLI (a pure client — design §4.3) never spawns a daemon, and it
+//!      never mistakes the wedge for a DOWN campd: something owns the socket,
+//!      so the remedy is kill -9, not "start campd";
 //!   3. the hung subprocess is killed at `[dispatch] exec_timeout` and
 //!      the failure lands in the ledger as dispatch.failed with the
 //!      timeout as its reason (invariants 3/5);
@@ -196,9 +198,9 @@ fn a_wedged_event_loop_fails_the_cli_loudly_within_its_bound_and_recovers() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // (1) A CLI verb against the wedged daemon: loud, actionable, bounded
-    // — never a hang. `camp top` is the auto-start path, so this also
-    // proves (2): a wedge never spawns a second campd.
+    // (1) A CLI verb against the wedged daemon: loud, actionable, bounded —
+    // never a hang. `camp top` needs the daemon, so this also proves (2): the
+    // wedge is reported AS a wedge, and no second campd is started.
     let start = Instant::now();
     let top = camp(&root, &["top"]);
     let elapsed = start.elapsed();
@@ -233,17 +235,18 @@ fn a_wedged_event_loop_fails_the_cli_loudly_within_its_bound_and_recovers() {
         })
     });
 
-    // (2) continued: the wedge triggered no auto-start.
-    let events = events_json(&root);
-    assert_eq!(
-        count(&events, "campd.autostarted"),
-        0,
-        "a wedged daemon owns its socket; auto-start must never fire: {events:#?}"
+    // (2) continued: the wedge started no second campd, and it was never
+    // reported as a down one — the remedies differ, so the errors must too.
+    assert!(
+        !stderr.contains("campd is not running"),
+        "a WEDGED campd owns its socket: reporting it as 'not running' would send \
+         the operator to `camp service status` instead of `kill -9`: {stderr}"
     );
+    let events = events_json(&root);
     assert_eq!(
         count(&events, "campd.started"),
         1,
-        "exactly one campd ever started: {events:#?}"
+        "exactly one campd ever started — the CLI never starts one: {events:#?}"
     );
 
     // (4) Recovery: the SAME daemon serves an event-loop round-trip again

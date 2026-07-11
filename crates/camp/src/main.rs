@@ -270,11 +270,11 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
-    /// One campd status snapshot as plain text (auto-starts the daemon)
+    /// One campd status snapshot as plain text (campd must be running)
     Top {
         /// Render the compact fleet badge (▲live ●ready ✖red) from a
-        /// read-only socket query. Never auto-starts campd; degrades to
-        /// empty output + a stderr note when campd is down (spec §11).
+        /// read-only socket query. Prints nothing and notes on stderr when
+        /// campd is down, exiting 0 (spec §11).
         #[arg(long)]
         statusline: bool,
     },
