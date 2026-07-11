@@ -25,6 +25,15 @@
 //!                      `git init` (many files) and one `bd init`
 //!                      (cli_export.rs). Nothing about camp applies to them.
 //!
+//!                      The marker must EARN it, not merely assert it: the
+//!                      chunk has to construct a literally-named other program
+//!                      (`Command::new("git")`, `Command::new("bd")` — how both
+//!                      real sites are already written) and must not run the
+//!                      camp binary (`cargo_bin("camp")`). Otherwise the
+//!                      comment alone would excuse the chunk, and the same
+//!                      comment lied onto a real `camp init` would wave a live
+//!                      LaunchAgent straight through the gate.
+//!
 //!   `// real-manager:` a DELIBERATE bare `camp init` — the environment-aware
 //!                      default (design §6) — which is legitimate ONLY inside a
 //!                      test that is BOTH `#[ignore]`d AND gated on
@@ -313,6 +322,30 @@ fn no_test_invokes_camp_init_without_no_service() {
                     lines[chunk.report_line].trim()
                 ));
                 continue;
+            }
+            if not_camp {
+                // M4 (review round 1). `not-camp:` was pure honor system: a
+                // comment asserting "this isn't the camp binary" excused the
+                // chunk outright, so the same comment lied onto a REAL
+                // `camp init` would wave a live LaunchAgent straight through.
+                // Make the marker prove itself from the code instead: a chunk
+                // that is genuinely not camp names some OTHER program
+                // literally (`Command::new("git")`, `Command::new("bd")` — how
+                // both real sites are written), and a chunk that runs the camp
+                // binary cannot excuse itself no matter what its comment says.
+                let runs_camp_binary = chunk.code.contains("cargo_bin(\"camp\")");
+                let names_another_program = chunk.code.contains("Command::new(\"")
+                    && !chunk.code.contains("Command::new(\"camp\")");
+                if runs_camp_binary || !names_another_program {
+                    violations.push(format!(
+                        "{file_name}:{}: carries `not-camp:` but the code does not bear it out — \
+                         a not-camp chunk must construct a literally-named OTHER program \
+                         (e.g. `Command::new(\"git\")`) and must not run the camp binary: {}",
+                        chunk.report_line + 1,
+                        lines[chunk.report_line].trim()
+                    ));
+                    continue;
+                }
             }
             if real_manager {
                 // The marker's precondition can't be checked from the chunk

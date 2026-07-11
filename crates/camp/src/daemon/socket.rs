@@ -287,6 +287,89 @@ pub fn poke_best_effort(camp: &CampDir, seq: Seq) {
     let _ = request(camp, &Request::Poke { seq });
 }
 
+/// A test double for a campd that is UP and ANSWERING.
+///
+/// The service verbs prove a stop actually took effect by asking the socket —
+/// so faking that answer means really serving one. This binds the camp's
+/// socket and speaks the exact wire format `request_on` speaks: one JSON line
+/// in, one JSON line out. A verb that only *believes* campd is gone cannot
+/// pass a test built on this.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub mod fake_campd {
+    use super::Response;
+    use crate::campdir::CampDir;
+    use camp_core::ledger::StatusSummary;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A live campd. `served()` counts the requests it actually ANSWERED, so a
+    /// test can prove the verb really talked to it rather than guessing.
+    pub struct FakeCampd {
+        served: Arc<AtomicUsize>,
+    }
+
+    impl FakeCampd {
+        pub fn served(&self) -> usize {
+            self.served.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Bind the camp's socket and answer `responses`, one per connection, in
+    /// order. The bind completes BEFORE this returns, so a caller may connect
+    /// immediately with no race. The server thread is detached: a verb that
+    /// never connects (a refusal that precedes any socket work, say) simply
+    /// leaves it parked in `accept`, and the test still ends.
+    pub fn serve(camp: &CampDir, responses: Vec<Response>) -> FakeCampd {
+        let listener =
+            UnixListener::bind(camp.socket_path()).expect("binding the fake campd socket");
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&served);
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request_line = String::new();
+                if BufReader::new(&stream)
+                    .read_line(&mut request_line)
+                    .is_err()
+                {
+                    return;
+                }
+                let mut line = serde_json::to_string(&response).expect("serializing the response");
+                line.push('\n');
+                if (&stream).write_all(line.as_bytes()).is_err() {
+                    return;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        FakeCampd { served }
+    }
+
+    /// What a campd alive at `pid` answers a `Status` with.
+    pub fn status(pid: u32) -> Response {
+        Response::Status {
+            ok: true,
+            summary: StatusSummary {
+                live_sessions: Vec::new(),
+                ready: 0,
+                open: 0,
+            },
+            red: 0,
+            campd_pid: pid,
+        }
+    }
+
+    /// What a campd answers a `Stop` with, just before it exits.
+    pub fn stopped() -> Response {
+        Response::Ok { ok: true }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

@@ -351,9 +351,9 @@ login, and can be cycled after a binary upgrade:
                              # Linux: a Restart=always systemd --user unit
     camp service status      # the unit's load/run state + campd's liveness answer
     camp service restart     # cycle the daemon after upgrading the binary
-    camp service stop        # stop campd (the unit stays installed)
+    camp service stop        # stop campd until the next login (the unit stays installed)
     camp service start       # …and bring it back
-    camp service uninstall   # stop, unload, remove the unit
+    camp service uninstall   # stop, unload, remove the unit — the durable "off"
     camp service list        # every camp with a managed unit, and its state
 
 `camp init` does this for you when it detects a usable host service manager
@@ -363,13 +363,19 @@ CI box — it does not fail: it says so on stderr and hands off, and you run
 `camp init --no-service` skips the unit; `camp init --service` insists on one
 and fails loudly if the host cannot provide it.
 
-**On a supervised camp, `camp stop` refuses.** A supervised campd is kept alive
-by its unit (`KeepAlive` / `Restart=always`), so a socket-level stop would be
-undone by the supervisor moments later — and a verb that says "campd stopped"
-about a daemon that is already coming back is lying. `camp stop` therefore
-hard-errors and points you at `camp service stop` (stop it) or `camp service
-uninstall` (un-manage it). On an unsupervised camp — a container, CI, a camp you
-never installed a unit for — `camp stop` behaves exactly as it always has.
+`camp service stop` is not durable across a login: the unit stays installed, so
+launchd re-bootstraps it (and systemd starts the still-enabled unit) the next
+time you log in. `camp service uninstall` is the durable off switch.
+
+**On a supervised camp with its unit loaded, `camp stop` refuses.** Such a campd
+is kept alive by its unit (`KeepAlive` / `Restart=always`), so a socket-level
+stop would be undone by the supervisor moments later — and a verb that says
+"campd stopped" about a daemon that is already coming back is lying. `camp stop`
+therefore hard-errors and points you at `camp service stop` (stop it) or
+`camp service uninstall` (un-manage it). Once the unit is stopped, nothing will
+restart campd behind your back, so `camp stop` goes back to doing exactly what
+it says. On an unsupervised camp — a container, CI, a camp you never installed a
+unit for — `camp stop` behaves exactly as it always has.
 
 There is no registry file: the installed units ARE the registry, and
 `camp service list` reads them.

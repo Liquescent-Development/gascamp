@@ -23,6 +23,20 @@ pub fn run(camp: &CampDir) -> Result<()> {
 fn run_with(camp: &CampDir, supervisor: Option<&dyn Supervisor>) -> Result<()> {
     if let Some(supervisor) = supervisor
         && let Some(unit) = crate::cmd::service::managed_unit(supervisor, &camp.root)?
+        // Keyed on the unit being LOADED, not on the unit FILE existing. The
+        // refusal's entire justification is that KeepAlive / Restart=always
+        // would restart campd the instant we stopped it — true only while the
+        // unit is loaded. Booted out (exactly what `camp service stop` leaves
+        // behind), the supervisor restarts nothing, so a socket stop is honest
+        // and this is the verb for it.
+        //
+        // Keyed on the file alone, `camp stop` refused here and sent the
+        // operator to `camp service stop` — which cannot stop a campd the
+        // supervisor never started either. Between them the camp became
+        // un-stoppable by any camp verb, with both verbs reporting success or
+        // naming each other. That is the §4.10 violation this pair exists to
+        // prevent, committed by the pair itself.
+        && supervisor.state(&unit.id)?.loaded
     {
         bail!(
             "campd for this camp is supervised by {} (unit {}, {}) — a socket stop would be \
@@ -78,7 +92,13 @@ mod tests {
         let camp = CampDir {
             root: camp_dir.path().to_path_buf(),
         };
-        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        // Two calls: the install's bootstrap, then the LOADED check the refusal
+        // is now keyed on — a loaded unit is the only state whose KeepAlive
+        // would really undo a socket stop, and so the only one worth refusing.
+        let install_runner = FakeRunner::new(vec![
+            FakeRunner::ok(""),
+            FakeRunner::ok("service = {\n\tstate = running\n}\n"),
+        ]);
         let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
         crate::cmd::service::install(&launchd, &camp.root, Path::new("/usr/local/bin/camp"))
             .unwrap();
@@ -107,6 +127,45 @@ mod tests {
         assert!(
             !msg.contains("not running"),
             "the refusal precedes any socket attempt: {msg}"
+        );
+    }
+
+    /// CRITICAL (review round 1). The refusal's ENTIRE justification is that
+    /// `KeepAlive` / `Restart=always` would restart campd immediately, making a
+    /// socket stop a lie. That is true only of a LOADED unit. Once the unit is
+    /// booted out — exactly the state `camp service stop` leaves behind — the
+    /// supervisor will not restart anything, so a socket stop is honest and
+    /// `camp stop` is the right verb for it.
+    ///
+    /// Keyed on the unit FILE merely existing, `camp stop` instead refused and
+    /// sent the operator to `camp service stop`, which (see the twin test in
+    /// cmd::service) did nothing and reported success — so a campd that any
+    /// auto-starting verb or a hand-run `camp daemon` had left listening could
+    /// not be stopped by ANY camp verb.
+    #[test]
+    fn stop_does_the_socket_stop_when_the_unit_is_installed_but_not_loaded() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        crate::cmd::service::install(&launchd, &camp.root, Path::new("/usr/local/bin/camp"))
+            .unwrap();
+
+        // A campd is listening, and launchd has booted the unit out: nothing
+        // will undo a socket stop, so `camp stop` must simply do it.
+        let campd = socket::fake_campd::serve(&camp, vec![socket::fake_campd::stopped()]);
+        let runner = FakeRunner::new(vec![FakeRunner::fail(113, "Could not find service\n")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &runner);
+
+        run_with(&camp, Some(&launchd))
+            .expect("an unloaded unit restarts nothing — the socket stop is honest, not a lie");
+        assert_eq!(
+            campd.served(),
+            1,
+            "camp stop must have actually stopped it over the socket"
         );
     }
 

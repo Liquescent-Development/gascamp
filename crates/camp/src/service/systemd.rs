@@ -75,17 +75,31 @@ impl Supervisor for Systemd<'_> {
                 OsStr::new("--property=SubState"),
             ],
         )?;
-        let value = |key: &str| -> String {
+        // A property systemd did not print is not an answer to fabricate a
+        // placeholder for — `detail`'s whole contract is the manager's OWN
+        // words, verbatim (supervisor.rs, invariant 3), and `unwrap_or("")`
+        // would synthesize `loaded=false running=false` with a detail systemd
+        // never said. systemd always prints a property it was asked for (an
+        // unknown unit is `LoadState=not-found`, not a missing line), so a
+        // successful `show` that omits one is a genuine surprise — an output
+        // format change, or a test double with the wrong shape — and is worth
+        // failing loudly on rather than guessing past (invariant 5). This is
+        // the exact standard `Launchd::state` holds itself to.
+        let value = |key: &str| -> Result<String> {
             out.stdout
                 .lines()
                 .find_map(|line| line.strip_prefix(key))
-                .unwrap_or("")
-                .trim()
-                .to_owned()
+                .map(|value| value.trim().to_owned())
+                .with_context(|| {
+                    format!(
+                        "systemctl --user show {name} succeeded but printed no `{key}` line:\n{}",
+                        out.stdout
+                    )
+                })
         };
-        let load = value("LoadState=");
-        let active = value("ActiveState=");
-        let sub = value("SubState=");
+        let load = value("LoadState=")?;
+        let active = value("ActiveState=")?;
+        let sub = value("SubState=")?;
         Ok(UnitState {
             loaded: load == "loaded",
             running: active == "active",
@@ -345,6 +359,28 @@ mod tests {
         let systemd = Systemd::new(PathBuf::from("/units"), &unknown);
         let state = systemd.state(&id()).unwrap();
         assert!(!state.loaded && !state.running, "{state:?}");
+    }
+
+    /// M1 (review round 1): a property systemd did not print must never be
+    /// papered over with a fabricated empty value — `detail`'s contract is the
+    /// manager's OWN words (invariant 3), and `unwrap_or("")` would report
+    /// `loaded=false` with a detail systemd never uttered. Held to exactly the
+    /// standard `Launchd::state` already holds itself to: bail loudly
+    /// (invariant 5). systemd always prints a property it was asked for — an
+    /// unknown unit is `LoadState=not-found`, not a missing line — so this
+    /// shape is a real surprise, not a routine state.
+    #[test]
+    fn state_bails_loudly_when_systemctl_show_omits_a_property() {
+        let weird = FakeRunner::new(vec![FakeRunner::ok(
+            "ActiveState=active\nSubState=running\n",
+        )]);
+        let systemd = Systemd::new(PathBuf::from("/units"), &weird);
+        let err = systemd.state(&id()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no `LoadState=` line"),
+            "must fail loudly, not fabricate a placeholder: {msg}"
+        );
     }
 
     #[test]

@@ -42,15 +42,31 @@ pub fn run(camp_flag: Option<&Path>, choice: ServiceChoice) -> Result<()> {
     let probe = SystemProbe::new(&runner);
     match service::decide(choice, service::detect(&probe)) {
         Decision::Install(manager) => {
-            let supervisor = service::supervisor_for(manager, &probe, &runner)?;
-            print!(
-                "{}",
-                crate::cmd::service::install(
-                    supervisor.as_ref(),
-                    &root,
-                    &crate::cmd::service::camp_binary()?
-                )?
-            );
+            // The camp is already on disk by now. If the service install fails
+            // (a path no unit could name, a manager that refused to bootstrap),
+            // the operator must not be left reading a bare service error and
+            // guessing whether `camp init` did anything — the same statement
+            // `FailNoManager` below makes carefully. The install itself rolls
+            // its OWN half back (no orphan unit file), so the camp really is
+            // the only thing that survives.
+            let installed = service::supervisor_for(manager, &probe, &runner)
+                .and_then(|supervisor| {
+                    crate::cmd::service::install(
+                        supervisor.as_ref(),
+                        &root,
+                        &crate::cmd::service::camp_binary()?,
+                    )
+                })
+                .with_context(|| {
+                    format!(
+                        "The camp at {} WAS created, but installing its service unit failed and \
+                         NO unit was installed — `camp service install` retries it, or run \
+                         `camp daemon --camp {}` under your own supervisor",
+                        root.display(),
+                        root.display()
+                    )
+                })?;
+            print!("{installed}");
         }
         Decision::SkipByFlag => println!(
             "service: skipped (--no-service) — run `camp daemon --camp {}` under your supervisor",
