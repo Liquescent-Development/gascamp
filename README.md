@@ -310,8 +310,9 @@ stall timers — all event-driven, never on a tick. Whether it is *standing*
 depends on supervision: under a host service manager (the `camp init`
 default) it is always-on, restarted by that supervisor across crashes and
 reboots; unsupervised — a container, CI, anywhere with no service manager —
-nothing is standing until you run `camp daemon` yourself, and it exits once
-there's no work left to watch.
+nothing is standing until you run `camp daemon` yourself, and once started it
+keeps serving until you `camp stop` it (or kill it) — there is no idle-exit
+path; "idle is free" means near-zero CPU, not that the process goes away.
 
 ```sh
 camp top                                     # one status snapshot (auto-starts campd)
