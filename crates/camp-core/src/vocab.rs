@@ -24,7 +24,7 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "bead.claimed",
     "campd.started",
     "campd.stopped",
-    "campd.autostarted",
+    "campd.autostarted", // historical: no producer since the CLI became a pure client
     "config.changed",
     "rig.added",
     "run.cooked",

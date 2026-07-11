@@ -139,18 +139,64 @@ impl Drop for Daemon {
     }
 }
 
-/// Cleans up an auto-started (detached) daemon even when a test fails.
-struct StopGuard {
-    sock: PathBuf,
-}
-
-impl Drop for StopGuard {
-    fn drop(&mut self) {
-        if let Ok(mut stream) = UnixStream::connect(&self.sock) {
-            let _ = stream.write_all(b"{\"op\":\"stop\"}\n");
-            let mut resp = String::new();
-            let _ = BufReader::new(stream).read_line(&mut resp);
-        }
+/// The pure-client contract (design §4.3, and §9's test obligation): a
+/// daemon-needing verb with campd DOWN fails loudly, names the remedy, and
+/// starts NOTHING.
+///
+/// "Started nothing" is asserted structurally, not by scanning the process
+/// table (which a parallel `cargo test` process tree would confound anyway).
+/// Three independent tripwires, each of which the removed CLI-spawn path
+/// would trip BEFORE the CLI could return:
+///   1. `<camp>/campd.log` — the removed path opened it (create+append) BEFORE
+///      it spawned the child, so this fires even on a regression that spawns a
+///      daemon without blocking on its readiness line;
+///   2. `<camp>/campd.sock` — a live campd binds it before serving anything;
+///   3. a `campd.started` event — appended before the readiness line
+///      (`daemon/mod.rs`), and the removed path BLOCKED on that line.
+///
+/// No sleep, no poll, no race.
+///
+/// `starts_before` is how many campds the TEST started by hand (a `kill -9`d
+/// daemon leaves its `campd.started` in the ledger and its socket file on
+/// disk — that is still "not running").
+fn assert_no_campd_came_up(root: &Path, out: &std::process::Output, starts_before: usize) {
+    assert!(
+        !out.status.success(),
+        "a daemon-needing verb must FAIL when campd is down; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !root.join("campd.log").exists(),
+        "campd.log is created only by a CLI that is about to spawn a daemon: it must not exist"
+    );
+    let sock = root.join("campd.sock");
+    assert!(
+        !sock.exists() || UnixStream::connect(&sock).is_err(),
+        "no campd may be listening: the CLI must never start one"
+    );
+    let types = event_types(root);
+    assert_eq!(
+        types
+            .iter()
+            .filter(|t| t.as_str() == "campd.started")
+            .count(),
+        starts_before,
+        "the CLI must not have started a campd: {types:?}"
+    );
+    assert_eq!(
+        types
+            .iter()
+            .filter(|t| t.as_str() == "campd.autostarted")
+            .count(),
+        0,
+        "the CLI is a pure client: no campd.autostarted may ever be recorded again: {types:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for needle in ["campd is not running", "camp service status", "camp daemon"] {
+        assert!(
+            stderr.contains(needle),
+            "the error must name {needle:?} — the remedy IS the feature: {stderr}"
+        );
     }
 }
 
@@ -304,89 +350,84 @@ fn second_daemon_refuses_to_start_while_the_first_lives() {
 }
 
 #[test]
-fn camp_top_autostarts_campd_with_the_event_trail() {
+fn camp_top_with_campd_down_fails_loudly_and_starts_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let root = init_camp(dir.path());
-    let _guard = StopGuard {
-        sock: root.join("campd.sock"),
-    };
 
-    let out = run_ok(&root, &["top"]);
-    assert!(out.contains("campd pid: "), "top output: {out:?}");
-    assert!(out.contains("ready: 0"), "top output: {out:?}");
-    assert!(out.contains("open: 0"), "top output: {out:?}");
+    let out = camp_cmd(&root).arg("top").output().unwrap();
 
-    // spec §13.3: the trail shows the cause — autostarted (by the cli, for
-    // top) then started (by campd)
-    let types = event_types(&root);
-    let auto = types
-        .iter()
-        .position(|t| t == "campd.autostarted")
-        .expect("campd.autostarted event");
-    let started = types
-        .iter()
-        .position(|t| t == "campd.started")
-        .expect("campd.started event");
+    assert_no_campd_came_up(&root, &out, 0);
     assert!(
-        auto < started,
-        "trail must read autostarted → started (cause before effect): {types:?}"
+        String::from_utf8_lossy(&out.stderr).contains("no campd has ever started"),
+        "a camp whose campd never ran must say so, not omit the pid: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let events_json = run_ok(&root, &["events", "--json"]);
-    assert!(
-        events_json.contains(r#""type":"campd.autostarted","actor":"cli","data":{"verb":"top"}"#),
-        "events: {events_json}"
-    );
-
-    // a second top finds the daemon up: no second autostart
-    run_ok(&root, &["top"]);
-    let autostarts = event_types(&root)
-        .iter()
-        .filter(|t| t.as_str() == "campd.autostarted")
-        .count();
-    assert_eq!(autostarts, 1);
-
-    // graceful shutdown of the detached daemon
-    run_ok(&root, &["stop"]);
 }
 
-/// PR #8 review findings 1 and 2 through the real surface: eight
-/// concurrent `camp top` invocations against a daemonless camp. Every one
-/// must succeed (losers of the start race must recognize the winner, not
-/// error), and exactly one campd may end up owning the socket (the
-/// replacement critical section is serialized — no split brain).
+/// Design §3: the down-campd error NAMES the pid from the ledger's last
+/// `campd.started` — the operator's thread back to the process that died.
+/// `kill -9` leaves a stale socket file; that is still "not running", never a
+/// wedge, and the two errors must not be interchangeable.
 #[test]
-fn concurrent_top_autostarts_exactly_one_campd() {
+fn camp_top_after_a_kill_dash_nine_names_the_dead_campd_pid() {
     let dir = tempfile::tempdir().unwrap();
     let root = init_camp(dir.path());
-    let _guard = StopGuard {
-        sock: root.join("campd.sock"),
-    };
+    let mut daemon = Daemon::spawn(&root);
+    let pid = daemon.child.id();
+    daemon.kill_dash_nine();
+    assert!(
+        root.join("campd.sock").exists(),
+        "kill -9 leaves the socket file behind (stale)"
+    );
 
-    let children: Vec<Child> = (0..8)
-        .map(|_| {
-            camp_cmd(&root)
-                .arg("top")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap()
-        })
-        .collect();
-    for child in children {
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "camp top failed under concurrent auto-start: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let started = event_types(&root)
-        .iter()
-        .filter(|t| t.as_str() == "campd.started")
-        .count();
-    assert_eq!(started, 1, "exactly one campd may win the start race");
+    let out = camp_cmd(&root).arg("top").output().unwrap();
 
-    run_ok(&root, &["stop"]);
+    assert_no_campd_came_up(&root, &out, 1); // only the one WE started
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&pid.to_string()),
+        "must name the dead campd's pid {pid}: {stderr}"
+    );
+    assert!(
+        !stderr.contains("kill -9"),
+        "a DEAD campd is not a wedged one: the remedies differ: {stderr}"
+    );
+}
+
+/// `camp adopt` is a socket op executed BY campd (the registry and the timers
+/// live in its memory), so it needs the daemon. Pure client: campd down is a
+/// loud, actionable error — never a fresh daemon started behind the operator's
+/// back just to answer a reconciliation request.
+#[test]
+fn camp_adopt_with_campd_down_fails_loudly_and_starts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_camp(dir.path());
+
+    let out = camp_cmd(&root).arg("adopt").output().unwrap();
+
+    assert_no_campd_came_up(&root, &out, 0);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("adopted:"),
+        "nothing was adopted: the summary line must not be printed"
+    );
+}
+
+/// The happy path, unchanged: against a running campd, `camp top` is one
+/// status query rendered as plain text.
+#[test]
+fn camp_top_against_a_running_campd_renders_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_camp(dir.path());
+    let daemon = Daemon::spawn(&root);
+
+    let out = run_ok(&root, &["top"]);
+
+    assert!(
+        out.contains(&format!("campd pid: {}", daemon.child.id())),
+        "top output: {out:?}"
+    );
+    assert!(out.contains("ready: 0"), "top output: {out:?}");
+    assert!(out.contains("open: 0"), "top output: {out:?}");
 }
 
 #[test]

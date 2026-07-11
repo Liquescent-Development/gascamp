@@ -22,6 +22,13 @@ pub enum EventType {
     SessionNudged,
     CampdStarted,
     CampdStopped,
+    /// HISTORICAL — no producer since the CLI became a pure socket client
+    /// (campd-service-management design §4.3): the removed CLI-spawn path
+    /// recorded which verb had spawned campd. The type STAYS: `EventType::parse`
+    /// rejects unknown names and every read path goes through it, so dropping
+    /// this variant would make any ledger that carries one unreadable
+    /// (`camp events`, the fold, `refold`). Invariant 3 — the ledger tells the
+    /// whole story, old ones included.
     CampdAutostarted,
     RigAdded,
     RunCooked,

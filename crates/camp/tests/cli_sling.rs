@@ -2,10 +2,12 @@
 //! camp sling (spec §8.1 Tier 0; master plan Phase 8). The daemon-side
 //! dispatch behavior lives in daemon_dispatch.rs; this file covers the
 //! CLI surface: routing resolution, fail-fast messages, assignee stamping,
-//! and the auto-start poke.
+//! and the poke to a running campd — sling is a PURE CLIENT (design §4.3):
+//! it never starts a daemon, and a campd that is down fails it loudly.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_camp");
 
@@ -20,7 +22,7 @@ fn camp(root: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// A camp with one rig and a config we control completely. `command` is
-/// `true` so an auto-started daemon's dispatch spawn is harmless.
+/// `true`, so when a test spawns a real campd its dispatch spawn is harmless.
 fn scaffold(dir: &Path, dispatch_default: Option<&str>, rig_default: Option<&str>) -> PathBuf {
     let root = dir.join(".camp");
     std::fs::create_dir_all(&root).unwrap();
@@ -64,9 +66,109 @@ fn events_json(root: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn stop_campd(root: &Path) {
-    // sling auto-starts campd; leave nothing running behind the test
-    let _ = camp(root, &["stop"]);
+const READY_PREFIX: &str = "campd listening on ";
+
+/// A real campd child. `spawn` blocks on the readiness line (deterministic —
+/// no connect polling); `Drop` SIGKILLs and reaps it (crash-only: a kill -9 is
+/// a supported shutdown, spec §5). `sling` is a pure client now, so every test
+/// whose sling must SUCCEED needs one of these up first.
+///
+/// This works in a `scaffold`-built camp even though `scaffold` never shells
+/// out to `camp init` (it writes `camp.toml` and opens the ledger directly):
+/// `camp daemon --camp <root>` is exactly the command the removed CLI-spawn
+/// path used to run, in exactly these scaffolded camps.
+struct Daemon {
+    child: Child,
+}
+
+impl Daemon {
+    fn spawn(root: &Path) -> Daemon {
+        let mut child = Command::new(BIN)
+            .env_remove("CAMP_DIR")
+            .args(["daemon", "--camp"])
+            .arg(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut line = String::new();
+        BufReader::new(stdout).read_line(&mut line).unwrap();
+        assert!(
+            line.starts_with(READY_PREFIX),
+            "unexpected first line from campd: {line:?}"
+        );
+        Daemon { child }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Design §4.3 + §9's test obligation. `sling` promises dispatch, and campd is
+/// the only dispatcher — so a campd that is down FAILS it, loudly. It does not
+/// spawn one. What it does NOT do is lose the operator's work: the bead is
+/// created (the write is durable — spec §7.2: campd catches up from its cursor
+/// on start), its id still reaches stdout, and the error says precisely what
+/// did and did not happen.
+#[test]
+fn sling_with_campd_down_creates_the_bead_prints_it_and_fails_loudly_without_spawning_a_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = scaffold(dir.path(), Some("dev"), None);
+    write_agent(&root, "dev");
+
+    let out = camp(&root, &["sling", "no daemon here"]);
+
+    assert!(
+        !out.status.success(),
+        "sling promises dispatch: a down campd must fail it"
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        "gc-1",
+        "the durable bead id still reaches stdout — a down campd costs the dispatch, not the id"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for needle in [
+        "gc-1",
+        "NOT dispatched",
+        "campd is not running",
+        "camp service status",
+        "camp daemon",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "the error must name {needle:?}: {stderr}"
+        );
+    }
+    // the write is durable and honest…
+    let events = events_json(&root);
+    assert!(
+        events.iter().any(|e| e["type"] == "bead.created"),
+        "the bead must exist: {events:?}"
+    );
+    // …and NO daemon came up (the same three tripwires as daemon_lifecycle's
+    // assert_no_campd_came_up: the log the removed path opened BEFORE it
+    // spawned, the socket a live campd binds, and the campd.started it appends).
+    assert!(
+        !root.join("campd.log").exists(),
+        "campd.log is created only by a CLI about to spawn a daemon"
+    );
+    assert!(
+        !root.join("campd.sock").exists(),
+        "the CLI must never start campd"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["type"] == "campd.started" || e["type"] == "campd.autostarted"),
+        "no campd may have come up: {events:?}"
+    );
 }
 
 #[test]
@@ -101,10 +203,12 @@ fn sling_with_an_unresolvable_agent_fails_before_creating_anything() {
 }
 
 #[test]
-fn sling_stamps_the_dispatch_default_agent_and_autostarts_campd() {
+fn sling_stamps_the_dispatch_default_agent_and_pokes_a_running_campd() {
     let dir = tempfile::tempdir().unwrap();
     let root = scaffold(dir.path(), Some("dev"), None);
     write_agent(&root, "dev");
+    let _campd = Daemon::spawn(&root);
+
     let out = camp(&root, &["sling", "add a flag"]);
     assert!(
         out.status.success(),
@@ -118,10 +222,9 @@ fn sling_stamps_the_dispatch_default_agent_and_autostarts_campd() {
     assert_eq!(created["data"]["assignee"], "dev");
     assert_eq!(created["data"]["title"], "add a flag");
     assert!(
-        events.iter().any(|e| e["type"] == "campd.autostarted"),
-        "sling must bring the daemon up (spec §5): {events:?}"
+        !events.iter().any(|e| e["type"] == "campd.autostarted"),
+        "the CLI is a pure client: no campd.autostarted may ever be recorded: {events:?}"
     );
-    stop_campd(&root);
 }
 
 #[test]
@@ -130,6 +233,8 @@ fn rig_default_agent_outranks_the_camp_wide_default() {
     let root = scaffold(dir.path(), Some("dev"), Some("rigger"));
     write_agent(&root, "dev");
     write_agent(&root, "rigger");
+    let _campd = Daemon::spawn(&root);
+
     let out = camp(&root, &["sling", "review it", "--rig", "gc"]);
     assert!(
         out.status.success(),
@@ -139,7 +244,6 @@ fn rig_default_agent_outranks_the_camp_wide_default() {
     let events = events_json(&root);
     let created = events.iter().find(|e| e["type"] == "bead.created").unwrap();
     assert_eq!(created["data"]["assignee"], "rigger");
-    stop_campd(&root);
 }
 
 #[test]
@@ -149,6 +253,8 @@ fn explicit_agent_flag_outranks_everything() {
     write_agent(&root, "dev");
     write_agent(&root, "rigger");
     write_agent(&root, "special");
+    let _campd = Daemon::spawn(&root);
+
     let out = camp(&root, &["sling", "x", "--agent", "special"]);
     assert!(
         out.status.success(),
@@ -158,7 +264,6 @@ fn explicit_agent_flag_outranks_everything() {
     let events = events_json(&root);
     let created = events.iter().find(|e| e["type"] == "bead.created").unwrap();
     assert_eq!(created["data"]["assignee"], "special");
-    stop_campd(&root);
 }
 
 // ---- Phase 9 Task 4: sling --formula (spec §8.2 cooking surface) ----------
@@ -174,6 +279,8 @@ fn sling_formula_cooks_a_run_and_pins_it() {
         "formula = \"one-step\"\n\n[[steps]]\nid = \"s1\"\ntitle = \"one step\"\n",
     )
     .unwrap();
+    let _campd = Daemon::spawn(&root);
+
     let out = camp(&root, &["sling", "--formula", "one-step"]);
     assert!(
         out.status.success(),
@@ -253,6 +360,8 @@ fn sling_creates_an_open_unclaimed_bead_with_no_reservation_state() {
     let dir = tempfile::tempdir().unwrap();
     let root = scaffold(dir.path(), Some("dev"), None);
     write_agent(&root, "dev");
+    let _campd = Daemon::spawn(&root);
+
     let out = camp(&root, &["sling", "reservation guard"]);
     assert!(
         out.status.success(),
@@ -260,7 +369,6 @@ fn sling_creates_an_open_unclaimed_bead_with_no_reservation_state() {
         String::from_utf8_lossy(&out.stderr)
     );
     let bead = String::from_utf8(out.stdout).unwrap().trim().to_owned();
-    stop_campd(&root);
 
     let events = events_json(&root);
     let created = events

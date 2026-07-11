@@ -250,8 +250,8 @@ Two things to get right, both easy to miss:
   your gascamp clone's `packs/starter` (as above), or copy the pack directory
   into `.camp/` instead.
 
-Then `camp sling "…"` (or `/camp:sling "…"`) creates the bead, auto-starts `campd`,
-and dispatches the worker. Route to a specific role with `--agent reviewer`.
+Then `camp sling "…"` (or `/camp:sling "…"`) creates the bead and campd
+dispatches the worker. Route to a specific role with `--agent reviewer`.
 Watch the fleet with `camp top` or `/camp:status`.
 
 ## Concepts
@@ -315,8 +315,8 @@ keeps serving until you `camp stop` it (or kill it) — there is no idle-exit
 path; "idle is free" means near-zero CPU, not that the process goes away.
 
 ```sh
-camp top                                     # one status snapshot (auto-starts campd)
-camp top --statusline                        # compact fleet badge (▲live ●ready ✖red); never auto-starts
+camp top                                     # one status snapshot (campd must be running)
+camp top --statusline                        # compact fleet badge (▲live ●ready ✖red); empty + a stderr note when campd is down
 camp stop                                    # graceful shutdown (unsupervised camps only — see below)
 ```
 
@@ -389,7 +389,7 @@ install` and `camp service start` refuse if a campd already holds the camp's
 socket: a supervised campd cannot take over a live socket — it would exit, and
 the supervisor would respawn it forever while the command told you the camp was
 supervised. Stop the running campd (`camp stop`) and install then works. This is
-the ordinary upgrade path for a camp that has been auto-starting its own campd.
+the ordinary upgrade path for a camp still running a campd of its own.
 
 There is no registry file: the installed units ARE the registry, and
 `camp service list` reads them.
@@ -511,8 +511,8 @@ Install it from this repo (see the [quickstart](#use-camp-from-inside-claude-cod
 
 The statusline is opt-in: a plugin cannot set your main status line for you, so
 wire it into your own `~/.claude/settings.json`. It renders `▲live ●ready ✖red`
-from a read-only socket query, never auto-starts `campd`, and degrades to empty
-output when `campd` is down.
+from a read-only socket query and degrades to empty output plus a stderr note
+when `campd` is down.
 
 ```json
 { "statusLine": { "type": "command",

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Camp fleet statusline snippet (opt-in). Renders `▲live ●ready ✖red` from a
-# read-only campd socket query. It NEVER auto-starts campd and degrades to
-# empty output + a stderr note when campd is down (spec §11) — the badge
+# read-only campd socket query. It degrades to empty output plus a stderr
+# note when campd is down (spec §11) — the badge
 # logic and degradation live in `camp top --statusline` (tested Rust); this
 # script just locates the workspace so `camp` resolves the right camp.
 #

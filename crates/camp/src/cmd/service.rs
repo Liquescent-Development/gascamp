@@ -300,7 +300,7 @@ pub fn status(supervisor: Option<&dyn Supervisor>, camp: &CampDir) -> Result<Str
                 let state = supervisor.state(&unit.id)?;
                 // m-B: `will-restart` is now THE variable every decision turns
                 // on — `camp stop`'s refusal, `camp service stop`'s
-                // did-I-stop-anything, `restart`'s guard, the auto-start guard.
+                // did-I-stop-anything, `restart`'s guard.
                 // An operator who is told "camp stop refuses here" must be able
                 // to SEE why, not infer it from the manager's raw detail.
                 report.push_str(&format!(
@@ -326,7 +326,7 @@ pub fn status(supervisor: Option<&dyn Supervisor>, camp: &CampDir) -> Result<Str
     }
     // Liveness is an ANSWERED REQUEST (spec §5 as amended by issue #55), never
     // a bare connect: a wedged campd's listen backlog accepts connections its
-    // event loop never serves. This never auto-starts; a campd that accepts
+    // event loop never serves. This never starts campd; a campd that accepts
     // and does not answer surfaces as the loud CampdUnresponsive error.
     match socket::request_if_up(camp, &Request::Status) {
         Ok(Some(Response::Status {
@@ -447,19 +447,20 @@ fn listening_campd_pid(camp_root: &Path) -> Result<Option<u32>> {
 /// that hand campd to the supervisor ASK first, and refuse before touching the
 /// unit directory or the manager.
 ///
-/// This is not a hypothetical: it is the UPGRADE path. Every camp that exists
-/// today has an auto-started, unsupervised campd, or was created with
-/// `--no-service` and is running one from the `camp daemon` hand-off.
+/// This is not a hypothetical: it is the UPGRADE path. A camp that predates the
+/// pure-client CLI may still be running an unsupervised campd the removed
+/// CLI-spawn path left behind, and a camp created with `--no-service` is running
+/// one from the `camp daemon` hand-off.
 ///
 /// m-E: this is a check-then-act, so it is TOCTOU against a campd that starts
-/// between the probe and the manager's load — an auto-starting verb racing an
-/// `install` in another terminal. It is not a redesign candidate: the race
-/// loses to `bind_or_replace`, which is the actual authority (the loser exits
-/// rather than take a live socket), so the outcome is the respawn loop this
+/// between the probe and the manager's load. No camp verb can start one any more
+/// (the CLI is a pure client — design §4.3), so the only racer left is a
+/// hand-run `camp daemon` in another terminal. It is not a redesign candidate:
+/// the race loses to `bind_or_replace`, which is the actual authority (the loser
+/// exits rather than take a live socket), so the outcome is the respawn loop this
 /// check exists to prevent — merely by a much narrower window, and reported by
 /// `camp service status` rather than by this verb. Closing it properly means
-/// holding the camp's bind lock across the install, which is Phase 3 territory
-/// (it is the same lock the auto-start path will stop needing).
+/// holding the camp's bind lock across the install.
 fn refuse_if_a_campd_holds_the_socket(
     supervisor: &dyn Supervisor,
     camp_root: &Path,
@@ -533,7 +534,8 @@ pub fn stop(supervisor: &dyn Supervisor, camp: &CampDir) -> Result<String> {
         Some(pid) => bail!(
             "{headline}, but a campd is STILL listening on this camp's socket (pid {pid}) — \
              stopping the unit did not stop it, so it is not the campd {mgr} manages (a hand-run \
-             `camp daemon`, or one auto-started before the unit was installed).\n       To stop \
+             `camp daemon`, or one the removed CLI-spawn path left before the unit was \
+             installed).\n       To stop \
              it: camp stop",
             mgr = supervisor.name(),
         ),
@@ -1012,7 +1014,7 @@ mod tests {
             "the manager's own detail: {report}"
         );
         // No campd is listening on this temp camp's socket — and that is a
-        // REPORTED state, not an error, and never an auto-start.
+        // REPORTED state, not an error, and never a spawn.
         assert!(report.contains("campd: not listening"), "{report}");
     }
 
@@ -1397,9 +1399,9 @@ mod tests {
     }
 
     /// IMPORTANT 2 (review round 2). `install` is the UPGRADE PATH, and it
-    /// needs no operator error to go wrong: every camp that exists today has an
-    /// auto-started, unsupervised campd (or was created `--no-service`, where
-    /// the README hands off to `camp daemon`). Installing a unit for such a
+    /// needs no operator error to go wrong: a camp may still be running an
+    /// unsupervised campd the removed CLI-spawn path left behind (or was created
+    /// `--no-service`, where the README hands off to `camp daemon`). Installing a unit for such a
     /// camp hands the supervisor a socket another campd already owns —
     /// `bind_or_replace` makes the supervised campd exit(1) on a socket that
     /// accepts — and `KeepAlive`/`Restart=always` then respawns it forever

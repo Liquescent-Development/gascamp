@@ -29,7 +29,7 @@ pub(crate) struct Deliverable {
 
 /// `camp show <bead> [--json] [--wait [--timeout SECONDS]]`: current state
 /// plus full event history (spec §7.4). Read-only: `show` never writes and
-/// never autostarts campd — `--wait` is a pure observer (design §7).
+/// never starts campd — `--wait` is a pure observer (design §7).
 pub fn run(
     camp: &CampDir,
     bead: String,

@@ -123,7 +123,7 @@ The whole system is three artifacts plus content:
 | Artifact | What it is | Why it exists |
 |---|---|---|
 | `camp` CLI | one static Rust binary: `init`, `sling`, `ls`, `show`, `search`, `remember`, `recall`, `events`, `rig`, `order`, `top`, `adopt`, `doctor`, `stop` | the verbs — used identically by the user, slash commands, hooks, and agents |
-| `campd` | the same binary in daemon mode, auto-started on demand | the only standing process: watches the ledger, dispatches ready work, schedules orders, arms stall timers — purely mechanical |
+| `campd` | the same binary in daemon mode, run by a supervisor (launchd / systemd `--user` / the container runtime / you) | the only standing process: watches the ledger, dispatches ready work, schedules orders, arms stall timers — purely mechanical |
 | camp plugin | a Claude Code plugin: slash commands, lifecycle hooks, the worker skill | makes the user's Claude Code session the control plane and every agent session observable |
 
 **Packs are content, not machinery** (§11): directories of Claude Code
@@ -162,19 +162,23 @@ agent definitions.
   refuses connections is removed and the daemon restarted. A socket that
   accepts but does not answer within the CLI's request timeout is a
   wedged daemon: the verb fails loudly, naming the pid recorded in the
-  ledger's `campd.started` event — `kill -9` it (a supported shutdown)
-  and rerun the verb. No pidfiles, no lockfiles-as-status.
+  ledger's `campd.started` event — `kill -9` it (a supported shutdown);
+  the supervisor brings campd back, or you run `camp daemon` where none
+  does. No pidfiles, no lockfiles-as-status.
   (Bind-conflict detection — may a second campd start? — still keys on
   accept-ability alone: a wedged daemon owns its socket until the
   operator kills it; auto-replacing it would hide the wedge.)
-- **Auto-start:** any `camp` verb that needs the daemon sends its request
-  — the request is the liveness probe, on the same connection. Only a
-  refused/absent socket triggers the spawn: `campd` starts detached, the
-  spawn is logged as an event, and the request retries exactly once. An
-  unanswered request is a loud error, never a second daemon. `camp stop`
-  shuts it down. An optional launchd agent (shipped as an example plist,
-  not installed by default) starts `campd` at login for users who want
-  orders firing without first running a `camp` command.
+- **Pure client:** any `camp` verb that needs the daemon sends its request
+  — the request is the liveness probe, on the same connection. The CLI
+  never starts `campd`: a refused or absent socket is a loud, actionable
+  error naming the pid from the ledger's last `campd.started` and the
+  remedies (`camp service status`, or `camp daemon` where no service
+  manager exists), never a silent respawn. An unanswered request is the
+  wedge error, never a second daemon. `campd` is a supervised foreground
+  process: `camp init` installs a host unit where a service manager exists,
+  and `camp service {status,restart,stop,start}` controls it; under a
+  container runtime, in CI, or on a bare box you run `camp daemon`
+  yourself. `camp stop` shuts down an unsupervised daemon.
 - **Crash-only design:** `campd` holds no exclusive state. On start it
   opens the ledger, processes any events past its cursor, runs adoption
   (§8.5), and continues. `kill -9` is a supported shutdown method.

@@ -7,7 +7,7 @@
 //! session's recorded cwd — the turn lands after its last one (A4/F6) and
 //! the reply prints here. Interactivity is a runtime/harness capability,
 //! never a dispatch mode: this verb never dispatches, reserves, or spawns
-//! workers, and it never auto-starts campd (a fresh campd could hold no
+//! workers, and it never starts campd (a fresh campd could hold no
 //! pipe for the target anyway).
 
 use std::path::PathBuf;

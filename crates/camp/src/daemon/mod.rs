@@ -3,7 +3,6 @@
 //! ledger, appends campd.started, catches up past its cursor, announces
 //! readiness on stdout, and sleeps on the socket.
 
-pub mod autostart;
 pub mod bounded;
 pub mod cursor;
 pub mod dispatch;
@@ -22,9 +21,10 @@ use camp_core::ledger::Ledger;
 use crate::campdir::CampDir;
 use cursor::ReadinessProcessor;
 
-/// The single line campd prints to stdout once the socket accepts.
-/// Auto-start (and the tests) block on it — an OS pipe read, not a
-/// sleep/retry loop. stdout is never written again after this line.
+/// The single line campd prints to stdout once the socket accepts. Anything
+/// that starts campd and needs to know it is up — a supervisor, a container
+/// entrypoint, the test harnesses — blocks on this line: an OS pipe read, not
+/// a sleep/retry loop. stdout is never written again after this line.
 pub const READY_PREFIX: &str = "campd listening on ";
 
 /// Test-only serialization of child-spawning tests against socket-probe

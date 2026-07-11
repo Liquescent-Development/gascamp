@@ -58,9 +58,9 @@ if you want explicit per-tool breadcrumbs; it is time-window throttled.
 ## Statusline (opt-in)
 
 `statusline/statusline.sh` renders `▲live ●ready ✖red` from a read-only
-socket query — it never auto-starts campd and degrades to empty output plus a
-stderr note when campd is down. It is the **main session** status line. A
-plugin cannot auto-set the main `statusLine`, so wire it into your own
+socket query — it degrades to empty output plus a stderr note when campd is
+down. It is the **main session** status line. A plugin cannot auto-set the
+main `statusLine`, so wire it into your own
 `~/.claude/settings.json` (opt-in per D6):
 
 ```json

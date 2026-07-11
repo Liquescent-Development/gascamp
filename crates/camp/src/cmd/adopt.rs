@@ -1,16 +1,14 @@
 use anyhow::{Result, bail};
 
 use crate::campdir::CampDir;
-use crate::daemon::autostart;
-use crate::daemon::socket::{Request, Response};
+use crate::daemon::socket::{self, Request, Response};
 
-/// `camp adopt`: reconcile the session registry against reality (spec
-/// §8.5) — the routine campd runs automatically at start, on demand.
-/// Auto-starts campd when it is down (the fresh daemon adopts at startup;
-/// the explicit request that follows is a no-op by construction —
-/// adoption is idempotent).
+/// `camp adopt`: reconcile the session registry against reality (spec §8.5) —
+/// the routine campd runs automatically at start, on demand. A PURE CLIENT
+/// (design §4.3): campd holds the registry and the timers, so this verb needs
+/// it; a campd that is down is a loud, actionable error, never a spawn.
 pub fn run(camp: &CampDir) -> Result<()> {
-    let response = autostart::request_with_autostart(camp, &Request::Adopt, "adopt")?;
+    let response = socket::require(camp, &Request::Adopt)?;
     match response {
         Response::Adopt {
             crashed,
