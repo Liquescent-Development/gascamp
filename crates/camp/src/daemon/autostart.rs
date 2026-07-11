@@ -7,6 +7,17 @@
 //! an OS pipe read, not a sleep/retry loop — and retries the request
 //! exactly ONCE. Fail fast after that; an unanswered request is the loud
 //! CampdUnresponsive error, never a second daemon.
+//!
+//! But a refused/absent socket has TWO causes, and only one of them may
+//! spawn: campd genuinely never started, or the HOST SUPERVISOR owns this
+//! camp and campd is merely stopped (`camp service stop`, or a crash outside
+//! its restart budget). Spawning in the second case hands the operator an
+//! unsupervised campd that `camp service start` will orphan into a
+//! respawn-throttle loop the moment they next touch the supervisor — the
+//! exact defect `cmd::stop::run_with` refuses on the other side of. So
+//! `start_detached` probes the host supervisor first (the same
+//! `service::host_supervisor` + `cmd::service::managed_unit` seam `camp
+//! stop` uses) and refuses loudly instead of spawning.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -18,6 +29,7 @@ use camp_core::ledger::Ledger;
 use super::READY_PREFIX;
 use super::socket::{self, Request, Response};
 use crate::campdir::CampDir;
+use crate::service::{self, Supervisor, SystemProbe, SystemRunner};
 
 pub fn request_with_autostart(camp: &CampDir, request: &Request, verb: &str) -> Result<Response> {
     // The request IS the liveness probe (issue #55), judged on the SAME
@@ -40,10 +52,48 @@ pub fn request_with_autostart(camp: &CampDir, request: &Request, verb: &str) -> 
     })
 }
 
+/// The production entry point: wires the REAL host supervisor (the same
+/// `SystemProbe`/`SystemRunner` pair `cmd::stop::run` wires) and delegates to
+/// the testable core below.
+fn start_detached(camp: &CampDir, verb: &str) -> Result<()> {
+    let runner = SystemRunner;
+    let probe = SystemProbe::new(&runner);
+    let supervisor = service::host_supervisor(&probe, &runner)?;
+    start_detached_with(camp, verb, supervisor.as_deref())
+}
+
+/// The testable core: the supervisor is injected (the exact dual of
+/// `cmd::stop::run_with`), so both branches — a camp the host supervisor
+/// owns, and one it does not — are unit-tested without a live service
+/// manager.
+///
+/// The bug this guards against (whole-branch review): `camp service stop`
+/// leaves the unit installed; this path used to spawn a second, UNSUPERVISED
+/// campd right past it, and the operator's next `camp service start` then
+/// bootstraps a THIRD instance whose bind is refused — a respawn-throttle
+/// loop that never ends, while the CLI printed "started". Refuse instead,
+/// before the ledger records campd.autostarted, let alone before anything is
+/// spawned: the operator's remedy is one command, not an inherited daemon.
 // The daemon is detached BY DESIGN (spec §5): it must outlive this CLI
 // process, which exits immediately; init reaps it. Never waited on.
 #[allow(clippy::zombie_processes)]
-fn start_detached(camp: &CampDir, verb: &str) -> Result<()> {
+fn start_detached_with(
+    camp: &CampDir,
+    verb: &str,
+    supervisor: Option<&dyn Supervisor>,
+) -> Result<()> {
+    if let Some(supervisor) = supervisor
+        && let Some(unit) = crate::cmd::service::managed_unit(supervisor, &camp.root)?
+    {
+        bail!(
+            "campd for this camp is supervised by {} (unit {}) but is not running. \
+             Start it with `camp service start` — auto-starting an unsupervised campd \
+             here would be undone by the supervisor.",
+            supervisor.name(),
+            unit.path.display()
+        );
+    }
+
     // Cause before effect (spec §13.3): the trail reads
     // campd.autostarted → campd.started.
     let mut ledger = Ledger::open(&camp.db_path())?;
@@ -103,8 +153,11 @@ fn start_detached(camp: &CampDir, verb: &str) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::service::launchd::Launchd;
+    use crate::service::runner::fake::FakeRunner;
     use std::io::Write as _;
     use std::os::unix::net::UnixListener;
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -195,7 +248,7 @@ mod tests {
         // nothing — the wedge shape
         let _wedged = UnixListener::bind(camp.socket_path()).unwrap();
 
-        let err = start_detached(&camp, "test").unwrap_err();
+        let err = start_detached_with(&camp, "test", None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             err.downcast_ref::<socket::CampdUnresponsive>().is_some(),
@@ -244,7 +297,7 @@ mod tests {
             }
         });
 
-        let result = start_detached(&camp, "test");
+        let result = start_detached_with(&camp, "test", None);
         assert!(
             result.is_ok(),
             "a live socket after child EOF is a won race, not a failure: {:?}",
@@ -257,6 +310,97 @@ mod tests {
             events
                 .iter()
                 .any(|e| e.kind.as_str() == "campd.autostarted")
+        );
+    }
+
+    /// Whole-branch review defect, pinned: `camp service stop` leaves the
+    /// unit installed but campd not running; auto-start used to know
+    /// nothing about supervision and would spawn right past it — the
+    /// operator's next `camp service start` then bootstraps a SECOND campd
+    /// whose bind is refused, and the supervisor respawn-throttles it
+    /// forever while the CLI claims "started". This is the exact dual of
+    /// `cmd::stop::run_with`'s refusal: a camp with an installed unit must
+    /// refuse HERE, before the ledger records campd.autostarted, let alone
+    /// before anything is spawned.
+    #[test]
+    fn start_detached_refuses_a_camp_the_host_supervisor_owns() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        crate::cmd::service::install(&launchd, &camp.root, Path::new("/usr/local/bin/camp"))
+            .unwrap();
+
+        let err = start_detached_with(&camp, "test", Some(&launchd)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("supervised by launchd"), "{msg}");
+        assert!(
+            msg.contains("com.gascamp.campd."),
+            "must name the unit: {msg}"
+        );
+        assert!(
+            msg.contains("camp service start"),
+            "must name the remedy: {msg}"
+        );
+
+        let ledger = Ledger::open(&camp.db_path()).unwrap();
+        let autostarted = ledger
+            .events_of_type(EventType::CampdAutostarted)
+            .unwrap()
+            .len();
+        assert_eq!(
+            autostarted, 0,
+            "a supervised camp must never record an autostart, let alone spawn one"
+        );
+    }
+
+    /// An UNSUPERVISED camp — a real supervisor is present, but no unit is
+    /// installed for THIS camp (a container/CI host with no supervisor at
+    /// all is already covered: every test above passes `None`) — must keep
+    /// today's auto-start behavior byte-for-byte. Same lost-race scenario as
+    /// `start_detached_recognizes_a_lost_race`, with a real (empty) launchd
+    /// wired in instead of `None`: identical outcome proves the guard is a
+    /// no-op here.
+    #[test]
+    fn start_detached_with_a_supervisor_but_no_installed_unit_is_unchanged() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".camp");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        let camp = CampDir { root };
+        let units = tempfile::tempdir().unwrap();
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &fake);
+
+        let winner = UnixListener::bind(camp.socket_path()).unwrap();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = winner.accept() {
+                let mut line = String::new();
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(clone) => clone,
+                    Err(_) => continue,
+                });
+                if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    let _ = stream.write_all(b"{\"ok\":true}\n");
+                }
+            }
+        });
+
+        let result = start_detached_with(&camp, "test", Some(&launchd));
+        assert!(
+            result.is_ok(),
+            "a supervisor with no unit for this camp must behave exactly like no \
+             supervisor at all: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            fake.call_count(),
+            0,
+            "no unit file for this camp — the guard must not touch the manager at all"
         );
     }
 }
