@@ -204,8 +204,18 @@ exit 0). Crash-only means SIGKILL stays safe; this just makes a normal
 
 **Reference container setup** (shipped under `contrib/docker/`):
 
-- `Dockerfile` — build/copy the `camp` binary; a small entrypoint runs
-  `camp init --no-service` (idempotent) then `exec camp daemon --camp <dir>`.
+- `Dockerfile` — build the `camp` binary; a small entrypoint runs
+  `camp init --no-service --exists-ok` then `exec camp daemon --camp <dir>`.
+  (`camp init` is NOT idempotent on its own — it hard-errors on an existing
+  camp, and a restarted container's camp volume always has one. Phase 4 adds
+  `--exists-ok`: an existing camp is a no-op success. The flag, not a shell
+  test, so one predicate owns "is there a camp here".)
+- The image must contain **`git`**: campd shells out to `git rev-parse --verify
+  HEAD^{commit}` on every dispatch to read the rig's base commit
+  (`daemon/spawn.rs::rig_base`), and to `git worktree add` for the default
+  isolation. It must also set a writable **`HOME`**: campd computes the worker
+  transcript path under `$HOME/.claude` (a hard error if `HOME` is unset) and
+  patrol creates that directory.
 - Run under a minimal init (`tini` / `dumb-init`) as PID 1 (documented
   belt-and-suspenders) — though with SIGTERM handling + SIGCHLD reaping,
   campd is PID-1-safe on its own.

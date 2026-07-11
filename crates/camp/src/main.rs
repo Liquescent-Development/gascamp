@@ -66,6 +66,10 @@ enum Command {
         /// Do not install a host service unit (containers, CI, or by choice)
         #[arg(long = "no-service")]
         no_service: bool,
+        /// An existing camp is a no-op success, not an error — for entrypoints
+        /// and units that re-run `camp init` on every start (contrib/docker/)
+        #[arg(long = "exists-ok")]
+        exists_ok: bool,
     },
     /// Verify ledger invariants
     #[command(group(
@@ -473,6 +477,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Init {
             service,
             no_service,
+            exists_ok,
         } => {
             // Two bools at the CLI edge; ONE tri-state inside (clap already
             // rejected the contradictory pair).
@@ -483,7 +488,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 ServiceChoice::Auto
             };
-            cmd::init::run(cli.camp.as_deref(), choice)
+            cmd::init::run(cli.camp.as_deref(), choice, exists_ok)
         }
         Command::Doctor {
             refold: _,
