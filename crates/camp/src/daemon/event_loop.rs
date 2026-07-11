@@ -30,7 +30,8 @@ const LISTENER: Token = Token(0);
 /// The notify→mio self-pipe (camp.toml watch). Authoritative campd token
 /// layout (lead ruling, PR #13 review MEDIUM 4; Phase 11 plan Decision I,
 /// approved): 0 = listener, 1 = config watch, 2 = Phase 8's SIGCHLD
-/// self-pipe, 3 = Phase 11's patrol transcript-watch self-pipe, 4+ =
+/// self-pipe, 3 = Phase 11's patrol transcript-watch self-pipe, 4 = Phase
+/// 1's SIGTERM/SIGINT self-pipe (campd service management), 5+ =
 /// connections. Coordinate with the lead before renumbering.
 const CONFIG_WATCH: Token = Token(1);
 /// Phase 8's SIGCHLD self-pipe (worker death detection, spec §10.1), per
@@ -39,6 +40,10 @@ const SIGCHLD: Token = Token(2);
 /// Phase 11's patrol transcript-watch self-pipe (spec §10.2), per the
 /// shared token layout above.
 const PATROL_WATCH: Token = Token(3);
+/// SIGTERM/SIGINT self-pipe (Phase 1, campd service management): a
+/// supervisor stops campd with SIGTERM; SIGINT is Ctrl-C on a foreground
+/// `camp daemon`. Both run the same graceful stop as Request::Stop.
+const SIGTERM_SIG: Token = Token(4);
 
 /// Upper bound on a single request line (PR #8 review finding 3). Real
 /// requests are tens of bytes; the cap keeps a broken or hostile client
@@ -85,6 +90,7 @@ enum ConnState {
 pub fn run(
     mut listener: UnixListener,
     sigchld: std::os::unix::net::UnixStream,
+    sigterm: std::os::unix::net::UnixStream,
     socket_path: &Path,
     ledger: &mut Ledger,
     processor: &mut ReadinessProcessor,
@@ -111,15 +117,19 @@ pub fn run(
     poll.registry()
         .register(patrol_rx, PATROL_WATCH, Interest::READABLE)
         .context("registering the patrol watch pipe")?;
+    let mut sigterm = UnixStream::from_std(sigterm);
+    poll.registry()
+        .register(&mut sigterm, SIGTERM_SIG, Interest::READABLE)
+        .context("registering the SIGTERM pipe")?;
     // The connection map is bounded by the process fd limit — the natural
     // cap for a single-user local socket. An artificial cap was considered
     // (PR #8 review finding 3) and rejected: it would reject legitimate
     // bursts, and per-connection memory is already bounded by
     // MAX_REQUEST_BYTES.
     let mut conns: HashMap<Token, Conn> = HashMap::new();
-    // Tokens 2 and 3 are RESERVED (SIGCHLD, patrol watch — the layout
-    // above); connections start at 4.
-    let mut next_token = 4usize;
+    // Tokens 2–4 are RESERVED (SIGCHLD, patrol watch, SIGTERM/SIGINT — the
+    // layout above); connections start at 5.
+    let mut next_token = 5usize;
     let mut self_raise_budget = SELF_RAISE_BUDGET;
 
     let mut last_seen = Timestamp::now();
@@ -205,7 +215,7 @@ pub fn run(
                     }
                 },
                 SIGCHLD => {
-                    drain_signal_pipe(&mut sigchld)?;
+                    drain_signal_pipe(&mut sigchld, "SIGCHLD")?;
                     // Reap → record ends → settle (catch up, cook, refill
                     // capacity). Errors are reported, never fatal: a broken
                     // child must not take campd down, and unrecorded exits
@@ -285,6 +295,27 @@ pub fn run(
                             graph.apply_config(runtime.config());
                         }
                     }
+                }
+                SIGTERM_SIG => {
+                    // Drain FIRST, then decide — signal-hook's prescribed
+                    // order for its pipe module, and the one arm in this loop
+                    // that cannot shrug off a spurious readable (mio documents
+                    // that events MAY be spurious; here acting on one would
+                    // EXIT the daemon). A byte in the pipe is the only proof a
+                    // signal was actually delivered; no byte, no stop.
+                    if drain_signal_pipe(&mut sigterm, "SIGTERM/SIGINT")? == 0 {
+                        continue;
+                    }
+                    // A supervisor (or Ctrl-C) asked us to stop. Run the SAME
+                    // graceful path as Request::Stop: durable event, unlink,
+                    // exit 0. No respond() — a signal has nobody to answer. A
+                    // second signal racing this stop just writes a byte nobody
+                    // reads; the fd dies with us. In-flight connection events
+                    // later in this same batch are dropped, exactly as the
+                    // ConnState::Stop arm drops them — durable truth is
+                    // already appended.
+                    stop(ledger, socket_path)?;
+                    return Ok(());
                 }
                 token => {
                     let Some(mut conn) = conns.remove(&token) else {
@@ -597,19 +628,28 @@ fn drain_lines(
     Ok(None)
 }
 
-/// Drain the SIGCHLD self-pipe (signal deliveries coalesce; one byte or
-/// many, one sweep of try_wait covers them all).
-fn drain_signal_pipe(stream: &mut UnixStream) -> Result<()> {
+/// Drain a signal self-pipe, returning how many bytes it held (signal
+/// deliveries coalesce; one byte or many, one sweep of the service path
+/// covers them all).
+///
+/// The count is what lets a caller distinguish a real delivery from a
+/// spurious readable — mio documents that readiness events MAY be spurious.
+/// SIGCHLD ignores it (a wasted try_wait sweep reaps nothing and is
+/// harmless); SIGTERM/SIGINT must not, because its service path exits the
+/// daemon. Drain first, then act, is also signal-hook's prescribed order for
+/// its `pipe` module.
+fn drain_signal_pipe(stream: &mut UnixStream, which: &str) -> Result<usize> {
     let mut buf = [0u8; 64];
+    let mut drained = 0usize;
     loop {
         match stream.read(&mut buf) {
             // the write end lives in the signal handler for the process
             // lifetime; 0 is unreachable-but-safe
-            Ok(0) => return Ok(()),
-            Ok(_) => {}
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+            Ok(0) => return Ok(drained),
+            Ok(n) => drained += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(drained),
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(e).context("draining the SIGCHLD pipe"),
+            Err(e) => return Err(e).with_context(|| format!("draining the {which} pipe")),
         }
     }
 }
