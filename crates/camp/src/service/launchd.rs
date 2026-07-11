@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use super::CampId;
-use super::runner::CommandRunner;
+use super::runner::{CommandRunner, run_checked};
 use super::supervisor::{InstalledUnit, Supervisor, UnitState, scan_units};
 
 /// Every camp unit's label starts with this — `camp service list` finds
@@ -37,6 +37,11 @@ impl<'a> Launchd<'a> {
     /// launchd's service target: `gui/<uid>/<label>`.
     fn service_target(&self, id: &CampId) -> String {
         format!("gui/{}/{}", self.uid, self.label(id))
+    }
+
+    /// launchd's per-user domain target.
+    fn domain(&self) -> String {
+        format!("gui/{}", self.uid)
     }
 }
 
@@ -114,6 +119,84 @@ impl Supervisor for Launchd<'_> {
             })
             .collect()
     }
+
+    fn unit_name(&self, id: &CampId) -> String {
+        self.label(id)
+    }
+
+    fn unit_text(&self, id: &CampId, camp_root: &str, exe: &str) -> String {
+        // KeepAlive (design §4.2, always-on): the supervisor keeps campd
+        // alive; a crash is restarted. StandardErrorPath is the camp's own
+        // campd.log (CampDir::log_path) — a supervised daemon's stderr is
+        // never swallowed (invariant 3). No lossy conversion anywhere: the
+        // caller passed strings `unit_safe_str` already vouched for.
+        let log = format!("{camp_root}/campd.log");
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+    <string>daemon</string>
+    <string>--camp</string>
+    <string>{root}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>{log}</string>
+</dict>
+</plist>
+"#,
+            label = xml_escape(&self.label(id)),
+            exe = xml_escape(exe),
+            root = xml_escape(camp_root),
+            log = xml_escape(&log),
+        )
+    }
+
+    fn reload_units(&self) -> Result<()> {
+        // launchd reads the plist at bootstrap time: there is nothing to
+        // reload. Stated, not silently skipped.
+        Ok(())
+    }
+
+    fn load(&self, id: &CampId) -> Result<()> {
+        let unit_path = self.unit_path(id);
+        run_checked(
+            self.runner,
+            "launchctl",
+            &[
+                OsStr::new("bootstrap"),
+                OsStr::new(&self.domain()),
+                unit_path.as_os_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn unload(&self, id: &CampId) -> Result<()> {
+        // `bootout` on a label launchd never bootstrapped fails. We do not
+        // guess and we do not silence a failure: we ASK for the state and act
+        // on the answer. A bootout of a LOADED unit that fails is still loud.
+        if !self.state(id)?.loaded {
+            return Ok(());
+        }
+        run_checked(
+            self.runner,
+            "launchctl",
+            &[OsStr::new("bootout"), OsStr::new(&self.service_target(id))],
+        )?;
+        Ok(())
+    }
 }
 
 /// A camp path may legally contain `&` or `<`; an escaped plist must survive
@@ -122,6 +205,15 @@ fn xml_unescape(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")
+}
+
+/// XML text escaping for the plist. A camp path may legally contain `&` or
+/// `<`; an unescaped one is a corrupt plist launchd refuses to load. `&` FIRST
+/// (it is the escape introducer), the inverse of `xml_unescape`.
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -239,6 +331,118 @@ mod tests {
         assert!(
             missing.installed().unwrap().is_empty(),
             "no unit dir = no units"
+        );
+    }
+
+    /// Design §5: `ProgramArguments = camp daemon --camp <dir>`, `RunAtLoad`
+    /// plus `KeepAlive`. PURE: a path in, the plist text out. Pinned as a
+    /// golden: a supervisor's unit file is an operator-visible artifact.
+    /// Note the `&str` parameters: `unit_safe_str` has ALREADY proven the
+    /// paths are representable, so no lossy conversion can hide in here.
+    #[test]
+    fn unit_text_is_the_keepalive_launch_agent() {
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        let text = launchd.unit_text(&id(), "/Users/x/camps/dev/.camp", "/usr/local/bin/camp");
+        assert_eq!(
+            text,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gascamp.campd.dev-f9481b53</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/camp</string>
+    <string>daemon</string>
+    <string>--camp</string>
+    <string>/Users/x/camps/dev/.camp</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/x/camps/dev/.camp/campd.log</string>
+</dict>
+</plist>
+"#
+        );
+    }
+
+    /// A camp path may contain XML metacharacters. An unescaped `&` is a
+    /// corrupt plist launchd refuses — and generation must survive the round
+    /// trip back to the exact path.
+    #[test]
+    fn unit_text_escapes_xml_and_round_trips() {
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        let root = "/Users/x/camps/R&D <beta>/.camp";
+        let text = launchd.unit_text(&id(), root, "/usr/local/bin/camp");
+        assert!(text.contains("R&amp;D &lt;beta&gt;"), "{text}");
+        assert!(
+            !text.contains("R&D <beta>"),
+            "raw metacharacters leaked: {text}"
+        );
+        assert_eq!(launchd.parse_camp_root(&text).unwrap(), PathBuf::from(root));
+    }
+
+    #[test]
+    fn unit_name_is_the_launchd_label() {
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        assert_eq!(launchd.unit_name(&id()), "com.gascamp.campd.dev-f9481b53");
+    }
+
+    #[test]
+    fn load_bootstraps_the_agent_into_the_gui_domain() {
+        let fake = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        launchd.load(&id()).unwrap();
+        assert_eq!(
+            fake.call(0),
+            "launchctl bootstrap gui/501 /units/com.gascamp.campd.dev-f9481b53.plist"
+        );
+    }
+
+    /// A launchctl failure is LOUD, carrying launchd's own words.
+    #[test]
+    fn a_failed_bootstrap_is_a_loud_error() {
+        let fake = FakeRunner::new(vec![FakeRunner::fail(5, "Input/output error\n")]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        let err = launchd.load(&id()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Input/output error"),
+            "must carry launchd's stderr: {msg}"
+        );
+    }
+
+    /// `bootout` on a unit launchd never bootstrapped fails. We do not guess
+    /// and we do not silence: we ASK (`state`) and act on the answer.
+    #[test]
+    fn unload_boots_out_a_loaded_unit_and_skips_an_unloaded_one() {
+        let loaded = FakeRunner::new(vec![
+            FakeRunner::ok("com.gascamp.campd.dev-f9481b53 = {\n\tstate = running\n}\n"),
+            FakeRunner::ok(""),
+        ]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &loaded);
+        launchd.unload(&id()).unwrap();
+        assert_eq!(
+            loaded.call(1),
+            "launchctl bootout gui/501/com.gascamp.campd.dev-f9481b53"
+        );
+
+        let absent = FakeRunner::new(vec![FakeRunner::fail(113, "Could not find service\n")]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &absent);
+        launchd.unload(&id()).unwrap();
+        assert_eq!(
+            absent.call_count(),
+            1,
+            "nothing to boot out: only the state query"
         );
     }
 }

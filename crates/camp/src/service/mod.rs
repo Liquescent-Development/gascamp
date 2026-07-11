@@ -19,9 +19,9 @@ pub mod runner;
 pub mod supervisor;
 pub mod systemd;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 pub use camp_id::CampId;
 pub use detect::{HostProbe, Manager, SystemProbe, detect};
@@ -71,4 +71,69 @@ fn home(probe: &dyn HostProbe) -> Result<PathBuf> {
         .env("HOME")
         .map(PathBuf::from)
         .context("$HOME is not set — cannot locate the user's unit directory")
+}
+
+/// The boundary gate for everything that enters a unit file.
+///
+/// A unit is TEXT: a launchd plist is XML, a systemd unit is line-oriented
+/// INI. A path that is not valid UTF-8 (legal on macOS and Linux), or that
+/// carries a control character, cannot be written into either without
+/// corrupting it — and a corrupt unit the manager still ACCEPTS is the worst
+/// outcome available: `install` prints "now supervised", and the supervisor
+/// respawn-throttles a campd that can never open its camp. `to_string_lossy`
+/// would do exactly that (U+FFFD for the unrepresentable bytes), which is the
+/// silent-fallback pattern invariant 5 exists to forbid. So we refuse HERE,
+/// loudly, before a single byte of unit text is generated — and `unit_text`
+/// takes `&str`, so no generator can reintroduce the lossy path.
+pub fn unit_safe_str<'a>(path: &'a Path, what: &str) -> Result<&'a str> {
+    let text = path.to_str().with_context(|| {
+        format!(
+            "the {what} path is not valid UTF-8 ({}) — no service unit can name it; \
+             move the camp to a UTF-8 path, or run `camp daemon --camp <dir>` under \
+             your own supervisor",
+            path.display()
+        )
+    })?;
+    if let Some(bad) = text.chars().find(|c| c.is_control()) {
+        bail!(
+            "the {what} path contains a control character ({bad:?}) — no service unit can \
+             name it (a launchd plist is XML; a systemd unit is line-oriented): {}",
+            path.display()
+        );
+    }
+    Ok(text)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// A unit file is TEXT — a launchd plist is XML, a systemd unit is
+    /// line-oriented INI. A path that is not valid UTF-8 (legal on macOS and
+    /// Linux), or that carries a control character, cannot be written into
+    /// either without corrupting it — and a corrupt unit the manager still
+    /// ACCEPTS is the worst outcome available: `install` prints "now
+    /// supervised", and the supervisor respawn-throttles a campd that can
+    /// never open its camp. `to_string_lossy` would do exactly that (U+FFFD
+    /// for the unrepresentable bytes), which is the silent-fallback pattern
+    /// invariant 5 exists to forbid. So we refuse HERE, loudly.
+    #[test]
+    fn a_path_that_cannot_be_written_into_a_unit_is_a_loud_error() {
+        assert_eq!(
+            unit_safe_str(Path::new("/Users/x/camps/dev/.camp"), "camp").unwrap(),
+            "/Users/x/camps/dev/.camp"
+        );
+
+        // Not valid UTF-8 (legal on macOS and Linux alike).
+        use std::os::unix::ffi::OsStrExt as _;
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/caf\xFF/.camp");
+        let err = unit_safe_str(Path::new(raw), "camp").unwrap_err();
+        assert!(format!("{err:#}").contains("not valid UTF-8"), "{err:#}");
+
+        // A control character would structurally corrupt either unit format.
+        let err = unit_safe_str(Path::new("/tmp/two\nlines/.camp"), "camp").unwrap_err();
+        assert!(format!("{err:#}").contains("control character"), "{err:#}");
+    }
 }

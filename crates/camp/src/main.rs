@@ -363,6 +363,10 @@ enum OrderCommand {
 
 #[derive(Subcommand)]
 enum ServiceCommand {
+    /// Install and start this camp's host service unit
+    Install,
+    /// Stop, unload and remove this camp's host service unit
+    Uninstall,
     /// Every camp with a managed unit, and its state (needs no camp)
     List,
 }
@@ -648,6 +652,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cmd::backup::run(&camp, dest)
         }
         Command::Service { command } => match command {
+            ServiceCommand::Install => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_install(&camp)
+            }
+            ServiceCommand::Uninstall => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_uninstall(&camp)
+            }
             // `list` is the fleet view: it deliberately does NOT resolve a
             // camp — the installed units are the registry (design §5).
             ServiceCommand::List => cmd::service::run_list(),

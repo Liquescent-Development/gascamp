@@ -44,6 +44,34 @@ pub trait Supervisor {
 
     /// Every camp unit installed for this user, read from the unit directory.
     fn installed(&self) -> Result<Vec<InstalledUnit>>;
+
+    /// PURE: the service manager's OWN name for this unit — a launchd label
+    /// (`com.gascamp.campd.<id>`), a systemd unit name (`campd-<id>.service`).
+    /// Operator-facing: every message about a unit names it.
+    fn unit_name(&self, id: &CampId) -> String;
+
+    /// PURE: the unit's text. `(camp id, camp root, camp binary) → plist /
+    /// unit file`. No IO, no environment — this is the function design §9
+    /// requires to be unit-tested without a live service manager.
+    ///
+    /// The paths arrive as `&str`, NOT `&Path`: `service::unit_safe_str` has
+    /// already proven they are representable in a unit file. A generator that
+    /// took `&Path` would need a lossy conversion, and a lossy conversion here
+    /// produces a "successfully installed" unit pointing at a directory that
+    /// does not exist (invariant 5).
+    fn unit_text(&self, id: &CampId, camp_root: &str, exe: &str) -> String;
+
+    /// Tell the service manager the unit DIRECTORY changed. Called after a
+    /// unit file is written and after one is removed. launchd reads the plist
+    /// at bootstrap, so it is a no-op there; systemd needs `daemon-reload`.
+    fn reload_units(&self) -> Result<()>;
+
+    /// Load + start an already-written unit.
+    fn load(&self, id: &CampId) -> Result<()>;
+
+    /// Stop + unload a unit. Its file is removed by the caller (the unit
+    /// directory is the registry, and the flow that owns it does the IO).
+    fn unload(&self, id: &CampId) -> Result<()>;
 }
 
 /// Shared by every supervisor: the unit DIRECTORY is the registry. Returns
