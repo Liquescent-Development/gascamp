@@ -164,14 +164,22 @@ pub struct CampdUnresponsive {
 impl std::fmt::Display for CampdUnresponsive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let secs = REQUEST_TIMEOUT.as_secs();
+        // What comes AFTER the kill. The CLI is a pure client (design §4.3), so
+        // rerunning the verb does not bring campd back — say who does. On a
+        // supervised camp the unit restarts it on its own; on a --no-service
+        // camp, in a container, or in CI there is no supervisor and `camp
+        // daemon` is the answer. Naming both is what makes this true in every
+        // camp rather than only in the supervised one.
+        let after = "the CLI never starts campd: once it is dead your supervisor brings it \
+                     back (watch it with `camp service status`), or run `camp daemon` \
+                     yourself where no service manager does";
         match self.campd_pid {
             Some(pid) => write!(
                 f,
                 "campd (pid {pid}, per the ledger's last campd.started) accepted the \
                  connection but sent no response within {secs}s — its event loop is \
                  wedged or stuck in one long operation; `kill -9 {pid}` is a supported \
-                 shutdown (crash-only: the ledger keeps the whole story), then rerun \
-                 the verb to start a fresh campd"
+                 shutdown (crash-only: the ledger keeps the whole story). {after}"
             ),
             None => write!(
                 f,
@@ -179,7 +187,7 @@ impl std::fmt::Display for CampdUnresponsive {
                  its event loop is wedged or stuck in one long operation (pid unknown: \
                  no campd.started event records one; `lsof {}` finds the holder); \
                  kill -9 it — a supported shutdown (crash-only: the ledger keeps the \
-                 whole story) — then rerun the verb to start a fresh campd",
+                 whole story). {after}",
                 self.socket.display()
             ),
         }
@@ -208,23 +216,31 @@ pub struct CampdNotRunning {
     /// Where a supervised campd's stderr lands: a crash-restart loop is
     /// visible there and nowhere else.
     pub log: std::path::PathBuf,
-    /// The pid from the ledger's last campd.started — the campd that WAS
-    /// running here (design §3). The only pid source that survives a crash:
-    /// there are no pidfiles (spec §5). None when none ever started.
-    pub last_pid: Option<u32>,
+    /// What the ledger says about the campd that WAS running here (design §3) —
+    /// a recorded pid, a ledger that holds none, or a ledger that could not be
+    /// read. The three are not interchangeable; see `LastCampd`.
+    pub last_campd: LastCampd,
 }
 
 impl std::fmt::Display for CampdNotRunning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let root = self.camp_root.display();
-        let history = match self.last_pid {
-            Some(pid) => format!(
+        let history = match &self.last_campd {
+            LastCampd::Pid(pid) => format!(
                 "the last campd here was pid {pid} (the ledger's last campd.started); \
                  that process is gone"
             ),
-            None => "no campd has ever started in this camp (no campd.started event in \
-                     the ledger)"
+            LastCampd::NeverStarted => "no campd has ever started in this camp (no \
+                                        campd.started event in the ledger)"
                 .to_owned(),
+            // Never claim the camp never ran a campd on the strength of a ledger
+            // we could not read — that is a positive claim about contents we
+            // never saw. State the ledger fault instead; it is a second, real
+            // problem the operator needs to know about.
+            LastCampd::Unknown(why) => format!(
+                "whether a campd ever started here is unknown — {why}; that is a second \
+                 fault, and worth fixing on its own"
+            ),
         };
         write!(
             f,
@@ -262,7 +278,7 @@ pub fn require(camp: &CampDir, request: &Request) -> Result<Response> {
             camp_root: camp.root.clone(),
             socket: camp.socket_path(),
             log: camp.log_path(),
-            last_pid: last_recorded_campd_pid(camp),
+            last_campd: last_campd(camp),
         })),
     }
 }
@@ -324,6 +340,55 @@ fn mark_wedge(camp: &CampDir, err: anyhow::Error) -> anyhow::Error {
     })
 }
 
+/// What the ledger can say about the campd that last ran in this camp — the
+/// only pid source that survives a crash (there are no pidfiles, spec §5).
+///
+/// THREE answers, never flattened into two. "No campd has ever started in this
+/// camp" is a positive claim about ledger CONTENTS; a camp.db that could not be
+/// read is not evidence for it, because the contents were never read. Collapsing
+/// `Unknown` into `NeverStarted` would tell an operator whose ledger is corrupt
+/// that their camp is merely fresh — a confident sentence hiding a real fault
+/// (invariant 5: no silenced errors).
+#[derive(Debug)]
+pub enum LastCampd {
+    /// The ledger's last `campd.started` recorded this pid.
+    Pid(u32),
+    /// The ledger WAS read, and it holds no `campd.started` at all.
+    NeverStarted,
+    /// The ledger could not be read, or its last `campd.started` carries no
+    /// usable pid (a pre-#55 ledger). The reason is carried, never dropped.
+    Unknown(String),
+}
+
+/// Read the ledger's account of the last campd. Infallible by construction: it
+/// decorates an error that is ALREADY being reported (a dead or wedged socket),
+/// so a ledger fault is folded into the message as `Unknown(why)` — stated, not
+/// silent — rather than replacing the fault the operator actually needs to see.
+fn last_campd(camp: &CampDir) -> LastCampd {
+    let ledger = match camp_core::ledger::Ledger::open_read_only(&camp.db_path()) {
+        Ok(ledger) => ledger,
+        Err(e) => return LastCampd::Unknown(format!("this camp's ledger could not be read: {e}")),
+    };
+    let starts = match ledger.events_of_type(camp_core::event::EventType::CampdStarted) {
+        Ok(starts) => starts,
+        Err(e) => return LastCampd::Unknown(format!("this camp's ledger could not be read: {e}")),
+    };
+    let Some(last) = starts.last() else {
+        return LastCampd::NeverStarted;
+    };
+    match last
+        .data
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    {
+        Some(pid) => LastCampd::Pid(pid),
+        None => LastCampd::Unknown(
+            "the ledger's last campd.started records no usable pid (a pre-#55 ledger)".to_owned(),
+        ),
+    }
+}
+
 /// The pid from the ledger's last campd.started event — recorded at every
 /// daemon start precisely because a WEDGED campd cannot be asked (the
 /// status op is the only other place its pid lives). Option, not Result:
@@ -331,11 +396,10 @@ fn mark_wedge(camp: &CampDir, err: anyhow::Error) -> anyhow::Error {
 /// cannot yield the pid downgrades the message to "pid unknown" (stated,
 /// not silent), never masks the wedge.
 fn last_recorded_campd_pid(camp: &CampDir) -> Option<u32> {
-    let ledger = camp_core::ledger::Ledger::open_read_only(&camp.db_path()).ok()?;
-    let starts = ledger
-        .events_of_type(camp_core::event::EventType::CampdStarted)
-        .ok()?;
-    u32::try_from(starts.last()?.data.get("pid")?.as_u64()?).ok()
+    match last_campd(camp) {
+        LastCampd::Pid(pid) => Some(pid),
+        LastCampd::NeverStarted | LastCampd::Unknown(_) => None,
+    }
 }
 
 /// The shared request body: one line out, one line back, on an
@@ -349,7 +413,17 @@ fn request_on(mut stream: UnixStream, request: &Request) -> Result<Response> {
     let mut response_line = String::new();
     BufReader::new(stream).read_line(&mut response_line)?;
     if response_line.is_empty() {
-        bail!("campd closed the connection without responding");
+        // EOF instead of a response line: campd accepted us and then went away
+        // mid-request — it exited or crashed, and a `camp service restart` or a
+        // `camp stop` racing this verb does exactly that. The CLI no longer
+        // papers over it by spawning a replacement (design §4.3), so this needs
+        // a remedy of its own: every other client-side campd fault names one.
+        bail!(
+            "campd accepted the connection and then closed it without responding — it exited \
+             or crashed mid-request (a `camp service restart` or a `camp stop` racing this \
+             verb will do exactly this). Check it is back: `camp service status`, or run \
+             `camp daemon` where no service manager does — then rerun this verb"
+        );
     }
     let response: Response = serde_json::from_str(response_line.trim_end())
         .with_context(|| format!("campd sent a malformed response: {response_line:?}"))?;
@@ -385,10 +459,16 @@ pub mod fake_campd {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A live campd. `served()` counts the requests it read and answered, so a
-    /// test can prove the verb really talked to it rather than guessing. A verb
-    /// that never connects leaves it at 0 (the server thread parks in `accept`),
-    /// which is the only thing any assertion here turns on.
+    /// A live campd. `served()` counts the requests it read and undertook to
+    /// answer, so a test can prove the verb really talked to it rather than
+    /// guessing.
+    ///
+    /// Precisely: the count is published BEFORE the response is written (it has
+    /// to be — see the server loop), so a peer that hangs up mid-write would
+    /// still be counted. No test does that, and nothing here turns on it. What
+    /// every assertion DOES turn on is the other direction, which is exact: a
+    /// verb that never connects leaves this at 0, because the server thread is
+    /// still parked in `accept`.
     pub struct FakeCampd {
         served: Arc<AtomicUsize>,
     }
@@ -621,6 +701,33 @@ mod tests {
             err.downcast_ref::<CampdUnresponsive>().is_some(),
             "typed, so a wedge is never reported as a down campd: {msg}"
         );
+        assert_wedge_text_promises_no_cli_spawn(&msg);
+    }
+
+    /// The gap a token grep cannot see. The CLI never starts campd (design
+    /// §4.3), so no error may tell the operator that running a camp verb will
+    /// — and the wedge error is where that lie survived the truth sweep, because
+    /// it phrased the promise ("rerun the verb to start a fresh campd") in words
+    /// carrying none of the sweep's tokens.
+    ///
+    /// It is not merely stale, it is CONTEXT-DEPENDENT, which is worse: on a
+    /// supervised camp KeepAlive/Restart=always happens to bring campd back, so
+    /// rerunning appears to work; on a --no-service camp, in a container, or in
+    /// CI — exactly the camps `CampdNotRunning`'s own `camp daemon` line exists
+    /// for — nothing brings it back and the advice strands the operator.
+    /// `daemon_lifecycle::camp_top_after_a_kill_dash_nine_names_the_dead_campd_pid`
+    /// does precisely what the old text instructed and asserts the rerun FAILS.
+    fn assert_wedge_text_promises_no_cli_spawn(msg: &str) {
+        assert!(
+            !msg.contains("start a fresh campd"),
+            "the wedge text must not promise that rerunning a verb starts a campd — \
+             the CLI is a pure client: {msg}"
+        );
+        assert!(
+            msg.contains("camp daemon") || msg.contains("camp service"),
+            "having killed the wedged campd, the operator needs the REAL way one comes \
+             back (the supervisor, or `camp daemon`): {msg}"
+        );
     }
 
     /// The pid-unknown flavor (no campd.started carries one — e.g. a
@@ -643,6 +750,7 @@ mod tests {
             msg.contains("pid unknown"),
             "the missing pid must be stated: {msg}"
         );
+        assert_wedge_text_promises_no_cli_spawn(&msg);
     }
 
     /// campd-not-listening is a NORMAL state for the converse verb (the
@@ -736,6 +844,42 @@ mod tests {
             msg.contains("no campd has ever started"),
             "the missing pid must be stated: {msg}"
         );
+        assert!(msg.contains("camp service status"), "{msg}");
+        assert!(msg.contains("camp daemon"), "{msg}");
+    }
+
+    /// Invariant 5, at the level of what the message CLAIMS. "No campd has ever
+    /// started in this camp (no campd.started event in the ledger)" is a positive
+    /// claim about ledger CONTENTS. A camp.db that cannot be read is not evidence
+    /// for it — the code never read the contents at all. Reporting the two as one
+    /// would tell an operator whose ledger is corrupt that their camp is merely
+    /// fresh, hiding the fault behind a confident sentence.
+    #[test]
+    fn an_unreadable_ledger_is_never_reported_as_a_camp_that_never_ran_campd() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        // A camp.db that is not a database at all.
+        std::fs::write(camp.db_path(), b"this is not a sqlite file").unwrap();
+
+        let err = require(&camp, &Request::Status).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("campd is not running"),
+            "the socket fault is still the headline: {msg}"
+        );
+        assert!(
+            !msg.contains("no campd has ever started"),
+            "an unreadable ledger must NOT be reported as a camp that never ran a campd — \
+             the code never read the events: {msg}"
+        );
+        assert!(
+            msg.contains("could not be read"),
+            "the ledger fault must be STATED, not silently downgraded: {msg}"
+        );
+        // and the remedies still reach the operator
         assert!(msg.contains("camp service status"), "{msg}");
         assert!(msg.contains("camp daemon"), "{msg}");
     }

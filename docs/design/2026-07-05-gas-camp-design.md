@@ -162,8 +162,9 @@ agent definitions.
   refuses connections is removed and the daemon restarted. A socket that
   accepts but does not answer within the CLI's request timeout is a
   wedged daemon: the verb fails loudly, naming the pid recorded in the
-  ledger's `campd.started` event — `kill -9` it (a supported shutdown)
-  and rerun the verb. No pidfiles, no lockfiles-as-status.
+  ledger's `campd.started` event — `kill -9` it (a supported shutdown);
+  the supervisor brings campd back, or you run `camp daemon` where none
+  does. No pidfiles, no lockfiles-as-status.
   (Bind-conflict detection — may a second campd start? — still keys on
   accept-ability alone: a wedged daemon owns its socket until the
   operator kills it; auto-replacing it would hide the wedge.)
