@@ -394,6 +394,24 @@ fn camp_top_after_a_kill_dash_nine_names_the_dead_campd_pid() {
     );
 }
 
+/// `camp adopt` is a socket op executed BY campd (the registry and the timers
+/// live in its memory), so it needs the daemon. Pure client: campd down is a
+/// loud, actionable error — never a fresh daemon started behind the operator's
+/// back just to answer a reconciliation request.
+#[test]
+fn camp_adopt_with_campd_down_fails_loudly_and_starts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_camp(dir.path());
+
+    let out = camp_cmd(&root).arg("adopt").output().unwrap();
+
+    assert_no_campd_came_up(&root, &out, 0);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("adopted:"),
+        "nothing was adopted: the summary line must not be printed"
+    );
+}
+
 /// The happy path, unchanged: against a running campd, `camp top` is one
 /// status query rendered as plain text.
 #[test]
