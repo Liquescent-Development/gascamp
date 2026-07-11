@@ -2,13 +2,13 @@
 //! `~/Library/LaunchAgents/com.gascamp.campd.<camp-id>.plist`.
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use super::CampId;
 use super::runner::{CommandRunner, run_checked};
-use super::supervisor::{InstalledUnit, Supervisor, UnitState, scan_units};
+use super::supervisor::{Supervisor, UnitState};
 
 /// Every camp unit's label starts with this — `camp service list` finds
 /// managed camps by it (design §5).
@@ -50,9 +50,16 @@ impl Supervisor for Launchd<'_> {
         "launchd"
     }
 
-    fn unit_path(&self, id: &CampId) -> PathBuf {
-        self.unit_dir
-            .join(format!("{LABEL_PREFIX}{id}{PLIST_SUFFIX}"))
+    fn unit_dir(&self) -> &Path {
+        &self.unit_dir
+    }
+
+    fn unit_prefix(&self) -> &str {
+        LABEL_PREFIX
+    }
+
+    fn unit_suffix(&self) -> &str {
+        PLIST_SUFFIX
     }
 
     fn parse_camp_root(&self, unit_text: &str) -> Result<PathBuf> {
@@ -86,38 +93,32 @@ impl Supervisor for Launchd<'_> {
                 detail: out.stderr.trim().to_owned(),
             });
         }
+        // F2 fix: a successful `launchctl print` with no `state = ` line is
+        // not a real answer to fabricate a placeholder for — `detail`'s
+        // whole contract is the manager's OWN words, verbatim (invariant 3),
+        // and a synthesized "state = unknown" would be handed back as if
+        // launchd had said it. launchd always prints `state = ` for a label
+        // it recognizes (the `!out.success()` branch above already covers
+        // "launchd doesn't know this label"), so a successful print with no
+        // such line is a genuine surprise — a launchd output-format change,
+        // or a test double that got the shape wrong — worth failing loudly
+        // on, never guessing past (invariant 5).
         let state_line = out
             .stdout
             .lines()
             .map(str::trim)
             .find(|line| line.starts_with("state = "))
-            .unwrap_or("state = unknown");
+            .with_context(|| {
+                format!(
+                    "launchctl print {target} succeeded but printed no `state = ` line:\n{}",
+                    out.stdout
+                )
+            })?;
         Ok(UnitState {
             loaded: true,
             running: state_line == "state = running",
             detail: state_line.to_owned(),
         })
-    }
-
-    fn installed(&self) -> Result<Vec<InstalledUnit>> {
-        scan_units(&self.unit_dir, LABEL_PREFIX, PLIST_SUFFIX)?
-            .into_iter()
-            .map(|(id, unit_path, text)| {
-                let camp_root = self
-                    .parse_camp_root(&text)
-                    .with_context(|| format!("reading {}", unit_path.display()))?;
-                // Recomputed via the trait method, not the raw scan result:
-                // `unit_path` IS the source of truth for where a unit lives
-                // (it is also how a future `install`/`uninstall` will find
-                // it), and scan_units necessarily agrees since it matches
-                // files by this same prefix/suffix.
-                Ok(InstalledUnit {
-                    unit_path: self.unit_path(&id),
-                    id,
-                    camp_root,
-                })
-            })
-            .collect()
     }
 
     fn unit_name(&self, id: &CampId) -> String {
@@ -326,6 +327,27 @@ mod tests {
         let state = launchd.state(&id()).unwrap();
         assert!(!state.loaded && !state.running, "{state:?}");
         assert_eq!(state.detail, "Could not find service");
+    }
+
+    /// F2 fix: a successful `launchctl print` with no `state = ` line must
+    /// never be papered over with a fabricated "state = unknown" — `detail`'s
+    /// whole contract (supervisor.rs doc) is the manager's OWN words,
+    /// verbatim. This case is a genuine surprise (launchd always prints
+    /// `state = ` for a label it recognizes; the "doesn't know this label"
+    /// case is the separate `!out.success()` branch), so it bails loudly
+    /// instead of guessing (invariant 5).
+    #[test]
+    fn state_bails_loudly_when_launchctl_print_has_no_state_line() {
+        let weird = FakeRunner::new(vec![FakeRunner::ok(
+            "com.gascamp.campd.dev-f9481b53 = {\n\tpid = 4242\n}\n",
+        )]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &weird);
+        let err = launchd.state(&id()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no `state = ` line"),
+            "must fail loudly, not fabricate a placeholder: {msg}"
+        );
     }
 
     /// `list`'s source of truth: the unit DIRECTORY. Files that are not ours

@@ -32,8 +32,27 @@ pub trait Supervisor {
     /// "launchd" | "systemd" — for operator-facing messages.
     fn name(&self) -> &'static str;
 
-    /// PURE: where this camp's unit file lives.
-    fn unit_path(&self, id: &CampId) -> PathBuf;
+    /// The directory this supervisor's unit files live in — the shared base
+    /// the default `unit_path` and `installed` below are built from.
+    fn unit_dir(&self) -> &Path;
+
+    /// The filename prefix common to every unit this supervisor manages
+    /// (`com.gascamp.campd.` for launchd, `campd-` for systemd).
+    fn unit_prefix(&self) -> &str;
+
+    /// The filename suffix common to every unit this supervisor manages
+    /// (`.plist` for launchd, `.service` for systemd).
+    fn unit_suffix(&self) -> &str;
+
+    /// PURE: where this camp's unit file lives —
+    /// `unit_dir`/`unit_prefix``id``unit_suffix`. The same shape for every
+    /// supervisor, so a third (a container supervisor, a BSD rc) needs only
+    /// the three accessors above, per this module's doc: a default built
+    /// from them, so no impl repeats it.
+    fn unit_path(&self, id: &CampId) -> PathBuf {
+        let (prefix, suffix) = (self.unit_prefix(), self.unit_suffix());
+        self.unit_dir().join(format!("{prefix}{id}{suffix}"))
+    }
 
     /// PURE: the camp root recorded in an installed unit's text — the exact
     /// inverse of `unit_text`. The unit is the source of truth.
@@ -43,7 +62,28 @@ pub trait Supervisor {
     fn state(&self, id: &CampId) -> Result<UnitState>;
 
     /// Every camp unit installed for this user, read from the unit directory.
-    fn installed(&self) -> Result<Vec<InstalledUnit>>;
+    /// A default built from `scan_units` plus the three accessors above —
+    /// every supervisor's `installed` was byte-identical in shape; this is
+    /// now the one place that shape lives. `unit_path` is recomputed via the
+    /// trait method, not the raw scan result: `unit_path` IS the source of
+    /// truth for where a unit lives (it is also how `install`/`uninstall`
+    /// find it), and `scan_units` necessarily agrees since it matches files
+    /// by this same prefix/suffix.
+    fn installed(&self) -> Result<Vec<InstalledUnit>> {
+        scan_units(self.unit_dir(), self.unit_prefix(), self.unit_suffix())?
+            .into_iter()
+            .map(|(id, unit_path, text)| {
+                let camp_root = self
+                    .parse_camp_root(&text)
+                    .with_context(|| format!("reading {}", unit_path.display()))?;
+                Ok(InstalledUnit {
+                    unit_path: self.unit_path(&id),
+                    id,
+                    camp_root,
+                })
+            })
+            .collect()
+    }
 
     /// PURE: the service manager's OWN name for this unit — a launchd label
     /// (`com.gascamp.campd.<id>`), a systemd unit name (`campd-<id>.service`).

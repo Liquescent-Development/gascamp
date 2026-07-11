@@ -83,11 +83,29 @@
 //!     tracking (also mask-aware) is what lets it tell a fn's own body apart
 //!     from the next top-level item, so blocks/closures *inside* a test body
 //!     never reset which function's `#[ignore]` is in scope.
+//!   - It is a TEXTUAL scan for the literal argument `"init"`, not a compiler:
+//!     an argv built from a `const` or a variable and handed to `.arg(…)`
+//!     (e.g. `const INIT: &str = "init"; cmd.arg(INIT)`) never spells the
+//!     text `"init"` at the call site, so this scan is blind to it — the
+//!     call would run a bare `camp init` with no `--no-service` and no
+//!     marker, and pass silently.
+//!   - Likewise for a macro: an argv assembled inside a macro invocation that
+//!     never spells `.arg(`/`.args(` as source text in this file (e.g. a
+//!     helper macro that expands to an `.arg(...)` call the scan never sees
+//!     verbatim) is invisible too, for the same reason — the predicate looks
+//!     for the literal tokens `"init"` and `.arg(`/`.args(` in this file's
+//!     text, not for what any macro expands to.
 //!
 //! The scan is also NON-RECURSIVE: it reads only the files directly inside
 //! `crates/camp/tests/`, not subdirectories (e.g. `tests/fixtures/`). Today
 //! nothing under a subdirectory is a `.rs` file that could hide a call site;
-//! if that ever changes, this scan must be taught to recurse.
+//! if that ever changes, this scan must be taught to recurse. It likewise
+//! never looks inside `crates/camp/src/**` — a `#[cfg(test)]` unit test
+//! living next to the code it tests is invisible to this gate no matter what
+//! it shells out to. Today that is exhaustive: every camp-init call site this
+//! suite needs already lives under `crates/camp/tests/`. If a future `src/`
+//! test ever shells out to `camp init`, it would bypass this gate silently —
+//! this scan would need to be taught to look there too.
 
 use std::path::Path;
 

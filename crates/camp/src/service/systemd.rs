@@ -3,13 +3,13 @@
 //! (default `~/.config/systemd/user`).
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use super::CampId;
 use super::runner::{CommandRunner, run_checked};
-use super::supervisor::{InstalledUnit, Supervisor, UnitState, scan_units};
+use super::supervisor::{Supervisor, UnitState};
 
 /// Every camp unit's name starts with this — `camp service list` finds
 /// managed camps by it (design §5).
@@ -32,8 +32,16 @@ impl Supervisor for Systemd<'_> {
         "systemd"
     }
 
-    fn unit_path(&self, id: &CampId) -> PathBuf {
-        self.unit_dir.join(self.unit_name(id))
+    fn unit_dir(&self) -> &Path {
+        &self.unit_dir
+    }
+
+    fn unit_prefix(&self) -> &str {
+        UNIT_PREFIX
+    }
+
+    fn unit_suffix(&self) -> &str {
+        UNIT_SUFFIX
     }
 
     fn parse_camp_root(&self, unit_text: &str) -> Result<PathBuf> {
@@ -83,27 +91,6 @@ impl Supervisor for Systemd<'_> {
             running: active == "active",
             detail: format!("LoadState={load} ActiveState={active} SubState={sub}"),
         })
-    }
-
-    fn installed(&self) -> Result<Vec<InstalledUnit>> {
-        scan_units(&self.unit_dir, UNIT_PREFIX, UNIT_SUFFIX)?
-            .into_iter()
-            .map(|(id, unit_path, text)| {
-                let camp_root = self
-                    .parse_camp_root(&text)
-                    .with_context(|| format!("reading {}", unit_path.display()))?;
-                // Recomputed via the trait method, not the raw scan result:
-                // `unit_path` IS the source of truth for where a unit lives
-                // (it is also how a future `install`/`uninstall` will find
-                // it), and scan_units necessarily agrees since it matches
-                // files by this same prefix/suffix.
-                Ok(InstalledUnit {
-                    unit_path: self.unit_path(&id),
-                    id,
-                    camp_root,
-                })
-            })
-            .collect()
     }
 
     fn unit_name(&self, id: &CampId) -> String {

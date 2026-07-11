@@ -29,9 +29,20 @@ fn service_list_is_a_read_only_query_that_needs_no_camp() {
         .get_output()
         .stdout
         .clone();
+    let out = String::from_utf8_lossy(&out).into_owned();
+    // F7 fix: a bare non-empty check would pass on almost any regression
+    // (even a stray newline). This must stay host-independent — it has to
+    // pass on a Linux CI runner with NO service manager AND on macOS WITH
+    // one — so assert on the UNION of `list`'s legitimate answers
+    // (crates/camp/src/cmd/service.rs::list), not on one host's: either it
+    // says outright that no host service manager was detected, or it names
+    // the manager it found (whether there are zero managed units or some).
+    let no_manager = out.contains("no host service manager detected");
+    let no_managed_units = out.contains("no camps have a managed");
+    let names_a_manager = out.contains("launchd") || out.contains("systemd");
     assert!(
-        !String::from_utf8_lossy(&out).trim().is_empty(),
-        "list must answer the query (managed units, or why there are none)"
+        no_manager || no_managed_units || names_a_manager,
+        "list must name the manager it found, or say why there is none: {out}"
     );
 }
 

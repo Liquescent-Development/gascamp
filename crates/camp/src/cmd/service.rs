@@ -304,7 +304,15 @@ pub fn status(supervisor: Option<&dyn Supervisor>, camp: &CampDir) -> Result<Str
         // the report INTO the error instead: both truths reach the operator,
         // the campd fault (and its remedy) survives verbatim as the error's
         // cause, and the non-zero exit is untouched.
-        Err(campd_error) => return Err(campd_error.context(report)),
+        //
+        // F4 fix: `report` ends in `\n` (every line above is pushed with a
+        // trailing newline), so handing it to `.context()` unchanged makes
+        // anyhow's `: `-joined chain render a line that starts bare with
+        // `: campd (pid …) …` — the wedge error, the flagship error this
+        // whole feature exists to surface, reading as garbage. Trim the
+        // trailing newline first so the chain joins onto the report's last
+        // real line instead.
+        Err(campd_error) => return Err(campd_error.context(report.trim_end().to_owned())),
     }
     Ok(report)
 }
@@ -464,7 +472,21 @@ mod tests {
 
         let report = list(Some(&launchd)).unwrap();
         assert!(report.contains("dev-f9481b53"), "{report}");
-        assert!(report.contains("running"), "{report}");
+        // F5 fix (mirrors the `status` twin fix, finding 2): `report.contains
+        // ("running")` is near-vacuous — `state.detail` carries launchd's
+        // raw "state = running" text regardless of what `mark` computed, so
+        // a `mark` bug that always rendered "loaded"/"not loaded" would
+        // still leave a "running" substring sitting in the detail bracket.
+        // Assert the computed mark AND the manager's own detail separately,
+        // so a broken loaded/running parse fails this test.
+        assert!(
+            report.contains("dev-f9481b53  running  "),
+            "the computed mark must be exactly \"running\": {report}"
+        );
+        assert!(
+            report.contains("[state = running]"),
+            "the manager's own detail: {report}"
+        );
         assert!(report.contains("/Users/x/camps/dev/.camp"), "{report}");
         assert!(
             report.contains("com.gascamp.campd.dev-f9481b53.plist"),
@@ -861,6 +883,16 @@ mod tests {
         assert!(
             msg.contains("wedged") && msg.contains("kill -9"),
             "the campd fault must still be reported, with its remedy: {msg}"
+        );
+        // F4 fix: `report` (the unit half) ends in `\n`; folded into the
+        // error unchanged, anyhow's `: `-joined chain would render a line
+        // starting bare with `: campd (pid …) …` — the flagship wedge error
+        // reading as garbage. `report.trim_end()` before `.context()` must
+        // leave no such dangling separator.
+        assert!(
+            !msg.contains("\n: "),
+            "the report's trailing newline must not leave a chain separator \
+             starting a bare line: {msg}"
         );
     }
 
