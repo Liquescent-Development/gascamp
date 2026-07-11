@@ -36,5 +36,7 @@ default_agent = "dev"
   (`crates/camp-core/tests/fixtures/formulas/valid/`), so it is guaranteed to
   compile under the real Gas City `gc` compiler (spec §8.2 subset invariant) —
   one source of truth, no drift.
-- `orders.toml` is an example; a powered-off or logged-out machine fires no
-  orders until wake (spec §9). Install the launchd agent for fire-at-login.
+- `orders.toml` is an example; a powered-off or sleeping machine fires no
+  orders until wake (spec §9). A supervised campd (`camp init`, or `camp
+  service install` on an existing camp) fires them from login onward — no
+  `camp` command needed first.

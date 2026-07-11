@@ -46,7 +46,8 @@ fleets.
   verification (`check`), bounded transient retries (`retry`), and runtime
   fan-out (`on_complete`) — all declared in TOML.
 - **Cron & event orders.** Scheduled or event-triggered formulas, including
-  while you're away, with an optional launchd agent for fire-at-login.
+  while you're away — campd is supervised (launchd, systemd `--user`, or your
+  container runtime), so orders fire whether or not you ran a `camp` command.
 
 ## Requirements
 
@@ -402,6 +403,22 @@ There is no registry file: the installed units ARE the registry, and
 > it against a live `systemd --user`. Treat Linux as un-smoke-tested until
 > someone runs `make service-e2e` there.
 
+#### In a container
+
+The container runtime is just another supervisor: campd is the container's main
+process, `restart: unless-stopped` is its KeepAlive, and `docker stop` is a
+SIGTERM campd answers gracefully. A reference `Dockerfile`, entrypoint and
+`compose.yaml` ship in [contrib/docker/](contrib/docker/README.md):
+
+    docker compose -f contrib/docker/compose.yaml up -d --build
+    docker exec gascamp camp sling "fix the flaky auth test"
+    docker stop gascamp     # graceful: campd.stopped in the ledger, exit 0
+
+The CLI is a pure socket client, so drive the camp with `docker exec` — that
+puts the CLI on the same side of `<camp>/campd.sock` as campd. Reaching the
+socket from the host means bind-mounting the camp dir and works only on a native
+Linux host; cross-host access is out of scope (there is no network transport).
+
 ### Formulas & graph execution
 
 For work bigger than one step, a **formula** is a dependency-gated graph. Camp
@@ -476,10 +493,13 @@ Cron orders are a min-heap of deadlines — a timer, not a tick — with a
 catch-up window for fires missed while asleep. Event orders match on the same
 post-commit path as readiness, so they add no standing cost. **Away-mode is the
 same code path**: orders fire, `campd` dispatches headless workers, everything
-lands in the ledger. Honest limits: with the default on-demand daemon, orders
-fire only while `campd` is running; install the optional launchd agent
-([contrib/launchd/](contrib/launchd/README.md)) for fire-at-login coverage; a
-powered-off laptop fires nothing until wake.
+lands in the ledger. Honest limits: a supervised campd (`camp service install`,
+or a container with `restart: unless-stopped`) is kept alive by its supervisor,
+so orders fire at login, after a crash, and after a reboot without you running
+anything. Where there is no supervisor — CI, a bare box, a container you did not
+keep running — orders fire only while a `camp daemon` you started is alive. And
+a powered-off or sleeping machine fires nothing until wake, when the catch-up
+window applies.
 
 ### Packs & the Claude Code plugin
 
