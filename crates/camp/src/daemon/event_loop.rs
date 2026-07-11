@@ -30,7 +30,8 @@ const LISTENER: Token = Token(0);
 /// The notify→mio self-pipe (camp.toml watch). Authoritative campd token
 /// layout (lead ruling, PR #13 review MEDIUM 4; Phase 11 plan Decision I,
 /// approved): 0 = listener, 1 = config watch, 2 = Phase 8's SIGCHLD
-/// self-pipe, 3 = Phase 11's patrol transcript-watch self-pipe, 4+ =
+/// self-pipe, 3 = Phase 11's patrol transcript-watch self-pipe, 4 = Phase
+/// 1's SIGTERM/SIGINT self-pipe (campd service management), 5+ =
 /// connections. Coordinate with the lead before renumbering.
 const CONFIG_WATCH: Token = Token(1);
 /// Phase 8's SIGCHLD self-pipe (worker death detection, spec §10.1), per
@@ -39,6 +40,10 @@ const SIGCHLD: Token = Token(2);
 /// Phase 11's patrol transcript-watch self-pipe (spec §10.2), per the
 /// shared token layout above.
 const PATROL_WATCH: Token = Token(3);
+/// SIGTERM/SIGINT self-pipe (Phase 1, campd service management): a
+/// supervisor stops campd with SIGTERM; SIGINT is Ctrl-C on a foreground
+/// `camp daemon`. Both run the same graceful stop as Request::Stop.
+const SIGTERM_SIG: Token = Token(4);
 
 /// Upper bound on a single request line (PR #8 review finding 3). Real
 /// requests are tens of bytes; the cap keeps a broken or hostile client
@@ -85,6 +90,7 @@ enum ConnState {
 pub fn run(
     mut listener: UnixListener,
     sigchld: std::os::unix::net::UnixStream,
+    sigterm: std::os::unix::net::UnixStream,
     socket_path: &Path,
     ledger: &mut Ledger,
     processor: &mut ReadinessProcessor,
@@ -111,15 +117,19 @@ pub fn run(
     poll.registry()
         .register(patrol_rx, PATROL_WATCH, Interest::READABLE)
         .context("registering the patrol watch pipe")?;
+    let mut sigterm = UnixStream::from_std(sigterm);
+    poll.registry()
+        .register(&mut sigterm, SIGTERM_SIG, Interest::READABLE)
+        .context("registering the SIGTERM pipe")?;
     // The connection map is bounded by the process fd limit — the natural
     // cap for a single-user local socket. An artificial cap was considered
     // (PR #8 review finding 3) and rejected: it would reject legitimate
     // bursts, and per-connection memory is already bounded by
     // MAX_REQUEST_BYTES.
     let mut conns: HashMap<Token, Conn> = HashMap::new();
-    // Tokens 2 and 3 are RESERVED (SIGCHLD, patrol watch — the layout
-    // above); connections start at 4.
-    let mut next_token = 4usize;
+    // Tokens 2–4 are RESERVED (SIGCHLD, patrol watch, SIGTERM/SIGINT — the
+    // layout above); connections start at 5.
+    let mut next_token = 5usize;
     let mut self_raise_budget = SELF_RAISE_BUDGET;
 
     let mut last_seen = Timestamp::now();
@@ -285,6 +295,18 @@ pub fn run(
                             graph.apply_config(runtime.config());
                         }
                     }
+                }
+                SIGTERM_SIG => {
+                    // A supervisor (or Ctrl-C) asked us to stop. Run the SAME
+                    // graceful path as Request::Stop: durable event, unlink,
+                    // exit 0. No respond() — a signal has nobody to answer.
+                    // Draining the self-pipe is moot: we are exiting, and the
+                    // fd dies with us. In-flight connection events later in
+                    // this same batch are dropped, exactly as the
+                    // ConnState::Stop arm drops them — durable truth is
+                    // already appended.
+                    stop(ledger, socket_path)?;
+                    return Ok(());
                 }
                 token => {
                     let Some(mut conn) = conns.remove(&token) else {

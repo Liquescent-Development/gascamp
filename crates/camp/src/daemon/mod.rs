@@ -75,6 +75,30 @@ pub fn run(camp: &CampDir) -> Result<()> {
         .set_nonblocking(true)
         .context("setting the SIGCHLD pipe non-blocking")?;
 
+    // SIGTERM/SIGINT self-pipe: a supervisor (launchd, systemd, the container
+    // runtime) stops a service with SIGTERM; SIGINT is Ctrl-C on a foreground
+    // `camp daemon`. Both wake the event loop to run the SAME graceful stop as
+    // the socket Request::Stop (append campd.stopped, unlink, exit 0).
+    // Registered here — after the bind, before the startup work — so a signal
+    // landing anywhere in the long startup queues a byte the first poll
+    // consumes, instead of killing us mid-catch-up. Crash-only is unchanged:
+    // SIGKILL remains a supported shutdown. The handler itself is signal-hook's
+    // one non-blocking write; all real work happens on the loop thread.
+    let (sigterm_read, sigterm_write) =
+        std::os::unix::net::UnixStream::pair().context("creating the SIGTERM pipe")?;
+    signal_hook::low_level::pipe::register(
+        signal_hook::consts::SIGTERM,
+        sigterm_write
+            .try_clone()
+            .context("cloning the SIGTERM pipe")?,
+    )
+    .context("registering the SIGTERM handler")?;
+    signal_hook::low_level::pipe::register(signal_hook::consts::SIGINT, sigterm_write)
+        .context("registering the SIGINT handler")?;
+    sigterm_read
+        .set_nonblocking(true)
+        .context("setting the SIGTERM pipe non-blocking")?;
+
     // The pid rides campd.started (issue #55): the ONE pid source that
     // survives a wedge — a wedged campd cannot answer the status op, and
     // there are no pidfiles (spec §5). Recorded after the bind wins, so
@@ -199,6 +223,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
     let result = event_loop::run(
         listener,
         sigchld_read,
+        sigterm_read,
         &socket_path,
         &mut ledger,
         &mut processor,
