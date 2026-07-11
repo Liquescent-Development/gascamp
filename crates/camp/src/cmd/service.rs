@@ -30,10 +30,16 @@ pub fn list(supervisor: Option<&dyn Supervisor>) -> Result<String> {
     let mut report = String::new();
     for unit in units {
         let state = supervisor.state(&unit.id)?;
-        let mark = match (state.loaded, state.running) {
-            (true, true) => "running",
-            (true, false) => "loaded",
-            (false, _) => "not loaded",
+        // m-A: the mark is manager-NEUTRAL. It used to render `loaded`, which
+        // means "bootstrapped" to launchd but merely "the unit file parsed" to
+        // systemd — so a systemd unit sitting in `failed` or `inactive` was
+        // marked "loaded", the exact cross-manager ambiguity that had to be
+        // driven out of the DECISION path. It has no business in the display
+        // path either. These three say the same thing about either manager.
+        let mark = match (state.running, state.will_restart_campd) {
+            (true, _) => "running",
+            (false, true) => "starting",
+            (false, false) => "stopped",
         };
         report.push_str(&format!(
             "{}  {}  {}\n  unit: {}  [{}]\n",
@@ -292,13 +298,20 @@ pub fn status(supervisor: Option<&dyn Supervisor>, camp: &CampDir) -> Result<Str
         Some(supervisor) => match managed_unit(supervisor, &camp.root)? {
             Some(unit) => {
                 let state = supervisor.state(&unit.id)?;
+                // m-B: `will-restart` is now THE variable every decision turns
+                // on — `camp stop`'s refusal, `camp service stop`'s
+                // did-I-stop-anything, `restart`'s guard, the auto-start guard.
+                // An operator who is told "camp stop refuses here" must be able
+                // to SEE why, not infer it from the manager's raw detail.
                 report.push_str(&format!(
-                    "unit:  {} ({}, {})\n       loaded={} running={}  [{}]\n",
+                    "unit:  {} ({}, {})\n       loaded={} running={} will-restart-campd={}  \
+                     [{}]\n",
                     unit.name,
                     supervisor.name(),
                     unit.path.display(),
                     state.loaded,
                     state.running,
+                    state.will_restart_campd,
                     indented_detail(&state.detail, "       ")
                 ));
             }
@@ -358,6 +371,44 @@ pub fn status(supervisor: Option<&dyn Supervisor>, camp: &CampDir) -> Result<Str
 /// path (`launchctl kickstart -k` / `systemctl --user restart`).
 pub fn restart(supervisor: &dyn Supervisor, camp_root: &Path) -> Result<String> {
     let unit = require_managed_unit(supervisor, camp_root, "`camp service install` first")?;
+    // Spec §4 decision 11: no verb takes its own word for its effect. `restart`
+    // was the last one that did.
+    //
+    // The guard is NOT `install`/`start`'s "is anything listening?" — for a
+    // restart, a listening campd is the NORMAL precondition: it is the
+    // supervised one we are cycling. Refusing on that would break the verb's
+    // entire primary use case (the post-upgrade cycle `install` itself
+    // advertises). The dangerous state is the CONJUNCTION: a campd on the
+    // socket that the manager is demonstrably NOT holding up.
+    //
+    // `systemctl --user restart` STARTS an inactive unit, so cycling there
+    // hands the supervisor a campd that can never bind the socket the orphan
+    // owns: it exits, `Restart=always` respawns it every second, and the unit
+    // hits its start limit and lands in `failed` — under a "restarted" the
+    // operator was told to trust.
+    if !supervisor.state(&unit.id)?.will_restart_campd {
+        if let Some(pid) = listening_campd_pid(camp_root)? {
+            bail!(
+                "a campd is listening on this camp's socket (pid {pid}) that {mgr} is not \
+                 running — cycling the unit cannot restart it, and would hand {mgr} a campd \
+                 that can never bind this socket ({policy} would then respawn it until the \
+                 unit fails).\n       Stop it first: camp stop\n       Then: camp service \
+                 start",
+                mgr = supervisor.name(),
+                policy = supervisor.restart_policy(),
+            );
+        }
+        // m-D: nothing is running, so there is nothing to cycle. launchd said
+        // so with a raw `kickstart` failure ("Could not find service") naming
+        // no remedy; systemd silently started the unit instead. Both managers
+        // now give the same answer, and it names the verb that does the job.
+        bail!(
+            "the {mgr} unit {name} is not running — there is nothing to restart.\n       \
+             Start it: camp service start",
+            mgr = supervisor.name(),
+            name = unit.name,
+        );
+    }
     supervisor.restart(&unit.id)?;
     Ok(format!(
         "restarted {} unit {} ({})\n",
@@ -399,6 +450,16 @@ fn listening_campd_pid(camp_root: &Path) -> Result<Option<u32>> {
 /// This is not a hypothetical: it is the UPGRADE path. Every camp that exists
 /// today has an auto-started, unsupervised campd, or was created with
 /// `--no-service` and is running one from the `camp daemon` hand-off.
+///
+/// m-E: this is a check-then-act, so it is TOCTOU against a campd that starts
+/// between the probe and the manager's load — an auto-starting verb racing an
+/// `install` in another terminal. It is not a redesign candidate: the race
+/// loses to `bind_or_replace`, which is the actual authority (the loser exits
+/// rather than take a live socket), so the outcome is the respawn loop this
+/// check exists to prevent — merely by a much narrower window, and reported by
+/// `camp service status` rather than by this verb. Closing it properly means
+/// holding the camp's bind lock across the install, which is Phase 3 territory
+/// (it is the same lock the auto-start path will stop needing).
 fn refuse_if_a_campd_holds_the_socket(
     supervisor: &dyn Supervisor,
     camp_root: &Path,
@@ -446,21 +507,6 @@ pub fn stop(supervisor: &dyn Supervisor, camp: &CampDir) -> Result<String> {
     if was_supervised {
         supervisor.stop(&unit.id)?;
     }
-    if let Some(pid) = listening_campd_pid(&camp.root)? {
-        bail!(
-            "the {mgr} unit {name} is {unit_state}, but a campd is STILL listening on this \
-             camp's socket (pid {pid}) — stopping the unit did not stop it, so it is not the \
-             campd {mgr} manages (a hand-run `camp daemon`, or one auto-started before the unit \
-             was installed).\n       To stop it: camp stop",
-            mgr = supervisor.name(),
-            name = unit.name,
-            unit_state = if was_supervised {
-                "stopped"
-            } else {
-                "not running"
-            },
-        );
-    }
     let headline = if was_supervised {
         format!(
             "stopped {} unit {} ({})",
@@ -476,13 +522,29 @@ pub fn stop(supervisor: &dyn Supervisor, camp: &CampDir) -> Result<String> {
             unit.path.display()
         )
     };
-    // The durability caveat is part of the effect, so it is stated: neither
-    // manager forgets a stopped-but-installed unit across a login.
-    Ok(format!(
-        "{headline}\nthe unit is still installed — `camp service start` brings campd back, and \
-         the host starts it again at your next login; `camp service uninstall` removes it for \
-         good\n"
-    ))
+    // m-F: the unit half of the answer is TRUE and already known — the unit
+    // really was stopped. A wedged campd on the socket check (accepts, never
+    // answers → CampdUnresponsive) must still fail this command loudly, but
+    // losing that fact to a bare `?` would hide it behind the campd fault. Fold
+    // it into the error, exactly as `status` does: both truths reach the
+    // operator, the campd fault survives verbatim as the cause, and the
+    // non-zero exit is untouched.
+    match listening_campd_pid(&camp.root).map_err(|e| e.context(headline.clone()))? {
+        Some(pid) => bail!(
+            "{headline}, but a campd is STILL listening on this camp's socket (pid {pid}) — \
+             stopping the unit did not stop it, so it is not the campd {mgr} manages (a hand-run \
+             `camp daemon`, or one auto-started before the unit was installed).\n       To stop \
+             it: camp stop",
+            mgr = supervisor.name(),
+        ),
+        // The durability caveat is part of the effect, so it is stated: neither
+        // manager forgets a stopped-but-installed unit across a login.
+        None => Ok(format!(
+            "{headline}\nthe unit is still installed — `camp service start` brings campd back, \
+             and the host starts it again at your next login; `camp service uninstall` removes \
+             it for good\n"
+        )),
+    }
 }
 
 /// `camp service start` (operator decision, 2026-07-10): start a stopped but
@@ -1097,15 +1159,25 @@ mod tests {
         let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
         install(&launchd, camp_dir.path(), Path::new("/usr/local/bin/camp")).unwrap();
 
-        let restart_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        // The unit is bootstrapped and running — the supervisor IS holding
+        // campd up, which is the only state in which cycling it means anything.
+        let restart_runner = FakeRunner::new(vec![
+            FakeRunner::ok("service = {\n\tstate = running\n}\n"),
+            FakeRunner::ok(""),
+        ]);
         let launchd = Launchd::new(units.path().to_path_buf(), 501, &restart_runner);
         let report = restart(&launchd, camp_dir.path()).unwrap();
         assert!(
+            restart_runner.call(0).starts_with("launchctl print "),
+            "the state is asked BEFORE the unit is cycled: {}",
+            restart_runner.call(0)
+        );
+        assert!(
             restart_runner
-                .call(0)
+                .call(1)
                 .starts_with("launchctl kickstart -k "),
             "{}",
-            restart_runner.call(0)
+            restart_runner.call(1)
         );
         assert!(report.contains("restarted"), "{report}");
     }
@@ -1239,6 +1311,88 @@ mod tests {
             runner.call_count(),
             1,
             "only the state query — nothing to boot out: {report}"
+        );
+    }
+
+    /// IMPORTANT (review round 3). `restart` was the one verb in the group left
+    /// taking its own word for its effect — the rule spec §4 decision 11 (added
+    /// by this very branch) states universally.
+    ///
+    /// systemd: `systemctl --user restart` STARTS an inactive unit. So on a camp
+    /// whose unit is stopped but whose socket a hand-run `camp daemon` holds —
+    /// reachable with documented commands and no operator error — restart handed
+    /// the supervisor a campd that could never bind: it exits, `Restart=always`
+    /// respawns it every second, the unit hits its start limit and lands in
+    /// `failed` — and `restart` printed "restarted systemd unit …" and exited 0.
+    ///
+    /// The guard is NOT `install`'s: a listening campd is the NORMAL, expected
+    /// precondition for a restart (it is the supervised one). It is the
+    /// conjunction — a campd on the socket that the manager is demonstrably not
+    /// holding up.
+    #[test]
+    fn restart_refuses_when_a_campd_the_manager_does_not_run_holds_the_socket_systemd() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok(""), FakeRunner::ok("")]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &install_runner);
+        install(&systemd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        let campd = socket::fake_campd::serve(&camp, vec![socket::fake_campd::status(5150)]);
+        // The unit is stopped; the campd on the socket is not systemd's.
+        let runner = FakeRunner::new(vec![
+            FakeRunner::ok("LoadState=loaded\nActiveState=inactive\nSubState=dead\n"),
+            FakeRunner::ok(""), // a `systemctl restart` that must never be reached
+        ]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &runner);
+
+        let err = restart(&systemd, &camp.root).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("5150"), "must name the live campd pid: {msg}");
+        assert!(
+            msg.contains("camp stop"),
+            "must name the verb that frees the socket: {msg}"
+        );
+        assert_eq!(campd.served(), 1, "restart must ASK the socket");
+        assert_eq!(
+            runner.call_count(),
+            1,
+            "only the state query — systemd must NOT be told to restart into a taken socket"
+        );
+    }
+
+    /// The launchd twin, which also fixes m-D: on a booted-out label
+    /// `launchctl kickstart` fails with launchd's raw "Could not find service"
+    /// and names no remedy, while the same sequence on systemd silently
+    /// "worked". Both managers now say the same thing, and name the remedy.
+    #[test]
+    fn restart_on_a_stopped_unit_names_the_remedy_rather_than_the_managers_raw_error() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        install(&launchd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        // Booted out, and nothing on the socket: there is simply nothing to
+        // cycle. `camp service start` is the verb, and restart must say so.
+        let runner = FakeRunner::new(vec![FakeRunner::fail(113, "Could not find service\n")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &runner);
+
+        let err = restart(&launchd, &camp.root).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("camp service start"),
+            "must name the remedy, not just relay the manager's raw error: {msg}"
+        );
+        assert_eq!(
+            runner.call_count(),
+            1,
+            "only the state query — nothing to kickstart"
         );
     }
 

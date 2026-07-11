@@ -122,9 +122,11 @@ manageability, reliable order firing, and native container fit.
     supervisor answers for itself — *not* on the unit file existing, and *not* on a
     single shared "loaded" flag, because the two managers do not mean the same thing
     by it. launchd: a **bootstrapped** label, since `KeepAlive` is unconditional.
-    systemd: an **active** (or activating) unit, since `Restart=always` acts only on a
-    running unit — `LoadState=loaded` is still true of an inactive, dead or failed
-    unit and means only that the unit file parsed. When the answer is no, nothing will
+    systemd: a unit whose `ActiveState` is **`active`, `activating` or `reloading`**,
+    since `Restart=always` acts only on a running unit — `LoadState=loaded` is still
+    true of an inactive, dead or failed unit and means only that the unit file parsed.
+    (`activating` covers systemd's `auto-restart` sub-state: that IS the crash-loop,
+    and systemd will put campd back.) When the answer is no, nothing will
     undo a socket stop, so `camp stop` performs it: it is then the honest verb for a
     campd the supervisor does not own. (A refusal keyed on the unit file, or on
     `loaded`, leaves such a campd un-stoppable by any verb — `camp stop` refusing and
