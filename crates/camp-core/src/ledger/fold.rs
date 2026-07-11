@@ -427,9 +427,10 @@ struct CampdAutostarted {
     verb: String,
 }
 
-/// `campd.autostarted` is log-only: the CLI records which verb caused the
-/// spawn (spec §13.3 — every action carries its cause). The fold validates
-/// the audit payload so a malformed event fails fast.
+/// `campd.autostarted` is log-only, and HISTORICAL: nothing emits it since the
+/// CLI became a pure socket client (design §4.3). The arm stays so that ledgers
+/// written before that still fold — and it still validates the audit payload,
+/// so a malformed event fails fast, then and now.
 fn campd_autostarted(event: &Event) -> Result<(), CoreError> {
     let p: CampdAutostarted = payload(event)?;
     if p.verb.is_empty() {

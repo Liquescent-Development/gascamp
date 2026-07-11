@@ -6,15 +6,17 @@ use camp_core::pack;
 
 use crate::campdir::CampDir;
 use crate::cmd::create::resolve_rig;
-use crate::daemon::autostart;
-use crate::daemon::socket::Request;
+use crate::daemon::socket::{self, Request};
 
 /// `camp sling "<title>" [--agent a] [--rig r]` (spec §8.1, Tier 0): one
-/// `bead.created` with the routed agent stamped as assignee, then a poke
-/// that auto-starts campd if needed — sling promises dispatch, so a
-/// fire-and-forget poke is not enough (Phase 8 plan decision P). campd
-/// does the spawning; there is no second dispatch path (dispatch-lifecycle
-/// Phase 1, #29).
+/// `bead.created` with the routed agent stamped as assignee, then a poke to a
+/// RUNNING campd — sling promises dispatch, so a fire-and-forget poke is not
+/// enough (Phase 8 plan decision P). A PURE CLIENT (design §4.3): it never
+/// starts campd. A campd that cannot serve the poke fails the verb loudly —
+/// but the bead is already durable, so its id is printed FIRST and the error
+/// says the bead exists and will dispatch once campd is up and serving (spec
+/// §7.2: campd catches up from its cursor on start). campd does the spawning;
+/// there is no second dispatch path (dispatch-lifecycle Phase 1, #29).
 ///
 /// `camp sling --formula <name> [--rig r]` (spec §8.2, Phase 9 plan
 /// Decision 7): cook `<camp>/formulas/<name>.toml` into `<camp>/runs/`
@@ -39,8 +41,8 @@ pub fn run(
     }
 }
 
-/// Cook a formula run (spec §8.2): pin into runs/, materialize beads,
-/// poke with autostart. Prints "<run_id> root <root-bead>".
+/// Cook a formula run (spec §8.2): pin into runs/, materialize beads, poke a
+/// running campd. Prints "<run_id> root <root-bead>".
 fn sling_formula(camp: &CampDir, name: &str, rig: Option<String>) -> Result<()> {
     let config = CampConfig::load(&camp.config_path())?;
     let rig_cfg = resolve_rig(&config, rig.as_deref())?;
@@ -61,8 +63,17 @@ fn sling_formula(camp: &CampDir, name: &str, rig: Option<String>) -> Result<()> 
         .map(|e| e.seq)
         .unwrap_or(0);
     drop(ledger); // campd may need the write lock immediately
-    autostart::request_with_autostart(camp, &Request::Poke { seq: head }, "sling")?;
+    // The run is cooked and PINNED — durable before the poke, so print it
+    // before we can fail on a campd that cannot serve us (spec §7.2).
     println!("{} root {}", cooked.run_id, cooked.root_bead);
+    socket::require(camp, &Request::Poke { seq: head }).map_err(|e| {
+        e.context(format!(
+            "run {} is cooked and pinned, but NOT started — campd advances runs, and only \
+             a healthy, running campd can; it starts as soon as one is (campd catches up \
+             from its cursor)",
+            cooked.run_id
+        ))
+    })?;
     Ok(())
 }
 
@@ -105,7 +116,15 @@ fn sling_bead(
     })?;
     drop(ledger); // campd may need the write lock immediately
 
-    autostart::request_with_autostart(camp, &Request::Poke { seq }, "sling")?;
+    // The bead is DURABLE now: print it before the poke, so a campd that
+    // cannot serve us costs the operator the dispatch and never the id.
     println!("{id}");
+    socket::require(camp, &Request::Poke { seq }).map_err(|e| {
+        e.context(format!(
+            "{id} is created and durable, but NOT dispatched — sling promises dispatch, and \
+             only a healthy, running campd dispatches; it runs as soon as one is (campd \
+             catches up from its cursor on start)"
+        ))
+    })?;
     Ok(())
 }
