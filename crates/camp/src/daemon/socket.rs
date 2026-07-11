@@ -385,8 +385,10 @@ pub mod fake_campd {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A live campd. `served()` counts the requests it actually ANSWERED, so a
-    /// test can prove the verb really talked to it rather than guessing.
+    /// A live campd. `served()` counts the requests it read and answered, so a
+    /// test can prove the verb really talked to it rather than guessing. A verb
+    /// that never connects leaves it at 0 (the server thread parks in `accept`),
+    /// which is the only thing any assertion here turns on.
     pub struct FakeCampd {
         served: Arc<AtomicUsize>,
     }
@@ -421,10 +423,19 @@ pub mod fake_campd {
                 }
                 let mut line = serde_json::to_string(&response).expect("serializing the response");
                 line.push('\n');
+                // Publish the witness BEFORE the write that unblocks the client.
+                // The client returns the moment it reads this response line, so a
+                // counter bumped AFTER the write has no happens-before edge to the
+                // test's `served()` load: the verb could finish and the assertion
+                // could run while this thread was still descheduled between the two
+                // statements (CI, both runners, PR #71). Incrementing first puts the
+                // increment strictly before the write, which is strictly before the
+                // client's read — so any client that can see the response can also
+                // see the count.
+                counter.fetch_add(1, Ordering::SeqCst);
                 if (&stream).write_all(line.as_bytes()).is_err() {
                     return;
                 }
-                counter.fetch_add(1, Ordering::SeqCst);
             }
         });
         FakeCampd { served }
