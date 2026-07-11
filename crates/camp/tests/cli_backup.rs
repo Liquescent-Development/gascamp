@@ -19,7 +19,7 @@ fn backup_writes_an_integrity_checked_copy_and_refuses_to_overwrite() {
     camp()
         .arg("--camp")
         .arg(root)
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
 

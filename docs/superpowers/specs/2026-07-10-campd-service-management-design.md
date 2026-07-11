@@ -94,8 +94,9 @@ manageability, reliable order firing, and native container fit.
    → install + start the unit (default). None detected (container/CI/minimal)
    → do not fail; print a clear hand-off (run `camp daemon` under your
    runtime). Flags `--service` (force; error if unavailable) / `--no-service`.
-5. **`camp service {install,uninstall,status,restart,list}`** is the control
-   surface; `list` is the "manage everything" view across all managed camps.
+5. **`camp service {install,uninstall,status,restart,list,stop,start}`** is the
+   control surface; `list` is the "manage everything" view across all managed
+   camps. (`stop`/`start` were added by decision 10.)
 6. **campd handles SIGTERM/SIGINT → graceful shutdown**, identical to the
    socket `Request::Stop`. Every supervisor stops a service with SIGTERM, so
    this makes campd well-behaved everywhere. (It already reaps its worker
@@ -109,6 +110,41 @@ manageability, reliable order firing, and native container fit.
    Since always-on = one process per camp, document one standalone camp with
    many `camp rig add` repos as the recommended pattern to bound daemon count;
    repo-local `.camp/` still works and costs one daemon each.
+10. **`camp stop` refuses when the supervisor would put campd straight back**
+    (operator, 2026-07-10). Always-on supervision (decision 2) means `KeepAlive` /
+    `Restart=always` restarts campd immediately after a socket `Request::Stop` — so a
+    `camp stop` that printed "campd stopped" would be a verb lying about its effect.
+    It hard-errors instead, naming the supervisor, the unit, the always-on mechanism,
+    and both remedies. On an unsupervised camp (container / CI / no manager) it is
+    unchanged.
+
+    The refusal is keyed on **"will this supervisor restart campd?"**, which each
+    supervisor answers for itself — *not* on the unit file existing, and *not* on a
+    single shared "loaded" flag, because the two managers do not mean the same thing
+    by it. launchd: a **bootstrapped** label, since `KeepAlive` is unconditional.
+    systemd: a unit whose `ActiveState` is **`active`, `activating` or `reloading`**,
+    since `Restart=always` acts only on a running unit — `LoadState=loaded` is still
+    true of an inactive, dead or failed unit and means only that the unit file parsed.
+    (`activating` covers systemd's `auto-restart` sub-state: that IS the crash-loop,
+    and systemd will put campd back.) When the answer is no, nothing will
+    undo a socket stop, so `camp stop` performs it: it is then the honest verb for a
+    campd the supervisor does not own. (A refusal keyed on the unit file, or on
+    `loaded`, leaves such a campd un-stoppable by any verb — `camp stop` refusing and
+    `camp service stop` unable to stop what it never started.)
+
+    Consequence: **`camp service stop` and `camp service start` join the §5 surface**
+    (supervisor-level: `launchctl bootout` / `bootstrap`; `systemctl --user stop` /
+    `start`), so the remedy the error names exists. Additive — nothing is removed.
+    Rationale: invariant 5 (fail fast) + invariant 3 (nothing hidden).
+
+11. **Every verb that hands campd to (or takes it from) the supervisor verifies its
+    own effect over the socket.** `camp service install` / `start` refuse when a campd
+    already holds the camp's socket: a supervised campd cannot take over a live socket
+    (§5 bind rules — it exits), and `KeepAlive` / `Restart=always` would then respawn
+    it forever while the verb reported "now supervised". `camp service stop` re-checks
+    the socket after stopping the unit and refuses to report a stop that did not
+    happen; `uninstall` reports a campd that survives it. No verb may take its own
+    word for its effect (invariants 3 and 5).
 
 ## 5. `camp service` — the control surface
 
@@ -124,7 +160,7 @@ A new subcommand group. Each operates on the resolved camp (`--camp` /
   slug of the camp's absolute path (collision-free, human-readable).
 - **`uninstall`** — stop + unload + remove the unit.
 - **`status`** — the unit's load/run state (wraps `launchctl print` /
-  `systemctl --user status`), plus the campd liveness answer (a status
+  `systemctl --user show`), plus the campd liveness answer (a status
   request on the socket).
 - **`restart`** — cycle the daemon (post-upgrade): `launchctl kickstart -k` /
   `systemctl --user restart`.
@@ -132,6 +168,11 @@ A new subcommand group. Each operates on the resolved camp (`--camp` /
   the installed units (label prefix `com.gascamp.campd.` / `campd-*.service`)
   — no separate registry file (units are the source of truth, matching the
   no-status-files principle).
+- **`stop`** — stop the supervised campd, leaving the unit INSTALLED
+  (`launchctl bootout` / `systemctl --user stop`). This is what `camp stop`
+  refuses in favor of on a supervised camp (decision 10).
+- **`start`** — start a stopped but still-installed unit (`launchctl bootstrap` /
+  `systemctl --user start`).
 
 Unit-file *generation* is pure (path in → plist/unit text out) and unit-tested;
 the `launchctl`/`systemctl` calls are thin wrappers behind a seam so the

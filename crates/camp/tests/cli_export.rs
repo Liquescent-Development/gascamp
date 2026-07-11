@@ -31,7 +31,7 @@ fn init_camp(dir: &Path) -> PathBuf {
     let status = Command::new(BIN)
         .env_remove("CAMP_DIR")
         .current_dir(dir)
-        .arg("init")
+        .args(["init", "--no-service"])
         .status()
         .unwrap();
     assert!(status.success());
@@ -218,7 +218,7 @@ fn bd_import_accepts_the_exported_jsonl() {
     std::fs::create_dir_all(&bd_home).unwrap();
     let init = Command::new("bd")
         .current_dir(&bd_home)
-        .args(["init"])
+        .args(["init"]) // not-camp: the beads CLI (`bd init`), not `camp init`
         .output()
         .unwrap();
     assert!(

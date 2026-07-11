@@ -14,7 +14,11 @@ fn camp() -> Command {
 /// Init a camp in `dir` and append two events through camp-core with a fixed
 /// clock, so CLI output is byte-deterministic.
 fn seeded_camp(dir: &std::path::Path) -> std::path::PathBuf {
-    camp().current_dir(dir).arg("init").assert().success();
+    camp()
+        .current_dir(dir)
+        .args(["init", "--no-service"])
+        .assert()
+        .success();
     let camp_root = dir.join(".camp");
     let mut ledger = Ledger::open_with_clock(
         &camp_root.join("camp.db"),
@@ -98,7 +102,7 @@ fn events_on_empty_log_prints_nothing() {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
     camp()

@@ -50,7 +50,7 @@ fn init_camp_with_rig(dir: &Path) -> PathBuf {
     let status = Command::new(BIN)
         .env_remove("CAMP_DIR")
         .current_dir(dir)
-        .arg("init")
+        .args(["init", "--no-service"])
         .status()
         .unwrap();
     assert!(status.success());

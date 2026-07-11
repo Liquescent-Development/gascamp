@@ -15,7 +15,7 @@ fn create_claim_close_stays_refold_clean_throughout() {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
     let rig_dir = dir.path().join("repo");

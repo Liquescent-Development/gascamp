@@ -45,7 +45,7 @@ fn graceful_stop_on(signal: &str) {
     let init = Command::new(BIN)
         .env_remove("CAMP_DIR")
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .status()
         .unwrap();
     assert!(init.success(), "camp init failed");

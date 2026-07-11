@@ -3,6 +3,7 @@
 mod campdir;
 mod daemon;
 mod gitignore;
+mod service;
 mod cmd {
     pub mod adopt;
     pub mod backup;
@@ -21,6 +22,7 @@ mod cmd {
     pub mod remember;
     pub mod rig;
     pub mod search;
+    pub mod service;
     pub mod session;
     pub mod show;
     pub mod sling;
@@ -35,6 +37,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use campdir::CampDir;
+use service::ServiceChoice;
 
 #[derive(Parser)]
 #[command(
@@ -55,7 +58,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create a new camp (./.camp by default; --camp DIR to choose the place)
-    Init,
+    Init {
+        /// Install and start a host service unit; a hard error when no host
+        /// service manager is available (container/CI)
+        #[arg(long, conflicts_with = "no_service")]
+        service: bool,
+        /// Do not install a host service unit (containers, CI, or by choice)
+        #[arg(long = "no-service")]
+        no_service: bool,
+    },
     /// Verify ledger invariants
     #[command(group(
         clap::ArgGroup::new("mode").required(true).args(["refold", "formula"])
@@ -273,6 +284,11 @@ enum Command {
         /// Destination file for the backup copy.
         dest: PathBuf,
     },
+    /// Manage the camp's host service unit (launchd / systemd --user)
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -352,6 +368,24 @@ enum OrderCommand {
         /// Order name from camp.toml
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install and start this camp's host service unit
+    Install,
+    /// Stop, unload and remove this camp's host service unit
+    Uninstall,
+    /// The unit's state and campd's liveness
+    Status,
+    /// Cycle the daemon (the post-upgrade path)
+    Restart,
+    /// Stop the supervised campd (the unit stays installed)
+    Stop,
+    /// Start a stopped but still-installed unit
+    Start,
+    /// Every camp with a managed unit, and its state (needs no camp)
+    List,
 }
 
 #[derive(Subcommand)]
@@ -436,7 +470,21 @@ fn run_daemon(camp_flag: Option<&Path>) -> anyhow::Result<()> {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Init => cmd::init::run(cli.camp.as_deref()),
+        Command::Init {
+            service,
+            no_service,
+        } => {
+            // Two bools at the CLI edge; ONE tri-state inside (clap already
+            // rejected the contradictory pair).
+            let choice = if service {
+                ServiceChoice::Force
+            } else if no_service {
+                ServiceChoice::Skip
+            } else {
+                ServiceChoice::Auto
+            };
+            cmd::init::run(cli.camp.as_deref(), choice)
+        }
         Command::Doctor {
             refold: _,
             repair,
@@ -634,5 +682,34 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::backup::run(&camp, dest)
         }
+        Command::Service { command } => match command {
+            ServiceCommand::Install => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_install(&camp)
+            }
+            ServiceCommand::Uninstall => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_uninstall(&camp)
+            }
+            ServiceCommand::Status => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_status(&camp)
+            }
+            ServiceCommand::Restart => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_restart(&camp)
+            }
+            ServiceCommand::Stop => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_stop(&camp)
+            }
+            ServiceCommand::Start => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_start(&camp)
+            }
+            // `list` is the fleet view: it deliberately does NOT resolve a
+            // camp — the installed units are the registry (design §5).
+            ServiceCommand::List => cmd::service::run_list(),
+        },
     }
 }

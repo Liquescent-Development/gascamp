@@ -43,7 +43,7 @@ fn camp_with_bead_in(prepare: impl Fn(&std::path::Path)) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
     let rig_dir = dir.path().join("repo");
