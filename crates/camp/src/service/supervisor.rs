@@ -84,6 +84,11 @@ pub trait Supervisor {
 
     /// Start a stopped, still-installed unit.
     fn start(&self, id: &CampId) -> Result<()>;
+
+    /// The always-on mechanism this supervisor uses to keep campd alive — the
+    /// reason a socket-level `camp stop` would be undone. Operator-facing:
+    /// `camp stop`'s refusal names it, so the operator can see WHY.
+    fn restart_policy(&self) -> &'static str;
 }
 
 /// Shared by every supervisor: the unit DIRECTORY is the registry. Returns

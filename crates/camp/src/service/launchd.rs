@@ -224,6 +224,10 @@ impl Supervisor for Launchd<'_> {
         // …and starting is bootstrapping the still-present plist back in.
         self.load(id)
     }
+
+    fn restart_policy(&self) -> &'static str {
+        "KeepAlive"
+    }
 }
 
 /// A camp path may legally contain `&` or `<`; an escaped plist must survive

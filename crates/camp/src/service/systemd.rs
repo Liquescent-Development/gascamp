@@ -225,6 +225,10 @@ impl Supervisor for Systemd<'_> {
         )?;
         Ok(())
     }
+
+    fn restart_policy(&self) -> &'static str {
+        "Restart=always"
+    }
 }
 
 /// systemd's `ExecStart` quoting, in reverse: double-quoted arguments (a camp
