@@ -8,11 +8,18 @@
 //! is about to be deleted. Every camp-init call in this suite MUST pass
 //! --no-service, and this test is what keeps that true as tests are added.
 //!
-//! An `.arg(…)`/`.args([…])` line mentioning "init" passes only if it carries
-//! ONE of three things. The two markers are NOT interchangeable, and a marker
-//! that does not describe the line it sits on is a lie that defeats the gate:
+//! A call site naming `"init"` on an `.arg(…)`/`.args([…])` chain passes only
+//! if it carries ONE of three things. The two markers are NOT interchangeable,
+//! and a marker that does not describe the call it sits on is a lie that
+//! defeats the gate:
 //!
 //!   `--no-service`     the normal case: a camp init that installs nothing.
+//!                       Must appear as an actual quoted argument
+//!                       (`"--no-service"`) in the CALL ITSELF — a comment
+//!                       that merely mentions the flag does not count (a
+//!                       stray `// TODO: --no-service` next to a bare
+//!                       `.arg("init")` is exactly the bug this gate exists
+//!                       to catch, not an excuse for it).
 //!
 //!   `// not-camp:`     it is not the camp binary at all. This suite also runs
 //!                      `git init` (many files) and one `bd init`
@@ -33,15 +40,49 @@
 //!
 //!                      Because the marker cannot verify its own precondition
 //!                      just by sitting on a line, this scan additionally
-//!                      requires that the FILE carrying a `real-manager:` line
-//!                      contain both `#[ignore` and `CAMP_SERVICE_E2E` — so the
-//!                      marker cannot be used to smuggle a bare `camp init`
-//!                      into a test that actually runs in CI.
+//!                      requires that the marker's OWN enclosing test function
+//!                      carry `#[ignore]` — not merely that the file contain
+//!                      an `#[ignore` somewhere, which a second, non-ignored
+//!                      bare init in the same file could otherwise ride along
+//!                      with — AND that the file contain `CAMP_SERVICE_E2E`.
 //!
-//! The scan is LINE-ORIENTED, not a parser: an init call split across lines
-//! (`.arg(\n    "init",\n)`) would slip past it. That is an accepted limit —
-//! every call site in this suite is single-line, and the point is to stop the
-//! easy, likely regression, not to be a Rust front end.
+//! THE SCAN IS OVER LOGICAL CALL CHAINS, NOT PHYSICAL LINES. rustfmt freely
+//! moves `"init"`, `.args([`, `--no-service`, and a trailing `// marker:`
+//! comment onto different physical lines of the same statement whenever a
+//! chain crosses its width limit (it already does this elsewhere in this very
+//! suite, e.g. cli_claim_close.rs, cli_create.rs) — a scan keyed to "does ONE
+//! physical line carry both `"init"` and `.arg(`" would go blind the moment
+//! that happens to a call site here, with no human intent required. So: each
+//! file is first split into logical units — a run of physical lines joined by
+//! tracking paren/bracket nesting (masking string-literal interiors and `//`
+//! comments first, so a bracket inside either can't perturb the count) until
+//! nesting returns to zero AND the line ends `;`, `{`, or `}` — and the
+//! `"init"`/`.arg(`/`--no-service` predicate runs against the JOINED unit, not
+//! a single line. A violation is still reported at the precise physical line
+//! that names `"init"`, not just "somewhere in this multi-line statement".
+//!
+//! Known, accepted limits of that join (not a parser, and not meant to be
+//! one):
+//!   - It has no notion of a match arm: a comma-terminated expression at
+//!     paren/bracket depth zero keeps a unit open until the next `;`/`{`/`}`,
+//!     so several arms between two block delimiters join into one unit. No
+//!     camp-init call in this suite sits inside a match arm; if one ever
+//!     does, give it its own `;`-terminated statement so the join stays
+//!     precise.
+//!   - Block comments (`/* … */`) are not specially masked — only `//` line
+//!     comments are. This suite uses no block comments.
+//!   - The `#[ignore]`-binding scan (for `// real-manager:`) finds a test
+//!     function's own attributes by walking physical lines too: it looks for
+//!     a line beginning (after `pub`/`async`/`unsafe`/`const`) with `fn `,
+//!     and treats the contiguous `#[...]`/doc-comment lines directly above it
+//!     as that function's attributes. A `#[ignore = "…"]` attribute that
+//!     itself got split across physical lines would not be recognized —
+//!     accepted, since rustfmt does not reflow attribute string literals the
+//!     way it reflows a `.args([…])` list. It also assumes no nested `fn`
+//!     items inside a test body (none exist in this suite); brace-depth
+//!     tracking (also mask-aware) is what lets it tell a fn's own body apart
+//!     from the next top-level item, so blocks/closures *inside* a test body
+//!     never reset which function's `#[ignore]` is in scope.
 //!
 //! The scan is also NON-RECURSIVE: it reads only the files directly inside
 //! `crates/camp/tests/`, not subdirectories (e.g. `tests/fixtures/`). Today
@@ -49,6 +90,174 @@
 //! if that ever changes, this scan must be taught to recurse.
 
 use std::path::Path;
+
+/// Splits `line` into (`mask`, `code`). Both drop anything after an unquoted
+/// `//` (this suite has no block comments). `mask` additionally blanks
+/// string-literal interiors — so a bracket character inside a string can't
+/// perturb bracket-depth counting — while `code` keeps string contents intact,
+/// so a quoted argument like `"init"`/`"--no-service"` can still be found.
+/// Escaped quotes (`\"`) inside a string do not end it.
+fn scan_line(line: &str) -> (String, String) {
+    let mut mask = String::with_capacity(line.len());
+    let mut code = String::with_capacity(line.len());
+    let mut chars = line.char_indices().peekable();
+    let mut in_string = false;
+    while let Some((_, c)) = chars.next() {
+        if in_string {
+            code.push(c);
+            mask.push(' ');
+            if c == '\\' {
+                if let Some(&(_, escaped)) = chars.peek() {
+                    code.push(escaped);
+                    mask.push(' ');
+                    chars.next();
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            code.push(c);
+            mask.push(' ');
+            continue;
+        }
+        if c == '/' && chars.peek().map(|&(_, next)| next) == Some('/') {
+            break; // the rest of the line is a line comment: drop it from both
+        }
+        code.push(c);
+        mask.push(c);
+    }
+    (mask, code)
+}
+
+/// Whether `trimmed` begins a fn item — after stripping the modifiers Rust
+/// allows before `fn` — used only to find the physical line a test function's
+/// signature starts on, so `#[ignore]` can be bound to the right function.
+fn starts_fn_signature(trimmed: &str) -> bool {
+    let mut rest = trimmed;
+    loop {
+        let stripped = ["pub(crate) ", "pub ", "async ", "unsafe ", "const "]
+            .iter()
+            .find_map(|prefix| rest.strip_prefix(prefix));
+        match stripped {
+            Some(r) => rest = r,
+            None => break,
+        }
+    }
+    rest.starts_with("fn ")
+}
+
+/// For every physical line, whether that line lies at or inside a test
+/// function whose OWN attributes (the contiguous `#[...]`/doc-comment lines
+/// directly above its `fn` line) include `#[ignore`. Brace depth (string/
+/// comment-masked) tracks where one fn's body ends and the next top-level
+/// item begins, so a block or closure inside a test body never resets it.
+fn ignore_scope(lines: &[&str]) -> Vec<bool> {
+    let mut result = vec![false; lines.len()];
+    let mut brace_depth: i64 = 0;
+    let mut pending_ignore = false;
+    let mut current_fn_ignored = false;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let (mask, _code) = scan_line(line);
+        if trimmed.starts_with("#[") {
+            if trimmed.contains("#[ignore") {
+                pending_ignore = true;
+            }
+        } else if trimmed.starts_with("///") || trimmed.starts_with("//!") || trimmed.is_empty() {
+            // Doc comments/blank lines between attributes and `fn` don't
+            // break the chain of attributes belonging to that fn.
+        } else if brace_depth == 0 && starts_fn_signature(trimmed) {
+            current_fn_ignored = pending_ignore;
+            pending_ignore = false;
+        } else if brace_depth == 0 {
+            pending_ignore = false;
+        }
+        result[i] = current_fn_ignored;
+        for c in mask.chars() {
+            match c {
+                '{' => brace_depth += 1,
+                '}' => brace_depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    result
+}
+
+/// One logical call-chain statement, joined back together across however many
+/// physical lines rustfmt put it on.
+struct Chunk {
+    /// The chunk's first physical line — lets a marker found at some offset
+    /// into `raw` be translated back to an absolute file line.
+    start: usize,
+    /// The physical line the reporter should point at: the first line in the
+    /// chunk that actually names `"init"`, or the chunk's first line if none
+    /// do (never surfaced, since the violation predicate requires `"init"`).
+    report_line: usize,
+    /// Comment-stripped, string-preserved text — safe to search for a quoted
+    /// `"init"`/`"--no-service"` argument without a comment forging a match.
+    code: String,
+    /// Untouched text (comments intact) — the markers live in comments, so
+    /// this is what marker detection searches.
+    raw: String,
+}
+
+/// Joins `lines` into logical units by tracking paren/bracket nesting
+/// (string/comment-masked) until it returns to zero AND the line ends `;`,
+/// `{`, or `}` — see the module docs for why a chain can't simply end at
+/// bracket-depth zero (e.g. `camp()` alone is balanced but the chain
+/// continues on the next line).
+fn chunks(lines: &[&str]) -> Vec<Chunk> {
+    let mut out = Vec::new();
+    let mut depth: i64 = 0;
+    let mut raw = String::new();
+    let mut code = String::new();
+    let mut init_line: Option<usize> = None;
+    let mut start = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if raw.is_empty() {
+            start = i;
+        }
+        raw.push_str(line);
+        raw.push('\n');
+        let (mask, line_code) = scan_line(line);
+        if init_line.is_none() && line_code.contains("\"init\"") {
+            init_line = Some(i);
+        }
+        code.push_str(&line_code);
+        code.push('\n');
+        for c in mask.chars() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        let mask_trim = mask.trim_end();
+        let boundary =
+            mask_trim.ends_with(';') || mask_trim.ends_with('{') || mask_trim.ends_with('}');
+        if depth == 0 && boundary {
+            out.push(Chunk {
+                start,
+                report_line: init_line.take().unwrap_or(start),
+                code: std::mem::take(&mut code),
+                raw: std::mem::take(&mut raw),
+            });
+        }
+    }
+    if !raw.is_empty() {
+        out.push(Chunk {
+            start,
+            report_line: init_line.unwrap_or(start),
+            code,
+            raw,
+        });
+    }
+    out
+}
 
 #[test]
 fn no_test_invokes_camp_init_without_no_service() {
@@ -65,37 +274,48 @@ fn no_test_invokes_camp_init_without_no_service() {
             continue;
         }
         let source = std::fs::read_to_string(&path).unwrap();
-        for (i, line) in source.lines().enumerate() {
-            let names_init = line.contains("\"init\"");
-            let is_arg = line.contains(".arg(") || line.contains(".args(");
+        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let file_gated = source.contains("CAMP_SERVICE_E2E");
+        let lines: Vec<&str> = source.lines().collect();
+        let fn_ignored_at = ignore_scope(&lines);
+
+        for chunk in chunks(&lines) {
+            let names_init = chunk.code.contains("\"init\"");
+            let is_arg = chunk.code.contains(".arg(") || chunk.code.contains(".args(");
             if !(names_init && is_arg) {
                 continue;
             }
-            let excused = line.contains("--no-service")
-                || line.contains("not-camp:")
-                || line.contains("real-manager:");
-            if !excused {
+            let has_no_service = chunk.code.contains("\"--no-service\"");
+            let not_camp = chunk.raw.contains("not-camp:");
+            let real_manager = chunk.raw.contains("real-manager:");
+            if !(has_no_service || not_camp || real_manager) {
                 violations.push(format!(
-                    "{}:{}: {}",
-                    path.file_name().unwrap().to_string_lossy(),
-                    i + 1,
-                    line.trim()
+                    "{file_name}:{}: {}",
+                    chunk.report_line + 1,
+                    lines[chunk.report_line].trim()
                 ));
                 continue;
             }
-            // The `real-manager:` marker's precondition (an #[ignore]d test
-            // gated on CAMP_SERVICE_E2E) cannot be checked from the line
-            // alone — check the file it sits in.
-            if line.contains("real-manager:")
-                && !(source.contains("#[ignore") && source.contains("CAMP_SERVICE_E2E"))
-            {
-                violations.push(format!(
-                    "{}:{}: carries `real-manager:` but this file is not both #[ignore]d \
-                     and gated on CAMP_SERVICE_E2E — the marker's precondition does not hold: {}",
-                    path.file_name().unwrap().to_string_lossy(),
-                    i + 1,
-                    line.trim()
-                ));
+            if real_manager {
+                // The marker's precondition can't be checked from the chunk
+                // alone: find the marker's OWN physical line and require
+                // that its enclosing test function itself carry #[ignore],
+                // plus that the file be CAMP_SERVICE_E2E-gated.
+                let marker_line = chunk
+                    .raw
+                    .lines()
+                    .position(|l| l.contains("real-manager:"))
+                    .map_or(chunk.start, |offset| chunk.start + offset);
+                let fn_ignored = fn_ignored_at.get(marker_line).copied().unwrap_or(false);
+                if !(fn_ignored && file_gated) {
+                    violations.push(format!(
+                        "{file_name}:{}: carries `real-manager:` but its enclosing test \
+                         function is not itself #[ignore]d and/or this file is not gated on \
+                         CAMP_SERVICE_E2E — the marker's precondition does not hold: {}",
+                        marker_line + 1,
+                        lines[marker_line].trim()
+                    ));
+                }
             }
         }
     }

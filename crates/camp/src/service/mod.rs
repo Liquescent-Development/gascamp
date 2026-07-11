@@ -168,7 +168,8 @@ mod tests {
         assert!(format!("{err:#}").contains("control character"), "{err:#}");
     }
 
-    /// Design §6: detection decides, the flags override. Six cells, all pinned.
+    /// Design §6: detection decides, the flags override. Nine cells (3
+    /// choices × 3 detections), all pinned.
     #[test]
     fn the_init_service_decision_is_a_pure_table() {
         // Default: a host with a manager gets a supervised campd…
@@ -185,6 +186,10 @@ mod tests {
 
         // --service forces it, and is a HARD ERROR where it cannot be honored.
         assert_eq!(
+            decide(ServiceChoice::Force, Some(Manager::Launchd)),
+            Decision::Install(Manager::Launchd)
+        );
+        assert_eq!(
             decide(ServiceChoice::Force, Some(Manager::Systemd)),
             Decision::Install(Manager::Systemd)
         );
@@ -193,6 +198,10 @@ mod tests {
         // --no-service skips, manager or not.
         assert_eq!(
             decide(ServiceChoice::Skip, Some(Manager::Launchd)),
+            Decision::SkipByFlag
+        );
+        assert_eq!(
+            decide(ServiceChoice::Skip, Some(Manager::Systemd)),
             Decision::SkipByFlag
         );
         assert_eq!(decide(ServiceChoice::Skip, None), Decision::SkipByFlag);
