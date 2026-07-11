@@ -5,6 +5,12 @@
 # builds (overrides the machine-global ignore of Cargo.lock).
 !Cargo.lock
 
+# The reference container's build context is the repo root, so .dockerignore is
+# what keeps target/ and .git/ out of it — it must be versioned, or every
+# `docker build -f contrib/docker/Dockerfile .` ships the host's build
+# artifacts (overrides the machine-global ignore of .dockerignore).
+!.dockerignore
+
 # Project Claude Code config (skill, hooks, settings) is versioned
 # (overrides the machine-global ignore of .claude/); per-user local
 # overrides stay out.

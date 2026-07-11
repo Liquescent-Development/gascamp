@@ -1,0 +1,15 @@
+# The build context for contrib/docker/Dockerfile is the repo root. Keep the
+# host's build artifacts and history out of it — they are megabytes of noise
+# the image never uses, and target/ would bust the layer cache on every build.
+#
+# NOT ignored, and it must stay that way: plugin/. The camp binary EMBEDS
+# plugin/skills/worker/SKILL.md at compile time
+# (crates/camp/src/daemon/spawn.rs — `include_str!`), so excluding plugin/ here
+# makes `cargo build -p camp` fail inside the image with "couldn't read
+# .../plugin/skills/worker/SKILL.md". docs/ and packs/ carry no such reference
+# and are excluded.
+target/
+.git/
+.github/
+docs/
+packs/

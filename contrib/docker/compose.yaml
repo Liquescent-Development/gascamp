@@ -1,0 +1,37 @@
+# Gas Camp — the reference compose file (campd-service design §3, §4.7, §7).
+#
+#   docker compose -f contrib/docker/compose.yaml up -d --build
+#   docker compose -f contrib/docker/compose.yaml exec campd camp sling "fix the flaky test"
+#   docker compose -f contrib/docker/compose.yaml logs -f campd
+#   docker compose -f contrib/docker/compose.yaml down          # SIGTERM: graceful
+#
+# `restart: unless-stopped` is this environment's KeepAlive — the container
+# runtime is the supervisor, and campd, the container's main process, is what it
+# keeps alive. Nothing here installs a service unit; there is no service manager
+# inside the container and camp does not want one (`camp init --no-service`, in
+# the entrypoint).
+services:
+  campd:
+    build:
+      context: ../..
+      dockerfile: contrib/docker/Dockerfile
+    image: gascamp:latest
+    container_name: gascamp
+    restart: unless-stopped
+    # The defaults, named because they are the contract: campd handles SIGTERM
+    # (v1 spec §5) — it appends campd.stopped, unlinks the socket, and exits 0.
+    # The 30 s is a CEILING for a shutdown that has real work to flush, not a
+    # target: a healthy campd exits in well under a second (the smoke test
+    # asserts under 5 s against a plain `docker stop`'s 10 s default). If you
+    # ever see a 137 exit, SIGTERM is not reaching campd and something has
+    # broken the entrypoint's `exec`.
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    volumes:
+      # The camp: the SQLite ledger, campd.sock, runs/, sessions/, worktrees/.
+      # A NAMED volume, so it survives `down`/`up` and a host reboot, and so the
+      # container user owns it (see README.md before you swap in a bind mount).
+      - camp:/camp
+
+volumes:
+  camp:
