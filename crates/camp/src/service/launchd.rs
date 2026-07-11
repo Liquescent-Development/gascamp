@@ -90,6 +90,9 @@ impl Supervisor for Launchd<'_> {
             return Ok(UnitState {
                 loaded: false,
                 running: false,
+                // Booted out: launchd is not holding this job at all, so
+                // nothing will bring campd back.
+                will_restart_campd: false,
                 detail: out.stderr.trim().to_owned(),
             });
         }
@@ -117,6 +120,12 @@ impl Supervisor for Launchd<'_> {
         Ok(UnitState {
             loaded: true,
             running: state_line == "state = running",
+            // `KeepAlive` is UNCONDITIONAL (see `unit_text`): launchd respawns
+            // a bootstrapped job whenever it exits. So for launchd, and only
+            // for launchd, "bootstrapped" IS "will restart campd" — which is
+            // why keying the verbs on `loaded` happened to work here, and did
+            // not work at all on systemd.
+            will_restart_campd: true,
             detail: state_line.to_owned(),
         })
     }
@@ -313,6 +322,8 @@ mod tests {
             UnitState {
                 loaded: true,
                 running: true,
+                // KeepAlive is unconditional: bootstrapped IS "will restart".
+                will_restart_campd: true,
                 detail: "state = running".to_owned()
             }
         );

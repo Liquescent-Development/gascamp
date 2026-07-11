@@ -23,20 +23,18 @@ pub fn run(camp: &CampDir) -> Result<()> {
 fn run_with(camp: &CampDir, supervisor: Option<&dyn Supervisor>) -> Result<()> {
     if let Some(supervisor) = supervisor
         && let Some(unit) = crate::cmd::service::managed_unit(supervisor, &camp.root)?
-        // Keyed on the unit being LOADED, not on the unit FILE existing. The
-        // refusal's entire justification is that KeepAlive / Restart=always
-        // would restart campd the instant we stopped it — true only while the
-        // unit is loaded. Booted out (exactly what `camp service stop` leaves
-        // behind), the supervisor restarts nothing, so a socket stop is honest
-        // and this is the verb for it.
+        // Keyed on the ONE question the refusal's justification rests on: will
+        // this supervisor put campd back if we stop it? Not on the unit file
+        // existing (round 1's bug), and not on `loaded` either (round 2's) —
+        // `loaded` means "bootstrapped" to launchd but merely "the unit file
+        // parsed" to systemd, so a `loaded` gate refused forever on Linux, on
+        // units systemd had long since let die. Only the supervisor knows its
+        // own restart semantics; it answers in `will_restart_campd`.
         //
-        // Keyed on the file alone, `camp stop` refused here and sent the
-        // operator to `camp service stop` — which cannot stop a campd the
-        // supervisor never started either. Between them the camp became
-        // un-stoppable by any camp verb, with both verbs reporting success or
-        // naming each other. That is the §4.10 violation this pair exists to
-        // prevent, committed by the pair itself.
-        && supervisor.state(&unit.id)?.loaded
+        // When it says no, nothing will undo a socket stop, so `camp stop`
+        // falls through and is the honest verb for exactly the campd the
+        // supervisor does not own.
+        && supervisor.state(&unit.id)?.will_restart_campd
     {
         bail!(
             "campd for this camp is supervised by {} (unit {}, {}) — a socket stop would be \
@@ -78,6 +76,7 @@ mod tests {
     use super::*;
     use crate::service::launchd::Launchd;
     use crate::service::runner::fake::FakeRunner;
+    use crate::service::systemd::Systemd;
     use std::path::Path;
 
     /// Operator decision (2026-07-10): on a SUPERVISED camp, `camp stop`
@@ -167,6 +166,80 @@ mod tests {
             1,
             "camp stop must have actually stopped it over the socket"
         );
+    }
+
+    /// CRITICAL (review round 2). The launchd twin above passes, and that is
+    /// exactly why this went unseen: every test of this verb wired `Launchd`.
+    ///
+    /// `UnitState.loaded` does not mean the same thing in the two supervisors.
+    /// On launchd it means BOOTSTRAPPED — and with `KeepAlive`, bootstrapped
+    /// really does mean "campd comes back if you stop it". On systemd it means
+    /// `LoadState=loaded`, which only says the unit FILE parsed and is in
+    /// systemd's memory: it is `loaded` for a unit that is inactive, dead,
+    /// stopped or failed. It is, near enough, "the unit file exists" — the very
+    /// predicate round 1 ordered this refusal to STOP using.
+    ///
+    /// So on Linux the refusal never opened: `camp stop` refused on any camp
+    /// with an installed unit forever, naming `camp service stop`, which
+    /// no-op'd its `systemctl stop` and bailed back naming `camp stop`. Round
+    /// 1's un-stoppable ping-pong, alive verbatim, on the whole of Linux.
+    #[test]
+    fn stop_does_the_socket_stop_when_the_systemd_unit_is_loaded_but_inactive() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![
+            FakeRunner::ok(""), // daemon-reload
+            FakeRunner::ok(""), // enable --now
+        ]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &install_runner);
+        crate::cmd::service::install(&systemd, &camp.root, Path::new("/usr/local/bin/camp"))
+            .unwrap();
+
+        // Literally what `systemctl show` prints for a stopped unit: still
+        // LOADED, but inactive and dead. `Restart=always` applies only to a
+        // unit that is running — systemd will restart NOTHING here, so a
+        // socket stop is honest and `camp stop` is the verb for it.
+        let campd = socket::fake_campd::serve(&camp, vec![socket::fake_campd::stopped()]);
+        let runner = FakeRunner::new(vec![FakeRunner::ok(
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\n",
+        )]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &runner);
+
+        run_with(&camp, Some(&systemd))
+            .expect("an inactive systemd unit restarts nothing — the socket stop is honest");
+        assert_eq!(
+            campd.served(),
+            1,
+            "camp stop must have actually stopped it over the socket"
+        );
+    }
+
+    /// The systemd unit that IS running must still be refused: `Restart=always`
+    /// on an active unit really would undo a socket stop.
+    #[test]
+    fn stop_refuses_on_an_active_systemd_unit() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let runner = FakeRunner::new(vec![
+            FakeRunner::ok(""), // daemon-reload
+            FakeRunner::ok(""), // enable --now
+            FakeRunner::ok("LoadState=loaded\nActiveState=active\nSubState=running\n"),
+        ]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &runner);
+        crate::cmd::service::install(&systemd, &camp.root, Path::new("/usr/local/bin/camp"))
+            .unwrap();
+
+        let err = run_with(&camp, Some(&systemd)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("supervised by systemd"), "{msg}");
+        assert!(msg.contains("Restart=always"), "{msg}");
+        assert!(msg.contains("camp service stop"), "{msg}");
     }
 
     /// An UNSUPERVISED camp (a container, CI, a camp nobody installed a unit

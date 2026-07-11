@@ -101,8 +101,19 @@ impl Supervisor for Systemd<'_> {
         let active = value("ActiveState=")?;
         let sub = value("SubState=")?;
         Ok(UnitState {
+            // `LoadState=loaded` says only that the unit FILE parsed and is in
+            // systemd's memory — it is `loaded` for a unit that is inactive,
+            // dead, stopped or failed. Near enough "the unit file exists", and
+            // emphatically NOT "systemd is holding campd up": see
+            // `will_restart_campd` below, which is what the verbs decide on.
             loaded: load == "loaded",
             running: active == "active",
+            // `Restart=always` (see `unit_text`) restarts the service only
+            // while the unit is RUNNING; systemd leaves an inactive, dead or
+            // failed unit exactly where it is. `activating`/`reloading` count:
+            // the unit is on its way up, and a campd stopped out from under it
+            // would be restarted just the same.
+            will_restart_campd: matches!(active.as_str(), "active" | "activating" | "reloading"),
             detail: format!("LoadState={load} ActiveState={active} SubState={sub}"),
         })
     }
@@ -344,6 +355,7 @@ mod tests {
             UnitState {
                 loaded: true,
                 running: true,
+                will_restart_campd: true,
                 detail: "LoadState=loaded ActiveState=active SubState=running".to_owned()
             }
         );
@@ -359,6 +371,54 @@ mod tests {
         let systemd = Systemd::new(PathBuf::from("/units"), &unknown);
         let state = systemd.state(&id()).unwrap();
         assert!(!state.loaded && !state.running, "{state:?}");
+        assert!(!state.will_restart_campd, "{state:?}");
+    }
+
+    /// CRITICAL (review round 2). The distinction the whole `camp stop` /
+    /// `camp service stop` pair decides on, pinned where it is actually
+    /// decided. A STOPPED systemd unit is still `LoadState=loaded` — that is
+    /// simply what LoadState means — so `loaded` says nothing about whether
+    /// systemd will put campd back. `Restart=always` acts only on a RUNNING
+    /// unit; an inactive, dead or failed one stays exactly where it is.
+    ///
+    /// Keying the verbs on `loaded` was therefore correct on launchd
+    /// (bootstrapped ⇒ unconditional `KeepAlive`) and inert on systemd, where
+    /// it refused every camp with an installed unit forever.
+    #[test]
+    fn a_stopped_or_failed_systemd_unit_is_still_loaded_but_will_not_restart_campd() {
+        for (active, sub) in [
+            ("inactive", "dead"),     // `systemctl stop`
+            ("failed", "failed"),     // crash-looped past the start limit
+            ("deactivating", "stop"), // on its way down
+        ] {
+            let fake = FakeRunner::new(vec![FakeRunner::ok(&format!(
+                "LoadState=loaded\nActiveState={active}\nSubState={sub}\n"
+            ))]);
+            let systemd = Systemd::new(PathBuf::from("/units"), &fake);
+            let state = systemd.state(&id()).unwrap();
+            assert!(
+                state.loaded,
+                "LoadState=loaded is what systemd really reports here: {state:?}"
+            );
+            assert!(
+                !state.will_restart_campd,
+                "systemd restarts nothing in ActiveState={active}: {state:?}"
+            );
+        }
+
+        // …and a unit on its way UP will restart campd: stopping campd out from
+        // under systemd here really would be undone.
+        for active in ["active", "activating", "reloading"] {
+            let fake = FakeRunner::new(vec![FakeRunner::ok(&format!(
+                "LoadState=loaded\nActiveState={active}\nSubState=running\n"
+            ))]);
+            let systemd = Systemd::new(PathBuf::from("/units"), &fake);
+            let state = systemd.state(&id()).unwrap();
+            assert!(
+                state.will_restart_campd,
+                "Restart=always applies in ActiveState={active}: {state:?}"
+            );
+        }
     }
 
     /// M1 (review round 1): a property systemd did not print must never be

@@ -14,8 +14,35 @@ use super::CampId;
 /// words, printed verbatim (invariant 3: nothing hidden).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnitState {
+    /// The manager knows this unit. It does NOT mean the same thing in both
+    /// managers, and it is not the predicate any verb should make a decision
+    /// on — see `will_restart_campd`. launchd: the label is bootstrapped in
+    /// `gui/<uid>`. systemd: `LoadState=loaded`, which says only that the unit
+    /// FILE parsed and sits in systemd's memory — true of a unit that is
+    /// inactive, dead, stopped, or failed.
     pub loaded: bool,
+    /// campd is up, under the manager.
     pub running: bool,
+    /// **The predicate the verbs decide on: will this supervisor put campd
+    /// BACK if something stops it out from under the manager?**
+    ///
+    /// This is the whole question `camp stop`'s refusal and `camp service
+    /// stop`'s "did I actually stop anything" both ask, and only the
+    /// supervisor can answer it, because the two managers restart on entirely
+    /// different conditions:
+    ///
+    /// - **launchd** — `KeepAlive` is unconditional: a bootstrapped job is
+    ///   respawned whenever it exits, so BOOTSTRAPPED (`loaded`) is the answer.
+    /// - **systemd** — `Restart=always` applies only to a unit that is running:
+    ///   an inactive/dead/failed unit stays down. So ACTIVE (or activating) is
+    ///   the answer, and `loaded` is nearly "the unit file exists".
+    ///
+    /// Keying the verbs on `loaded` therefore worked on launchd and was inert
+    /// on systemd — `camp stop` refused forever on any camp with an installed
+    /// unit, and `camp service stop` claimed a stop it never performed. Each
+    /// supervisor computes this from its OWN raw output, where the distinction
+    /// is still visible; nothing above this trait may re-derive it.
+    pub will_restart_campd: bool,
     pub detail: String,
 }
 

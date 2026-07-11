@@ -85,10 +85,39 @@ fn start_detached_with(
     if let Some(supervisor) = supervisor
         && let Some(unit) = crate::cmd::service::managed_unit(supervisor, &camp.root)?
     {
+        // Keyed on the unit's STATE, not on the file's existence. The file
+        // existing conflates two situations that need opposite advice, and the
+        // one it got wrong is the branch's own headline first-run flow:
+        //
+        //   supervisor is NOT holding campd (after `camp service stop`) — the
+        //   case this guard was written for. Refuse; `camp service start` is
+        //   the remedy and it works.
+        //
+        //   supervisor IS holding campd, but campd has not answered yet — the
+        //   window right after `camp init` / `camp service start|restart`, and
+        //   during a crash-restart. (The real-manager lifecycle test polls up
+        //   to 30s for campd here, so the window is real and this branch's own
+        //   test says so.) Telling the operator campd "is not running" is
+        //   false, and sending them to `camp service start` is worse: on an
+        //   already-bootstrapped launchd label that runs `launchctl bootstrap`
+        //   again and hard-errors. A `camp init && camp top` script hits this.
+        let state = supervisor.state(&unit.id)?;
+        if state.will_restart_campd {
+            bail!(
+                "campd for this camp is supervised by {} (unit {}) and the supervisor is \
+                 holding it up, but it is not answering on its socket yet — it may still be \
+                 starting, or it may be crash-looping.\n       Look:  camp service status\n       Why:   {}\n       \
+                 Then re-run this command; auto-starting a second, unsupervised campd here \
+                 would be refused its socket and respawned forever.",
+                supervisor.name(),
+                unit.path.display(),
+                camp.log_path().display(),
+            );
+        }
         bail!(
-            "campd for this camp is supervised by {} (unit {}) but is not running. \
-             Start it with `camp service start` — auto-starting an unsupervised campd \
-             here would be undone by the supervisor.",
+            "campd for this camp is supervised by {} (unit {}) but the supervisor is not \
+             running it. Start it with `camp service start` — auto-starting an unsupervised \
+             campd here would be undone by the supervisor.",
             supervisor.name(),
             unit.path.display()
         );
@@ -323,7 +352,7 @@ mod tests {
     /// refuse HERE, before the ledger records campd.autostarted, let alone
     /// before anything is spawned.
     #[test]
-    fn start_detached_refuses_a_camp_the_host_supervisor_owns() {
+    fn start_detached_refuses_a_camp_whose_supervisor_has_campd_stopped() {
         let camp_dir = tempfile::tempdir().unwrap();
         let units = tempfile::tempdir().unwrap();
         let camp = CampDir {
@@ -334,6 +363,10 @@ mod tests {
         crate::cmd::service::install(&launchd, &camp.root, Path::new("/usr/local/bin/camp"))
             .unwrap();
 
+        // Booted out — exactly the state `camp service stop` leaves behind.
+        let runner = FakeRunner::new(vec![FakeRunner::fail(113, "Could not find service\n")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &runner);
+
         let err = start_detached_with(&camp, "test", Some(&launchd)).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("supervised by launchd"), "{msg}");
@@ -343,7 +376,7 @@ mod tests {
         );
         assert!(
             msg.contains("camp service start"),
-            "must name the remedy: {msg}"
+            "must name the remedy — and here it is the one that works: {msg}"
         );
 
         let ledger = Ledger::open(&camp.db_path()).unwrap();
@@ -354,6 +387,62 @@ mod tests {
         assert_eq!(
             autostarted, 0,
             "a supervised camp must never record an autostart, let alone spawn one"
+        );
+    }
+
+    /// IMPORTANT 3 (review round 2). Keyed on the unit FILE, the guard could
+    /// not tell "the supervisor has campd stopped" from "the supervisor is
+    /// starting campd RIGHT NOW" — the window right after `camp init`, and
+    /// during every crash-restart. In that window it told the operator campd
+    /// "is not running" (false — the supervisor has it) and sent them to
+    /// `camp service start`, which on an already-bootstrapped launchd label
+    /// runs `launchctl bootstrap` again and hard-errors. **The remedy it named
+    /// was itself an error**, on a plain `camp init && camp top`.
+    #[test]
+    fn start_detached_does_not_send_a_starting_campd_to_camp_service_start() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        crate::cmd::service::install(&launchd, &camp.root, Path::new("/usr/local/bin/camp"))
+            .unwrap();
+
+        // Bootstrapped and running: launchd HAS campd — it simply has not
+        // answered on the socket yet.
+        let runner = FakeRunner::new(vec![FakeRunner::ok("service = {\n\tstate = running\n}\n")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &runner);
+
+        let err = start_detached_with(&camp, "test", Some(&launchd)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("camp service start"),
+            "`camp service start` on an already-bootstrapped label is itself an error — it must \
+             NOT be named here: {msg}"
+        );
+        assert!(
+            !msg.contains("is not running"),
+            "the supervisor IS running it; saying otherwise is false: {msg}"
+        );
+        assert!(
+            msg.contains("camp service status"),
+            "must point at the verb that shows what is going on: {msg}"
+        );
+        assert!(
+            msg.contains("campd.log"),
+            "must point at the log that says WHY, if it is crash-looping: {msg}"
+        );
+
+        let ledger = Ledger::open(&camp.db_path()).unwrap();
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::CampdAutostarted)
+                .unwrap()
+                .len(),
+            0,
+            "still no second campd"
         );
     }
 

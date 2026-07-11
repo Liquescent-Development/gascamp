@@ -41,7 +41,7 @@ pub fn list(supervisor: Option<&dyn Supervisor>) -> Result<String> {
             mark,
             unit.camp_root.display(),
             unit.unit_path.display(),
-            indented_detail(&state.detail)
+            indented_detail(&state.detail, "        ")
         ));
     }
     Ok(report)
@@ -64,8 +64,15 @@ pub fn run_list() -> Result<()> {
 /// to column 0 and breaks the alignment of a report whose whole job is to be
 /// read. Indent the continuation lines under the first instead: nothing is
 /// dropped, nothing is summarized, and the block still reads as one field.
-fn indented_detail(detail: &str) -> String {
-    detail.lines().collect::<Vec<_>>().join("\n         ")
+///
+/// The indent is the CALLER's, because `status` and `list` set their fields at
+/// different columns (m4) — a single hard-coded indent lines up under one of
+/// them and not the other.
+fn indented_detail(detail: &str, indent: &str) -> String {
+    detail
+        .lines()
+        .collect::<Vec<_>>()
+        .join(&format!("\n{indent}"))
 }
 
 /// The unit installed for THIS camp — identity verified.
@@ -134,6 +141,11 @@ pub fn install(supervisor: &dyn Supervisor, camp_root: &Path, exe: &Path) -> Res
             existing.path.display()
         );
     }
+    // Before ANY unit text is generated, any file is written, or any manager is
+    // told this camp is supervised: a campd already on the socket means the
+    // supervised one could never bind, and would be respawn-throttled forever
+    // while we reported success.
+    refuse_if_a_campd_holds_the_socket(supervisor, camp_root, "install")?;
     let id = CampId::for_camp(camp_root)?;
     // The unit must name the camp's REAL path: a supervisor runs campd from
     // its own cwd, and a relative path would resolve somewhere else entirely.
@@ -246,12 +258,25 @@ pub fn uninstall(supervisor: &dyn Supervisor, camp_root: &Path) -> Result<String
     std::fs::remove_file(&unit.path)
         .with_context(|| format!("removing {}", unit.path.display()))?;
     supervisor.reload_units()?;
-    Ok(format!(
+    let mut report = format!(
         "uninstalled {} unit {} ({})\n",
         supervisor.name(),
         unit.name,
         unit.path.display()
-    ))
+    );
+    // m5: uninstall took its own word for it too. Unloading stops the campd the
+    // manager owned — but a campd it never started survives untouched, and the
+    // camp is now unsupervised, so saying only "uninstalled" would leave a live
+    // daemon unmentioned. Not an error (the unit really is gone, and `camp stop`
+    // now works on it): a stated fact, with the remedy.
+    if let Some(pid) = listening_campd_pid(camp_root)? {
+        report.push_str(&format!(
+            "note: a campd is still listening on this camp's socket (pid {pid}) — {} did not \
+             start it, and this camp is now unsupervised. `camp stop` stops it.\n",
+            supervisor.name()
+        ));
+    }
+    Ok(report)
 }
 
 /// `camp service status` (design §5): the unit's load/run state, PLUS the
@@ -274,7 +299,7 @@ pub fn status(supervisor: Option<&dyn Supervisor>, camp: &CampDir) -> Result<Str
                     unit.path.display(),
                     state.loaded,
                     state.running,
-                    indented_detail(&state.detail)
+                    indented_detail(&state.detail, "       ")
                 ));
             }
             None => {
@@ -350,12 +375,47 @@ pub fn restart(supervisor: &dyn Supervisor, camp_root: &Path) -> Result<String> 
 /// manager-less host) is invisible to it and survives a stop of the unit
 /// untouched. A wedged campd (accepts, never answers) surfaces as the loud
 /// `CampdUnresponsive` error rather than as "gone": still not stopped.
-fn listening_campd_pid(camp: &CampDir) -> Result<Option<u32>> {
-    match socket::request_if_up(camp, &Request::Status)? {
+fn listening_campd_pid(camp_root: &Path) -> Result<Option<u32>> {
+    let camp = CampDir {
+        root: camp_root.to_path_buf(),
+    };
+    match socket::request_if_up(&camp, &Request::Status)? {
         Some(Response::Status { campd_pid, .. }) => Ok(Some(campd_pid)),
         Some(other) => bail!("unexpected response to status: {other:?}"),
         None => Ok(None),
     }
+}
+
+/// Never hand the supervisor a camp whose socket another campd already owns.
+///
+/// `socket::bind_or_replace` is explicit: a socket that ACCEPTS means a live
+/// campd, so a second one exits(1) rather than take it over. Under `KeepAlive`
+/// / `Restart=always` the supervisor then respawns that doomed campd forever —
+/// launchd every ~10s on an idle machine (invariant 1), systemd straight into
+/// `failed` — while the verb that started it reported success. So both verbs
+/// that hand campd to the supervisor ASK first, and refuse before touching the
+/// unit directory or the manager.
+///
+/// This is not a hypothetical: it is the UPGRADE path. Every camp that exists
+/// today has an auto-started, unsupervised campd, or was created with
+/// `--no-service` and is running one from the `camp daemon` hand-off.
+fn refuse_if_a_campd_holds_the_socket(
+    supervisor: &dyn Supervisor,
+    camp_root: &Path,
+    verb: &str,
+) -> Result<()> {
+    if let Some(pid) = listening_campd_pid(camp_root)? {
+        bail!(
+            "a campd is already listening on this camp's socket (pid {pid}), and it is not one \
+             {mgr} started. A supervised campd cannot take over a socket another campd owns — it \
+             would exit immediately, and {mgr} would respawn it forever ({policy}) while this \
+             command told you the camp was supervised.\n       Stop it first: camp stop\n       \
+             Then: camp service {verb}",
+            mgr = supervisor.name(),
+            policy = supervisor.restart_policy(),
+        );
+    }
+    Ok(())
 }
 
 /// `camp service stop` (operator decision, 2026-07-10): stop the supervised
@@ -376,23 +436,32 @@ fn listening_campd_pid(camp: &CampDir) -> Result<Option<u32>> {
 ///    and the verb that CAN stop it.
 pub fn stop(supervisor: &dyn Supervisor, camp: &CampDir) -> Result<String> {
     let unit = require_managed_unit(supervisor, &camp.root, "nothing to stop")?;
-    let was_loaded = supervisor.state(&unit.id)?.loaded;
-    if was_loaded {
+    // `will_restart_campd`, not `loaded`: on systemd `loaded` is true of a unit
+    // that is inactive, dead or failed, so a `loaded` gate meant this verb
+    // always ran a `systemctl stop` that did nothing and always printed
+    // "stopped" — the claim-of-an-action-that-never-happened this check exists
+    // to remove, on the whole of Linux. Only a supervisor that will actually
+    // put campd back has anything here to stop.
+    let was_supervised = supervisor.state(&unit.id)?.will_restart_campd;
+    if was_supervised {
         supervisor.stop(&unit.id)?;
     }
-    if let Some(pid) = listening_campd_pid(camp)? {
+    if let Some(pid) = listening_campd_pid(&camp.root)? {
         bail!(
             "the {mgr} unit {name} is {unit_state}, but a campd is STILL listening on this \
-             camp's socket (pid {pid}) — {mgr} did not start it, so stopping the unit cannot \
-             stop it.\n       To stop it: camp stop\n       (an unsupervised campd like this \
-             one comes from `camp daemon`, or from an auto-starting verb that ran before the \
-             unit was installed)",
+             camp's socket (pid {pid}) — stopping the unit did not stop it, so it is not the \
+             campd {mgr} manages (a hand-run `camp daemon`, or one auto-started before the unit \
+             was installed).\n       To stop it: camp stop",
             mgr = supervisor.name(),
             name = unit.name,
-            unit_state = if was_loaded { "stopped" } else { "not loaded" },
+            unit_state = if was_supervised {
+                "stopped"
+            } else {
+                "not running"
+            },
         );
     }
-    let headline = if was_loaded {
+    let headline = if was_supervised {
         format!(
             "stopped {} unit {} ({})",
             supervisor.name(),
@@ -401,7 +470,7 @@ pub fn stop(supervisor: &dyn Supervisor, camp: &CampDir) -> Result<String> {
         )
     } else {
         format!(
-            "already stopped: the {} unit {} ({}) is not loaded",
+            "already stopped: the {} unit {} ({}) is not running",
             supervisor.name(),
             unit.name,
             unit.path.display()
@@ -420,6 +489,10 @@ pub fn stop(supervisor: &dyn Supervisor, camp: &CampDir) -> Result<String> {
 /// still-installed unit.
 pub fn start(supervisor: &dyn Supervisor, camp_root: &Path) -> Result<String> {
     let unit = require_managed_unit(supervisor, camp_root, "`camp service install` first")?;
+    // Same reason as `install`: starting the unit while another campd holds the
+    // socket produces a supervised campd that can never bind, respawned
+    // forever, under a "started" the operator was told to trust.
+    refuse_if_a_campd_holds_the_socket(supervisor, camp_root, "start")?;
     supervisor.start(&unit.id)?;
     Ok(format!(
         "started {} unit {} ({})\n",
@@ -1166,6 +1239,165 @@ mod tests {
             runner.call_count(),
             1,
             "only the state query — nothing to boot out: {report}"
+        );
+    }
+
+    /// IMPORTANT 2 (review round 2). `install` is the UPGRADE PATH, and it
+    /// needs no operator error to go wrong: every camp that exists today has an
+    /// auto-started, unsupervised campd (or was created `--no-service`, where
+    /// the README hands off to `camp daemon`). Installing a unit for such a
+    /// camp hands the supervisor a socket another campd already owns —
+    /// `bind_or_replace` makes the supervised campd exit(1) on a socket that
+    /// accepts — and `KeepAlive`/`Restart=always` then respawns it forever
+    /// (launchd: a standing spawn every ~10s on an idle machine, invariant 1;
+    /// systemd: straight into `failed`), while `install` printed "campd for …
+    /// is now supervised". Nothing is supervised. So: ASK first, refuse loudly,
+    /// and touch neither the unit dir nor the manager.
+    #[test]
+    fn install_refuses_when_a_campd_is_already_listening() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let campd = socket::fake_campd::serve(&camp, vec![socket::fake_campd::status(4242)]);
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &fake);
+
+        let err = install(&launchd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("4242"),
+            "must name the campd already holding the socket: {msg}"
+        );
+        assert!(
+            msg.contains("camp stop"),
+            "must name the verb that frees the socket: {msg}"
+        );
+        assert_eq!(campd.served(), 1, "install must ASK the socket");
+        assert_eq!(fake.call_count(), 0, "the manager must not be touched");
+        assert!(
+            std::fs::read_dir(units.path()).unwrap().next().is_none(),
+            "no unit file may be written"
+        );
+    }
+
+    /// IMPORTANT 2, the twin: `camp service start` has the identical shape —
+    /// it printed "started …" without ever asking whether campd could come up.
+    #[test]
+    fn start_refuses_when_a_foreign_campd_is_listening() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        install(&launchd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        let campd = socket::fake_campd::serve(&camp, vec![socket::fake_campd::status(4242)]);
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &fake);
+
+        let err = start(&launchd, &camp.root).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("4242"), "must name the live campd: {msg}");
+        assert_eq!(campd.served(), 1, "start must ASK the socket");
+        assert_eq!(
+            fake.call_count(),
+            0,
+            "the manager must not be asked to start a campd that cannot bind"
+        );
+    }
+
+    /// CRITICAL (review round 2): the systemd twin of the "already stopped"
+    /// test above. `LoadState=loaded` is true of an inactive, dead, stopped or
+    /// failed unit — so keying on `loaded`, this verb always believed the unit
+    /// was running, always ran a `systemctl stop` that did nothing (exit 0 on
+    /// an inactive unit), and always printed "stopped systemd unit …". The
+    /// "already stopped" branch was UNREACHABLE on the whole of Linux.
+    #[test]
+    fn service_stop_on_an_already_stopped_systemd_unit_says_so_rather_than_claiming_a_stop() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok(""), FakeRunner::ok("")]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &install_runner);
+        install(&systemd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        // Exactly what `systemctl show` prints for a stopped unit.
+        let runner = FakeRunner::new(vec![FakeRunner::ok(
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\n",
+        )]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &runner);
+
+        let report = stop(&systemd, &camp).unwrap();
+        assert!(
+            report.contains("already stopped"),
+            "must not claim an action it did not take: {report}"
+        );
+        assert_eq!(
+            runner.call_count(),
+            1,
+            "an inactive unit needs no `systemctl stop`: {report}"
+        );
+    }
+
+    /// The systemd twin of the orphan test: a campd the supervisor never
+    /// started, still answering after the unit's stop. This one already held
+    /// before round 2 (the socket check catches it either way) — it is here so
+    /// that it KEEPS holding now that the predicate underneath it changed.
+    #[test]
+    fn service_stop_on_systemd_never_reports_success_while_a_campd_still_answers() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok(""), FakeRunner::ok("")]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &install_runner);
+        install(&systemd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        let campd = socket::fake_campd::serve(&camp, vec![socket::fake_campd::status(31337)]);
+        let runner = FakeRunner::new(vec![FakeRunner::ok(
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\n",
+        )]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &runner);
+
+        let err = stop(&systemd, &camp).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("31337"), "must name the live campd pid: {msg}");
+        assert_eq!(campd.served(), 1, "stop must ASK the socket, not assume");
+    }
+
+    /// An ACTIVE systemd unit really is stopped by `systemctl stop`, and the
+    /// verb may say so.
+    #[test]
+    fn service_stop_on_an_active_systemd_unit_really_stops_it() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok(""), FakeRunner::ok("")]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &install_runner);
+        install(&systemd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        let runner = FakeRunner::new(vec![
+            FakeRunner::ok("LoadState=loaded\nActiveState=active\nSubState=running\n"),
+            FakeRunner::ok(""), // systemctl --user stop
+        ]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &runner);
+
+        let report = stop(&systemd, &camp).unwrap();
+        assert!(report.contains("stopped"), "{report}");
+        assert!(!report.contains("already stopped"), "{report}");
+        assert!(
+            runner.call(1).starts_with("systemctl --user stop "),
+            "an active unit must really be stopped: {}",
+            runner.call(1)
         );
     }
 

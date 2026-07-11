@@ -367,18 +367,40 @@ and fails loudly if the host cannot provide it.
 launchd re-bootstraps it (and systemd starts the still-enabled unit) the next
 time you log in. `camp service uninstall` is the durable off switch.
 
-**On a supervised camp with its unit loaded, `camp stop` refuses.** Such a campd
-is kept alive by its unit (`KeepAlive` / `Restart=always`), so a socket-level
-stop would be undone by the supervisor moments later — and a verb that says
-"campd stopped" about a daemon that is already coming back is lying. `camp stop`
+**While the supervisor is running campd, `camp stop` refuses.** Such a campd is
+kept alive by its unit (`KeepAlive` / `Restart=always`), so a socket-level stop
+would be undone by the supervisor moments later — and a verb that says "campd
+stopped" about a daemon that is already coming back is lying. `camp stop`
 therefore hard-errors and points you at `camp service stop` (stop it) or
-`camp service uninstall` (un-manage it). Once the unit is stopped, nothing will
-restart campd behind your back, so `camp stop` goes back to doing exactly what
-it says. On an unsupervised camp — a container, CI, a camp you never installed a
-unit for — `camp stop` behaves exactly as it always has.
+`camp service uninstall` (un-manage it). Once the supervisor is no longer
+running campd, nothing will restart it behind your back, so `camp stop` goes
+back to doing exactly what it says — and it is then the verb for a campd the
+supervisor does not own. On an unsupervised camp — a container, CI, a camp you
+never installed a unit for — `camp stop` behaves exactly as it always has.
+
+"Is the supervisor running campd?" is answered by the supervisor, not guessed:
+on launchd it means the label is **bootstrapped** (`KeepAlive` is
+unconditional); on systemd it means the unit is **active** (`Restart=always`
+acts only on a running unit — a stopped unit is still `LoadState=loaded`, which
+says only that its unit file parsed).
+
+**The verbs that hand campd to the supervisor check first.** `camp service
+install` and `camp service start` refuse if a campd already holds the camp's
+socket: a supervised campd cannot take over a live socket — it would exit, and
+the supervisor would respawn it forever while the command told you the camp was
+supervised. Stop the running campd (`camp stop`) and install then works. This is
+the ordinary upgrade path for a camp that has been auto-starting its own campd.
 
 There is no registry file: the installed units ARE the registry, and
 `camp service list` reads them.
+
+> **What has actually been exercised against a live service manager:** the
+> end-to-end lifecycle test (`make service-e2e`) has only ever been run against
+> **launchd, on macOS**. The systemd path is covered by unit tests against a
+> faked `systemctl` — the generated unit text, the `systemctl` argv, and the
+> state parsing are all pinned, but no CI job and no test in this repo has run
+> it against a live `systemd --user`. Treat Linux as un-smoke-tested until
+> someone runs `make service-e2e` there.
 
 ### Formulas & graph execution
 

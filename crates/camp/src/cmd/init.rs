@@ -58,10 +58,18 @@ pub fn run(camp_flag: Option<&Path>, choice: ServiceChoice) -> Result<()> {
                     )
                 })
                 .with_context(|| {
+                    // Deliberately does NOT assert that no unit exists: `install`
+                    // also fails when a unit is ALREADY there (a stale one left
+                    // by a previous camp at this path), and claiming "NO unit was
+                    // installed" would then be false, with a suggested retry that
+                    // fails the same way (m2). State only what is certainly true
+                    // — the camp exists, campd is not supervised — and let the
+                    // cause below say which it was.
                     format!(
-                        "The camp at {} WAS created, but installing its service unit failed and \
-                         NO unit was installed — `camp service install` retries it, or run \
-                         `camp daemon --camp {}` under your own supervisor",
+                        "The camp at {} WAS created, but campd was NOT put under the host \
+                         service manager (the cause is below) — the camp is usable: \
+                         `camp service status` shows where it stands, `camp service install` \
+                         retries, and `camp daemon --camp {}` runs campd yourself",
                         root.display(),
                         root.display()
                     )
