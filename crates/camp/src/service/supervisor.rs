@@ -72,6 +72,18 @@ pub trait Supervisor {
     /// Stop + unload a unit. Its file is removed by the caller (the unit
     /// directory is the registry, and the flow that owns it does the IO).
     fn unload(&self, id: &CampId) -> Result<()>;
+
+    /// Cycle the service (the post-upgrade path: a running campd keeps
+    /// executing the OLD binary until it is restarted — design §1).
+    fn restart(&self, id: &CampId) -> Result<()>;
+
+    /// Stop the service, leaving the unit INSTALLED (operator decision,
+    /// 2026-07-10: this is what `camp stop` points a supervised operator at —
+    /// a socket stop would just be undone by the supervisor).
+    fn stop(&self, id: &CampId) -> Result<()>;
+
+    /// Start a stopped, still-installed unit.
+    fn start(&self, id: &CampId) -> Result<()>;
 }
 
 /// Shared by every supervisor: the unit DIRECTORY is the registry. Returns

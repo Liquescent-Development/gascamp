@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::campdir::CampDir;
+use crate::daemon::socket::{self, Request, Response};
 use crate::service::{self, CampId, Supervisor, SystemProbe, SystemRunner};
 
 /// `camp service list`: every camp with a managed unit, and its state. The
@@ -241,6 +242,105 @@ pub fn uninstall(supervisor: &dyn Supervisor, camp_root: &Path) -> Result<String
     ))
 }
 
+/// `camp service status` (design §5): the unit's load/run state, PLUS the
+/// campd liveness answer. Two independent truths — a loaded unit whose campd
+/// does not answer is precisely the fault worth seeing.
+pub fn status(supervisor: Option<&dyn Supervisor>, camp: &CampDir) -> Result<String> {
+    let mut report = String::new();
+    match supervisor {
+        None => report.push_str("unit:  no host service manager detected (container/CI?)\n"),
+        // `managed_unit` — not a bare `unit_path.exists()` — so a unit that
+        // names a different camp is reported as the loud collision it is,
+        // rather than as this camp's state.
+        Some(supervisor) => match managed_unit(supervisor, &camp.root)? {
+            Some(unit) => {
+                let state = supervisor.state(&unit.id)?;
+                report.push_str(&format!(
+                    "unit:  {} ({}, {})\n       loaded={} running={}  [{}]\n",
+                    unit.name,
+                    supervisor.name(),
+                    unit.path.display(),
+                    state.loaded,
+                    state.running,
+                    state.detail
+                ));
+            }
+            None => {
+                let id = CampId::for_camp(&camp.root)?;
+                report.push_str(&format!(
+                    "unit:  not installed ({} does not exist) — `camp service install`\n",
+                    supervisor.unit_path(&id).display()
+                ));
+            }
+        },
+    }
+    // Liveness is an ANSWERED REQUEST (spec §5 as amended by issue #55), never
+    // a bare connect: a wedged campd's listen backlog accepts connections its
+    // event loop never serves. This never auto-starts; a campd that accepts
+    // and does not answer surfaces as the loud CampdUnresponsive error.
+    match socket::request_if_up(camp, &Request::Status)? {
+        Some(Response::Status {
+            summary,
+            red,
+            campd_pid,
+            ..
+        }) => report.push_str(&format!(
+            "campd: listening (pid {campd_pid}) — {} live sessions, {} ready, {} red\n",
+            summary.live_sessions.len(),
+            summary.ready,
+            red
+        )),
+        Some(other) => bail!("unexpected response to status: {other:?}"),
+        None => report.push_str(&format!(
+            "campd: not listening ({})\n",
+            camp.socket_path().display()
+        )),
+    }
+    Ok(report)
+}
+
+/// `camp service restart` (design §5): cycle the daemon — the post-upgrade
+/// path (`launchctl kickstart -k` / `systemctl --user restart`).
+pub fn restart(supervisor: &dyn Supervisor, camp_root: &Path) -> Result<String> {
+    let unit = require_managed_unit(supervisor, camp_root, "`camp service install` first")?;
+    supervisor.restart(&unit.id)?;
+    Ok(format!(
+        "restarted {} unit {} ({})\n",
+        supervisor.name(),
+        unit.name,
+        unit.path.display()
+    ))
+}
+
+/// `camp service stop` (operator decision, 2026-07-10): stop the supervised
+/// campd — the verb `camp stop` sends a supervised operator to. The unit stays
+/// INSTALLED; `camp service start` brings it back, `camp service uninstall`
+/// removes it for good.
+pub fn stop(supervisor: &dyn Supervisor, camp_root: &Path) -> Result<String> {
+    let unit = require_managed_unit(supervisor, camp_root, "nothing to stop")?;
+    supervisor.stop(&unit.id)?;
+    Ok(format!(
+        "stopped {} unit {} ({})\nthe unit is still installed — `camp service start` \
+         brings campd back; `camp service uninstall` removes it\n",
+        supervisor.name(),
+        unit.name,
+        unit.path.display()
+    ))
+}
+
+/// `camp service start` (operator decision, 2026-07-10): start a stopped but
+/// still-installed unit.
+pub fn start(supervisor: &dyn Supervisor, camp_root: &Path) -> Result<String> {
+    let unit = require_managed_unit(supervisor, camp_root, "`camp service install` first")?;
+    supervisor.start(&unit.id)?;
+    Ok(format!(
+        "started {} unit {} ({})\n",
+        supervisor.name(),
+        unit.name,
+        unit.path.display()
+    ))
+}
+
 /// The `camp` binary a unit must run: the running executable's REAL absolute
 /// path. A unit naming a relative path breaks the moment the supervisor's cwd
 /// differs from yours (it always does).
@@ -278,6 +378,40 @@ pub fn run_uninstall(camp: &CampDir) -> Result<()> {
     let probe = SystemProbe::new(&runner);
     let supervisor = require_supervisor(&probe, &runner)?;
     print!("{}", uninstall(supervisor.as_ref(), &camp.root)?);
+    Ok(())
+}
+
+pub fn run_status(camp: &CampDir) -> Result<()> {
+    let runner = SystemRunner;
+    let probe = SystemProbe::new(&runner);
+    // No supervisor is a normal state for `status` (a container still has a
+    // campd to report on) — it is only fatal for the MUTATING verbs.
+    let supervisor = service::host_supervisor(&probe, &runner)?;
+    print!("{}", status(supervisor.as_deref(), camp)?);
+    Ok(())
+}
+
+pub fn run_restart(camp: &CampDir) -> Result<()> {
+    let runner = SystemRunner;
+    let probe = SystemProbe::new(&runner);
+    let supervisor = require_supervisor(&probe, &runner)?;
+    print!("{}", restart(supervisor.as_ref(), &camp.root)?);
+    Ok(())
+}
+
+pub fn run_stop(camp: &CampDir) -> Result<()> {
+    let runner = SystemRunner;
+    let probe = SystemProbe::new(&runner);
+    let supervisor = require_supervisor(&probe, &runner)?;
+    print!("{}", stop(supervisor.as_ref(), &camp.root)?);
+    Ok(())
+}
+
+pub fn run_start(camp: &CampDir) -> Result<()> {
+    let runner = SystemRunner;
+    let probe = SystemProbe::new(&runner);
+    let supervisor = require_supervisor(&probe, &runner)?;
+    print!("{}", start(supervisor.as_ref(), &camp.root)?);
     Ok(())
 }
 
@@ -604,5 +738,149 @@ mod tests {
             unit_path.exists(),
             "and another camp's unit is never removed"
         );
+    }
+
+    /// Design §5: status is TWO independent truths — the unit's load/run state
+    /// AND the campd liveness answer. A loaded unit whose campd does not
+    /// answer is exactly the fault this command exists to show.
+    #[test]
+    fn status_reports_the_unit_and_the_campd_liveness_answer() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        install(&launchd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        let status_runner =
+            FakeRunner::new(vec![FakeRunner::ok("service = {\n\tstate = running\n}\n")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &status_runner);
+        let report = status(Some(&launchd), &camp).unwrap();
+
+        assert!(report.contains("running"), "the unit's state: {report}");
+        // No campd is listening on this temp camp's socket — and that is a
+        // REPORTED state, not an error, and never an auto-start.
+        assert!(report.contains("campd: not listening"), "{report}");
+    }
+
+    #[test]
+    fn status_without_a_unit_says_so_and_names_the_remedy() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &fake);
+        let report = status(Some(&launchd), &camp).unwrap();
+        assert!(report.contains("not installed"), "{report}");
+        assert!(
+            report.contains("camp service install"),
+            "must name the remedy: {report}"
+        );
+        assert_eq!(
+            fake.call_count(),
+            0,
+            "no unit file, nothing to ask the manager"
+        );
+    }
+
+    /// In a container there is no unit — but campd's liveness is still the
+    /// half of the answer that matters there.
+    #[test]
+    fn status_with_no_host_service_manager_still_answers_for_campd() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let report = status(None, &camp).unwrap();
+        assert!(report.contains("no host service manager"), "{report}");
+        assert!(report.contains("campd: not listening"), "{report}");
+    }
+
+    #[test]
+    fn restart_cycles_an_installed_unit_and_refuses_a_missing_one() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let missing = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &missing);
+        let err = restart(&launchd, camp_dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("camp service install"),
+            "{err:#}"
+        );
+        assert_eq!(missing.call_count(), 0);
+
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        install(&launchd, camp_dir.path(), Path::new("/usr/local/bin/camp")).unwrap();
+
+        let restart_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &restart_runner);
+        let report = restart(&launchd, camp_dir.path()).unwrap();
+        assert!(
+            restart_runner
+                .call(0)
+                .starts_with("launchctl kickstart -k "),
+            "{}",
+            restart_runner.call(0)
+        );
+        assert!(report.contains("restarted"), "{report}");
+    }
+
+    /// `camp service stop` / `start` (operator decision, 2026-07-10): the
+    /// supervisor-level verbs that `camp stop` points a supervised operator at.
+    /// The unit STAYS installed — that is the whole difference from uninstall.
+    #[test]
+    fn stop_and_start_act_on_the_installed_unit_and_leave_it_installed() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        install(&launchd, camp_dir.path(), Path::new("/usr/local/bin/camp")).unwrap();
+        let id = crate::service::CampId::for_camp(camp_dir.path()).unwrap();
+        let unit_path = launchd.unit_path(&id);
+
+        let stop_runner = FakeRunner::new(vec![
+            FakeRunner::ok("service = {\n\tstate = running\n}\n"),
+            FakeRunner::ok(""),
+        ]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &stop_runner);
+        let report = stop(&launchd, camp_dir.path()).unwrap();
+        assert!(report.contains("stopped"), "{report}");
+        assert!(
+            unit_path.exists(),
+            "stop must NOT remove the unit (that is uninstall)"
+        );
+
+        let start_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &start_runner);
+        let report = start(&launchd, camp_dir.path()).unwrap();
+        assert!(
+            start_runner.call(0).starts_with("launchctl bootstrap "),
+            "{}",
+            start_runner.call(0)
+        );
+        assert!(report.contains("started"), "{report}");
+    }
+
+    /// Stopping/starting what was never installed is an error, not a no-op.
+    #[test]
+    fn stop_and_start_without_a_unit_are_loud_errors() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &fake);
+        assert!(
+            format!("{:#}", stop(&launchd, camp_dir.path()).unwrap_err())
+                .contains("no launchd unit")
+        );
+        assert!(
+            format!("{:#}", start(&launchd, camp_dir.path()).unwrap_err())
+                .contains("no launchd unit")
+        );
+        assert_eq!(fake.call_count(), 0);
     }
 }

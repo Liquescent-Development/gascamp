@@ -367,6 +367,14 @@ enum ServiceCommand {
     Install,
     /// Stop, unload and remove this camp's host service unit
     Uninstall,
+    /// The unit's state and campd's liveness
+    Status,
+    /// Cycle the daemon (the post-upgrade path)
+    Restart,
+    /// Stop the supervised campd (the unit stays installed)
+    Stop,
+    /// Start a stopped but still-installed unit
+    Start,
     /// Every camp with a managed unit, and its state (needs no camp)
     List,
 }
@@ -659,6 +667,22 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ServiceCommand::Uninstall => {
                 let camp = CampDir::resolve(cli.camp.as_deref())?;
                 cmd::service::run_uninstall(&camp)
+            }
+            ServiceCommand::Status => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_status(&camp)
+            }
+            ServiceCommand::Restart => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_restart(&camp)
+            }
+            ServiceCommand::Stop => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_stop(&camp)
+            }
+            ServiceCommand::Start => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::service::run_start(&camp)
             }
             // `list` is the fleet view: it deliberately does NOT resolve a
             // camp — the installed units are the registry (design §5).

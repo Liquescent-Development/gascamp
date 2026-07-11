@@ -188,6 +188,43 @@ impl Supervisor for Systemd<'_> {
         )?;
         Ok(())
     }
+
+    fn restart(&self, id: &CampId) -> Result<()> {
+        let name = self.unit_name(id);
+        run_checked(
+            self.runner,
+            "systemctl",
+            &[
+                OsStr::new("--user"),
+                OsStr::new("restart"),
+                OsStr::new(&name),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn stop(&self, id: &CampId) -> Result<()> {
+        // Unlike launchd, systemd separates the service from the unit: `stop`
+        // leaves it ENABLED (it returns at the next login), `disable --now`
+        // (our `unload`) does not.
+        let name = self.unit_name(id);
+        run_checked(
+            self.runner,
+            "systemctl",
+            &[OsStr::new("--user"), OsStr::new("stop"), OsStr::new(&name)],
+        )?;
+        Ok(())
+    }
+
+    fn start(&self, id: &CampId) -> Result<()> {
+        let name = self.unit_name(id);
+        run_checked(
+            self.runner,
+            "systemctl",
+            &[OsStr::new("--user"), OsStr::new("start"), OsStr::new(&name)],
+        )?;
+        Ok(())
+    }
 }
 
 /// systemd's `ExecStart` quoting, in reverse: double-quoted arguments (a camp
@@ -472,5 +509,39 @@ mod tests {
         let systemd = Systemd::new(PathBuf::from("/units"), &fake);
         systemd.reload_units().unwrap();
         assert_eq!(fake.call(0), "systemctl --user daemon-reload");
+    }
+
+    /// Design §5: restart = `systemctl --user restart`.
+    #[test]
+    fn restart_restarts_the_unit() {
+        let fake = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let systemd = Systemd::new(PathBuf::from("/units"), &fake);
+        systemd.restart(&id()).unwrap();
+        assert_eq!(
+            fake.call(0),
+            "systemctl --user restart campd-dev-f9481b53.service"
+        );
+    }
+
+    /// The operator's remedy (2026-07-10). Unlike launchd, systemd separates
+    /// "stop the service" from "unload the unit": `stop` leaves it enabled
+    /// (so it returns at login), `disable --now` (that is `unload`) does not.
+    #[test]
+    fn stop_and_start_are_the_unit_level_verbs() {
+        let stopping = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let systemd = Systemd::new(PathBuf::from("/units"), &stopping);
+        systemd.stop(&id()).unwrap();
+        assert_eq!(
+            stopping.call(0),
+            "systemctl --user stop campd-dev-f9481b53.service"
+        );
+
+        let starting = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let systemd = Systemd::new(PathBuf::from("/units"), &starting);
+        systemd.start(&id()).unwrap();
+        assert_eq!(
+            starting.call(0),
+            "systemctl --user start campd-dev-f9481b53.service"
+        );
     }
 }

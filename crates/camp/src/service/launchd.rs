@@ -197,6 +197,33 @@ impl Supervisor for Launchd<'_> {
         )?;
         Ok(())
     }
+
+    fn restart(&self, id: &CampId) -> Result<()> {
+        run_checked(
+            self.runner,
+            "launchctl",
+            &[
+                OsStr::new("kickstart"),
+                OsStr::new("-k"),
+                OsStr::new(&self.service_target(id)),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn stop(&self, id: &CampId) -> Result<()> {
+        // launchd has no "stop but stay bootstrapped" for a KeepAlive agent:
+        // `launchctl kill` sends a signal and KeepAlive restarts it. Stopping
+        // IS booting out of the gui domain — the plist stays on disk, which is
+        // exactly what separates this from `uninstall`. Same operation as
+        // `unload`, stated rather than aliased so the intent is readable.
+        self.unload(id)
+    }
+
+    fn start(&self, id: &CampId) -> Result<()> {
+        // …and starting is bootstrapping the still-present plist back in.
+        self.load(id)
+    }
 }
 
 /// A camp path may legally contain `&` or `<`; an escaped plist must survive
@@ -443,6 +470,45 @@ mod tests {
             absent.call_count(),
             1,
             "nothing to boot out: only the state query"
+        );
+    }
+
+    /// Design §5: restart = `launchctl kickstart -k` (the post-upgrade cycle).
+    #[test]
+    fn restart_kickstarts_the_service() {
+        let fake = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        launchd.restart(&id()).unwrap();
+        assert_eq!(
+            fake.call(0),
+            "launchctl kickstart -k gui/501/com.gascamp.campd.dev-f9481b53"
+        );
+    }
+
+    /// The operator's remedy (2026-07-10). launchd has no "stop but stay
+    /// bootstrapped" for a KeepAlive agent — `launchctl kill` would just be
+    /// restarted — so stopping IS booting out of the domain, and starting IS
+    /// bootstrapping back in. The plist stays on disk (that is what makes this
+    /// `stop`, not `uninstall`).
+    #[test]
+    fn stop_boots_the_agent_out_and_start_bootstraps_it_back() {
+        let stopping = FakeRunner::new(vec![
+            FakeRunner::ok("service = {\n\tstate = running\n}\n"), // state: loaded
+            FakeRunner::ok(""),                                    // bootout
+        ]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &stopping);
+        launchd.stop(&id()).unwrap();
+        assert_eq!(
+            stopping.call(1),
+            "launchctl bootout gui/501/com.gascamp.campd.dev-f9481b53"
+        );
+
+        let starting = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &starting);
+        launchd.start(&id()).unwrap();
+        assert_eq!(
+            starting.call(0),
+            "launchctl bootstrap gui/501 /units/com.gascamp.campd.dev-f9481b53.plist"
         );
     }
 }
