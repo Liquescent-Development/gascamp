@@ -14,7 +14,11 @@ fn camp() -> Command {
 /// Init a camp, then seed beads directly through camp-core with a fixed clock
 /// so `--json` output is byte-deterministic (the binary uses SystemClock).
 fn seeded(dir: &std::path::Path) {
-    camp().current_dir(dir).arg("init").assert().success();
+    camp()
+        .current_dir(dir)
+        .args(["init", "--no-service"])
+        .assert()
+        .success();
     let mut ledger = Ledger::open_with_clock(
         &dir.join(".camp/camp.db"),
         Box::new(FixedClock::new("2026-07-05T21:14:03Z")),
@@ -95,7 +99,7 @@ fn ls_surfaces_work_outcomes_and_dispatch_failures() {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
     {

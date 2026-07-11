@@ -37,6 +37,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use campdir::CampDir;
+use service::ServiceChoice;
 
 #[derive(Parser)]
 #[command(
@@ -57,7 +58,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create a new camp (./.camp by default; --camp DIR to choose the place)
-    Init,
+    Init {
+        /// Install and start a host service unit; a hard error when no host
+        /// service manager is available (container/CI)
+        #[arg(long, conflicts_with = "no_service")]
+        service: bool,
+        /// Do not install a host service unit (containers, CI, or by choice)
+        #[arg(long = "no-service")]
+        no_service: bool,
+    },
     /// Verify ledger invariants
     #[command(group(
         clap::ArgGroup::new("mode").required(true).args(["refold", "formula"])
@@ -461,7 +470,21 @@ fn run_daemon(camp_flag: Option<&Path>) -> anyhow::Result<()> {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Init => cmd::init::run(cli.camp.as_deref()),
+        Command::Init {
+            service,
+            no_service,
+        } => {
+            // Two bools at the CLI edge; ONE tri-state inside (clap already
+            // rejected the contradictory pair).
+            let choice = if service {
+                ServiceChoice::Force
+            } else if no_service {
+                ServiceChoice::Skip
+            } else {
+                ServiceChoice::Auto
+            };
+            cmd::init::run(cli.camp.as_deref(), choice)
+        }
         Command::Doctor {
             refold: _,
             repair,

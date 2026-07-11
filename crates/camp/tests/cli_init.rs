@@ -14,7 +14,7 @@ fn camp() -> Command {
 fn git_init(dir: &Path) {
     let ok = std::process::Command::new("git")
         .current_dir(dir)
-        .args(["init", "-q"])
+        .args(["init", "-q"]) // not-camp: `git init`, not `camp init`
         .status()
         .unwrap()
         .success();
@@ -38,7 +38,7 @@ fn init_creates_dot_camp_in_cwd() {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success()
         .stdout(predicates::str::contains(".camp"));
@@ -50,6 +50,34 @@ fn init_creates_dot_camp_in_cwd() {
     assert!(config.contains("name = "), "camp.toml was: {config}");
 }
 
+/// Design §6.4: `--no-service` skips the unit even on a desktop — and says so.
+/// (Every OTHER init test in this repo passes --no-service too: a bare
+/// `camp init` on a macOS host installs a REAL LaunchAgent and starts a
+/// daemon. Unit CI must never do that.)
+#[test]
+fn init_no_service_skips_the_unit_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    camp()
+        .current_dir(dir.path())
+        .args(["init", "--no-service"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("service: skipped"));
+    assert!(dir.path().join(".camp/camp.toml").exists());
+}
+
+/// The two flags are contradictory; clap rejects the pair (fail fast).
+#[test]
+fn init_rejects_service_and_no_service_together() {
+    let dir = tempfile::tempdir().unwrap();
+    camp()
+        .current_dir(dir.path())
+        .args(["init", "--service", "--no-service"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
 #[test]
 fn init_with_explicit_camp_dir() {
     let dir = tempfile::tempdir().unwrap();
@@ -58,7 +86,7 @@ fn init_with_explicit_camp_dir() {
         .current_dir(dir.path())
         .arg("--camp")
         .arg(&target)
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
 
@@ -76,7 +104,11 @@ fn init_gitignores_live_runtime_but_not_camp_toml() {
     let repo = dir.path();
     git_init(repo);
 
-    camp().current_dir(repo).arg("init").assert().success();
+    camp()
+        .current_dir(repo)
+        .args(["init", "--no-service"])
+        .assert()
+        .success();
 
     for runtime in [
         ".camp/camp.db",
@@ -112,7 +144,7 @@ fn init_gitignores_nested_camp_with_anchored_paths() {
         .current_dir(repo)
         .arg("--camp")
         .arg(&camp_dir)
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
 
@@ -137,7 +169,7 @@ fn init_outside_git_repo_creates_no_gitignore() {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
     assert!(
@@ -157,7 +189,11 @@ fn init_then_rig_add_gitignore_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
     git_init(repo);
-    camp().current_dir(repo).arg("init").assert().success();
+    camp()
+        .current_dir(repo)
+        .args(["init", "--no-service"])
+        .assert()
+        .success();
 
     let after_init = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
     assert_eq!(
@@ -190,12 +226,12 @@ fn reinit_fails_fast() {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .failure()
         .code(1)

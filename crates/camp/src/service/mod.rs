@@ -66,6 +66,37 @@ pub fn host_supervisor<'a>(
     }
 }
 
+/// What the operator asked `camp init` to do about the host service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceChoice {
+    /// Default: install where a manager exists; hand off where none does.
+    Auto,
+    /// `--service`: install, or fail loudly.
+    Force,
+    /// `--no-service`: never install.
+    Skip,
+}
+
+/// What `camp init` will DO. Pure — `(choice, detection) → decision` — so
+/// every environment is a unit test (design §9), and the IO-shaped half stays
+/// a thin shell over a table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Install(Manager),
+    SkipByFlag,
+    SkipNoManager,
+    FailNoManager,
+}
+
+pub fn decide(choice: ServiceChoice, detected: Option<Manager>) -> Decision {
+    match (choice, detected) {
+        (ServiceChoice::Skip, _) => Decision::SkipByFlag,
+        (_, Some(manager)) => Decision::Install(manager),
+        (ServiceChoice::Force, None) => Decision::FailNoManager,
+        (ServiceChoice::Auto, None) => Decision::SkipNoManager,
+    }
+}
+
 fn home(probe: &dyn HostProbe) -> Result<PathBuf> {
     probe
         .env("HOME")
@@ -135,5 +166,35 @@ mod tests {
         // A control character would structurally corrupt either unit format.
         let err = unit_safe_str(Path::new("/tmp/two\nlines/.camp"), "camp").unwrap_err();
         assert!(format!("{err:#}").contains("control character"), "{err:#}");
+    }
+
+    /// Design §6: detection decides, the flags override. Six cells, all pinned.
+    #[test]
+    fn the_init_service_decision_is_a_pure_table() {
+        // Default: a host with a manager gets a supervised campd…
+        assert_eq!(
+            decide(ServiceChoice::Auto, Some(Manager::Launchd)),
+            Decision::Install(Manager::Launchd)
+        );
+        assert_eq!(
+            decide(ServiceChoice::Auto, Some(Manager::Systemd)),
+            Decision::Install(Manager::Systemd)
+        );
+        // …and a container/CI box gets a VISIBLE hand-off, not a failure.
+        assert_eq!(decide(ServiceChoice::Auto, None), Decision::SkipNoManager);
+
+        // --service forces it, and is a HARD ERROR where it cannot be honored.
+        assert_eq!(
+            decide(ServiceChoice::Force, Some(Manager::Systemd)),
+            Decision::Install(Manager::Systemd)
+        );
+        assert_eq!(decide(ServiceChoice::Force, None), Decision::FailNoManager);
+
+        // --no-service skips, manager or not.
+        assert_eq!(
+            decide(ServiceChoice::Skip, Some(Manager::Launchd)),
+            Decision::SkipByFlag
+        );
+        assert_eq!(decide(ServiceChoice::Skip, None), Decision::SkipByFlag);
     }
 }

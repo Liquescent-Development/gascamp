@@ -19,7 +19,7 @@ fn doctor_formula_exits_0_on_a_valid_formula() {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
     let f = write(
@@ -41,7 +41,7 @@ fn doctor_formula_exits_1_listing_every_violation() {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
     let f = write(
@@ -68,7 +68,7 @@ fn doctor_requires_exactly_one_of_refold_or_formula() {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
     camp()

@@ -61,7 +61,7 @@ fn camp_with_rig_dir() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     camp()
         .current_dir(dir.path())
-        .arg("init")
+        .args(["init", "--no-service"])
         .assert()
         .success();
     let rig_dir = dir.path().join("myrepo");
