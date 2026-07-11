@@ -92,10 +92,13 @@ Uninstall removes both the binary and the `campd` symlink:
 make uninstall                        # honors the same PREFIX
 ```
 
-You almost never start the daemon by hand: **`campd` auto-starts** the first
-time a `camp` verb needs it (it spawns detached, records the cause in the
-ledger, and waits for readiness), and `camp stop` shuts it down. That's the
-"idle is free" model — nothing runs until there's work.
+You almost never start the daemon by hand: on a desktop, `camp init` puts
+campd under the host's service manager, so it's **always-on** — restarted
+across crashes and reboots by that supervisor (see [Supervised
+campd](#supervised-campd--camp-service)). Without one — a container, CI —
+nothing is standing until you run `camp daemon` yourself, and `camp stop`
+shuts down what you started. Either way, "idle is free" means no ticks, no
+polling — an idle campd costs ~0% CPU, not that no process exists.
 
 ## Quickstart
 
@@ -327,9 +330,15 @@ red: 0
 ```
 
 Liveness *is* the socket (`<camp>/campd.sock`) — no pidfiles, no
-lockfiles-as-status. `campd` is crash-only: `kill -9` is a supported shutdown.
-Idle it holds no worker processes and, per invariant 1, targets < 20 MB RSS and
-0.0% CPU (asserted by the local-only `make perf` suite).
+lockfiles-as-status. `campd` is crash-only: it holds no private state, so
+`kill -9` loses nothing and is always safe — the ledger tells the whole
+story on the next start. That is not the same as a shutdown, though: on a
+supervised camp the unit's `KeepAlive`/`Restart=always` respawns campd
+within moments, so `kill -9` there is a **restart**, not a stop — use `camp
+service stop` to actually stop a supervised campd. Only on an unsupervised
+camp does `kill -9` shut it down. Idle it holds no worker processes and, per
+invariant 1, targets < 20 MB RSS and 0.0% CPU (asserted by the local-only
+`make perf` suite).
 
 #### Supervised campd — `camp service`
 

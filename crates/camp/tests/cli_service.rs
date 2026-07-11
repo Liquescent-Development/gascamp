@@ -77,6 +77,13 @@ impl Drop for Uninstall {
 
 /// Block until campd answers on this camp's socket (test-side polling is
 /// sanctioned for harnesses — campd itself never polls — invariant 1).
+///
+/// `camp service status`'s exit status is checked BEFORE its stdout is read
+/// (fix wave 1, F5): a hard error (e.g. the camp-id-collision `bail!`) prints
+/// nothing to stdout, so without this check `listening` would silently read
+/// as `false` — meaning both `wait_for_campd(&root, false)` call sites below
+/// would return immediately and green on a BROKEN command, mistaking it for
+/// "campd is stopped". A broken command must fail this test loudly instead.
 fn wait_for_campd(camp: &Path, want_listening: bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -86,6 +93,12 @@ fn wait_for_campd(camp: &Path, want_listening: bool) {
             .args(["service", "status"])
             .output()
             .unwrap();
+        assert!(
+            out.status.success(),
+            "`camp service status` must succeed — a hard error here is a broken \
+             command, not evidence that campd is stopped: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let text = String::from_utf8_lossy(&out.stdout);
         let listening = text.contains("campd: listening");
         if listening == want_listening {
@@ -97,6 +110,34 @@ fn wait_for_campd(camp: &Path, want_listening: bool) {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// campd's pid, parsed from `camp service status`'s `campd: listening (pid
+/// N)` line (fix wave 1, F3) — the direct observable that proves `camp
+/// service restart` actually cycles the process, rather than leaving an
+/// already-listening campd untouched. Requires that campd currently be
+/// listening; call after `wait_for_campd(camp, true)`.
+fn campd_pid(camp: &Path) -> u32 {
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("camp"))
+        .args(["--camp"])
+        .arg(camp)
+        .args(["service", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "camp service status must succeed to read campd's pid: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let pid_str = text
+        .split("(pid ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .unwrap_or_else(|| panic!("no \"(pid N)\" in status output:\n{text}"));
+    pid_str
+        .parse()
+        .unwrap_or_else(|e| panic!("pid {pid_str:?} did not parse ({e}):\n{text}"))
 }
 
 /// Design §9: the `camp service` lifecycle against the HOST's REAL service
@@ -112,6 +153,16 @@ fn service_lifecycle_against_the_real_host_manager() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join(".camp");
 
+    // The cleanup guard is constructed BEFORE `camp init` runs (fix wave 1,
+    // F4): uninstalling a unit that does not exist yet is already a
+    // no-op-with-message, so there is no cost to having the guard in scope
+    // early — but if the init below panics (`.assert().success()` on a
+    // non-zero exit) AFTER the unit is written and the supervisor started
+    // it, the guard must already exist to run during unwind. Built after the
+    // call, a panicking init would leak a real LaunchAgent/systemd unit and
+    // a running campd onto this machine with no guard left to clean it up.
+    let _cleanup = Uninstall(root.clone());
+
     // `camp init` with NO flag: the environment-aware default (design §6) —
     // on a host with a manager it installs and starts the unit itself. This
     // bare init is the THING UNDER TEST, and it is safe only because this test
@@ -124,7 +175,6 @@ fn service_lifecycle_against_the_real_host_manager() {
         .arg("init") // real-manager: deliberate bare `camp init` — #[ignore]d + CAMP_SERVICE_E2E-gated
         .assert()
         .success();
-    let _cleanup = Uninstall(root.clone());
     let init_out = String::from_utf8_lossy(&init.get_output().stdout).into_owned();
     assert!(
         init_out.contains("installed"),
@@ -167,7 +217,12 @@ fn service_lifecycle_against_the_real_host_manager() {
         "`camp service list` must name this camp: {list}"
     );
 
-    // The post-upgrade cycle: campd comes back.
+    // The post-upgrade cycle: campd comes back — as a NEW process, not the
+    // same one left untouched (fix wave 1, F3). `wait_for_campd(&root, true)`
+    // alone proves nothing here: campd was already listening before this
+    // call, so a `restart` that is a total no-op would still pass it. Capture
+    // the pid before and after and require it to change.
+    let pid_before_restart = campd_pid(&root);
     camp()
         .args(["--camp"])
         .arg(&root)
@@ -175,6 +230,12 @@ fn service_lifecycle_against_the_real_host_manager() {
         .assert()
         .success();
     wait_for_campd(&root, true);
+    let pid_after_restart = campd_pid(&root);
+    assert_ne!(
+        pid_before_restart, pid_after_restart,
+        "camp service restart must actually cycle campd to a NEW process, not \
+         leave the already-listening one untouched"
+    );
 
     // The operator's ruling (2026-07-10), end to end: `camp stop` REFUSES on a
     // supervised camp — and the remedy it names actually works.
