@@ -7,7 +7,7 @@
 //! `camp daemon`.
 
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 // Repo precedent (`daemon_lifecycle.rs:11-12`). `camp` is a bin-only crate
@@ -15,6 +15,25 @@ use std::time::{Duration, Instant};
 // integration test — it is re-declared here, exactly as daemon_lifecycle does.
 const BIN: &str = env!("CARGO_BIN_EXE_camp");
 const READY_PREFIX: &str = "campd listening on ";
+
+/// RAII kill-guard for the spawned daemon — the repo's uniform precedent
+/// (`daemon_lifecycle.rs:135`, `daemon_dispatch.rs:149`, `daemon_wedge.rs:155`,
+/// …). `std::process::Child` does NOT kill on drop, and an idle campd sleeps
+/// in `poll()` forever (invariant 1: no idle timeout). Any assertion that
+/// panics between the spawn and the exit would otherwise strand a live daemon
+/// holding a dup of this test binary's inherited stderr — the pipe cargo and
+/// the CI runner read to EOF — so a half-second red failure could instead hang
+/// the job to its timeout. Every exit path reaps: on the happy path campd has
+/// already exited 0, so both calls are no-ops and the exit-status assertion is
+/// untouched.
+struct Campd(Child);
+
+impl Drop for Campd {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 /// The whole phase contract, once. Both signal tests call THIS — so the
 /// "identical outcome" in spec §9 is enforced by construction rather than
@@ -33,21 +52,24 @@ fn graceful_stop_on(signal: &str) {
     let camp_root = dir.path().join(".camp");
 
     // Spawn the long-lived daemon; capture stdout for the readiness line.
-    let mut child = Command::new(BIN)
-        .env_remove("CAMP_DIR")
-        .args(["daemon", "--camp"])
-        .arg(&camp_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
+    // The guard owns it from here on: every panic below reaps it.
+    let mut child = Campd(
+        Command::new(BIN)
+            .env_remove("CAMP_DIR")
+            .args(["daemon", "--camp"])
+            .arg(&camp_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
 
     // Block until campd announces readiness — an OS pipe read, not a
     // sleep/retry loop. Assert the PREFIX, not merely that some bytes
     // arrived: that distinguishes "campd is up and listening" from "campd
     // printed something and died".
-    let stdout = child.stdout.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
     let mut line = String::new();
     BufReader::new(stdout).read_line(&mut line).unwrap();
     assert!(
@@ -62,21 +84,22 @@ fn graceful_stop_on(signal: &str) {
     // kill(1) rather than a libc dep: `Child::kill` is SIGKILL-only.
     let sent = Command::new("kill")
         .arg(format!("-{signal}"))
-        .arg(child.id().to_string())
+        .arg(child.0.id().to_string())
         .status()
         .unwrap();
     assert!(sent.success(), "kill -{signal} failed to send");
 
     // (1 of 3) It exits CLEANLY — not terminated by the signal's default action.
+    // The deadline panic needs no cleanup of its own: the guard reaps.
     let deadline = Instant::now() + Duration::from_secs(10);
     let exit = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.0.try_wait().unwrap() {
             break status;
         }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("campd did not exit within 10s of SIG{signal}");
-        }
+        assert!(
+            Instant::now() <= deadline,
+            "campd did not exit within 10s of SIG{signal}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
     assert!(
@@ -85,13 +108,17 @@ fn graceful_stop_on(signal: &str) {
     );
 
     // (2 of 3) The graceful stop is DURABLE — the same event as `camp stop`.
+    // The EXACT sequence, not merely "campd.stopped appears somewhere": that is
+    // the assertion the socket Request::Stop test makes (`daemon/mod.rs:331`),
+    // and parity with that path is the whole claim of this phase. The stricter
+    // form also catches a double-append or a stray event on the signal path.
     let ledger = camp_core::ledger::Ledger::open_read_only(&camp_root.join("camp.db")).unwrap();
-    let stopped = ledger
-        .events_of_type(camp_core::event::EventType::CampdStopped)
-        .unwrap();
-    assert!(
-        !stopped.is_empty(),
-        "a graceful SIG{signal} stop must record campd.stopped"
+    let events = ledger.events_range(1, None).unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(
+        types,
+        vec!["campd.started", "campd.stopped"],
+        "a graceful SIG{signal} stop must record exactly campd.started then campd.stopped"
     );
 
     // (3 of 3) The socket is DROPPED. This is the part that bites under a

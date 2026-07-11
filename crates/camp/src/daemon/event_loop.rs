@@ -215,7 +215,7 @@ pub fn run(
                     }
                 },
                 SIGCHLD => {
-                    drain_signal_pipe(&mut sigchld)?;
+                    drain_signal_pipe(&mut sigchld, "SIGCHLD")?;
                     // Reap → record ends → settle (catch up, cook, refill
                     // capacity). Errors are reported, never fatal: a broken
                     // child must not take campd down, and unrecorded exits
@@ -297,12 +297,21 @@ pub fn run(
                     }
                 }
                 SIGTERM_SIG => {
+                    // Drain FIRST, then decide — signal-hook's prescribed
+                    // order for its pipe module, and the one arm in this loop
+                    // that cannot shrug off a spurious readable (mio documents
+                    // that events MAY be spurious; here acting on one would
+                    // EXIT the daemon). A byte in the pipe is the only proof a
+                    // signal was actually delivered; no byte, no stop.
+                    if drain_signal_pipe(&mut sigterm, "SIGTERM/SIGINT")? == 0 {
+                        continue;
+                    }
                     // A supervisor (or Ctrl-C) asked us to stop. Run the SAME
                     // graceful path as Request::Stop: durable event, unlink,
-                    // exit 0. No respond() — a signal has nobody to answer.
-                    // Draining the self-pipe is moot: we are exiting, and the
-                    // fd dies with us. In-flight connection events later in
-                    // this same batch are dropped, exactly as the
+                    // exit 0. No respond() — a signal has nobody to answer. A
+                    // second signal racing this stop just writes a byte nobody
+                    // reads; the fd dies with us. In-flight connection events
+                    // later in this same batch are dropped, exactly as the
                     // ConnState::Stop arm drops them — durable truth is
                     // already appended.
                     stop(ledger, socket_path)?;
@@ -619,19 +628,28 @@ fn drain_lines(
     Ok(None)
 }
 
-/// Drain the SIGCHLD self-pipe (signal deliveries coalesce; one byte or
-/// many, one sweep of try_wait covers them all).
-fn drain_signal_pipe(stream: &mut UnixStream) -> Result<()> {
+/// Drain a signal self-pipe, returning how many bytes it held (signal
+/// deliveries coalesce; one byte or many, one sweep of the service path
+/// covers them all).
+///
+/// The count is what lets a caller distinguish a real delivery from a
+/// spurious readable — mio documents that readiness events MAY be spurious.
+/// SIGCHLD ignores it (a wasted try_wait sweep reaps nothing and is
+/// harmless); SIGTERM/SIGINT must not, because its service path exits the
+/// daemon. Drain first, then act, is also signal-hook's prescribed order for
+/// its `pipe` module.
+fn drain_signal_pipe(stream: &mut UnixStream, which: &str) -> Result<usize> {
     let mut buf = [0u8; 64];
+    let mut drained = 0usize;
     loop {
         match stream.read(&mut buf) {
             // the write end lives in the signal handler for the process
             // lifetime; 0 is unreachable-but-safe
-            Ok(0) => return Ok(()),
-            Ok(_) => {}
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+            Ok(0) => return Ok(drained),
+            Ok(n) => drained += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(drained),
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(e).context("draining the SIGCHLD pipe"),
+            Err(e) => return Err(e).with_context(|| format!("draining the {which} pipe")),
         }
     }
 }
