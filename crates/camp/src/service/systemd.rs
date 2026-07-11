@@ -118,14 +118,21 @@ impl Supervisor for Systemd<'_> {
         // parse can be structurally corrupted by a path.
         //
         // systemd expands `%`-specifiers (e.g. `%h` → the invoking user's
-        // home directory) in `ExecStart`. A literal `%` in the camp path or
-        // the binary path must be escaped `%%`, or systemd substitutes
-        // something else entirely: the unit ends up naming a directory that
-        // does not exist, `install` reports success, and campd crash-loops
-        // forever under `Restart=always`. `escape_percent` runs BEFORE
-        // `quote`, so the doubled `%%` is itself quoted verbatim; `split_exec`
-        // undoes the quoting first and `unescape_percent` undoes this last,
-        // making `parse_camp_root` the exact inverse of this function.
+        // home directory) EVERYWHERE in a unit file, not only `ExecStart` —
+        // `Description=` included. A literal `%` in the camp path or the
+        // binary path must be escaped `%%` in every field it is interpolated
+        // into, or systemd substitutes something else entirely (or, for a
+        // specifier it does not recognize, refuses to load the unit at all).
+        // `escape_percent` runs BEFORE `quote`, so the doubled `%%` is itself
+        // quoted verbatim in `ExecStart`; `split_exec` undoes the quoting
+        // first and `unescape_percent` undoes this last, making
+        // `parse_camp_root` the exact inverse of this function.
+        //
+        // `camp_root` is escaped once and reused for both `Description=`
+        // (unquoted) and `ExecStart` (quoted): every place this function
+        // interpolates the camp root into a field systemd expands specifiers
+        // in must see the escaped form.
+        let camp_root = escape_percent(camp_root);
         format!(
             "[Unit]\n\
              Description=Gas Camp daemon (campd) for {camp_root}\n\
@@ -139,7 +146,7 @@ impl Supervisor for Systemd<'_> {
              [Install]\n\
              WantedBy=default.target\n",
             exe = quote(&escape_percent(exe)),
-            camp = quote(&escape_percent(camp_root)),
+            camp = quote(&camp_root),
         )
     }
 
@@ -377,6 +384,57 @@ mod tests {
             "a literal `%` must be escaped to `%%` in ExecStart: {text}"
         );
         assert_eq!(systemd.parse_camp_root(&text).unwrap(), PathBuf::from(root));
+    }
+
+    /// systemd expands `%`-specifiers in `Description=` too, not only
+    /// `ExecStart=`. A camp root containing a literal `%` (e.g. `50%off`) is a
+    /// perfectly legal path, but `%o` is not a valid specifier: an unescaped
+    /// `Description=` makes systemd refuse to load the WHOLE unit, so
+    /// `install` fails and the camp becomes permanently uninstallable via a
+    /// cryptic systemd error. The escaping must cover every generated field,
+    /// not just `ExecStart=`.
+    #[test]
+    fn unit_text_escapes_percent_in_description_too() {
+        let fake = FakeRunner::new(vec![]);
+        let systemd = Systemd::new(PathBuf::from("/units"), &fake);
+        let root = "/home/x/50%off/.camp";
+        let text = systemd.unit_text(&id(), root, "/usr/local/bin/camp");
+        let description = text
+            .lines()
+            .find(|line| line.starts_with("Description="))
+            .expect("unit text must have a Description= line");
+        assert!(
+            description.contains("50%%off"),
+            "a literal % in Description= must be escaped to %%, or systemd's \
+             specifier expansion corrupts or refuses the whole unit: {text}"
+        );
+        assert!(
+            !description.contains("50%off"),
+            "a raw, unescaped % must never survive into Description=: {text}"
+        );
+    }
+
+    /// The escape/unescape pair must be a true round trip through the WHOLE
+    /// generated unit (Description= included), for every shape of `%` a camp
+    /// path might contain: a lone `%`, an already-doubled `%%`, a trailing
+    /// lone `%`, and a real specifier-looking `%h`.
+    #[test]
+    fn unit_text_round_trips_every_percent_shape() {
+        let fake = FakeRunner::new(vec![]);
+        let systemd = Systemd::new(PathBuf::from("/units"), &fake);
+        for root in [
+            "/home/x/50%off/.camp",
+            "/home/x/50%%off/.camp",
+            "/home/x/trailing%/.camp",
+            "/home/x/%h/.camp",
+        ] {
+            let text = systemd.unit_text(&id(), root, "/usr/local/bin/camp");
+            assert_eq!(
+                systemd.parse_camp_root(&text).unwrap(),
+                PathBuf::from(root),
+                "round trip broke for root {root:?}: {text}"
+            );
+        }
     }
 
     #[test]

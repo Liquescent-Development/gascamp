@@ -139,7 +139,20 @@ pub fn install(supervisor: &dyn Supervisor, camp_root: &Path, exe: &Path) -> Res
     }
     std::fs::write(&unit_path, supervisor.unit_text(&id, root_text, exe_text))
         .with_context(|| format!("writing {}", unit_path.display()))?;
-    supervisor.reload_units()?;
+    if let Err(reload_error) = supervisor.reload_units() {
+        // Fail fast, no half state: a unit the manager could not even be
+        // told about must not be left on disk pretending to be installed —
+        // the next `install` would otherwise refuse with "already installed"
+        // for a camp that is neither installed nor loaded. Same rollback as
+        // a failed `load`, one line later.
+        let error = reload_error.context(format!(
+            "reloading {} after writing the unit {} ({})",
+            supervisor.name(),
+            supervisor.unit_name(&id),
+            unit_path.display()
+        ));
+        return Err(rollback_unit_file(supervisor, &unit_path, error));
+    }
 
     if let Err(load_error) = supervisor.load(&id) {
         // Fail fast, no half state: a unit the manager refused must not be
@@ -152,18 +165,7 @@ pub fn install(supervisor: &dyn Supervisor, camp_root: &Path, exe: &Path) -> Res
             supervisor.unit_name(&id),
             unit_path.display()
         ));
-        return Err(match std::fs::remove_file(&unit_path) {
-            Err(e) => error.context(format!(
-                "and the unit file could not be rolled back: removing {} ({e})",
-                unit_path.display()
-            )),
-            Ok(()) => match supervisor.reload_units() {
-                Err(e) => error.context(format!(
-                    "and the manager could not be reloaded after the rollback: {e:#}"
-                )),
-                Ok(()) => error,
-            },
-        });
+        return Err(rollback_unit_file(supervisor, &unit_path, error));
     }
     Ok(format!(
         "installed {} unit {} ({})\ncampd for {} is now supervised — it restarts on crash \
@@ -174,6 +176,32 @@ pub fn install(supervisor: &dyn Supervisor, camp_root: &Path, exe: &Path) -> Res
         unit_path.display(),
         root.display()
     ))
+}
+
+/// After the unit file has been written, undo it: no failure between "the
+/// file is on disk" and "install reports success" may leave that file
+/// behind (invariant 5, no half state) — reachable from a failed
+/// `reload_units` (just after the write) or a failed `load` (one line
+/// later), so both go through here. The ORIGINAL error is never swallowed: a
+/// failed rollback is folded INTO it (both failures visible), never
+/// replaces it.
+fn rollback_unit_file(
+    supervisor: &dyn Supervisor,
+    unit_path: &Path,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match std::fs::remove_file(unit_path) {
+        Err(e) => error.context(format!(
+            "and the unit file could not be rolled back: removing {} ({e})",
+            unit_path.display()
+        )),
+        Ok(()) => match supervisor.reload_units() {
+            Err(e) => error.context(format!(
+                "and the manager could not be reloaded after the rollback: {e:#}"
+            )),
+            Ok(()) => error,
+        },
+    }
 }
 
 /// The managed unit, or the loud "this camp is not managed" error. `remedy` is
@@ -499,6 +527,37 @@ mod tests {
         assert!(
             std::fs::read_dir(units.path()).unwrap().next().is_none(),
             "the unit file must not survive a failed load"
+        );
+    }
+
+    /// Finding 2 fix: the FIRST `reload_units` call — right after the unit
+    /// file is written, before `load` is ever attempted — must roll the file
+    /// back on failure exactly like a failed `load` does. Without this, a
+    /// transient manager failure here (e.g. a bus hiccup) leaves the unit
+    /// file on disk, and the next `install` refuses with "already installed"
+    /// for a camp that was never actually loaded — the operator has to run
+    /// `uninstall` just to recover from a FAILED install.
+    #[test]
+    fn a_failed_reload_before_load_rolls_the_unit_file_back() {
+        let camp = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let fake = FakeRunner::new(vec![
+            FakeRunner::fail(1, "Failed to connect to bus\n"), // daemon-reload (after write)
+            FakeRunner::ok(""),                                // daemon-reload (after rollback)
+        ]);
+        let systemd = Systemd::new(units.path().to_path_buf(), &fake);
+
+        let err = install(&systemd, camp.path(), Path::new("/usr/local/bin/camp")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to connect to bus"),
+            "must carry the manager's own words: {msg}"
+        );
+
+        let id = crate::service::CampId::for_camp(camp.path()).unwrap();
+        assert!(
+            !systemd.unit_path(&id).exists(),
+            "a unit whose reload failed must not survive the failed install"
         );
     }
 
