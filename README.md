@@ -395,13 +395,19 @@ the ordinary upgrade path for a camp still running a campd of its own.
 There is no registry file: the installed units ARE the registry, and
 `camp service list` reads them.
 
-> **What has actually been exercised against a live service manager:** the
-> end-to-end lifecycle test (`make service-e2e`) has only ever been run against
-> **launchd, on macOS**. The systemd path is covered by unit tests against a
-> faked `systemctl` — the generated unit text, the `systemctl` argv, and the
-> state parsing are all pinned, but no CI job and no test in this repo has run
-> it against a live `systemd --user`. Treat Linux as un-smoke-tested until
-> someone runs `make service-e2e` there.
+> **What has actually been exercised against a live service manager:** both.
+> The end-to-end lifecycle test (`make service-e2e`) runs against **launchd on
+> macOS**. The **systemd** path was driven by hand against a live
+> `systemd --user` (Ubuntu 24.04, aarch64) on 2026-07-11: `camp init` detecting
+> the user manager and installing a unit, `status`, `list`, `stop`, `start`,
+> `restart` (the supervised campd's pid really does change), `uninstall` leaving
+> nothing behind, `camp stop` refusing while the unit is running and falling
+> through to a socket stop once it is not, and the `install`/`restart` refusals
+> firing on a campd systemd does not own. A camp path containing `%` was included
+> deliberately: systemd expands `%` specifiers in `ExecStart`, and the escaping
+> holds — the unit stores `%%`, systemd resolves it back to the literal path, and
+> campd binds. No CI job runs either path (neither can run on a hosted runner);
+> the systemd flows also stay pinned by unit tests against a faked `systemctl`.
 
 #### In a container
 
