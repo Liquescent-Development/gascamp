@@ -175,6 +175,8 @@ Per the component spec, retained: `[imports.<name>]` in `camp.toml`; a tracked `
 
 ### 8.1 Workers stay headless. The control plane is a protocol.
 
+> **This section is a summary. The full design is `2026-07-12-camp-control-plane-design.md`** — the operator's view, the permission flow, the overseer, and the undocumented-protocol risk (accepted, with mitigations).
+
 Camp spawns `claude -p --output-format stream-json --input-format stream-json` and holds stdin as a live pipe. That channel carries a **full control protocol** — verified in the shipped binary (v2.1.207): `control_request` / `control_response` / `control_cancel_request`, and the subtypes **`interrupt`**, **`can_use_tool`**, **`set_model`**, **`set_permission_mode`**.
 
 So camp can watch, converse with, **interrupt**, and **answer permission requests for** a worker **without a PTY, tmux, or screen-scraping**. Gas City needs tmux because it drives agents through a terminal; herdr regexes the rendered TUI because it only has pixels. Camp kept the structured channel and can simply *use* it.
