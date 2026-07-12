@@ -3,7 +3,7 @@
 **Date:** 2026-07-12
 **Issues:** [#80](https://github.com/Liquescent-Development/gascamp/issues/80) · [#84](https://github.com/Liquescent-Development/gascamp/issues/84) · [#85](https://github.com/Liquescent-Development/gascamp/issues/85)
 **Incorporates:** `2026-07-12-camp-pack-imports-design.md` — the import machinery (source grammar, lock, verbs, `camp init` flow, error table) in full detail. That is the component spec for §7; this is the umbrella. Where they disagree, this wins.
-**Status:** rev 2 — re-authored after adversarial review (rev 1: CHANGES REQUIRED, 4 Critical)
+**Status:** rev 3 — after a second adversarial review. Rev 2's fix for "the design refuses gastown" **introduced the biggest defect in the document**: it re-scoped v1 onto three packs chosen by reading only their *agents*, never their `pack.toml` or their formulas. Those packs need a transitive pack import (which rev 2 put out of scope) and `drain` (which rev 2 put in phase 5), and all 51 of their agents no-op under camp's worker environment. §3, §6.1–6.3 and §12 are the fix.
 
 ## 1. Why
 
@@ -57,13 +57,28 @@ gc *externalizes* its control plane as an agent process (`gc convoy control --se
 
 **Mail — gc's messages ARE beads** (`beadmail.go:198-207`, `Type="message"`, `Assignee=to`). Camp already has a `mail` bead type (`fold.rs:13`), already excluded from dispatch (`readiness.rs:84-88`), already exported as bd's `message` (`export.rs:189`). And the packs' own doctrine is **nudge-first**: *"Every `gc mail send` creates a permanent bead… Default to nudge for all routine communication. The litmus test: if the recipient dies and restarts, do they need this message?"*
 
-## 3. Goal
+## 3. Goal, and what v1 actually requires
 
-**v1:** `camp import add https://github.com/gastownhall/gascity-packs/tree/main/bmad --name bmad` fetches a real Gas City pack and its agents, formulas, and orders run in camp **without editing the pack**. Same for `gstack` and `compound-engineering` — 51 agents.
+**v1:** `camp import add https://github.com/gastownhall/gascity-packs/tree/main/bmad --name bmad` fetches a real Gas City pack and its agents, formulas, and orders run in camp **without editing the pack**. Same for `gstack` and `compound-engineering`.
+
+**Rev 2 chose those three packs by reading only their agents, and was wrong.** Read at the `pack.toml` and formula layers, they demand three things rev 2 put out of scope or in a later phase:
+
+| what | evidence |
+|---|---|
+| **A transitive pack import.** All three declare `[imports.gc] source = "../gascity"`. **24 of their 32 formulas `extends` a parent (`build-base`, `implement`, `do-work-item`…) that exists only in the gascity pack.** Without resolving it, the three packs contribute **zero runnable formulas**. | measured, `tomllib` |
+| **`drain`.** Each pack's headline entry formula (`bmad-build`, `gstack-build`, `compound-build`) has **two `drain` steps**, both `member_access = "exclusive"`. **The step that does the work *is* a drain step, in all three.** | measured |
+| **A worker environment.** All 51 agents share one fragment that reads `BEADS_ACTOR` / `GC_SESSION_NAME` / `GC_AGENT` / `GC_TEMPLATE` and **exits 0 doing nothing** if they are unset. Camp sets only `CAMP_*`. | `spawn.rs:230` |
+
+So v1 is redefined by the corpus, not by preference:
+
+- **Single-level pack imports are IN SCOPE, in phase 1.** Recursion depth **1 covers 100% of the corpus** — no pack imports a pack that itself imports. A relative `../gascity` source must resolve *after* materialization (see §7).
+- **`drain` moves to phase 2**, with formulas. There is no v1 without it.
+- **The v1 unit is `bmad | gstack | compound-engineering` + `gascity`**, imported together.
+- **`gascity` carries 10 `mail` calls**, so v1 either implements mail or states plainly what those agents lose. **Decision:** `camp mail` ships in v1 (§8.2), not v1.5 — the transitive dependency dragged it forward and pretending otherwise is how rev 2 broke.
 
 **Not the goal:** being Gas City. Camp stays single-binary, SQLite-ledgered, zero-idle-cost, daily-driver scale. Where fidelity and camp's laws conflict, camp **refuses loudly and names what it refused** — never silently approximates.
 
-**gastown is v2, explicitly.** It needs standing named sessions, pools, and 46 mail calls. That is the phase where invariant 2 gets challenged, and isolating it there keeps it from contaminating everything else.
+**gastown is still v2.** It needs standing named sessions, pools, and 66 mail calls. That is where invariant 2 gets challenged, and isolating it keeps it from contaminating the rest.
 
 ## 4. The permissiveness rule
 
@@ -122,17 +137,27 @@ Camp's `spawn.rs:198-208` pushes `--model` / `--permission-mode` / `--allowedToo
 **Decision:**
 
 - Camp gains **`[agent_defaults]` in `camp.toml`** — *operator-owned*, never pack-owned: `model`, `permission_mode`, `tools`.
-- A pack agent's `option_defaults.{model,permission_mode}` may **narrow** it. It may never widen `tools`, because it cannot express them.
+- **A pack cannot influence model, permission mode, or tools at all.** Rev 2 allowed `option_defaults` to "narrow" them; that clause is **deleted**. `option_defaults` appears **0 times in all 80 real agents**, so it was a rule for nobody — and "narrow" is undefined for an ordered enum (`permission_mode`) and for a set (`tools`: intersection? error on an un-granted request? silent drop?), which is exactly the ambiguity two implementers resolve differently. Operator-owned, full stop: simpler, strictly safer, and it costs zero corpus compatibility.
 - **Camp refuses to spawn any agent for which no tool allowlist resolves.** Unrestricted-by-omission is impossible.
 - Camp **never** adopts gc's `unrestricted` default.
 
 This is operator configuration, not a fallback: absent config is an *error*, not a default.
 
-### 5.3 What camp refuses (v1), loudly and itemized
+### 5.3 `skills/` is NOT ignorable — 13 of the 51 v1 agents depend on it
 
-`pre_start` (2/80) · `work_dir` (8/80) · `wake_mode`/`idle_timeout` (7/80) · `min/max_active_sessions` (2/80) · `[[named_session]]` · `[global].session_live` (tmux chrome only) · `tmux_alias` (0 uses) · ACP (0 uses) · provider presets (0 `[providers.*]` in the whole corpus).
+Rev 2's component spec said `skills/` and `commands/` are *"IGNORED by camp. That is a design decision, not an oversight."* It was an oversight.
 
-Every refusal names the pack, the agent, and the key. **Never silently skipped.**
+**9 of bmad's 10 agents** and **4 of compound-engineering's 28** open with, verbatim: *"Use the shared `bmad-create-architecture` skill from this pack's `skills/` catalog."* Ignore `skills/` and 90% of bmad's agents are pointed at instructions that do not exist — so they improvise, silently, which is worse than failing.
+
+**Camp installs a pack's `skills/` into the worker's `.claude/skills/`.** `commands/` (Claude Code slash commands) remain out of scope and are **reported as ignored** at import.
+
+### 5.4 What camp refuses (v1), loudly and itemized
+
+`pre_start` (2/80) · `work_dir` (8/80) · `wake_mode`/`idle_timeout` (7/80) · `min_active_sessions` (2/80) · `max_active_sessions` (**7**/80) · `nudge` (6/80) · `sleep_after_idle` / `max_session_age` / `max_session_age_jitter` (1 each) · `[[named_session]]` · `[global].session_live` (tmux chrome only) · `tmux_alias` (0 uses) · ACP (0 uses) · provider presets (0 `[providers.*]` in the whole corpus).
+
+Every refusal names the pack, the agent, and the key, **and appends a ledger event**. Never silently skipped.
+
+**Warnings are aggregated, not per-key.** 93 of 100 formulas name at least one dead key (§4); a warning per key is a wall of noise nobody reads. `camp import add` prints **one line per import naming the distinct ignored keys**, and appends one ledger event.
 
 ## 6. The worker contract: camp serves gc's vocabulary
 
@@ -159,9 +184,52 @@ campd writes these into `.camp/bin/` and prepends that directory **to the worker
 | `mail` (v1.5) | 72 | §8 |
 | `convoy status --json` | 9 | worker-facing read |
 
-**Unknown subcommands and flags FAIL FAST**, naming exactly what the pack asked for and which pack asked. Never a no-op — a silently-ignored `bd update --set-metadata gc.outcome=pass` is a corrupted ledger. The measured surface is 17 `bd` subcommands and 26+ flags; `bd mol` (102 refs), `bd ready` (80) and `bd gate` have **no camp equivalent** and are refused by name until implemented.
+**Unknown subcommands and flags FAIL FAST**, naming exactly what the pack asked for and which pack asked. Never a no-op — a silently-ignored `bd update --set-metadata gc.outcome=pass` is a corrupted ledger.
 
-**Note the refusal surface has a hole and the spec must own it:** §5.3's refusals are *pack-level*. Prompts call `bd`/`gc` **directly**, routing around the formula layer. The shim is therefore the *only* place that refusal can be enforced for those calls — which is another reason it must fail fast rather than approximate.
+**But failing fast is not enough, because the caller swallows failures.** The worker fragment opens its claim block with `set +e` and routes every failure into `sleep 2; continue` inside an **unbounded `while true` loop**. A refused `bd` call there does not surface as a fast failure — it produces a silent spin. So **every shim refusal also appends a ledger event** (`shim.refused`, naming pack / agent / verb / flag). The operator sees it even when the bash block eats it. Without that, "fail fast" is a claim the architecture cannot honour.
+
+*(Scale note: within the 51 v1 agents, `bd mol` / `bd ready` / `bd gate` appear **only as prohibitions** in the shared fragment — "do not run broad `bd ready`". Refusing them is safe for v1. The corpus-wide counts rev 2 quoted were dominated by those negations.)*
+
+### 6.1 The worker environment contract — without it, all 51 agents no-op
+
+Every v1 agent's first act is this, from the shared `gc-role-worker` fragment:
+
+```sh
+EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+EXPECTED_ROUTE="${GC_TEMPLATE:-${GC_AGENT:-}}"
+if [ -z "$EXPECTED_ASSIGNEE" ]; then echo "CONFIG_REJECTED missing expected assignee"; gc runtime drain-ack; exit 0; fi
+if ! command -v python3 >/dev/null 2>&1; then echo "CONFIG_REJECTED missing python3"; gc runtime drain-ack; exit 0; fi
+```
+
+Gas City exports those (`build_desired_state.go:1001-1003`, `bd_env.go:229-230`). Camp exports only `CAMP_DIR`, `CAMP_BEAD`, `CAMP_SESSION`, `CAMP_TRANSCRIPT` (`spawn.rs:230`). **Every one of the 51 agents would print `CONFIG_REJECTED` and exit 0** — a clean exit, for a worker that did nothing. That is rev 1's "dies on line one" failure reproduced through a different hole.
+
+**Camp exports the gc worker environment**, and the values must **equal by construction** what `camp hook --claim --json` returns:
+
+| var | value |
+|---|---|
+| `BEADS_ACTOR`, `GC_SESSION_NAME`, `GC_SESSION_ID` | the session name — **the same string `hook --claim` returns as `assignee`** |
+| `GC_AGENT`, `GC_TEMPLATE` | the agent's qualified name — **the same string returned as `route`** |
+
+This is not cosmetic. The fragment compares `EXPECTED_ASSIGNEE` against the bead's assignee and `EXPECTED_ROUTE` against `hook`'s `route`, and **a mismatch does not fail — it `sleep 2; continue`s forever.** If camp's exported values and its `hook` output disagree by a byte, the worker spins in one Bash call until it is killed.
+
+**`python3` is a hard runtime dependency of the gc worker contract.** It must be declared, and added to `contrib/docker/` (which installs only `ca-certificates git tini`).
+
+### 6.2 Session lifecycle: camp truncates gc's continuation loop, and says so
+
+The gc worker is **not bead-scoped**. After closing a bead it loops — *"check for more routed work before draining… continue by running the same `GC_CLAIM` block again"* — and exits only via `gc runtime drain-ack`.
+
+Camp is bead-scoped: on `bd close`, campd drops the held stdin and kills the worker after a grace (`dispatch.rs:243-269`). Two outcomes, both wrong: the worker is killed before it can `drain-ack` (violating the handshake §6 calls mandatory), or it wins the race and **claims a second bead that campd's registry does not know about** — a bead then claimed by a session campd is about to kill.
+
+**Decision:** `camp hook --claim --json` returns **`action: "drain"`** for any session whose dispatched bead is already closed. One bead per session is enforced **at the hook**, so the worker takes its own clean `NO_ROUTED_WORK → drain-ack → exit 0` path. **`drain-ack` becomes campd's release signal** (release on drain-ack, with the existing grace timer as a backstop), not bead-close.
+
+**Fidelity cost, stated plainly:** camp does not honour `gc.continuation_group`, and a `context = "shared"` drain does not actually share a worker session. Master §8.4 is therefore **narrowed, not upheld** — see §11.5.
+
+### 6.3 The shims: absolute path, gitignored, dispatch-only
+
+- **The shim must embed camp's absolute path** (`std::env::current_exe()`), not `exec camp …` by bare name. campd's PATH is a snapshot baked into the service unit at install (`service/mod.rs`, `campd_path()`), and it is not guaranteed to contain camp's own bindir — that snapshot exists so campd can find *`claude` and `git`*. A bare-name lookup would re-introduce the exact PATH bug this repo just spent five review rounds fixing.
+- **`.camp/bin` is gitignored.** `gitignore::RUNTIME_DIRS` gains `bin` alongside `imports`. Autonomous workers deliver by commit from a worktree; generated executables must not ride along.
+- **Attended sessions get no shims.** Camp sets the *worker child's* env, not the operator's shell. **Therefore gc pack agents are campd-dispatch-only and cannot be run attended** — stated so nobody wires `.camp/bin` into the plugin's SessionStart hook.
+- The shims **shadow a real `gc`/`bd`** inside a worker for an operator who also runs a city. That is intended (the worker must talk to camp's ledger), and it is why refusals must be loud.
 
 ## 7. Import machinery
 
@@ -222,11 +290,11 @@ v2 designs it; v1 and v1.5 do not need it (0 named sessions across 51 agents, 8 
 
 | phase | key set added | corpus loading |
 |---|---|---|
-| 2a | dead keys ignored; annotations; `contract`; `description_file`; step `metadata` (incl. `gc.run_target` routing) | pinned by test |
-| 2b | `vars`, `condition` | pinned by test |
-| 2c | `extends` | pinned by test |
+| 2a | dead keys ignored; annotations; `contract`; `description_file` (**53** formulas); step `metadata` (incl. `gc.run_target` routing) | pinned by test |
+| 2b | `vars`, `condition` (**13**) | pinned by test |
+| 2c | `extends` (48) | pinned by test |
 | 2d | `type`, `template`, `expand`, `expand_vars`, `children` | pinned by test |
-| 5 | `drain` | pinned by test |
+| **2e** | **`drain` (13)** — moved here from phase 5. **v1's three packs cannot run without it**: their headline formula's `implement` step *is* a drain step. | pinned by test |
 
 **Permanently refused, and therefore the ceiling is below 100:** `phase = "vapor"` (2 formulas — v1 materialization semantics) and `scope-check` / `gc.scope_*` (1). Rev 1 claimed 100/100 while simultaneously refusing these. **The ceiling is 97–98, and the gate will say exactly which.**
 
@@ -246,7 +314,13 @@ Today's CI proves **camp ⊆ gc** (camp's corpus compiles under the real gc comp
 
 The new gate: **fetch the real `gascity-packs` corpus at a pinned ref and assert camp loads and compiles exactly what it claims — and refuses, by name, what it does not.** The claimed numbers become tests. A regression from 85 to 60 fails CI.
 
-**Do not vendor the corpus.** `gastownhall/gascity-packs` has **no top-level LICENSE**; it is a mixed-license tree (third-party vendored dirs carry their own), i.e. all-rights-reserved by default, and gascamp is AGPL-3.0. The repo ships **`registry.toml` with per-pack `commit` + `sha256:` content hashes** — **fetch and verify against those pins at CI time.** Licensing-clean, and stronger provenance than a copy.
+**Do not vendor the corpus.** `gastownhall/gascity-packs` has **no top-level LICENSE**; it is a mixed-license tree (third-party vendored dirs carry their own), i.e. all-rights-reserved by default, and gascamp is AGPL-3.0. The repo ships **`registry.toml` with per-pack `commit` + `sha256:` hashes** (11 packs, 28 releases) — **fetch and verify against those pins at CI time.**
+
+**Two things this obliges, which "verify the sha256" hides:**
+- The hash is **not a tarball digest**. It is a bespoke *manifest* hash (`validate_registry.py:94-136`): for every file in the pack subtree at that commit, build `"<relpath> <perm> <sha256(content)>"` (perm from the git mode — `100644`→`644`, `100755`→`755`, **`120000`→symlink**), join, and sha256 the result. Camp's gate must **port that algorithm**, and pin the version of it, because it is a third party's undocumented, unversioned function.
+- **Verification runs on the raw fetched tree, BEFORE symlink dereference** (§7). Dereferencing turns mode `120000` into `100644` and invalidates the hash.
+
+The gate must also state **which `[[pack.release]]` version it pins**.
 
 Both gates run. Without the new one, "compatible" is a claim, not a fact.
 
@@ -257,15 +331,18 @@ AGENTS.md forbids re-litigating the record without one. Four changes:
 1. **Master §11 — "a role is a Claude Code agent file, zero invented formats."** *Retired.* Camp's native agent is a Gas City directory (§5.1). The trade is deliberate: gc compatibility is worth more than bare-Claude-Code portability, because packs+formulas *are* the process. (The companion clause — *machinery ships no roles* — **survives**: camp's binary carries only a pack *source URL*. Note gc's own machinery ships one agent, `core/control-dispatcher`, `prompt_mode="none"` — so the narrow reading is what holds in gc too.)
 2. **Invariant 1 — "no polling loops, anywhere."** *Narrowed:* campd never polls; a per-turn `mail check` hook in the **worker** is a poll that costs tokens, not idle CPU (§8.2).
 3. **Invariant 5 — "no fallbacks."** *Upheld, and made sharper:* a pack agent with no resolvable tool allowlist is an **error**, not a default (§5.2). Camp never inherits gc's `unrestricted`.
-4. **Master §8.4 — workers spawn per bead and exit on close.** *Upheld in v1/v1.5.* Standing named sessions (which gastown requires) are **v2**, and that phase must re-litigate **invariant 2** ("cost proportional to job") explicitly (§8.3).
+4. **Master §8.4 — workers spawn per bead and exit on close.** *Narrowed, not upheld* (rev 2 claimed "upheld" and was wrong). The gc worker contract camp adopts mandates a **multi-bead continuation loop** and a **`drain-ack` exit handshake**; camp is bead-scoped and kills the worker on close. Camp therefore **truncates gc's session protocol**: `hook --claim` returns `drain` once the session's bead is closed, and `drain-ack` becomes the release signal (§6.2). **Fidelity cost:** `gc.continuation_group` is not honoured, and a `context = "shared"` drain does not share a worker session. Standing named sessions (which gastown requires) remain **v2**, and that phase must re-litigate **invariant 2** explicitly (§8.3).
+5. **Master §11's `skills/` corollary.** Retiring "a role is a Claude Code agent file" (amendment 1) does not license dropping a pack's `skills/`: **13 of the 51 v1 agents' prompts depend on it** (§5.3). Camp installs pack skills into the worker's `.claude/skills/`. A format decision must not silently become a content decision.
 
 ## 12. Phases
 
-1. **Import machinery + pack loader.** Fetch/lock/install, git hardening, `trust_exec`. `pack.toml`, agent directories, flat `formulas/`, flat `orders/`. Fixes #80; retires the `.md` agent format; fixes #85 by construction.
-2. **Formulas** (§9), phase-gated by key set, each rung pinned by the gate.
-3. **The worker contract** — `gc`/`bd` shims, `hook --claim --json`, `runtime drain-ack`. A gc worker closes a gc bead end-to-end. **v1 target: bmad, gstack, compound-engineering (51 agents).**
-4. **Observability + control plane** (§8.1) — campd socket verbs, `camp attach` TUI. Also mail + `prime` (**v1.5**: +gascity/roles, +superpowers = 72 agents).
-5. **`drain`**, and **gastown** (standing sessions, pools) — the phase that re-opens invariant 2.
+1. **Import machinery + pack loader.** Fetch/lock/install, git hardening, `trust_exec`. `pack.toml`, **single-level `[imports.*]`** (§3 — depth 1 covers the whole corpus), agent directories, `formulas/`, `orders/` **directories**, `skills/` install. Fixes #80; retires the `.md` agent format; fixes #85 by construction.
+2. **Formulas** (§9), phase-gated by key set, each rung pinned by the gate — **including `drain` (2e)**, without which none of v1's packs run.
+3. **The worker contract** — `gc`/`bd` shims (§6.3), the **worker environment** (§6.1), `hook --claim --json`, `runtime drain-ack` as the release signal (§6.2), `python3` in the container, **and #86 (`--verbose`)**. A gc worker closes a gc bead end-to-end.
+   **v1 target: `bmad | gstack | compound-engineering` + `gascity` (the transitive dependency).**
+4. **Mail** (§8.2) + `prime`. Pulled into v1 by gascity's 10 mail calls, not deferred.
+5. **The control plane** — see `2026-07-12-camp-control-plane-design.md`, which has its own phase 0 (the read channel).
+6. **gastown** — standing sessions, pools, 66 mail calls. The phase that re-opens invariant 2.
 
 ## 13. Security
 
@@ -294,4 +371,19 @@ Imported orders load, validate, and appear in `camp order ls` as **disabled**, w
 
 ## 15. Out of scope (#84)
 
-The transitive import graph, `[[exports]]`/namespaces, semver constraint solving, the pack registry, a shared machine-local cache, credentials for private pack repos, `why`/`--tree`/`prune`/`status`/`migrate`, gc's `overlay/` mutation semantics, `commands/`, `doctor/` checks, ACP, provider presets, tmux, and a remote API / Web UI / per-agent VM isolation (§8.1 constrains the design so these stay possible; it does not build them).
+`[[exports]]`/namespaces, semver constraint solving, the pack registry, a shared machine-local cache, credentials for private pack repos, `why`/`--tree`/`prune`/`status`/`migrate`, gc's `overlay/` mutation semantics, `commands/`, `doctor/` checks, ACP, provider presets, tmux, and a remote API / Web UI / per-agent VM isolation (the control-plane spec constrains the design so these stay possible; it does not build them).
+
+**No longer out of scope:** the **transitive import graph**. Rev 2 listed it here while its own goal statement required it — all three v1 packs declare `[imports.gc] source = "../gascity"` (§3). **Single-level resolution is in phase 1**; depth >1 does not occur in the corpus and stays out.
+
+## 16. Corrections to rev 2's numbers
+
+Re-derived and confirmed by review. Rev 2 was wrong on these, and they are fixed above:
+
+| claim | rev 2 | actual |
+|---|---|---|
+| `description_file` | 67 formulas | **53** |
+| `condition` | 17 | **13** |
+| `max_active_sessions` | 2 | **7** |
+| gastown mail calls | 46 | **66** |
+| literal `gc hook` refs | 140 | **151** (the load-bearing half — `{{cmd}} hook` = **0** — was right) |
+| `bd mol` / `bd ready` | "102 / 80 refs, no camp equivalent" | corpus-wide counts **dominated by prohibitions**; **0 real invocations** among the 51 v1 agents |
