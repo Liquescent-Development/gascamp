@@ -216,9 +216,18 @@ exit 0). Crash-only means SIGKILL stays safe; this just makes a normal
   isolation. It must also set a writable **`HOME`**: campd computes the worker
   transcript path under `$HOME/.claude` (a hard error if `HOME` is unset) and
   patrol creates that directory.
-- Run under a minimal init (`tini` / `dumb-init`) as PID 1 (documented
-  belt-and-suspenders) — though with SIGTERM handling + SIGCHLD reaping,
-  campd is PID-1-safe on its own.
+- Run under a minimal init (`tini` / `dumb-init`) as PID 1. **Required — and
+  this design originally said otherwise.** It claimed SIGTERM handling plus
+  SIGCHLD reaping made campd "PID-1-safe on its own". That is half right, and
+  the wrong half matters. campd handles SIGTERM (so `docker stop` is graceful
+  either way) and reaps the workers it *spawned* — but it reaps by `try_wait`
+  on pids it holds, and it has no way to wait on a pid it never spawned (there
+  is no `libc` dependency with which to `waitpid(-1)`). A worker's own
+  subprocess, orphaned when the worker dies first, is reparented to PID 1; with
+  campd as PID 1 it stays a zombie for the life of the container, leaking a PID
+  slot per orphan. Measured 2026-07-11: campd as PID 1 accumulated a zombie per
+  orphan; behind tini, zero. `docker run --init` / compose `init: true` is an
+  equivalent substitute. No init at all is not.
 - `compose.yaml` — `restart: unless-stopped`.
 - CLI usage: `docker exec <container> camp sling "…"` (connects over the
   in-container socket); mount the camp dir to reach the socket from outside.

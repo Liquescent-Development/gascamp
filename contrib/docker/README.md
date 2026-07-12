@@ -114,11 +114,24 @@ ledger, where every camp failure goes.
 
 ## Why tini
 
-campd reaps its own worker children (a SIGCHLD self-pipe) and handles SIGTERM,
-so it is PID-1-safe on its own. `tini` is belt and braces — it also means an
-adopted orphan from a worker's own subprocess tree can never accumulate. If you
-would rather not have it, `docker run --init` (or compose's `init: true`) does
-the same job with the runtime's own init.
+Because PID 1 has to reap orphans, and **campd cannot**.
+
+campd handles SIGTERM itself (that is what makes `docker stop` graceful) and it
+reaps the workers it *spawned* — it holds each worker's `Child` and waits on
+that pid. What it cannot do is wait on a pid it never spawned. When a worker
+spawns its own subprocess and then dies first, that subprocess is reparented to
+PID 1. If PID 1 were campd, it would never wait on it, and it would sit there
+as a zombie for the life of the container. A camp that runs for weeks would leak
+one PID slot per orphan.
+
+That is the whole job `tini` does here, and it is why the entrypoint is
+`tini -- camp-entrypoint` rather than the entrypoint alone. It is measured, not
+assumed: with campd as PID 1, orphaning a process leaves a zombie every time;
+behind tini, none — the container smoke test asserts it.
+
+`docker run --init`, or compose's `init: true`, does the same job with the
+runtime's own init and is a fine substitute. What is *not* fine is having no
+init at all.
 
 ## Why the build context is the repo root
 

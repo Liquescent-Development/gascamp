@@ -38,11 +38,15 @@ FROM debian:bookworm-slim
 #                 EVERY dispatch to read the rig's base commit
 #                 (daemon/spawn.rs::rig_base), and to `git worktree add` for the
 #                 default isolation (spec §12). No git, no dispatch.
-# tini            a real init as PID 1. Belt and braces: campd reaps its own
-#                 workers (SIGCHLD self-pipe) and handles SIGTERM (Phase 1), so
-#                 it is PID-1-safe on its own — tini just means you never have
-#                 to think about it. `docker run --init` / compose `init: true`
-#                 is the same thing by another route.
+# tini            a real init as PID 1. REQUIRED, not a nicety: campd reaps the
+#                 workers it SPAWNED (SIGCHLD self-pipe, `try_wait` per known
+#                 pid) and handles SIGTERM (Phase 1) — but it has no way to wait
+#                 on a pid it never spawned. A worker's own subprocess, orphaned
+#                 when the worker dies first, is reparented to PID 1; with campd
+#                 as PID 1 it stays a zombie forever, and a long-lived camp leaks
+#                 PIDs. Measured: campd as PID 1 accumulates zombies; behind tini
+#                 it accumulates none. `docker run --init` / compose `init: true`
+#                 is the same job by another route — but SOMETHING must do it.
 # ca-certificates for the worker you wire into [dispatch].command (a real
 #                 Claude Code worker talks TLS). camp itself opens no sockets
 #                 but the unix one.
