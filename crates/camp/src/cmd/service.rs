@@ -407,9 +407,17 @@ fn worker_command_warning(problem: &WorkerCommand, camp_root: &Path) -> String {
              cannot check it for you. An absolute path in {toml} is checkable, and does not \
              depend on which rig a bead lands in.\n"
         ),
+        // A TOML parse error's Display is a MULTI-LINE snippet (the offending
+        // line, a caret, the reason) — the realistic case here, since the way an
+        // operator's camp.toml becomes unreadable is that they typoed it. Raw,
+        // it drops every line after the first to column 0 and breaks the shape of
+        // the report this command exists to render: the same defect `launchctl
+        // print`'s multi-line stderr caused, which is why `indented_detail`
+        // exists. The manager's words go through it; so do these.
         WorkerCommand::Uncheckable(why) => format!(
             "NOTE: could not read {toml}, so the worker command campd will spawn was not \
-             checked ({why}). campd and `camp doctor` report the config fault itself.\n"
+             checked ({}). campd and `camp doctor` report the config fault itself.\n",
+            indented_detail(why, "      ")
         ),
     }
 }
@@ -1515,12 +1523,28 @@ mod tests {
         let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
         install(&launchd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
 
+        // A camp with NO camp.toml fails config load with a ONE-LINE io error,
+        // and a one-line error cannot break a column-0 invariant — so a fixture
+        // built only from that cannot fail, whatever it asserts. The way an
+        // operator's camp.toml actually becomes unreadable is that they typo it,
+        // and `toml`'s parse error Display is a MULTI-LINE snippet (offending
+        // line, caret, reason). That is the input this invariant exists for, so
+        // it is the input the fixture must carry.
+        std::fs::write(camp.root.join("camp.toml"), "[dispatch]\ncommand =\n").unwrap();
+
         let runner = FakeRunner::new(vec![FakeRunner::fail(
             113,
             "Bad request.\nCould not find service in domain for user gui: 501\n",
         )]);
         let launchd = Launchd::new(units.path().to_path_buf(), 501, &runner);
         let report = status(Some(&launchd), &camp).unwrap();
+
+        // The config fault reaches the operator (nothing hidden)…
+        assert!(
+            report.contains("could not read") && report.contains("was not checked"),
+            "an unreadable camp.toml must be stated, not silently read as 'the worker is \
+             fine': {report}"
+        );
 
         // Nothing the manager said is dropped or summarized…
         assert!(report.contains("Bad request."), "{report}");
