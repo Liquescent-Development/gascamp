@@ -58,6 +58,26 @@ impl Supervisor for Systemd<'_> {
         Ok(PathBuf::from(root))
     }
 
+    fn parse_path(&self, unit_text: &str) -> Option<String> {
+        // The exact inverse of `unit_text`'s `Environment=` line: undo the
+        // quoting, then strip the `PATH=` the value carries. A unit from before
+        // campd's PATH was baked in has no Environment= line and says so by
+        // returning None.
+        //
+        // `split_exec` ALREADY unescapes `%%` on every arg it emits — which is
+        // why `parse_camp_root` does not do it either, and must not. Unescaping
+        // a second time here corrupted any PATH with two adjacent `%`
+        // (`/opt/50%%off` came back as `/opt/50%off`): not None, not an error —
+        // a wrong answer, from the one function whose whole contract is "the
+        // exact inverse", in the change whose whole thesis is that the tooling
+        // must never state something false about campd's PATH.
+        let value = unit_text
+            .lines()
+            .find_map(|line| line.strip_prefix("Environment="))?;
+        let unquoted = split_exec(value).into_iter().next()?;
+        unquoted.strip_prefix("PATH=").map(str::to_owned)
+    }
+
     fn state(&self, id: &CampId) -> Result<UnitState> {
         // One machine-readable call. `show` exits 0 even for a unit systemd
         // has never heard of (LoadState=not-found), so this is a state query,
@@ -122,7 +142,7 @@ impl Supervisor for Systemd<'_> {
         format!("{UNIT_PREFIX}{id}{UNIT_SUFFIX}")
     }
 
-    fn unit_text(&self, _id: &CampId, camp_root: &str, exe: &str) -> String {
+    fn unit_text(&self, _id: &CampId, camp_root: &str, exe: &str, path: &str) -> String {
         // Restart=always (design §4.2, always-on). Output goes to the journal
         // (`journalctl --user -u campd-<id>`): visible, not swallowed. The
         // paths are `&str` that `unit_safe_str` vouched for — control-character
@@ -152,6 +172,7 @@ impl Supervisor for Systemd<'_> {
              [Service]\n\
              Type=simple\n\
              ExecStart={exe} daemon --camp {camp}\n\
+             Environment={path}\n\
              Restart=always\n\
              RestartSec=1\n\
              \n\
@@ -159,6 +180,10 @@ impl Supervisor for Systemd<'_> {
              WantedBy=default.target\n",
             exe = quote(&escape_percent(exe)),
             camp = quote(&camp_root),
+            // A systemd user service gets /usr/local/bin:/usr/bin:/bin:… — no
+            // ~/.local/bin, where `claude` lives. Same wound as launchd's, same
+            // dressing. Quoted and %-escaped like every other value here.
+            path = quote(&escape_percent(&format!("PATH={path}"))),
         )
     }
 
@@ -463,7 +488,12 @@ mod tests {
     fn unit_text_is_the_restart_always_user_unit() {
         let fake = FakeRunner::new(vec![]);
         let systemd = Systemd::new(PathBuf::from("/units"), &fake);
-        let text = systemd.unit_text(&id(), "/home/x/camps/dev/.camp", "/usr/local/bin/camp");
+        let text = systemd.unit_text(
+            &id(),
+            "/home/x/camps/dev/.camp",
+            "/usr/local/bin/camp",
+            "/usr/local/bin:/usr/bin:/bin",
+        );
         assert_eq!(
             text,
             "[Unit]\n\
@@ -472,6 +502,7 @@ mod tests {
              [Service]\n\
              Type=simple\n\
              ExecStart=\"/usr/local/bin/camp\" daemon --camp \"/home/x/camps/dev/.camp\"\n\
+             Environment=\"PATH=/usr/local/bin:/usr/bin:/bin\"\n\
              Restart=always\n\
              RestartSec=1\n\
              \n\
@@ -487,7 +518,12 @@ mod tests {
         let fake = FakeRunner::new(vec![]);
         let systemd = Systemd::new(PathBuf::from("/units"), &fake);
         let root = "/home/x/my \"camps\"/.camp";
-        let text = systemd.unit_text(&id(), root, "/usr/local/bin/camp");
+        let text = systemd.unit_text(
+            &id(),
+            root,
+            "/usr/local/bin/camp",
+            "/usr/local/bin:/usr/bin:/bin",
+        );
         assert_eq!(systemd.parse_camp_root(&text).unwrap(), PathBuf::from(root));
     }
 
@@ -502,12 +538,83 @@ mod tests {
         let fake = FakeRunner::new(vec![]);
         let systemd = Systemd::new(PathBuf::from("/units"), &fake);
         let root = "/home/x/100%h/.camp";
-        let text = systemd.unit_text(&id(), root, "/usr/local/bin/camp");
+        let text = systemd.unit_text(
+            &id(),
+            root,
+            "/usr/local/bin/camp",
+            "/usr/local/bin:/usr/bin:/bin",
+        );
         assert!(
             text.contains("100%%h"),
             "a literal `%` must be escaped to `%%` in ExecStart: {text}"
         );
         assert_eq!(systemd.parse_camp_root(&text).unwrap(), PathBuf::from(root));
+    }
+
+    /// The unit MUST carry a PATH, and it must survive systemd's own escaping.
+    ///
+    /// A `systemd --user` service gets `/usr/local/bin:/usr/bin:/bin:…` — no
+    /// `~/.local/bin`, where Claude Code installs `claude`. Same wound as
+    /// launchd's: campd comes up, serves the socket, takes beads, and then fails
+    /// every dispatch with `spawn failed: spawning claude: No such file or
+    /// directory`. A `%` in the PATH would be worse than useless — systemd
+    /// expands specifiers in `Environment=` as well, so `%h` in a PATH would
+    /// silently become the home directory.
+    #[test]
+    fn unit_text_carries_the_path_campd_will_run_with_and_escapes_it() {
+        let fake = FakeRunner::new(vec![]);
+        let systemd = Systemd::new(PathBuf::from("/units"), &fake);
+        let path = "/home/x/.local/bin:/opt/100%h/bin:/usr/bin";
+        let text = systemd.unit_text(&id(), "/home/x/c/.camp", "/usr/local/bin/camp", path);
+        assert!(
+            text.contains(r#"Environment="PATH=/home/x/.local/bin:/opt/100%%h/bin:/usr/bin""#),
+            "the unit must carry campd's PATH, quoted and %-escaped: {text}"
+        );
+        assert!(
+            !text.contains("/opt/100%h/bin"),
+            "an unescaped `%` in the PATH is a systemd specifier — it would expand: {text}"
+        );
+    }
+
+    /// `parse_path` must undo BOTH layers `unit_text` applied — the quoting and
+    /// the `%%` escaping — in that order, or a PATH with a `%` in it reads back
+    /// wrong. And it answers `None` for a unit that carries no PATH, which is
+    /// how `camp service status` spots the pre-fix installed base.
+    #[test]
+    fn parse_path_round_trips_through_quoting_and_percent_escaping() {
+        let fake = FakeRunner::new(vec![]);
+        let systemd = Systemd::new(PathBuf::from("/units"), &fake);
+        // `100%h` (a SINGLE `%`) survives a double-unescape unchanged, so a
+        // fixture built only from that cannot fail — which is exactly the test
+        // this file first shipped, and exactly why it did not catch the bug.
+        // `50%%off` and `a%%%b` DO change under a second unescape, so they are
+        // the ones that hold `parse_path` to its "exact inverse" contract.
+        for path in [
+            "/home/x/.local/bin:/opt/100%h/bin:/usr/bin",
+            "/opt/50%%off/bin:/usr/bin",
+            "/opt/a%%%b/bin:/usr/bin",
+        ] {
+            let text = systemd.unit_text(&id(), "/c/.camp", "/usr/local/bin/camp", path);
+            assert_eq!(
+                systemd.parse_path(&text).as_deref(),
+                Some(path),
+                "the PATH must read back byte-exact, `%` and all — `split_exec` already \
+                 unescapes, so unescaping again silently corrupts it"
+            );
+        }
+        let path = "/home/x/.local/bin:/opt/100%h/bin:/usr/bin";
+        let text = systemd.unit_text(&id(), "/c/.camp", "/usr/local/bin/camp", path);
+
+        let old = text
+            .lines()
+            .filter(|l| !l.starts_with("Environment="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            systemd.parse_path(&old),
+            None,
+            "a unit with no Environment= line must report NONE, not a wrong answer"
+        );
     }
 
     /// systemd expands `%`-specifiers in `Description=` too, not only
@@ -522,7 +629,12 @@ mod tests {
         let fake = FakeRunner::new(vec![]);
         let systemd = Systemd::new(PathBuf::from("/units"), &fake);
         let root = "/home/x/50%off/.camp";
-        let text = systemd.unit_text(&id(), root, "/usr/local/bin/camp");
+        let text = systemd.unit_text(
+            &id(),
+            root,
+            "/usr/local/bin/camp",
+            "/usr/local/bin:/usr/bin:/bin",
+        );
         let description = text
             .lines()
             .find(|line| line.starts_with("Description="))
@@ -552,7 +664,12 @@ mod tests {
             "/home/x/trailing%/.camp",
             "/home/x/%h/.camp",
         ] {
-            let text = systemd.unit_text(&id(), root, "/usr/local/bin/camp");
+            let text = systemd.unit_text(
+                &id(),
+                root,
+                "/usr/local/bin/camp",
+                "/usr/local/bin:/usr/bin:/bin",
+            );
             assert_eq!(
                 systemd.parse_camp_root(&text).unwrap(),
                 PathBuf::from(root),

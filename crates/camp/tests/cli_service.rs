@@ -107,6 +107,34 @@ impl Drop for Uninstall {
 /// as `false` — meaning both `wait_for_campd(&root, false)` call sites below
 /// would return immediately and green on a BROKEN command, mistaking it for
 /// "campd is stopped". A broken command must fail this test loudly instead.
+/// The unit file `camp service status` just named. `status` prints it as
+/// `unit:  <name> (<manager>, <path>)`, and the path is the only thing in there
+/// that ends in the manager's suffix — so read the artifact the tool itself
+/// pointed at rather than reconstructing a path this test would then be free to
+/// get wrong in the same way the code did.
+fn unit_path_from(status: &str) -> PathBuf {
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("unit:"))
+        .unwrap_or_else(|| panic!("no `unit:` line in status:\n{status}"));
+    // `unit:  <name> (<manager>, <path>)`. Split at the FIRST ", " after the
+    // "(", not the last: the manager is `launchd`/`systemd` and never contains
+    // one, but a unit PATH can — `$HOME` is the operator's to name. Splitting
+    // from the right made this helper fail on a perfectly correct product for
+    // anyone whose home directory has a comma in it, which is a test that lies
+    // in the other direction.
+    let after_paren = line
+        .split_once(" (")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("no `(manager, path)` in: {line:?}"));
+    let inside = after_paren
+        .strip_suffix(')')
+        .and_then(|s| s.split_once(", "))
+        .map(|(_manager, path)| path)
+        .unwrap_or_else(|| panic!("no unit path in: {line:?}"));
+    PathBuf::from(inside)
+}
+
 fn wait_for_campd(camp: &Path, want_listening: bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -203,6 +231,15 @@ fn service_lifecycle_against_the_real_host_manager() {
         init_out.contains("installed"),
         "on a host WITH a service manager, `camp init` installs the unit: {init_out}"
     );
+    // install REPORTS the PATH it baked (invariant 3, nothing hidden). This says
+    // nothing about what actually reached the unit — that claim belongs to the
+    // artifact assertion further down, which reads the file. Keeping the two
+    // separate is the point: an earlier version of this test asserted only this
+    // line and called it proof the unit carried a PATH, and it was not.
+    assert!(
+        init_out.contains("campd's PATH"),
+        "install must report the PATH campd will run with: {init_out}"
+    );
 
     // The supervisor started campd; status shows BOTH truths.
     wait_for_campd(&root, true);
@@ -223,6 +260,37 @@ fn service_lifecycle_against_the_real_host_manager() {
     assert!(
         status.contains("campd: listening"),
         "campd must answer: {status}"
+    );
+
+    // …and the UNIT ON DISK carries campd's PATH.
+    //
+    // Asserting that `install` SAID it baked one proves nothing: that line is
+    // pushed unconditionally, independent of what the generator wrote. The
+    // artifact is the claim. Delete the PATH from the generator — reintroducing
+    // the exact bug a user reported — and an install-output assertion still
+    // passes; this one does not. It is the only check in the repo that holds the
+    // REAL supervisor's unit to it.
+    let unit_path = unit_path_from(&status);
+    let unit_text = std::fs::read_to_string(&unit_path)
+        .unwrap_or_else(|e| panic!("reading the installed unit {}: {e}", unit_path.display()));
+    let carries_path = unit_text.contains("<key>PATH</key>") // launchd plist
+        || unit_text.contains("Environment=\"PATH="); // systemd unit
+    assert!(
+        carries_path,
+        "the installed unit must carry campd's PATH — without it campd runs with the \
+         supervisor's minimal environment, never finds `claude`, and fails every dispatch \
+         while looking perfectly healthy. Unit at {}:\n{unit_text}",
+        unit_path.display()
+    );
+    // `status` must report the PATH the unit actually bakes — that is what tells
+    // an operator with a pre-PATH unit why nothing dispatches. Asserted as "a
+    // PATH line that is not NONE" rather than "starts with /": a PATH may
+    // legally begin with an empty entry (`:/usr/bin` means cwd first), and a
+    // test that fails on a correct product is the same disease as a test that
+    // passes on a broken one.
+    assert!(
+        status.contains("campd PATH: ") && !status.contains("campd PATH: NONE"),
+        "status must report the PATH the unit bakes: {status}"
     );
 
     // The fleet view finds this camp.

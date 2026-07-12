@@ -135,11 +135,109 @@ pub fn unit_safe_str<'a>(path: &'a Path, what: &str) -> Result<&'a str> {
     Ok(text)
 }
 
+/// The same gate for a value that is already a `str` — the PATH we bake into
+/// the unit. A newline in it would end the `Environment=` line early and hand
+/// systemd a unit that means something else entirely; a control character in a
+/// plist is no better.
+pub fn unit_safe_value<'a>(text: &'a str, what: &str) -> Result<&'a str> {
+    if let Some(bad) = text.chars().find(|c| c.is_control()) {
+        bail!(
+            "the {what} contains a control character ({bad:?}) — no service unit can carry \
+             it (a launchd plist is XML; a systemd unit is line-oriented): {text:?}"
+        );
+    }
+    Ok(text)
+}
+
+/// The PATH a supervised campd will run with, and why the unit must say it.
+///
+/// A supervisor does NOT give campd your shell's environment. launchd hands a
+/// LaunchAgent `PATH=/usr/bin:/bin:/usr/sbin:/sbin`; a systemd user service gets
+/// `/usr/local/bin:/usr/bin:/bin:…`. Neither contains `~/.local/bin` — which is
+/// where Claude Code installs `claude`, the very thing campd spawns to do the
+/// work. Before campd was supervised the CLI started it, so it inherited the
+/// shell that ran the verb and this never came up. Supervision took that away,
+/// and a campd that cannot find `claude` cannot dispatch anything: every bead
+/// lands as `session.crashed  spawn failed: spawning claude: No such file or
+/// directory`, which is the whole product, silently broken.
+///
+/// So the PATH is captured HERE — from the environment that ran the install,
+/// which is demonstrably one where the operator's tools resolve — and written
+/// into the unit, where it is visible (`camp service status` reads it back and
+/// prints it; the file itself is human-readable).
+///
+/// It is a snapshot, not a live link, and re-capturing it is
+/// `camp service uninstall && camp service install` — BOTH, in that order.
+/// `install` alone refuses to clobber an existing unit, so any message that tells
+/// an operator to "re-run `camp service install`" hands them an error at the
+/// moment they need a fix. (This doc comment used to say exactly that.)
+pub fn campd_path() -> Result<String> {
+    campd_path_from(std::env::var("PATH"))
+}
+
+/// The whole of `campd_path` except reading the environment — split out for one
+/// reason: the gate has to be testable WHERE IT IS WIRED.
+///
+/// A test that calls `unit_safe_value` directly pins the helper, not the code
+/// path that uses it: delete the call from here and such a test stays green while
+/// a newline in `$PATH` becomes a systemd unit that means something else
+/// entirely, which systemd would accept and run. And the environment cannot be
+/// mutated in a test to reach the real thing — this crate is
+/// `#![forbid(unsafe_code)]` and `set_var` is unsafe. So the seam goes here, and
+/// `install`'s real route to the gate is `campd_path` → `campd_path_from` →
+/// `unit_safe_value`, every link of it exercised.
+fn campd_path_from(var: std::result::Result<String, std::env::VarError>) -> Result<String> {
+    let path = var.context(
+        "this environment has no PATH, so the unit could not give campd one — and campd \
+         needs it to find the worker command (`claude`) and `git`",
+    )?;
+    unit_safe_value(&path, "PATH")?;
+    Ok(path)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The gate, tested WHERE IT IS WIRED — not where it is defined.
+    ///
+    /// The test below calls `unit_safe_value` directly, which pins the helper.
+    /// This pins the CALL SITE: delete the `unit_safe_value` line from
+    /// `campd_path_from` and this fails, where a helper-only test would stay
+    /// green while `install` happily bakes a newline into a unit — and a newline
+    /// in a systemd unit does not corrupt it, it makes it a DIFFERENT unit that
+    /// systemd accepts and runs.
+    #[test]
+    fn campd_path_refuses_a_newline_in_the_environment_it_captures() {
+        let err = campd_path_from(Ok("/usr/bin:/tmp\nExecStart=/bin/sh".to_owned())).unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(
+            shown.contains("control character"),
+            "a newline in $PATH must be refused where the PATH is captured: {shown}"
+        );
+        assert!(campd_path_from(Ok("/usr/bin:/bin".to_owned())).is_ok());
+        // And an environment with no PATH at all is a loud error, not an empty
+        // unit that campd would come up under and spawn nothing from.
+        let err = campd_path_from(Err(std::env::VarError::NotPresent)).unwrap_err();
+        assert!(format!("{err:#}").contains("no PATH"), "{err:#}");
+    }
+
+    /// The PATH goes into the unit as text, so it gets the same gate the camp
+    /// path gets. A newline is the one that matters: a systemd unit is
+    /// line-oriented, so `PATH=/a\nExecStart=/bin/sh` would not be a broken unit
+    /// — it would be a DIFFERENT one, which systemd would accept and run.
+    #[test]
+    fn a_path_with_a_control_character_is_refused_before_any_unit_is_written() {
+        let err = unit_safe_value("/usr/bin:/tmp\nExecStart=/bin/sh", "PATH").unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(
+            shown.contains("control character"),
+            "a newline in the PATH must be a hard error, not a corrupt unit: {shown}"
+        );
+        assert!(unit_safe_value("/usr/bin:/bin", "PATH").is_ok());
+    }
 
     /// A unit file is TEXT — a launchd plist is XML, a systemd unit is
     /// line-oriented INI. A path that is not valid UTF-8 (legal on macOS and

@@ -181,6 +181,33 @@ A new subcommand group. Each operates on the resolved camp (`--camp` /
   `campd-<camp-id>.service` (`ExecStart=camp daemon --camp <dir>`,
   `Restart=always`), `systemctl --user enable --now`. `<camp-id>` is a stable
   slug of the camp's absolute path (collision-free, human-readable).
+
+  **The unit must carry campd's PATH, and this is not a detail.** A supervisor
+  does NOT give campd the shell's environment: launchd hands a LaunchAgent
+  `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, and a systemd user service gets
+  `/usr/local/bin:/usr/bin:/bin:…`. Neither contains `~/.local/bin`, which is
+  where Claude Code installs `claude` — the process campd spawns to do all of
+  the work. This was missed, and it shipped: campd came up healthy, served its
+  socket, accepted beads, and failed every single dispatch with `spawn failed:
+  spawning claude: No such file or directory`. Before supervision the CLI
+  started campd, so campd inherited the shell that ran the verb and the question
+  never arose; **removing the auto-start (§4.3) removed that inheritance, and
+  nothing replaced it.** So `install` captures the PATH of the shell that runs
+  it — the one environment where the operator's tools demonstrably resolve —
+  writes it into the unit (`EnvironmentVariables`/`PATH`, `Environment=`), prints
+  it, and warns when the configured worker command is not on it.
+
+  It is a **snapshot**, and a snapshot goes stale — a version manager retires a
+  bin directory and the camp quietly returns to the original bug. So checking
+  once, at install, is a one-shot net under a permanent hazard: **`status` reads
+  the PATH back out of the unit and re-asks the question every time it runs.** A
+  unit carrying no PATH at all — every unit installed before this existed — is
+  reported as the fault it is rather than as `loaded=true running=true`, which is
+  what the installed base would otherwise keep seeing while dispatching nothing.
+  The re-capture command is `camp service uninstall && camp service install`:
+  `install` alone refuses to clobber an existing unit, so any message that tells
+  an operator to "re-run `camp service install`" is handing them an error at the
+  moment they need a fix.
 - **`uninstall`** — stop + unload + remove the unit.
 - **`status`** — the unit's load/run state (wraps `launchctl print` /
   `systemctl --user show`), plus the campd liveness answer (a status

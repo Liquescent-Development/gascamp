@@ -79,6 +79,19 @@ impl Supervisor for Launchd<'_> {
         Ok(PathBuf::from(root))
     }
 
+    fn parse_path(&self, unit_text: &str) -> Option<String> {
+        // The `<string>` right after `<key>PATH</key>` — the exact inverse of
+        // what `unit_text` writes. A unit installed before campd's PATH was
+        // baked in has no such key at all, and says so by returning None.
+        let after_key = unit_text.split("<key>PATH</key>").nth(1)?;
+        let value = after_key
+            .split("<string>")
+            .nth(1)?
+            .split("</string>")
+            .next()?;
+        Some(xml_unescape(value))
+    }
+
     fn state(&self, id: &CampId) -> Result<UnitState> {
         let target = self.service_target(id);
         let out = self
@@ -134,12 +147,18 @@ impl Supervisor for Launchd<'_> {
         self.label(id)
     }
 
-    fn unit_text(&self, id: &CampId, camp_root: &str, exe: &str) -> String {
+    fn unit_text(&self, id: &CampId, camp_root: &str, exe: &str, path: &str) -> String {
         // KeepAlive (design §4.2, always-on): the supervisor keeps campd
         // alive; a crash is restarted. StandardErrorPath is the camp's own
         // campd.log (CampDir::log_path) — a supervised daemon's stderr is
         // never swallowed (invariant 3). No lossy conversion anywhere: the
         // caller passed strings `unit_safe_str` already vouched for.
+        //
+        // EnvironmentVariables/PATH is load-bearing, not decoration: launchd
+        // hands a LaunchAgent PATH=/usr/bin:/bin:/usr/sbin:/sbin, which does not
+        // contain ~/.local/bin — where `claude` lives. Without this, campd
+        // spawns nothing and every bead dies as `spawn failed: spawning claude:
+        // No such file or directory`. See service::campd_path.
         let log = format!("{camp_root}/campd.log");
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -155,6 +174,11 @@ impl Supervisor for Launchd<'_> {
     <string>--camp</string>
     <string>{root}</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{path}</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -169,6 +193,7 @@ impl Supervisor for Launchd<'_> {
             label = xml_escape(&self.label(id)),
             exe = xml_escape(exe),
             root = xml_escape(camp_root),
+            path = xml_escape(path),
             log = xml_escape(&log),
         )
     }
@@ -407,7 +432,12 @@ mod tests {
     fn unit_text_is_the_keepalive_launch_agent() {
         let fake = FakeRunner::new(vec![]);
         let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
-        let text = launchd.unit_text(&id(), "/Users/x/camps/dev/.camp", "/usr/local/bin/camp");
+        let text = launchd.unit_text(
+            &id(),
+            "/Users/x/camps/dev/.camp",
+            "/usr/local/bin/camp",
+            "/usr/local/bin:/usr/bin:/bin",
+        );
         assert_eq!(
             text,
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -423,6 +453,11 @@ mod tests {
     <string>--camp</string>
     <string>/Users/x/camps/dev/.camp</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -445,13 +480,95 @@ mod tests {
         let fake = FakeRunner::new(vec![]);
         let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
         let root = "/Users/x/camps/R&D <beta>/.camp";
-        let text = launchd.unit_text(&id(), root, "/usr/local/bin/camp");
+        let text = launchd.unit_text(
+            &id(),
+            root,
+            "/usr/local/bin/camp",
+            "/usr/local/bin:/usr/bin:/bin",
+        );
         assert!(text.contains("R&amp;D &lt;beta&gt;"), "{text}");
         assert!(
             !text.contains("R&D <beta>"),
             "raw metacharacters leaked: {text}"
         );
         assert_eq!(launchd.parse_camp_root(&text).unwrap(), PathBuf::from(root));
+    }
+
+    /// The unit MUST carry a PATH, and it must be the one it was handed.
+    ///
+    /// launchd gives a LaunchAgent `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, which
+    /// does not contain `~/.local/bin` — where Claude Code installs `claude`,
+    /// the process campd spawns to do all of the work. A plist with no
+    /// EnvironmentVariables/PATH produced a campd that came up healthy, served
+    /// its socket, accepted beads, and then failed EVERY dispatch with
+    /// `spawn failed: spawning claude: No such file or directory`. It reached a
+    /// user that way. This assertion is what stops it coming back.
+    #[test]
+    fn unit_text_carries_the_path_campd_will_run_with() {
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        let path = "/Users/x/.local/bin:/usr/bin:/bin";
+        let text = launchd.unit_text(&id(), "/Users/x/c/.camp", "/usr/local/bin/camp", path);
+        assert!(
+            text.contains("<key>EnvironmentVariables</key>"),
+            "the plist must set an environment at all: {text}"
+        );
+        assert!(
+            text.contains("<key>PATH</key>") && text.contains(&format!("<string>{path}</string>")),
+            "the plist must carry the PATH campd runs with — without it campd finds no \
+             `claude` and dispatches nothing: {text}"
+        );
+    }
+
+    /// `parse_path` is the exact inverse of what `unit_text` wrote — including
+    /// through XML escaping — and it answers `None` for a unit that carries no
+    /// PATH at all. That `None` is what lets `camp service status` tell an
+    /// operator their pre-fix unit is the reason nothing dispatches, instead of
+    /// reporting it as healthy.
+    #[test]
+    fn parse_path_round_trips_and_reports_a_unit_that_has_none() {
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        let path = "/opt/R&D <b>/bin:/Users/x/.local/bin:/usr/bin";
+        let text = launchd.unit_text(&id(), "/c/.camp", "/usr/local/bin/camp", path);
+        assert_eq!(launchd.parse_path(&text).as_deref(), Some(path));
+
+        // A unit from before the PATH was baked in: no EnvironmentVariables.
+        let old = text
+            .split("  <key>EnvironmentVariables</key>")
+            .next()
+            .unwrap()
+            .to_owned()
+            + "</dict>\n</plist>\n";
+        assert_eq!(
+            launchd.parse_path(&old),
+            None,
+            "a unit with no PATH must report NONE, not a wrong answer"
+        );
+    }
+
+    /// A PATH is XML too — and it must not be able to corrupt the
+    /// ProgramArguments the camp registry is read back out of.
+    #[test]
+    fn a_hostile_path_is_escaped_and_cannot_break_the_camp_root_round_trip() {
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        let root = "/Users/x/camps/dev/.camp";
+        // XML metacharacters, and a `--camp` inside the PATH itself: the parser
+        // takes the FIRST `--camp` (in ProgramArguments, above this), so a PATH
+        // cannot hijack which camp the unit claims to be for.
+        let path = "/opt/R&D <b>/bin:/x/--camp/bin:/usr/bin";
+        let text = launchd.unit_text(&id(), root, "/usr/local/bin/camp", path);
+        assert!(
+            !text.contains("R&D <b>"),
+            "raw metacharacters leaked from the PATH into the plist: {text}"
+        );
+        assert!(text.contains("R&amp;D &lt;b&gt;"), "{text}");
+        assert_eq!(
+            launchd.parse_camp_root(&text).unwrap(),
+            PathBuf::from(root),
+            "a PATH must not be able to change which camp this unit resolves to"
+        );
     }
 
     #[test]
