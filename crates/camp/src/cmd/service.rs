@@ -1433,6 +1433,22 @@ mod tests {
         ];
         for problem in &arms {
             let text = worker_command_warning(problem, camp.path());
+            // The shape check below walks `lines().skip(1)`, which inspects
+            // NOTHING for an empty or single-line return — so on its own it would
+            // pass for an arm that had stopped saying anything at all. Prove the
+            // payload is present and multi-line FIRST, so the loop that follows
+            // is guaranteed to have something to judge. A test that can pass
+            // vacuously is the fourth cousin of the three this PR already shipped.
+            assert!(
+                text.contains("INJECTED-AT-COLUMN-0"),
+                "the arm must actually carry the operator's string — an assertion that walks \
+                 continuation lines proves nothing about a report with none: {text}"
+            );
+            assert!(
+                text.lines().count() > 1,
+                "and the payload must still be multi-line, or the column-0 rule is untested \
+                 for this arm: {text}"
+            );
             for line in text.lines().skip(1) {
                 assert!(
                     line.starts_with(' ') || line.is_empty(),
