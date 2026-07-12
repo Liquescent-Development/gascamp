@@ -67,8 +67,10 @@ enum Command {
         #[arg(long = "no-service")]
         no_service: bool,
         /// An existing camp is a no-op success, not an error — for entrypoints
-        /// and units that re-run `camp init` on every start (contrib/docker/)
-        #[arg(long = "exists-ok")]
+        /// and units that re-run `camp init` on every start (contrib/docker/).
+        /// A no-op, never a repair, so it contradicts --service: to put an
+        /// existing camp under a supervisor, `camp service install`
+        #[arg(long = "exists-ok", conflicts_with = "service")]
         exists_ok: bool,
     },
     /// Verify ledger invariants

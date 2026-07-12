@@ -78,6 +78,35 @@ fn init_rejects_service_and_no_service_together() {
         .stderr(predicates::str::contains("cannot be used with"));
 }
 
+/// `--service` and `--exists-ok` are contradictory too, and clap rejects the
+/// pair for the same reason it rejects `--service --no-service`: the two make
+/// incompatible promises about the SAME run.
+///
+/// `--service` is a hard promise to install and start a host service unit (it
+/// even `bail!`s when no manager exists). `--exists-ok` is a no-op, NEVER a
+/// repair: an existing camp is returned exactly as it is, unit and all. On an
+/// existing camp the pair can only be honoured by breaking one of them — and
+/// the one that would break silently is `--service`, an explicit request that
+/// would exit 0 having installed nothing. That is precisely the silent no-op
+/// this project bans, so the contradiction dies at the CLI edge instead.
+///
+/// The explicit way to put an EXISTING camp under a supervisor is
+/// `camp init --exists-ok && camp service install` — init never repairs a
+/// camp's service state behind your back (feature design §11: existing camps
+/// are not auto-migrated).
+#[test]
+fn init_rejects_service_and_exists_ok_together() {
+    let dir = tempfile::tempdir().unwrap();
+    camp()
+        .current_dir(dir.path())
+        // clap-rejected: refused by the parser; `init` itself never runs, so
+        // no unit can be installed (see tests/no_bare_camp_init.rs).
+        .args(["init", "--service", "--exists-ok"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
 #[test]
 fn init_with_explicit_camp_dir() {
     let dir = tempfile::tempdir().unwrap();

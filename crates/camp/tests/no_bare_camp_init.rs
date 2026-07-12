@@ -9,7 +9,7 @@
 //! --no-service, and this test is what keeps that true as tests are added.
 //!
 //! A call site naming `"init"` on an `.arg(…)`/`.args([…])` chain passes only
-//! if it carries ONE of three things. The two markers are NOT interchangeable,
+//! if it carries ONE of four things. The three markers are NOT interchangeable,
 //! and a marker that does not describe the call it sits on is a lie that
 //! defeats the gate:
 //!
@@ -54,6 +54,26 @@
 //!                      an `#[ignore` somewhere, which a second, non-ignored
 //!                      bare init in the same file could otherwise ride along
 //!                      with — AND that the file contain `CAMP_SERVICE_E2E`.
+//!
+//!   `// clap-rejected:` the invocation is one clap REFUSES to parse — a test
+//!                      that pins a contradictory flag pair (today:
+//!                      `--service --no-service`, `--service --exists-ok`).
+//!                      `camp` exits from the argument parser; `cmd::init::run`
+//!                      is never called, so no unit can be installed no matter
+//!                      what host it runs on.
+//!
+//!                      This marker earns itself from the code too, and its
+//!                      proof is unusually strong: the chunk must assert BOTH
+//!                      `.failure()` AND a stderr predicate naming clap's own
+//!                      conflict message (`cannot be used with`). Only the
+//!                      parser emits that message, and it emits it before any
+//!                      camp code runs — so a chunk carrying this marker either
+//!                      really did die in the parser, or the assertion it makes
+//!                      about its own stderr fails and the test blows up. The
+//!                      marker cannot be lied onto an init that actually runs:
+//!                      such a call prints "initialized camp"/"installed
+//!                      launchd unit" and exits 0, and `.failure()` alone would
+//!                      already catch it.
 //!
 //! THE SCAN IS OVER LOGICAL CALL CHAINS, NOT PHYSICAL LINES. rustfmt freely
 //! moves `"init"`, `.args([`, `--no-service`, and a trailing `// marker:`
@@ -104,6 +124,18 @@
 //!     verbatim) is invisible too, for the same reason — the predicate looks
 //!     for the literal tokens `"init"` and `.arg(`/`.args(` in this file's
 //!     text, not for what any macro expands to.
+//!   - The `.arg(`/`.args(` half of the predicate means an argv passed as a
+//!     bare ARRAY to some other runner is invisible: `container_smoke.rs`
+//!     invokes init as `docker_ok(&["run", …, "init", "--camp", "/camp",
+//!     "--no-service"])`, which names `"init"` but never spells `.arg(`, so
+//!     this scan does not see it and would not catch a future bare
+//!     `camp init` added there. Harmless today on two counts — that call does
+//!     pass `--no-service`, and it runs INSIDE a container that has no host
+//!     service manager to install into (it could not touch the developer's
+//!     LaunchAgents even if the flag were dropped) — but the gate's coverage
+//!     is narrower than it looks, and a future test that shells `camp init`
+//!     through a non-`Command` runner on the HOST would need this scan taught
+//!     about that runner.
 //!
 //! The scan is also NON-RECURSIVE: it reads only the files directly inside
 //! `crates/camp/tests/`, not subdirectories (e.g. `tests/fixtures/`). Today
@@ -315,7 +347,8 @@ fn no_test_invokes_camp_init_without_no_service() {
             let has_no_service = chunk.code.contains("\"--no-service\"");
             let not_camp = chunk.raw.contains("not-camp:");
             let real_manager = chunk.raw.contains("real-manager:");
-            if !(has_no_service || not_camp || real_manager) {
+            let clap_rejected = chunk.raw.contains("clap-rejected:");
+            if !(has_no_service || not_camp || real_manager || clap_rejected) {
                 violations.push(format!(
                     "{file_name}:{}: {}",
                     chunk.report_line + 1,
@@ -341,6 +374,29 @@ fn no_test_invokes_camp_init_without_no_service() {
                         "{file_name}:{}: carries `not-camp:` but the code does not bear it out — \
                          a not-camp chunk must construct a literally-named OTHER program \
                          (e.g. `Command::new(\"git\")`) and must not run the camp binary: {}",
+                        chunk.report_line + 1,
+                        lines[chunk.report_line].trim()
+                    ));
+                    continue;
+                }
+            }
+            if clap_rejected {
+                // Same discipline as `not-camp:`: the marker must be borne out
+                // by the chunk's own code, never taken on trust. A chunk that
+                // clap really refused asserts BOTH that the process failed and
+                // that stderr carried clap's own conflict message — a message
+                // only the argument parser emits, and only before `init` runs.
+                // Lie this marker onto a real `camp init` and the chunk's own
+                // assertions fail at runtime (an init that runs exits 0 and
+                // prints "initialized camp"), so the gate cannot be talked past.
+                let asserts_failure = chunk.code.contains(".failure()");
+                let asserts_clap_conflict = chunk.code.contains("cannot be used with");
+                if !(asserts_failure && asserts_clap_conflict) {
+                    violations.push(format!(
+                        "{file_name}:{}: carries `clap-rejected:` but the code does not bear it \
+                         out — such a chunk must assert `.failure()` AND a stderr predicate \
+                         naming clap's own conflict message (\"cannot be used with\"), which is \
+                         what proves `init` never ran: {}",
                         chunk.report_line + 1,
                         lines[chunk.report_line].trim()
                     ));
@@ -375,9 +431,11 @@ fn no_test_invokes_camp_init_without_no_service() {
         violations.is_empty(),
         "these lines run a bare `camp init`, which installs a REAL host service unit on any \
          machine that has a service manager (every dev mac; the macos-latest runner). Pass \
-         --no-service. The only exemptions are `// not-camp:` (not the camp binary — git/bd) \
-         and `// real-manager:` (a deliberate bare init inside an #[ignore]d, \
-         CAMP_SERVICE_E2E-gated test); see this test's module docs before using either:\n{}",
+         --no-service. The only exemptions are `// not-camp:` (not the camp binary — git/bd), \
+         `// real-manager:` (a deliberate bare init inside an #[ignore]d, CAMP_SERVICE_E2E-gated \
+         test), and `// clap-rejected:` (a contradictory flag pair clap refuses to parse, so \
+         `init` never runs — the chunk must assert `.failure()` and clap's own \"cannot be used \
+         with\" message); see this test's module docs before using any of them:\n{}",
         violations.join("\n")
     );
 }

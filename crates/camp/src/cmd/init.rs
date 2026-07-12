@@ -17,6 +17,15 @@ use crate::service::{self, Decision, ServiceChoice, SystemProbe, SystemRunner};
 /// It is a no-op, never a repair: an existing camp is returned as it is, and
 /// no unit is installed for it (a camp created before this had a service
 /// manager gets one from `camp service install` — an explicit act).
+///
+/// That is why `--exists-ok` returns BEFORE the service decision below, and
+/// why it may: clap rejects `--service --exists-ok` as the contradiction it is
+/// (`conflicts_with = "service"`), so the short-circuit can never swallow an
+/// explicit request to install a unit. Honouring `--service` here instead
+/// would make `camp init` REPAIR an existing camp's service state — exactly
+/// the auto-migration feature design §11 rules out. The idempotent
+/// provisioning path is `camp init --exists-ok && camp service install`: two
+/// verbs, each of which means what it says.
 pub fn run(camp_flag: Option<&Path>, choice: ServiceChoice, exists_ok: bool) -> Result<()> {
     let root = match camp_flag {
         Some(dir) => dir.to_path_buf(),
