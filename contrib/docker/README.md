@@ -67,6 +67,15 @@ command = "claude"           # the worker executable (the default)
 default_agent = "dev"
 ```
 
+"Mount your repo here" is literal, and it is the one line `compose.yaml` cannot
+write for you: nothing is mounted at `/rigs/gascity` by default, so uncomment
+the rig volume in `compose.yaml` (`- /path/to/repo:/rigs/gascity`) and keep the
+container path identical to the `[[rigs]] path` above. Mount it **writable** —
+the default isolation is `worktree`, and `git worktree add` writes the new
+branch ref into the rig's `.git`, so a `:ro` mount fails every dispatch. If the
+rig path is missing entirely, campd says so in the ledger (`dispatch.failed`)
+rather than crash-looping — a loud no, not a silent one.
+
 ...plus an agent definition in `/camp/agents/dev.md`. `command = "claude"` means
 the image needs the Claude Code CLI and its credentials: build an image `FROM
 gascamp:latest` that installs it, and mount the credentials in. The reference

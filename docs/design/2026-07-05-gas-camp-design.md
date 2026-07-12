@@ -167,6 +167,7 @@ agent definitions.
   `camp service {install,uninstall,status,restart,list,stop,start}` is the
   control surface, and the installed units are its registry (no status files,
   §13).
+
   **Always-on is not idle cost.** A supervised campd runs continuously, and
   invariant 1 measures what that costs: it sleeps on OS events, never ticks, and
   idles at < 20 MB RSS and 0.0% CPU. What always-on buys is that orders fire

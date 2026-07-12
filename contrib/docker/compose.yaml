@@ -32,6 +32,21 @@ services:
       # A NAMED volume, so it survives `down`/`up` and a host reboot, and so the
       # container user owns it (see README.md before you swap in a bind mount).
       - camp:/camp
+      # The rig: the repo campd dispatches work against. Nothing is mounted here
+      # by default — this image supervises campd, it does not presume your repo
+      # — so uncomment this and point it at yours. The container path MUST match
+      # the `[[rigs]] path` in /camp/camp.toml (README.md's example camp.toml
+      # says `path = "/rigs/gascity"`, which is this line). A rig path that does
+      # not exist in the container is not a crash: campd checks it and fails the
+      # dispatch loudly (`dispatch.failed`) — but no work will run.
+      #
+      # NOT `:ro`. The default isolation is `worktree`, and campd dispatches by
+      # running `git -C <rig> worktree add -b camp/<bead> …`, which WRITES to the
+      # rig's .git (the new branch ref, the worktree registration) even though
+      # the checkout itself lands on the camp volume. A read-only mount fails
+      # every dispatch with `cannot lock ref 'refs/heads/camp/<bead>'`. An
+      # `isolation: none` agent works IN the rig and needs write access anyway.
+      # - /path/to/repo:/rigs/gascity
 
 volumes:
   camp:
