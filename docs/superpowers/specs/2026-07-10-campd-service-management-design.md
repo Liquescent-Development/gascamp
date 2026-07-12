@@ -181,6 +181,23 @@ A new subcommand group. Each operates on the resolved camp (`--camp` /
   `campd-<camp-id>.service` (`ExecStart=camp daemon --camp <dir>`,
   `Restart=always`), `systemctl --user enable --now`. `<camp-id>` is a stable
   slug of the camp's absolute path (collision-free, human-readable).
+
+  **The unit must carry campd's PATH, and this is not a detail.** A supervisor
+  does NOT give campd the shell's environment: launchd hands a LaunchAgent
+  `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, and a systemd user service gets
+  `/usr/local/bin:/usr/bin:/bin:…`. Neither contains `~/.local/bin`, which is
+  where Claude Code installs `claude` — the process campd spawns to do all of
+  the work. This was missed, and it shipped: campd came up healthy, served its
+  socket, accepted beads, and failed every single dispatch with `spawn failed:
+  spawning claude: No such file or directory`. Before supervision the CLI
+  started campd, so campd inherited the shell that ran the verb and the question
+  never arose; **removing the auto-start (§4.3) removed that inheritance, and
+  nothing replaced it.** So `install` captures the PATH of the shell that runs
+  it — the one environment where the operator's tools demonstrably resolve —
+  writes it into the unit (`EnvironmentVariables`/`PATH`, `Environment=`), prints
+  it, and warns when the configured worker command is not on it. It is a
+  snapshot: a changed PATH means `camp service install` again, which is stated at
+  install rather than left to be discovered.
 - **`uninstall`** — stop + unload + remove the unit.
 - **`status`** — the unit's load/run state (wraps `launchctl print` /
   `systemctl --user show`), plus the campd liveness answer (a status

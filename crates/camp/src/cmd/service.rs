@@ -163,14 +163,23 @@ pub fn install(supervisor: &dyn Supervisor, camp_root: &Path, exe: &Path) -> Res
     // manager is told a camp is supervised.
     let root_text = service::unit_safe_str(&root, "camp")?;
     let exe_text = service::unit_safe_str(exe, "camp binary")?;
+    // The PATH campd will run with. A supervisor does NOT hand campd the shell's
+    // environment (see `service::campd_path`), and campd spawns `claude` and
+    // `git` by name — so the unit has to carry one. Captured from the
+    // environment running this verb, which is demonstrably one where the
+    // operator's tools resolve.
+    let path_text = service::campd_path()?;
 
     let unit_path = supervisor.unit_path(&id);
     if let Some(parent) = unit_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(&unit_path, supervisor.unit_text(&id, root_text, exe_text))
-        .with_context(|| format!("writing {}", unit_path.display()))?;
+    std::fs::write(
+        &unit_path,
+        supervisor.unit_text(&id, root_text, exe_text, &path_text),
+    )
+    .with_context(|| format!("writing {}", unit_path.display()))?;
     if let Err(reload_error) = supervisor.reload_units() {
         // Fail fast, no half state: a unit the manager could not even be
         // told about must not be left on disk pretending to be installed —
@@ -199,7 +208,7 @@ pub fn install(supervisor: &dyn Supervisor, camp_root: &Path, exe: &Path) -> Res
         ));
         return Err(rollback_unit_file(supervisor, &unit_path, error));
     }
-    Ok(format!(
+    let mut report = format!(
         "installed {} unit {} ({})\ncampd for {} is now supervised — it restarts on crash \
          and at login\nto stop it: `camp service stop`; to un-manage it: \
          `camp service uninstall`; to cycle it after an upgrade: `camp service restart`\n",
@@ -207,7 +216,57 @@ pub fn install(supervisor: &dyn Supervisor, camp_root: &Path, exe: &Path) -> Res
         supervisor.unit_name(&id),
         unit_path.display(),
         root.display()
-    ))
+    );
+    // The PATH is a SNAPSHOT of this shell, not a live link to it. Say so, and
+    // say what to do about it — a supervised campd that cannot find `claude` is
+    // a camp that dispatches nothing, and the operator would otherwise learn
+    // that from a `session.crashed` in the ledger, one sling too late.
+    report.push_str(&format!(
+        "campd's PATH (a snapshot of this shell — re-run `camp service install` after you \
+         change it): {path_text}\n"
+    ));
+    if let Some(missing) = worker_command_not_on(&root, &path_text) {
+        report.push_str(&format!(
+            "WARNING: the worker command `{missing}` is not on that PATH. campd will start, \
+             but every bead it dispatches will die with `spawn failed: spawning {missing}: \
+             No such file or directory`. Install it, or set an absolute path in \
+             [dispatch] command in {}/camp.toml — then `camp service install` again to \
+             re-capture the PATH.\n",
+            root.display()
+        ));
+    }
+    Ok(report)
+}
+
+/// The worker command campd will spawn, IF it cannot be found on the PATH the
+/// unit will carry. `None` means it resolves — which is the answer we want.
+///
+/// This is a preflight, not a gate: a camp is still worth supervising without a
+/// worker (the ledger, `camp ls`, `camp search` all work), so a missing `claude`
+/// is a loud statement at the one moment the operator can act on it, not a hard
+/// refusal to install. What it must never be is silent — that is how this bug
+/// reached a user: campd came up, the camp looked healthy, and the failure only
+/// surfaced as a `session.crashed` event after work had been slung at it.
+fn worker_command_not_on(camp_root: &Path, path: &str) -> Option<String> {
+    let camp = CampDir {
+        root: camp_root.to_path_buf(),
+    };
+    // A camp whose config will not load is not this verb's problem to report —
+    // `camp doctor` and campd itself both say so, loudly. Skip the preflight
+    // rather than invent a second opinion about it.
+    let config = camp_core::config::CampConfig::load(&camp.config_path()).ok()?;
+    let command = config.dispatch.command;
+    // An absolute (or explicitly relative) path is not a PATH lookup at all:
+    // campd hands it to the OS as-is, so PATH has no say. Ask the filesystem.
+    if command.components().count() > 1 {
+        return (!command.exists()).then(|| command.display().to_string());
+    }
+    let name = command.as_os_str();
+    let found = std::env::split_paths(path).any(|dir| {
+        let candidate = dir.join(name);
+        std::fs::metadata(&candidate).is_ok_and(|m| m.is_file())
+    });
+    (!found).then(|| command.display().to_string())
 }
 
 /// After the unit file has been written, undo it: no failure between "the
@@ -809,6 +868,80 @@ mod tests {
             fake.call(0)
         );
         assert!(report.contains("installed"), "{report}");
+    }
+
+    /// The bug a user hit: `camp init` on macOS installed a unit, campd came up
+    /// healthy, and then every bead died with
+    /// `spawn failed: spawning claude: No such file or directory` — because
+    /// launchd runs a LaunchAgent with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, and
+    /// `claude` lives in `~/.local/bin`. campd was fine; its environment was not.
+    ///
+    /// So the unit `install` writes must carry a real PATH, and it must be the
+    /// PATH of the shell that ran the install — the one place we know the
+    /// operator's tools actually resolve.
+    #[test]
+    fn install_bakes_this_shells_path_into_the_unit_so_campd_can_find_its_worker() {
+        let camp = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let fake = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &fake);
+
+        let report = install(&launchd, camp.path(), Path::new("/usr/local/bin/camp")).unwrap();
+
+        let id = CampId::for_camp(camp.path()).unwrap();
+        let written = std::fs::read_to_string(launchd.unit_path(&id)).unwrap();
+        let path = std::env::var("PATH").unwrap();
+        assert!(
+            written.contains("<key>PATH</key>"),
+            "the unit must give campd a PATH — without one it can spawn nothing: {written}"
+        );
+        assert!(
+            written.contains(&xml_escaped(&path)),
+            "and it must be THIS shell's PATH, where the operator's `claude` resolves"
+        );
+        // Nothing hidden (invariant 3): the operator is told what campd will run
+        // with, and that it is a snapshot rather than a live link.
+        assert!(
+            report.contains("campd's PATH"),
+            "install must say what PATH it baked: {report}"
+        );
+    }
+
+    /// Escape the way the plist generator does, so the assertion above compares
+    /// like with like on a PATH that happens to contain XML metacharacters.
+    fn xml_escaped(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
+    /// A missing worker command must be LOUD at install — the one moment the
+    /// operator can act on it. It reached a user as a `session.crashed` event in
+    /// the ledger, discovered only after slinging real work at a camp that was
+    /// never going to run it.
+    #[test]
+    fn install_warns_when_the_worker_command_is_not_on_the_path_campd_will_use() {
+        let camp = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        std::fs::write(
+            camp.path().join("camp.toml"),
+            "[camp]\nname = \"x\"\n\n[dispatch]\ncommand = \"definitely-not-installed-anywhere\"\n",
+        )
+        .unwrap();
+        let fake = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &fake);
+
+        let report = install(&launchd, camp.path(), Path::new("/usr/local/bin/camp")).unwrap();
+
+        assert!(
+            report.contains("WARNING") && report.contains("definitely-not-installed-anywhere"),
+            "a worker command campd cannot find must be said out loud, naming it: {report}"
+        );
+        assert!(
+            report.contains("spawn failed"),
+            "and it must name the failure the operator would otherwise meet in the ledger: \
+             {report}"
+        );
     }
 
     /// Never a silent overwrite: an existing unit is a hard error naming the

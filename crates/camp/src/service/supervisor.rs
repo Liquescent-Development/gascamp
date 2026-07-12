@@ -126,7 +126,12 @@ pub trait Supervisor {
     /// took `&Path` would need a lossy conversion, and a lossy conversion here
     /// produces a "successfully installed" unit pointing at a directory that
     /// does not exist (invariant 5).
-    fn unit_text(&self, id: &CampId, camp_root: &str, exe: &str) -> String;
+    /// `path` is the PATH campd will run with. It is not optional and it is not
+    /// cosmetic: a supervisor gives campd a minimal environment (launchd:
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`), and campd spawns `claude` and `git` by
+    /// name. Without it a supervised campd cannot dispatch a single bead — see
+    /// `service::campd_path`.
+    fn unit_text(&self, id: &CampId, camp_root: &str, exe: &str, path: &str) -> String;
 
     /// Tell the service manager the unit DIRECTORY changed. Called after a
     /// unit file is written and after one is removed. launchd reads the plist

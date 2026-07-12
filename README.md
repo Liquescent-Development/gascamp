@@ -395,6 +395,26 @@ the ordinary upgrade path for a camp still running a campd of its own.
 There is no registry file: the installed units ARE the registry, and
 `camp service list` reads them.
 
+#### campd's PATH
+
+A supervisor does not give campd your shell's environment. launchd runs a
+LaunchAgent with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`; a `systemd --user`
+service gets `/usr/local/bin:/usr/bin:/bin:…`. Neither contains
+`~/.local/bin` — which is where Claude Code installs `claude`, the process
+campd spawns to do the work. A campd with that PATH comes up healthy, serves
+its socket, accepts beads, and then fails **every** dispatch with
+`spawn failed: spawning claude: No such file or directory`.
+
+So `camp service install` captures the PATH of the shell that runs it — the
+one place your tools demonstrably resolve — and writes it into the unit. It
+prints what it captured, and warns if the configured worker command is not on
+it, because the alternative is finding out from a `session.crashed` event after
+you have already slung work at a camp that was never going to run it.
+
+It is a **snapshot, not a live link**. Change your PATH, move `claude`, and the
+unit still names the old one — re-run `camp service install` to re-capture it.
+(`camp service restart` only cycles the daemon; it does not re-read your shell.)
+
 > **What has actually been exercised against a live service manager:** both.
 > The end-to-end lifecycle test (`make service-e2e`) runs against **launchd on
 > macOS**. The **systemd** path was driven by hand against a live
