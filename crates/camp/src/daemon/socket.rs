@@ -506,16 +506,21 @@ pub mod fake_campd {
         }
     }
 
-    /// A campd in the middle of the graceful shutdown you just asked for: it
-    /// accepts, reads the request, and closes without answering — then goes
-    /// away entirely, so the next connect is refused.
+    /// A campd in the middle of the graceful shutdown you just asked for: for
+    /// `dying_accepts` connections it accepts, reads the request, and closes
+    /// WITHOUT answering — then it serves `then`, and when that is exhausted it
+    /// goes away entirely (the listener drops, so the next connect is refused).
     ///
     /// This is not a hypothetical. `launchctl bootout` returns BEFORE campd has
-    /// finished exiting (measured: ~760 ms on macOS), so any verb that stops the
-    /// unit and immediately asks the socket "is a campd still serving this camp?"
-    /// meets exactly this. `dying_accepts` is how many connections get the
-    /// accept-then-close treatment before the listener drops.
-    pub fn serve_then_die(camp: &CampDir, dying_accepts: usize) -> FakeCampd {
+    /// finished exiting, so any verb that stops the unit and immediately asks the
+    /// socket "is a campd still serving this camp?" meets exactly this.
+    ///
+    /// `then` is what makes this double as the guard test: pass a `status(pid)`
+    /// and the socket is answered by a campd AFTER the dying one — an orphan the
+    /// probe must still catch. A fix that merely swallowed the dying state
+    /// ("closed without responding" → "gone, success") would sail past that, and
+    /// would be decision 11's exact sin: reporting an effect it never confirmed.
+    pub fn serve_then_die(camp: &CampDir, dying_accepts: usize, then: Vec<Response>) -> FakeCampd {
         let listener =
             UnixListener::bind(camp.socket_path()).expect("binding the fake campd socket");
         let served = Arc::new(AtomicUsize::new(0));
@@ -530,6 +535,26 @@ pub mod fake_campd {
                 counter.fetch_add(1, Ordering::SeqCst);
                 // Close without answering: campd went away mid-request.
                 drop(stream);
+            }
+            for response in then {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request_line = String::new();
+                if BufReader::new(&stream)
+                    .read_line(&mut request_line)
+                    .is_err()
+                {
+                    return;
+                }
+                let mut line = serde_json::to_string(&response).expect("serializing the response");
+                line.push('\n');
+                // Publish the witness BEFORE the write that unblocks the client
+                // (same happens-before reason as `serve`).
+                counter.fetch_add(1, Ordering::SeqCst);
+                if (&stream).write_all(line.as_bytes()).is_err() {
+                    return;
+                }
             }
             // …and now it is gone: the listener drops, so the socket file is
             // still on disk but nothing is behind it — connect() gets

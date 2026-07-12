@@ -146,6 +146,29 @@ manageability, reliable order firing, and native container fit.
     happen; `uninstall` reports a campd that survives it. No verb may take its own
     word for its effect (invariants 3 and 5).
 
+    **Stopping is ASYNCHRONOUS on launchd, and the verification must allow for it.**
+    `launchctl bootout` returns 0 while campd is still running its graceful exit —
+    the socket goes quiet ~8-18 ms later and the process lingers to ~760 ms
+    (measured, macOS). `systemctl --user stop` blocks until the process is gone, so
+    Linux does not show this and macOS always does. That asymmetry is a trap, and it
+    has now bitten twice: first as `loaded` (which means "bootstrapped" to launchd
+    but merely "the unit file parsed" to systemd — decision 10), and then here, where
+    a verify step that probed the socket the instant `bootout` returned met a campd
+    part-way through the shutdown it had just ordered and called it a fault. `camp
+    service stop` exited 1 with a scary error while the unit was, in fact, stopped —
+    the check that exists to stop verbs lying about their effect, lying about its
+    own, pointing the other way.
+
+    So a campd that accepts and then closes without answering is a THIRD state, not
+    a fault: to a verb that just ordered a stop it is success in progress. The
+    verification waits it out, bounded, and only concludes when the socket is quiet
+    (stopped), a campd answers properly (an orphan the manager does not own — the
+    fault this check exists to catch), or the window expires. **Do not "simplify"
+    that wait away**, and do not assume a supervisor's stop is synchronous because
+    one of them is: the last author to reason that way ("a successful `bootout`
+    blocks until the process is gone") shipped this bug, having been unable to run
+    the real-manager test that catches it instantly.
+
 ## 5. `camp service` — the control surface
 
 A new subcommand group. Each operates on the resolved camp (`--camp` /

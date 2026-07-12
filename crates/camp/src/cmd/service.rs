@@ -276,7 +276,15 @@ pub fn uninstall(supervisor: &dyn Supervisor, camp_root: &Path) -> Result<String
     // camp is now unsupervised, so saying only "uninstalled" would leave a live
     // daemon unmentioned. Not an error (the unit really is gone, and `camp stop`
     // now works on it): a stated fact, with the remedy.
-    if let Some(pid) = listening_campd_pid(camp_root)? {
+    //
+    // The unit half of the answer is TRUE and already known — the unit really was
+    // removed. A bare `?` here would lose that fact behind a campd fault, leaving
+    // the operator unable to tell whether the unit is gone (it is). Fold it into
+    // the error, exactly as `stop` and `status` already do: both truths reach the
+    // operator and the non-zero exit is untouched.
+    let still_listening =
+        listening_campd_pid(camp_root).map_err(|e| e.context(report.trim_end().to_owned()))?;
+    if let Some(pid) = still_listening {
         report.push_str(&format!(
             "note: a campd is still listening on this camp's socket (pid {pid}) — {} did not \
              start it, and this camp is now unsupervised. `camp stop` stops it.\n",
@@ -423,11 +431,20 @@ pub fn restart(supervisor: &dyn Supervisor, camp_root: &Path) -> Result<String> 
 /// before we stop calling it "shutting down" and start calling it a fault.
 ///
 /// `launchctl bootout` is ASYNCHRONOUS: it returns 0 while campd is still
-/// running its graceful exit (measured on macOS: campd was gone 761 ms after
-/// bootout returned). `systemctl --user stop` blocks until the process is gone,
-/// which is why Linux never showed this and macOS always did. 5 s is ~6x the
-/// measured worst case, and it is a ceiling, not a delay: the poll returns the
-/// instant the socket goes quiet.
+/// running its graceful exit. `systemctl --user stop` blocks until the process
+/// is gone, which is why Linux never showed this and macOS always did.
+///
+/// The thing being waited on is the SOCKET going quiet, not the process exiting
+/// — campd unlinks the socket part-way through its teardown, so the socket is
+/// quiet in ~8-18 ms while the process itself lingers to ~760 ms (both measured
+/// on macOS). 5 s is a vast ceiling over either, and it is a ceiling, not a
+/// delay: the poll returns the instant the socket is quiet (measured: one 50 ms
+/// tick in the common case).
+///
+/// It does NOT bound the verb: a probe that meets a wedged campd spends
+/// `socket::REQUEST_TIMEOUT` (5 s) inside a single attempt, and the deadline is
+/// checked before the sleep — so the true worst case for a verb that stops a
+/// unit is ~10 s, not 5. Bounded, and only in a state that is already a fault.
 const SHUTDOWN_SETTLES_WITHIN: Duration = Duration::from_secs(5);
 const SETTLE_POLL: Duration = Duration::from_millis(50);
 
@@ -1294,7 +1311,6 @@ mod tests {
     /// lying about its effect — precisely what this branch's own §4.10 ruling
     /// forbids — and it strands the operator, because `camp stop` sends them
     /// to exactly this verb.
-
     #[test]
     fn service_stop_never_reports_success_while_a_campd_still_answers() {
         let camp_dir = tempfile::tempdir().unwrap();
@@ -1351,7 +1367,7 @@ mod tests {
 
         // campd is mid-exit: the first probe is accepted and dropped without an
         // answer, and by the second it is gone.
-        let campd = socket::fake_campd::serve_then_die(&camp, 1);
+        let campd = socket::fake_campd::serve_then_die(&camp, 1, vec![]);
         // launchd: `stop` asks the state (is there anything to stop?), then
         // `unload` asks again before booting out, then the bootout succeeds.
         let runner = FakeRunner::new(vec![
@@ -1378,6 +1394,59 @@ mod tests {
         assert!(
             campd.served() >= 1,
             "the verb must really have probed the socket — this must not pass by never asking"
+        );
+    }
+
+    /// The settle wait must RE-PROBE, not swallow.
+    ///
+    /// The cheap wrong fix for the bug above is to map "campd closed the
+    /// connection without responding" straight to "gone, success" — which passes
+    /// the test above, because in that test campd really was gone. It would also
+    /// report a stop it never confirmed, which is decision 11's exact sin.
+    ///
+    /// So: a campd that closes one connection mid-request and is then ANSWERING
+    /// on the next probe is an orphan the supervisor does not own, and it must
+    /// still be caught. Nothing about waiting out a shutdown may cost us that.
+    #[test]
+    fn service_stop_re_probes_and_still_catches_an_orphan_that_survives_the_shutdown() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        install(&launchd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        // First probe: accepted, closed without answering. Second probe: a campd
+        // answers — alive, and not one launchd started.
+        let campd =
+            socket::fake_campd::serve_then_die(&camp, 1, vec![socket::fake_campd::status(49602)]);
+        let runner = FakeRunner::new(vec![
+            FakeRunner::ok("com.gascamp.campd.x = {\n\tstate = running\n}\n"),
+            FakeRunner::ok("com.gascamp.campd.x = {\n\tstate = running\n}\n"),
+            FakeRunner::ok(""),
+        ]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &runner);
+
+        let result = stop(&launchd, &camp);
+        let shown = match &result {
+            Ok(report) => report.clone(),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            result.is_err(),
+            "a campd still ANSWERING after the stop is an orphan — waiting out a shutdown must \
+             not swallow it: {shown}"
+        );
+        assert!(
+            shown.contains("49602"),
+            "the orphan must still be named by pid: {shown}"
+        );
+        assert_eq!(
+            campd.served(),
+            2,
+            "it must have re-probed after the dying connection, not concluded from it"
         );
     }
 
