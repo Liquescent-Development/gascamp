@@ -147,6 +147,34 @@ pub fn bind_or_replace(path: &Path) -> Result<UnixListener> {
 /// cost.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// campd accepted the connection and then went away before answering: it
+/// exited or crashed mid-request.
+///
+/// Typed because it is NOT always a fault, and the third state matters. To a
+/// verb that merely wanted an answer, this is an error. To a verb that has just
+/// asked the supervisor to STOP campd, it is the shutdown working — campd is
+/// tearing down, and a moment later nothing will be listening at all. Telling
+/// the two apart is the difference between `camp service stop` reporting the
+/// truth and reporting a scary failure for a stop that succeeded (which it did,
+/// on macOS, until this type existed: `launchctl bootout` returns while campd is
+/// still exiting, so the post-stop probe met exactly this).
+#[derive(Debug)]
+pub struct CampdWentAway;
+
+impl std::fmt::Display for CampdWentAway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "campd accepted the connection and then closed it without responding — it exited \
+             or crashed mid-request (a `camp service restart` or a `camp stop` racing this \
+             verb will do exactly this). Check it is back: `camp service status`, or run \
+             `camp daemon` where no service manager does — then rerun this verb"
+        )
+    }
+}
+
+impl std::error::Error for CampdWentAway {}
+
 /// The wedge shape (issue #55): the kernel's listen backlog accepted the
 /// connection — that happens even when the event loop never runs accept —
 /// but no response line arrived within REQUEST_TIMEOUT. Typed so it is never
@@ -418,12 +446,11 @@ fn request_on(mut stream: UnixStream, request: &Request) -> Result<Response> {
         // `camp stop` racing this verb does exactly that. The CLI no longer
         // papers over it by spawning a replacement (design §4.3), so this needs
         // a remedy of its own: every other client-side campd fault names one.
-        bail!(
-            "campd accepted the connection and then closed it without responding — it exited \
-             or crashed mid-request (a `camp service restart` or a `camp stop` racing this \
-             verb will do exactly this). Check it is back: `camp service status`, or run \
-             `camp daemon` where no service manager does — then rerun this verb"
-        );
+        //
+        // TYPED (not a bare bail): a verb that just told the supervisor to stop
+        // campd is SUPPOSED to meet this, and for it this is success in
+        // progress, not a fault. See CampdWentAway.
+        return Err(CampdWentAway.into());
     }
     let response: Response = serde_json::from_str(response_line.trim_end())
         .with_context(|| format!("campd sent a malformed response: {response_line:?}"))?;
@@ -477,6 +504,64 @@ pub mod fake_campd {
         pub fn served(&self) -> usize {
             self.served.load(Ordering::SeqCst)
         }
+    }
+
+    /// A campd in the middle of the graceful shutdown you just asked for: for
+    /// `dying_accepts` connections it accepts, reads the request, and closes
+    /// WITHOUT answering — then it serves `then`, and when that is exhausted it
+    /// goes away entirely (the listener drops, so the next connect is refused).
+    ///
+    /// This is not a hypothetical. `launchctl bootout` returns BEFORE campd has
+    /// finished exiting, so any verb that stops the unit and immediately asks the
+    /// socket "is a campd still serving this camp?" meets exactly this.
+    ///
+    /// `then` is what makes this double as the guard test: pass a `status(pid)`
+    /// and the socket is answered by a campd AFTER the dying one — an orphan the
+    /// probe must still catch. A fix that merely swallowed the dying state
+    /// ("closed without responding" → "gone, success") would sail past that, and
+    /// would be decision 11's exact sin: reporting an effect it never confirmed.
+    pub fn serve_then_die(camp: &CampDir, dying_accepts: usize, then: Vec<Response>) -> FakeCampd {
+        let listener =
+            UnixListener::bind(camp.socket_path()).expect("binding the fake campd socket");
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&served);
+        std::thread::spawn(move || {
+            for _ in 0..dying_accepts {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request_line = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut request_line);
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Close without answering: campd went away mid-request.
+                drop(stream);
+            }
+            for response in then {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request_line = String::new();
+                if BufReader::new(&stream)
+                    .read_line(&mut request_line)
+                    .is_err()
+                {
+                    return;
+                }
+                let mut line = serde_json::to_string(&response).expect("serializing the response");
+                line.push('\n');
+                // Publish the witness BEFORE the write that unblocks the client
+                // (same happens-before reason as `serve`).
+                counter.fetch_add(1, Ordering::SeqCst);
+                if (&stream).write_all(line.as_bytes()).is_err() {
+                    return;
+                }
+            }
+            // …and now it is gone: the listener drops, so the socket file is
+            // still on disk but nothing is behind it — connect() gets
+            // ECONNREFUSED, which is what a stopped campd looks like.
+            drop(listener);
+        });
+        FakeCampd { served }
     }
 
     /// Bind the camp's socket and answer `responses`, one per connection, in
