@@ -78,6 +78,35 @@ fn init_rejects_service_and_no_service_together() {
         .stderr(predicates::str::contains("cannot be used with"));
 }
 
+/// `--service` and `--exists-ok` are contradictory too, and clap rejects the
+/// pair for the same reason it rejects `--service --no-service`: the two make
+/// incompatible promises about the SAME run.
+///
+/// `--service` is a hard promise to install and start a host service unit (it
+/// even `bail!`s when no manager exists). `--exists-ok` is a no-op, NEVER a
+/// repair: an existing camp is returned exactly as it is, unit and all. On an
+/// existing camp the pair can only be honoured by breaking one of them — and
+/// the one that would break silently is `--service`, an explicit request that
+/// would exit 0 having installed nothing. That is precisely the silent no-op
+/// this project bans, so the contradiction dies at the CLI edge instead.
+///
+/// The explicit way to put an EXISTING camp under a supervisor is
+/// `camp init --exists-ok && camp service install` — init never repairs a
+/// camp's service state behind your back (feature design §11: existing camps
+/// are not auto-migrated).
+#[test]
+fn init_rejects_service_and_exists_ok_together() {
+    let dir = tempfile::tempdir().unwrap();
+    camp()
+        .current_dir(dir.path())
+        // clap-rejected: refused by the parser; `init` itself never runs, so
+        // no unit can be installed (see tests/no_bare_camp_init.rs).
+        .args(["init", "--service", "--exists-ok"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
 #[test]
 fn init_with_explicit_camp_dir() {
     let dir = tempfile::tempdir().unwrap();
@@ -236,4 +265,75 @@ fn reinit_fails_fast() {
         .failure()
         .code(1)
         .stderr(predicates::str::contains("already"));
+}
+
+/// The container entrypoint (contrib/docker/) re-runs `camp init` on every
+/// start, and on a restart the camp already exists on the mounted volume.
+/// `--exists-ok` makes that a no-op SUCCESS — and a no-op means it touches
+/// NOTHING: the marker we wrote into camp.toml must survive it.
+#[test]
+fn init_exists_ok_is_a_no_op_on_an_existing_camp() {
+    let dir = tempfile::tempdir().unwrap();
+    camp()
+        .current_dir(dir.path())
+        .args(["init", "--no-service"])
+        .assert()
+        .success();
+
+    let config = dir.path().join(".camp/camp.toml");
+    let before = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{before}\n# operator's own edit\n")).unwrap();
+    let marked = std::fs::read_to_string(&config).unwrap();
+
+    camp()
+        .current_dir(dir.path())
+        .args(["init", "--no-service", "--exists-ok"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("already exists"));
+
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        marked,
+        "--exists-ok must not rewrite an existing camp.toml"
+    );
+}
+
+/// On a FRESH directory --exists-ok changes nothing: it still creates the camp.
+#[test]
+fn init_exists_ok_on_a_fresh_dir_still_creates_the_camp() {
+    let dir = tempfile::tempdir().unwrap();
+    camp()
+        .current_dir(dir.path())
+        .args(["init", "--no-service", "--exists-ok"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("initialized camp"));
+
+    assert!(dir.path().join(".camp/camp.toml").exists());
+    assert!(dir.path().join(".camp/camp.db").exists());
+}
+
+/// A camp with a ledger but no camp.toml is still "already there" — the flag
+/// reuses init's OWN existence predicate rather than inventing a second one,
+/// so `--exists-ok` never half-repairs a camp behind your back. (It hands off
+/// to campd, which opens the ledger; it does not rebuild what it did not make.)
+#[test]
+fn init_exists_ok_uses_inits_own_existence_predicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(".camp");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("camp.db"), b"").unwrap();
+
+    camp()
+        .current_dir(dir.path())
+        .args(["init", "--no-service", "--exists-ok"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("already exists"));
+
+    assert!(
+        !root.join("camp.toml").exists(),
+        "--exists-ok is a no-op, not a repair: it must not write into a camp it did not create"
+    );
 }

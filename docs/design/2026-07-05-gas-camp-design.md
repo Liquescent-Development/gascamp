@@ -153,6 +153,27 @@ agent definitions.
 
 ### campd lifecycle
 
+- **Who supervises campd is environment-provided.** `camp daemon` — foreground,
+  long-lived, socket-serving — is the one primitive; the supervisor around it is
+  whatever the environment already has:
+
+  | Environment | Supervisor | How campd runs |
+  |---|---|---|
+  | macOS desktop | launchd — a `KeepAlive` LaunchAgent | `camp init`, or `camp service install` |
+  | Linux desktop/server | systemd `--user` — `Restart=always` | `camp init`, or `camp service install` |
+  | Container | the container runtime (`restart: unless-stopped`, K8s) | `camp daemon` **is** the container's main process (`contrib/docker/`) |
+  | CI / bare box | you | `camp daemon`, run in the foreground |
+
+  `camp service {install,uninstall,status,restart,list,stop,start}` is the
+  control surface, and the installed units are its registry (no status files,
+  §13).
+
+  **Always-on is not idle cost.** A supervised campd runs continuously, and
+  invariant 1 measures what that costs: it sleeps on OS events, never ticks, and
+  idles at < 20 MB RSS and 0.0% CPU. What always-on buys is that orders fire
+  (§9) and that the daemon can be managed, upgraded, and restarted like any
+  other service. What it costs is one process per camp — which is why one
+  standalone camp with many rigs is the recommended shape (§12).
 - **Liveness is an answered request, per the no-status-files principle:**
   `campd` serves a unix socket at `<camp>/campd.sock`. Alive means a
   request on the socket gets a response — an event-loop round-trip (e.g.
@@ -561,11 +582,15 @@ An order's `formula` names `<camp>/formulas/<name>.toml`; when packs land
 - **Away-mode is the same code path.** An order fires, `campd` cooks and
   dispatches headless workers, everything lands in the ledger. You come
   back, `/status` shows what happened, and every worker it spawned is
-  resumable. Limits stated honestly: with the default on-demand daemon,
-  orders fire only while `campd` is running (from first `camp` use until
-  `camp stop`/reboot); install the optional launchd agent for
-  fire-at-login coverage; a powered-off laptop fires nothing until wake
-  (catch-up policy applies).
+  resumable. Limits stated honestly, and supervision (§5) removes the worst
+  one: a **supervised** campd is kept alive by launchd, systemd `--user`, or
+  the container runtime, so it is up at login, up again after a crash, and up
+  after a reboot — scheduled orders fire without anyone running a `camp`
+  command first. Where there is **no supervisor** — a bare box, CI, a container
+  you did not keep running — the old limit stands unchanged: orders fire only
+  while a `camp daemon` you started is alive, and no wake source means no fire.
+  In every case a powered-off or sleeping machine fires nothing until wake, and
+  what it then catches up on is the `catch_up_window` policy above.
 
 ## 10. Health patrol
 
@@ -635,6 +660,14 @@ mypack/
 
 - A camp dir stands alone (`~/camps/dev/` + `camp rig add ~/code/gascity`)
   or lives repo-local (`.camp/`, rig = self).
+- **One standalone camp with many rigs is the recommended shape**, and
+  supervision (§5) is why: a supervised campd is always on, so the number of
+  standing daemons is exactly the number of camps. One camp
+  (`~/camps/dev/` + a `camp rig add` per repo) is one supervised campd across
+  every repo you work in — one ledger, one place to look, scoped queries by rig
+  (below). Repo-local `.camp/` still works and is still right for a repo you
+  want self-contained; it just costs one supervised daemon each, and
+  `camp service list` is where you will notice that count growing.
 - Beads carry their rig; bead IDs get per-rig prefixes (`gc-142`,
   `t3-17`) — one ledger, scoped queries, Gas City's namespacing idea
   without a shared database.

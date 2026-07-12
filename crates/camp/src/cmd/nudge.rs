@@ -34,8 +34,9 @@ pub fn run(camp: &CampDir, session: String, text: String) -> Result<()> {
     drop(ledger); // the resume path re-opens for the append; campd may write meanwhile
 
     if row.status == "live" {
-        // campd-not-listening is a normal state (on-demand daemon), and a
-        // fresh campd holds no pipes — Ok(None) routes to resume (A4).
+        // A down campd is a normal state for THIS verb — it never requires the
+        // daemon — and a fresh campd holds no pipes anyway: Ok(None) routes to
+        // resume (A4).
         match socket::request_if_up(
             camp,
             &Request::Nudge {

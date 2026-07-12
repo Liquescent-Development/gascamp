@@ -284,7 +284,8 @@ path, and closed **`pass`**. Three defects, one flow. Verified findings:
 in the *same* LLM turn, is instructed to spawn the pack agent as a teammate.
 But `camp sling` (`crates/camp/src/cmd/sling.rs:98-107`) appends `bead.created`
 (with the routed agent as `assignee`) and immediately **pokes campd** via
-`request_with_autostart(..., Poke)`. On that poke, `campd`'s dispatcher
+`socket::require(..., Poke)` — the pure-client poke (campd down is a loud
+error, never a spawn). On that poke, `campd`'s dispatcher
 (`crates/camp/src/daemon/dispatch.rs:332` `converge`) queries the full
 dispatchable set and spawns a headless `claude -p` worker
 (`launch`, dispatch.rs:488), which claims the bead.

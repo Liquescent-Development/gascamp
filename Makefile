@@ -10,7 +10,7 @@
 PREFIX ?= $(HOME)/.local
 BINDIR := $(PREFIX)/bin
 
-.PHONY: install uninstall perf e2e service-e2e
+.PHONY: install uninstall perf e2e service-e2e container-smoke
 
 # Build the release binary and install `camp` into $(BINDIR), plus the
 # `campd` symlink that argv0 dispatch uses to run the daemon (main.rs keys
@@ -58,3 +58,11 @@ e2e:
 #            && systemctl --user daemon-reload
 service-e2e:
 	CAMP_SERVICE_E2E=1 cargo test -p camp --test cli_service -- --ignored --nocapture --test-threads=1
+
+# Opt-in reference-container smoke (design §9). LOCAL-ONLY and never in CI: the
+# test is #[ignore]d AND gated on CAMP_CONTAINER_E2E=1. It builds
+# contrib/docker/Dockerfile, runs the image, slings a bead over the
+# in-container socket, and asserts `docker stop` is a graceful SIGTERM (exit 0,
+# campd.stopped in the ledger). Requires `docker` on PATH.
+container-smoke:
+	CAMP_CONTAINER_E2E=1 cargo test -p camp --test container_smoke -- --ignored --nocapture --test-threads=1

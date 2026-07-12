@@ -8,7 +8,25 @@ use crate::service::{self, Decision, ServiceChoice, SystemProbe, SystemRunner};
 /// Create a new camp: `<cwd>/.camp` by default, `--camp DIR` to choose. Then
 /// (design §6) put its campd under the host's service manager where one
 /// exists — `--service` forces it, `--no-service` skips it.
-pub fn run(camp_flag: Option<&Path>, choice: ServiceChoice) -> Result<()> {
+///
+/// `exists_ok` turns the "already a camp here" case from a hard error into a
+/// no-op success. It exists for supervised entrypoints that re-run init on
+/// every start (contrib/docker/): a restarted container with a persistent camp
+/// volume MUST come back up, and a crash-loop over an error that says "yes,
+/// the camp you asked for is right there" would be a lie about a failure.
+/// It is a no-op, never a repair: an existing camp is returned as it is, and
+/// no unit is installed for it (a camp created before this had a service
+/// manager gets one from `camp service install` — an explicit act).
+///
+/// That is why `--exists-ok` returns BEFORE the service decision below, and
+/// why it may: clap rejects `--service --exists-ok` as the contradiction it is
+/// (`conflicts_with = "service"`), so the short-circuit can never swallow an
+/// explicit request to install a unit. Honouring `--service` here instead
+/// would make `camp init` REPAIR an existing camp's service state — exactly
+/// the auto-migration feature design §11 rules out. The idempotent
+/// provisioning path is `camp init --exists-ok && camp service install`: two
+/// verbs, each of which means what it says.
+pub fn run(camp_flag: Option<&Path>, choice: ServiceChoice, exists_ok: bool) -> Result<()> {
     let root = match camp_flag {
         Some(dir) => dir.to_path_buf(),
         None => std::env::current_dir()
@@ -16,6 +34,10 @@ pub fn run(camp_flag: Option<&Path>, choice: ServiceChoice) -> Result<()> {
             .join(".camp"),
     };
     if root.join("camp.toml").exists() || root.join("camp.db").exists() {
+        if exists_ok {
+            println!("camp already exists at {} (--exists-ok)", root.display());
+            return Ok(());
+        }
         bail!("a camp already exists at {}", root.display());
     }
     std::fs::create_dir_all(&root).with_context(|| format!("cannot create {}", root.display()))?;
