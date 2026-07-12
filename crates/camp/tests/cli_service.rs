@@ -117,9 +117,20 @@ fn unit_path_from(status: &str) -> PathBuf {
         .lines()
         .find(|l| l.starts_with("unit:"))
         .unwrap_or_else(|| panic!("no `unit:` line in status:\n{status}"));
-    let inside = line
-        .rsplit_once(", ")
-        .and_then(|(_, rest)| rest.strip_suffix(')'))
+    // `unit:  <name> (<manager>, <path>)`. Split at the FIRST ", " after the
+    // "(", not the last: the manager is `launchd`/`systemd` and never contains
+    // one, but a unit PATH can — `$HOME` is the operator's to name. Splitting
+    // from the right made this helper fail on a perfectly correct product for
+    // anyone whose home directory has a comma in it, which is a test that lies
+    // in the other direction.
+    let after_paren = line
+        .split_once(" (")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("no `(manager, path)` in: {line:?}"));
+    let inside = after_paren
+        .strip_suffix(')')
+        .and_then(|s| s.split_once(", "))
+        .map(|(_manager, path)| path)
         .unwrap_or_else(|| panic!("no unit path in: {line:?}"));
     PathBuf::from(inside)
 }
@@ -273,10 +284,15 @@ fn service_lifecycle_against_the_real_host_manager() {
          while looking perfectly healthy. Unit at {}:\n{unit_text}",
         unit_path.display()
     );
+    // `status` must report the PATH the unit actually bakes — that is what tells
+    // an operator with a pre-PATH unit why nothing dispatches. Asserted as "a
+    // PATH line that is not NONE" rather than "starts with /": a PATH may
+    // legally begin with an empty entry (`:/usr/bin` means cwd first), and a
+    // test that fails on a correct product is the same disease as a test that
+    // passes on a broken one.
     assert!(
-        status.contains("campd PATH: /"),
-        "and `status` must report the PATH the unit actually bakes — that is what tells an \
-         operator with a pre-PATH unit why nothing dispatches: {status}"
+        status.contains("campd PATH: ") && !status.contains("campd PATH: NONE"),
+        "status must report the PATH the unit bakes: {status}"
     );
 
     // The fleet view finds this camp.
