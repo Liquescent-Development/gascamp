@@ -30,19 +30,31 @@ fn service_list_is_a_read_only_query_that_needs_no_camp() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out).into_owned();
-    // F7 fix: a bare non-empty check would pass on almost any regression
-    // (even a stray newline). This must stay host-independent — it has to
-    // pass on a Linux CI runner with NO service manager AND on macOS WITH
-    // one — so assert on the UNION of `list`'s legitimate answers
-    // (crates/camp/src/cmd/service.rs::list), not on one host's: either it
-    // says outright that no host service manager was detected, or it names
-    // the manager it found (whether there are zero managed units or some).
+    // A bare non-empty check would pass on almost any regression (even a stray
+    // newline), so assert on the UNION of `list`'s legitimate answers
+    // (crates/camp/src/cmd/service.rs::list). It has exactly three, and the
+    // test has to pass on all of them, because which one you get is a fact
+    // about the HOST, not about the code:
+    //   1. no service manager      (a Linux CI runner, a container)
+    //   2. a manager, zero units   (a clean dev box — names the manager)
+    //   3. a manager, SOME units   (a dev box that actually uses this feature)
+    //
+    // Case 3 was missing, and it is the one every adopter of `camp service`
+    // hits: `list` prints one block per camp and never prints the manager's
+    // lowercase name (the launchd unit PATH says "LaunchAgents", capital L —
+    // it does not match "launchd"). So `cargo test --workspace` failed for
+    // anyone with a supervised camp, while CI stayed green because runners
+    // have no units. Assert on what case 3 actually emits.
     let no_manager = out.contains("no host service manager detected");
     let no_managed_units = out.contains("no camps have a managed");
-    let names_a_manager = out.contains("launchd") || out.contains("systemd");
+    let lists_units = out.contains("unit: ")
+        && ["running", "starting", "stopped"]
+            .iter()
+            .any(|mark| out.contains(mark));
     assert!(
-        no_manager || no_managed_units || names_a_manager,
-        "list must name the manager it found, or say why there is none: {out}"
+        no_manager || no_managed_units || lists_units,
+        "list must name the manager it found, say why there is none, or list the managed \
+         units with their state — it printed: {out}"
     );
 }
 
