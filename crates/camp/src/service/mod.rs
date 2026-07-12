@@ -172,7 +172,22 @@ pub fn unit_safe_value<'a>(text: &'a str, what: &str) -> Result<&'a str> {
 /// an operator to "re-run `camp service install`" hands them an error at the
 /// moment they need a fix. (This doc comment used to say exactly that.)
 pub fn campd_path() -> Result<String> {
-    let path = std::env::var("PATH").context(
+    campd_path_from(std::env::var("PATH"))
+}
+
+/// The whole of `campd_path` except reading the environment — split out for one
+/// reason: the gate has to be testable WHERE IT IS WIRED.
+///
+/// A test that calls `unit_safe_value` directly pins the helper, not the code
+/// path that uses it: delete the call from here and such a test stays green while
+/// a newline in `$PATH` becomes a systemd unit that means something else
+/// entirely, which systemd would accept and run. And the environment cannot be
+/// mutated in a test to reach the real thing — this crate is
+/// `#![forbid(unsafe_code)]` and `set_var` is unsafe. So the seam goes here, and
+/// `install`'s real route to the gate is `campd_path` → `campd_path_from` →
+/// `unit_safe_value`, every link of it exercised.
+fn campd_path_from(var: std::result::Result<String, std::env::VarError>) -> Result<String> {
+    let path = var.context(
         "this environment has no PATH, so the unit could not give campd one — and campd \
          needs it to find the worker command (`claude`) and `git`",
     )?;
@@ -185,6 +200,29 @@ pub fn campd_path() -> Result<String> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The gate, tested WHERE IT IS WIRED — not where it is defined.
+    ///
+    /// The test below calls `unit_safe_value` directly, which pins the helper.
+    /// This pins the CALL SITE: delete the `unit_safe_value` line from
+    /// `campd_path_from` and this fails, where a helper-only test would stay
+    /// green while `install` happily bakes a newline into a unit — and a newline
+    /// in a systemd unit does not corrupt it, it makes it a DIFFERENT unit that
+    /// systemd accepts and runs.
+    #[test]
+    fn campd_path_refuses_a_newline_in_the_environment_it_captures() {
+        let err = campd_path_from(Ok("/usr/bin:/tmp\nExecStart=/bin/sh".to_owned())).unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(
+            shown.contains("control character"),
+            "a newline in $PATH must be refused where the PATH is captured: {shown}"
+        );
+        assert!(campd_path_from(Ok("/usr/bin:/bin".to_owned())).is_ok());
+        // And an environment with no PATH at all is a loud error, not an empty
+        // unit that campd would come up under and spawn nothing from.
+        let err = campd_path_from(Err(std::env::VarError::NotPresent)).unwrap_err();
+        assert!(format!("{err:#}").contains("no PATH"), "{err:#}");
+    }
 
     /// The PATH goes into the unit as text, so it gets the same gate the camp
     /// path gets. A newline is the one that matters: a systemd unit is

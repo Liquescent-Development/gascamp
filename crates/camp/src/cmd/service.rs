@@ -257,8 +257,9 @@ fn campd_path_report(supervisor: &dyn Supervisor, unit: &ManagedUnit, camp_root:
         Ok(text) => text,
         Err(e) => {
             return format!(
-                "campd PATH: cannot read the unit ({}): {e}\n",
-                unit.path.display()
+                "campd PATH: cannot read the unit ({}): {}\n",
+                unit.path.display(),
+                indented_detail(&e.to_string(), "      ")
             );
         }
     };
@@ -272,7 +273,11 @@ fn campd_path_report(supervisor: &dyn Supervisor, unit: &ManagedUnit, camp_root:
             supervisor.name()
         );
     };
-    let mut report = format!("campd PATH: {path}\n");
+    // The PATH is read back out of a FILE, so it is foreign too. campd's own gate
+    // (`unit_safe_value`) refuses to write a newline into a unit, but a unit is a
+    // plain text file an operator or another tool can edit — and "we wrote it, so
+    // it must be well-formed" is the assumption that starts these bugs.
+    let mut report = format!("campd PATH: {}\n", indented_detail(&path, "      "));
     if let Some(problem) = worker_command_problem(camp_root, &path) {
         report.push_str(&worker_command_warning(&problem, camp_root));
     }
@@ -386,38 +391,56 @@ fn lookup(candidate: &Path) -> Lookup {
 /// The one thing an operator with a broken camp needs to read: what is wrong,
 /// and the command that fixes it. Shared by `install` (before the fact) and
 /// `status` (after it), so the two can never drift apart.
+///
+/// EVERY value interpolated here is a string this code does not control — a
+/// `[dispatch] command` an operator typed, a `toml` parse error, a manager's
+/// stderr — and any of them may be multi-line. Raw, the second line and every
+/// one after it lands at column 0 and breaks the shape of the report this
+/// command exists to render. That defect has now been fixed twice in this file
+/// (once for `launchctl print`'s stderr, which is why `indented_detail` exists,
+/// and once for a typo'd `camp.toml`), both times as a one-site patch — so the
+/// third one was always going to be shipped by whoever added the next arm.
+///
+/// So it is not a per-arm rule any more: every foreign string goes through
+/// `indent` on the way in, and there is no way into this report that does not.
 fn worker_command_warning(problem: &WorkerCommand, camp_root: &Path) -> String {
     let toml = format!("{}/camp.toml", camp_root.display());
+    let indent = |foreign: &str| indented_detail(foreign, "      ");
     match problem {
-        WorkerCommand::NotFound(cmd) => format!(
-            "WARNING: the worker command `{cmd}` is not on the PATH campd runs with. campd \
-             will serve this camp, and every bead it dispatches will die with `spawn failed: \
-             spawning {cmd}: No such file or directory`. Install it, or set an absolute path \
-             in [dispatch] command in {toml} — then re-capture campd's PATH with \
-             `camp service uninstall && camp service install`.\n"
-        ),
-        WorkerCommand::NotExecutable(cmd) => format!(
-            "WARNING: the worker command `{cmd}` is on campd's PATH but is not executable. \
-             Every bead will die with `spawn failed: spawning {cmd}: Permission denied`. \
-             `chmod +x` it — then `camp service uninstall && camp service install`.\n"
-        ),
-        WorkerCommand::RelativeToTheRig(cmd) => format!(
-            "NOTE: [dispatch] command is the relative path `{cmd}`, which campd resolves \
-             against the RIG's directory at spawn time — not against this one, so this verb \
-             cannot check it for you. An absolute path in {toml} is checkable, and does not \
-             depend on which rig a bead lands in.\n"
-        ),
+        WorkerCommand::NotFound(cmd) => {
+            let cmd = indent(cmd);
+            format!(
+                "WARNING: the worker command `{cmd}` is not on the PATH campd runs with. campd \
+                 will serve this camp, and every bead it dispatches will die with `spawn failed: \
+                 spawning {cmd}: No such file or directory`. Install it, or set an absolute path \
+                 in [dispatch] command in {toml} — then re-capture campd's PATH with \
+                 `camp service uninstall && camp service install`.\n"
+            )
+        }
+        WorkerCommand::NotExecutable(cmd) => {
+            let cmd = indent(cmd);
+            format!(
+                "WARNING: the worker command `{cmd}` is on campd's PATH but is not executable. \
+                 Every bead will die with `spawn failed: spawning {cmd}: Permission denied`. \
+                 `chmod +x` it — then `camp service uninstall && camp service install`.\n"
+            )
+        }
+        WorkerCommand::RelativeToTheRig(cmd) => {
+            let cmd = indent(cmd);
+            format!(
+                "NOTE: [dispatch] command is the relative path `{cmd}`, which campd resolves \
+                 against the RIG's directory at spawn time — not against this one, so this verb \
+                 cannot check it for you. An absolute path in {toml} is checkable, and does not \
+                 depend on which rig a bead lands in.\n"
+            )
+        }
         // A TOML parse error's Display is a MULTI-LINE snippet (the offending
         // line, a caret, the reason) — the realistic case here, since the way an
-        // operator's camp.toml becomes unreadable is that they typoed it. Raw,
-        // it drops every line after the first to column 0 and breaks the shape of
-        // the report this command exists to render: the same defect `launchctl
-        // print`'s multi-line stderr caused, which is why `indented_detail`
-        // exists. The manager's words go through it; so do these.
+        // operator's camp.toml becomes unreadable is that they typoed it.
         WorkerCommand::Uncheckable(why) => format!(
             "NOTE: could not read {toml}, so the worker command campd will spawn was not \
              checked ({}). campd and `camp doctor` report the config fault itself.\n",
-            indented_detail(why, "      ")
+            indent(why)
         ),
     }
 }
@@ -1327,6 +1350,40 @@ mod tests {
         );
     }
 
+    /// The column-0 invariant, established for EVERY arm instead of patched at
+    /// the one that broke.
+    ///
+    /// This report interpolates strings this code does not control — a
+    /// `[dispatch] command` an operator typed, a `toml` parse error, a manager's
+    /// stderr, a PATH read back off disk — and any of them can be multi-line.
+    /// Raw, every line after the first lands at column 0 and wrecks the shape of
+    /// the report. That has now been fixed twice here, both times as a one-site
+    /// patch, and both times the guarding test used a fixture that could not
+    /// fail. So this drives all four arms with a multi-line payload and holds the
+    /// whole function to the rule: the next arm someone adds is covered before
+    /// they write it.
+    #[test]
+    fn no_foreign_string_can_break_the_report_shape_in_any_arm() {
+        let camp = tempfile::tempdir().unwrap();
+        let nasty = "abc\nINJECTED-AT-COLUMN-0";
+        let arms = [
+            WorkerCommand::NotFound(nasty.to_owned()),
+            WorkerCommand::NotExecutable(nasty.to_owned()),
+            WorkerCommand::RelativeToTheRig(nasty.to_owned()),
+            WorkerCommand::Uncheckable(nasty.to_owned()),
+        ];
+        for problem in &arms {
+            let text = worker_command_warning(problem, camp.path());
+            for line in text.lines().skip(1) {
+                assert!(
+                    line.starts_with(' ') || line.is_empty(),
+                    "a continuation line dropped to column 0 and broke the report shape: \
+                     {line:?}\nin:\n{text}"
+                );
+            }
+        }
+    }
+
     /// The installed base. Every unit written before campd's PATH was baked
     /// into it carries none — so campd runs with the supervisor's minimal
     /// environment, cannot find `claude`, and fails every dispatch, while
@@ -1466,6 +1523,59 @@ mod tests {
             ),
             "a relative command is resolved against the rig's cwd — this verb must not pretend \
              to know"
+        );
+
+        // A DIRECTORY named like the command. The OS finds it and refuses with
+        // EACCES, so the operator's ledger will say "Permission denied" — the
+        // string they will grep for. Reporting "No such file or directory" warns
+        // for the right reason with the wrong evidence.
+        std::fs::create_dir(bin.path().join("dirtool")).unwrap();
+        set("dirtool");
+        assert!(
+            matches!(
+                worker_command_problem(camp.path(), &path),
+                Some(WorkerCommand::NotExecutable(_))
+            ),
+            "a directory on the PATH is EACCES at exec, not ENOENT"
+        );
+
+        // …and a bad match must NOT shadow a good one later on the PATH, because
+        // the OS keeps looking too. Getting this wrong produces a FALSE warning:
+        // it tells an operator whose camp works perfectly to go and reinstall it.
+        let first = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("realtool"), "#!/bin/sh\n").unwrap();
+        let two_dirs = format!("{}:{}", first.path().display(), bin.path().display());
+        set("realtool");
+        assert!(
+            worker_command_problem(camp.path(), &two_dirs).is_none(),
+            "a non-executable match earlier on the PATH must not hide the real one later — the \
+             OS keeps looking, and so must we"
+        );
+
+        // The absolute branch: PATH has no say, so ask the filesystem.
+        let abs = bin.path().join("realtool");
+        set(&abs.display().to_string());
+        assert!(
+            worker_command_problem(camp.path(), "/nowhere").is_none(),
+            "an absolute command that exists and is executable resolves, whatever the PATH says"
+        );
+        let abs_bad = bin.path().join("notexec");
+        set(&abs_bad.display().to_string());
+        assert!(
+            matches!(
+                worker_command_problem(camp.path(), "/nowhere"),
+                Some(WorkerCommand::NotExecutable(_))
+            ),
+            "an absolute command without +x is Permission denied, and is checkable"
+        );
+        set("/nowhere/at/all/claude");
+        assert!(
+            matches!(
+                worker_command_problem(camp.path(), "/nowhere"),
+                Some(WorkerCommand::NotFound(_))
+            ),
+            "an absolute command that is not there is NotFound — and must not silently \
+             downgrade to `cannot check`"
         );
     }
 
