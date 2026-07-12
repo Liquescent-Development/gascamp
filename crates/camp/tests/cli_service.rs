@@ -107,6 +107,23 @@ impl Drop for Uninstall {
 /// as `false` — meaning both `wait_for_campd(&root, false)` call sites below
 /// would return immediately and green on a BROKEN command, mistaking it for
 /// "campd is stopped". A broken command must fail this test loudly instead.
+/// The unit file `camp service status` just named. `status` prints it as
+/// `unit:  <name> (<manager>, <path>)`, and the path is the only thing in there
+/// that ends in the manager's suffix — so read the artifact the tool itself
+/// pointed at rather than reconstructing a path this test would then be free to
+/// get wrong in the same way the code did.
+fn unit_path_from(status: &str) -> PathBuf {
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("unit:"))
+        .unwrap_or_else(|| panic!("no `unit:` line in status:\n{status}"));
+    let inside = line
+        .rsplit_once(", ")
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("no unit path in: {line:?}"));
+    PathBuf::from(inside)
+}
+
 fn wait_for_campd(camp: &Path, want_listening: bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -234,6 +251,32 @@ fn service_lifecycle_against_the_real_host_manager() {
     assert!(
         status.contains("campd: listening"),
         "campd must answer: {status}"
+    );
+
+    // …and the UNIT ON DISK carries campd's PATH.
+    //
+    // Asserting that `install` SAID it baked one proves nothing: that line is
+    // pushed unconditionally, independent of what the generator wrote. The
+    // artifact is the claim. Delete the PATH from the generator — reintroducing
+    // the exact bug a user reported — and an install-output assertion still
+    // passes; this one does not. It is the only check in the repo that holds the
+    // REAL supervisor's unit to it.
+    let unit_path = unit_path_from(&status);
+    let unit_text = std::fs::read_to_string(&unit_path)
+        .unwrap_or_else(|e| panic!("reading the installed unit {}: {e}", unit_path.display()));
+    let carries_path = unit_text.contains("<key>PATH</key>") // launchd plist
+        || unit_text.contains("Environment=\"PATH="); // systemd unit
+    assert!(
+        carries_path,
+        "the installed unit must carry campd's PATH — without it campd runs with the \
+         supervisor's minimal environment, never finds `claude`, and fails every dispatch \
+         while looking perfectly healthy. Unit at {}:\n{unit_text}",
+        unit_path.display()
+    );
+    assert!(
+        status.contains("campd PATH: /"),
+        "and `status` must report the PATH the unit actually bakes — that is what tells an \
+         operator with a pre-PATH unit why nothing dispatches: {status}"
     );
 
     // The fleet view finds this camp.

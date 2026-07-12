@@ -163,10 +163,14 @@ pub fn unit_safe_value<'a>(text: &'a str, what: &str) -> Result<&'a str> {
 ///
 /// So the PATH is captured HERE — from the environment that ran the install,
 /// which is demonstrably one where the operator's tools resolve — and written
-/// into the unit, where it is visible (`camp service status` prints the unit's
-/// path; the file itself is human-readable). It is a snapshot, not a live link:
-/// change your PATH and you re-run `camp service install` to re-capture it. That
-/// is stated at install rather than left to be discovered.
+/// into the unit, where it is visible (`camp service status` reads it back and
+/// prints it; the file itself is human-readable).
+///
+/// It is a snapshot, not a live link, and re-capturing it is
+/// `camp service uninstall && camp service install` — BOTH, in that order.
+/// `install` alone refuses to clobber an existing unit, so any message that tells
+/// an operator to "re-run `camp service install`" hands them an error at the
+/// moment they need a fix. (This doc comment used to say exactly that.)
 pub fn campd_path() -> Result<String> {
     let path = std::env::var("PATH").context(
         "this environment has no PATH, so the unit could not give campd one — and campd \

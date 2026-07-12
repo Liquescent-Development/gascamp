@@ -304,17 +304,25 @@ enum WorkerCommand {
     /// rig's path, not to wherever `camp service install` was run — so this verb
     /// cannot resolve it, and must not pretend to. Say what we don't know.
     RelativeToTheRig(String),
+    /// The camp's config would not load, so we do not know what the worker
+    /// command even IS. Saying nothing would read as "it's fine".
+    Uncheckable(String),
 }
 
 fn worker_command_problem(camp_root: &Path, path: &str) -> Option<WorkerCommand> {
     let camp = CampDir {
         root: camp_root.to_path_buf(),
     };
-    // A camp whose config will not load is not this verb's problem to report —
-    // campd and `camp doctor` both say so, loudly, and inventing a second
-    // opinion here would just be a worse copy of theirs. Nothing is swallowed:
-    // no error is being discarded, the preflight simply has nothing to check.
-    let config = camp_core::config::CampConfig::load(&camp.config_path()).ok()?;
+    // A camp whose config will not load is campd's and `camp doctor`'s to report,
+    // loudly, and a second opinion here would be a worse copy of theirs. But
+    // silence would be a LIE BY OMISSION: saying nothing reads as "the worker is
+    // fine", and this preflight's whole purpose is that a camp which cannot
+    // dispatch must never look like one that can. Same principle as
+    // `RelativeToTheRig` — when we cannot answer, say we cannot answer.
+    let config = match camp_core::config::CampConfig::load(&camp.config_path()) {
+        Ok(config) => config,
+        Err(e) => return Some(WorkerCommand::Uncheckable(e.to_string())),
+    };
     let command = config.dispatch.command;
     let shown = command.display().to_string();
 
@@ -361,9 +369,16 @@ enum Lookup {
 fn lookup(candidate: &Path) -> Lookup {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(candidate) {
+        // A DIRECTORY named `claude` on the PATH is not "nothing is there" — the
+        // OS finds it and refuses: exec gives EACCES, so campd's spawn fails with
+        // "Permission denied", not "No such file or directory". Reporting it as
+        // missing warns for the right reason with the wrong errno, and the errno
+        // is the string the operator will grep their ledger for.
+        Ok(m) if m.is_dir() => Lookup::NotExecutable,
         Ok(m) if !m.is_file() => Lookup::Missing,
         Ok(m) if m.permissions().mode() & 0o111 != 0 => Lookup::Executable,
         Ok(_) => Lookup::NotExecutable,
+        // Includes a dangling symlink: `metadata` follows, and nothing is there.
         Err(_) => Lookup::Missing,
     }
 }
@@ -391,6 +406,10 @@ fn worker_command_warning(problem: &WorkerCommand, camp_root: &Path) -> String {
              against the RIG's directory at spawn time — not against this one, so this verb \
              cannot check it for you. An absolute path in {toml} is checkable, and does not \
              depend on which rig a bead lands in.\n"
+        ),
+        WorkerCommand::Uncheckable(why) => format!(
+            "NOTE: could not read {toml}, so the worker command campd will spawn was not \
+             checked ({why}). campd and `camp doctor` report the config fault itself.\n"
         ),
     }
 }

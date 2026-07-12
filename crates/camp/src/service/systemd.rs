@@ -60,17 +60,22 @@ impl Supervisor for Systemd<'_> {
 
     fn parse_path(&self, unit_text: &str) -> Option<String> {
         // The exact inverse of `unit_text`'s `Environment=` line: undo the
-        // quoting first (as `parse_camp_root` does for ExecStart), then the
-        // `%%` escaping, then strip the `PATH=` the value carries. A unit from
-        // before campd's PATH was baked in has no Environment= line and says so
-        // by returning None.
+        // quoting, then strip the `PATH=` the value carries. A unit from before
+        // campd's PATH was baked in has no Environment= line and says so by
+        // returning None.
+        //
+        // `split_exec` ALREADY unescapes `%%` on every arg it emits — which is
+        // why `parse_camp_root` does not do it either, and must not. Unescaping
+        // a second time here corrupted any PATH with two adjacent `%`
+        // (`/opt/50%%off` came back as `/opt/50%off`): not None, not an error —
+        // a wrong answer, from the one function whose whole contract is "the
+        // exact inverse", in the change whose whole thesis is that the tooling
+        // must never state something false about campd's PATH.
         let value = unit_text
             .lines()
             .find_map(|line| line.strip_prefix("Environment="))?;
         let unquoted = split_exec(value).into_iter().next()?;
-        unescape_percent(&unquoted)
-            .strip_prefix("PATH=")
-            .map(str::to_owned)
+        unquoted.strip_prefix("PATH=").map(str::to_owned)
     }
 
     fn state(&self, id: &CampId) -> Result<UnitState> {
@@ -579,13 +584,26 @@ mod tests {
     fn parse_path_round_trips_through_quoting_and_percent_escaping() {
         let fake = FakeRunner::new(vec![]);
         let systemd = Systemd::new(PathBuf::from("/units"), &fake);
+        // `100%h` (a SINGLE `%`) survives a double-unescape unchanged, so a
+        // fixture built only from that cannot fail — which is exactly the test
+        // this file first shipped, and exactly why it did not catch the bug.
+        // `50%%off` and `a%%%b` DO change under a second unescape, so they are
+        // the ones that hold `parse_path` to its "exact inverse" contract.
+        for path in [
+            "/home/x/.local/bin:/opt/100%h/bin:/usr/bin",
+            "/opt/50%%off/bin:/usr/bin",
+            "/opt/a%%%b/bin:/usr/bin",
+        ] {
+            let text = systemd.unit_text(&id(), "/c/.camp", "/usr/local/bin/camp", path);
+            assert_eq!(
+                systemd.parse_path(&text).as_deref(),
+                Some(path),
+                "the PATH must read back byte-exact, `%` and all — `split_exec` already \
+                 unescapes, so unescaping again silently corrupts it"
+            );
+        }
         let path = "/home/x/.local/bin:/opt/100%h/bin:/usr/bin";
         let text = systemd.unit_text(&id(), "/c/.camp", "/usr/local/bin/camp", path);
-        assert_eq!(
-            systemd.parse_path(&text).as_deref(),
-            Some(path),
-            "the PATH must read back byte-exact, `%` and all"
-        );
 
         let old = text
             .lines()
