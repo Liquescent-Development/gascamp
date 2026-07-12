@@ -99,9 +99,29 @@ def main(root):
         print(f"  {k:22} {n}")
 
     # Routing: every gc.run_target in the corpus is a QUALIFIED <binding>.<agent>
-    # name. Camp's namespace is flat. This is Critical 1 in KNOWN-DEFECTS.md.
+    # name. This is Critical 1 in KNOWN-DEFECTS.md, and the compat spec's §7.1.
+    #
+    # Counted TWO ways, because 46 of the raw values are {{var}} references:
+    #   raw       — the literal metadata value ({{implementation_target}} et al.)
+    #   resolved  — {{var}} references replaced by the formula's own [vars]
+    #               default. Every default in the corpus is itself qualified;
+    #               the 4 sites with no default receive a qualified value via
+    #               expand_vars from their caller (verified by hand, not here).
+    # The spec's load-bearing claim is the last line: ZERO bare route values.
     routes = collections.Counter()
+    resolved = collections.Counter()
+    unresolved = collections.Counter()
     for _, d in formulas:
+        formula_vars = d.get("vars") or {}
+
+        def resolve(rt):
+            if rt.startswith("{{") and rt.endswith("}}"):
+                v = formula_vars.get(rt[2:-2].strip())
+                if isinstance(v, dict) and "default" in v:
+                    return v["default"], True
+                return rt, False
+            return rt, True
+
         def walk(steps):
             for s in steps or []:
                 if not isinstance(s, dict):
@@ -109,11 +129,22 @@ def main(root):
                 rt = (s.get("metadata") or {}).get("gc.run_target")
                 if rt:
                     routes[rt] += 1
+                    r, ok = resolve(rt)
+                    (resolved if ok else unresolved)[r] += 1
                 walk(s.get("children"))
         walk(d.get("steps"))
-    print("\ngc.run_target values (ALL are <binding>.<agent> — camp is flat):")
+    print("\ngc.run_target values, raw:")
     for k, n in routes.most_common(8):
         print(f"  {k:44} {n}")
+    print("\ngc.run_target values, [vars] defaults resolved:")
+    for k, n in resolved.most_common(12):
+        print(f"  {k:44} {n}")
+    if unresolved:
+        print("  (no default — supplied qualified via expand_vars:)")
+        for k, n in unresolved.most_common():
+            print(f"  {k:44} {n}")
+    bare = sorted(k for k in resolved if "." not in k)
+    print(f"\nBARE (unqualified) resolved route values: {bare or 'NONE'}")
 
     # Agents: a directory per agent, per pack. gascity has NO agents/ — its 12
     # roles live in the NESTED pack gascity/roles/. This is Critical 4.

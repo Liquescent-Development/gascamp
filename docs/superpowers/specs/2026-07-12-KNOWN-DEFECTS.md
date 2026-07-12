@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-12
 **Applies to:** `2026-07-12-gas-city-pack-compatibility-design.md` (rev 3) and `2026-07-12-camp-control-plane-design.md` (rev 2)
-**Status:** BOTH SPECS ARE CHANGES-REQUIRED. Do not implement from them until these are fixed.
+**Status:** ADDRESSED — compat rev 4, control-plane rev 3, and component-spec rev 3 fix every finding below (resolution map at the end of this file). This file remains as the record of the findings and their evidence; the findings' text is unchanged and still describes rev 3 / rev 2.
 
 Three revisions of the compat spec each drew four Criticals from adversarial review. **Every one was the same error: asserting camp has a mechanism, and stopping one `grep` short of where the corpus actually lands.** The direction is sound and the measurements are now solid; the mechanisms are not. This file exists so the next pass starts from the findings instead of rediscovering them.
 
@@ -134,6 +134,31 @@ So §9's *"a byte cap with rotation"* is **not implementable against a live work
 - **`subscribe` needs numbers, not adjectives:** an outbound-buffer cap (the `MAX_REQUEST_BYTES` mold — it is otherwise campd's only unbounded memory), and a bounded server hello so a `camp watch` against a **wedged** campd is distinguishable from a quiet one (issue #55's bug class).
 
 ---
+
+## Resolution map (compat rev 4 · control-plane rev 3 · component rev 3)
+
+| finding | resolved by |
+|---|---|
+| C1 binding namespace | compat §7.1 (first-class binding; routes split at the first dot; unbound binding = named fail-fast); §15 un-scopes it. One correction to this file's evidence: the route table above (`gc.run-operator` 82, `compound-engineering.ce-code-review-selector` 11) is **not reproducible** — `measure_corpus.py` (now deriving `[vars]`-resolved routes) measures 55 raw + 46 via `{{implementation_target}}` defaults. The load-bearing fact survives strengthened: **0 bare route values, corpus-wide, measured.** |
+| C2 wrong side of the equality | compat §6.1: the invariant moved to the bead row; hook/`bd-shim show`/env are three byte-projections of it. §14: the REAL-fragment test with a deadline (a hang is the failing signal). |
+| C3a `../gascity` resolution | compat §7.2: pack-level `[imports.*]`, relative sources anchored at the declaring pack's subpath in its own (repo, commit); escape = hard error; camp materializes transitively, deduped by `(repo, commit, subpath)` with `via` in the lock. |
+| C3b collision bomb | compat §7.1 + component decision 9 rescoped: `gstack.review-synthesizer` / `gc.review-synthesizer` coexist by construction; §14 pins it. |
+| C4 gascity has no agents/ | compat §7.3: gc doesn't auto-discover `gascity/roles` either — the corpus READMEs deploy it as an explicit rig-scoped import bound `gc`. Camp's v1 recipe (§3) mirrors it; nested `pack.toml` is reported, never composed silently. No discovery machinery invented. |
+| gate can't pin 3 of 4 packs | compat §10: pin = `GCPACKS_REF` commit sha (the `GASCITY_REF` mold); the registry manifest-hash moves out of the gate, documented for the future registry verb. |
+| invariant-1 amendment for nothing | compat §8.2 + §11.2: v1 mail = `send human` + operator inbox; the inject hook AND the amendment are withdrawn to v2/gastown. Invariant 1 ships intact. |
+| shared drains silently approximated | compat §9 drain bullet: `same-session` refused loudly; `on_item_failure`/`single_lane` semantics pinned to gc's compiler defaulting; exclusive reservations stored as member-bead metadata (`gc.exclusive_drain_reservation`, gc's key verbatim). |
+| layering law overturned unamended | compat §11.5: master §11's cross-pack last-wins formally amended; binding scoping dissolves it. |
+| `skills/` install path | compat §5.3: `<worktree>/.claude/skills/` + self-ignoring `.claude/.gitignore` (`*`); tracked-`.claude` conflicts refuse; missing `Skill` in the allowlist refuses with two named remedies. |
+| stale §9 prose | compat §9: 53 / 13 / phase 2e throughout; §16 records the corrections. |
+| component spec stale | component rev 3: header lists every override; §4/§6/§10/§14 updated (skills installed, `orders/` directory, binding-scoped decision 9, pack-level imports delegated to umbrella §7.2). |
+| B1 lossy notify, no net | control-plane §2.3: "not new machinery" deleted and inverted (patrol watches, never tails); byte-offset reads drained on EVERY wake; Rescan/empty-paths = drain everything; delivery bound stated (≤ one stall interval, never lost). |
+| B2 ladder SIGKILLs BLOCKED | control-plane §5.3.3: `permission.pending` disarms the stall timer; decision re-arms; the ladder's first act is always to drain the read channel (simultaneously B1's net and B2's fix). |
+| B3 bounding vs tailing | control-plane §2.3 + §9: append-only until reap; `max_stream_bytes` = loud session failure; cursors are byte offsets (restart-durable for free). |
+| invariant-1 evidence false | control-plane §4.3: what the empty-camp gate proves vs. doesn't, stated; obligation to extend `make perf` to M tailed workers + N subscribers; §8 test list carries it. |
+| kill-on-adoption kills healthy / strands bead | control-plane §5.3 step 5 (ledger-before-pipe ordering makes pending-in-ledger proof of never-sent) + §5.3.4: named reason `"adoption: unanswerable permission request"`, bead re-hooks exactly as patrol restart; the inverse crash window degrades to the bounded ladder. |
+| fail-fast refuses every agent today | control-plane §5.3.1: the stdio flag is per-agent, added only when the resolved mode can ask; F7's pinned config spawns unchanged. |
+| real-claude gate mostly free | control-plane §8: split into a $0 tier (argv, initialize, pre-turn interrupt) and a paid tier riding `make e2e`. |
+| subscribe needs numbers | control-plane §4.4: `subscriber_buffer_bytes` (1 MiB default, `MAX_REQUEST_BYTES` mold — `event_loop.rs:53`), drop-loudly policy, hello within `REQUEST_TIMEOUT`. |
 
 ## Verified correct — do not re-litigate
 

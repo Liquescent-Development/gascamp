@@ -2,12 +2,29 @@
 
 **Date:** 2026-07-12
 **Issues:** [#80](https://github.com/Liquescent-Development/gascamp/issues/80) (a fresh camp cannot run its first bead) · [#84](https://github.com/Liquescent-Development/gascamp/issues/84) (the gc parity gap)
-**Status:** rev 2 — the **import-machinery component spec**. The umbrella design is
+**Status:** rev 3 — the **import-machinery component spec**. The umbrella design is
 `2026-07-12-gas-city-pack-compatibility-design.md`, which this feeds; where the two
-disagree, the umbrella wins. Two decisions here are **overridden** by it: the agent
-format (the Claude Code `.md` file is retired in favour of Gas City agent directories),
-and pack content (camp loads a real gc pack's agents, formulas, and orders, not only
-camp-format ones).
+disagree, the umbrella wins. Decisions here **overridden or amended** by it (umbrella
+rev 4):
+
+- the agent format — the Claude Code `.md` file is retired in favour of Gas City
+  agent directories (umbrella §5.1);
+- pack content — camp loads a real gc pack's agents, formulas, and orders, not only
+  camp-format ones;
+- `skills/` is **installed into the session worktree**, not ignored (umbrella §5.3 —
+  13 of the 51 v1 agents depend on it);
+- pack orders are an **`orders/` directory of files** (gc's v2 layout), not an
+  `orders.toml`;
+- **decision 9 is rescoped**: imported agents are binding-qualified
+  (`<binding>.<agent>`, umbrella §7.1), so a cross-import collision is structurally
+  impossible; the hard error applies to same-binding collisions only;
+- **pack-level `[imports.*]` exists** (umbrella §7.2): camp reads it, resolves
+  relative sources against the *declaring pack's* subpath within its own repository
+  and commit, materializes transitively (depth 1), and dedupes by
+  `(repo, commit, subpath)` with `via` provenance in the lock. Decision 6's
+  camp-root anchoring applies to **`camp.toml`-level** relative sources only —
+  the same rule gc uses (city-level `declDir = cityRoot`, pack-level
+  `declDir = the pack`).
 
 ## 1. The problem
 
@@ -59,10 +76,9 @@ Camp is "what k3s is to k8s" for Gas City (README), so this surface is modelled 
 6. **`[imports.<name>]` is the only pack surface. `packs = [...]` is removed.** A local pack is an import whose source is a path (gc's own model). A relative path source resolves against the **camp root** — the rule `packs` used, so no existing path shifts meaning. `version` on a path source is rejected, not ignored.
 7. **A pack is a directory with a `pack.toml`.** Camp adopts the manifest `camp export` **already writes** (`export.rs:597-606`: `[pack] name / schema / description`), so a camp pack is a valid gc pack and vice versa. gc *requires* `pack.toml` (`packman/install.go:481`); rev 1's claim that sources round-trip "in both directions" was false without it. A pack with no manifest is a hard error. `packs/starter/` gains one.
 8. **Layer everything a pack defines — agents, formulas, and orders — finishing Phase 12.** §6 specifies each.
-9. **A cross-import name collision is a hard error, for agents and formulas alike.** Two imports both defining `dev` fails loudly, naming both imports and the name.
-   - *Why it must change:* `packs` was an ordered array, so "last wins" was well-defined. `[imports.<name>]` are TOML **tables**; agent resolution must not silently depend on table iteration order. Erroring removes the ordering dependency entirely.
-   - It is strictly more fail-fast: today a second pack **silently shadows** the first (`pack.rs:215-229`, pinned by `resolve_agent_layers_packs_last_wins_with_local_agents_highest`, `pack.rs:376-422` — that test is deliberately inverted by this design). `load_layer` already hard-errors on duplicates *within* a layer; this is the same rule, consistently applied.
-   - `<camp>/agents/` and `<camp>/formulas/` remain the **sanctioned override layer**, and stay highest. Shadowing is legal exactly where it is explicit.
+9. **A name collision is a hard error WITHIN a binding** *(rescoped by umbrella §7.1 — rev 2 made it cross-import, which crashes on day one: `review-synthesizer` is defined by both gstack and gascity/roles, and in gc they coexist as `gstack.review-synthesizer` and `gc.review-synthesizer`)*. Agents are binding-qualified, so two imports can never collide by construction; the hard error fires when one binding acquires two agents of one name (which, since `[imports.*]` keys are unique in TOML, only a transitive-binding clash can produce). Formulas resolve by bare name through layers (gc's model — `extends = ["build-base"]` is unqualified), where cross-import duplication **is** still a hard error naming both providers.
+   - *Why the ordering argument still holds:* `[imports.<name>]` are TOML **tables**; nothing may silently depend on table iteration order. Binding-scoping removes the dependency for agents; erroring removes it for formulas.
+   - `<camp>/agents/` and `<camp>/formulas/` remain the **sanctioned override layer** for bare names, and local formulas stay highest. v1 defines no shadowing of qualified names (umbrella §11.5).
 10. **An imported pack's orders are inert until explicitly enabled.** This is a money invariant, not a preference — see §7.
 11. **`camp init` offers the starter pack, and never prompts where it cannot.** See §8. The prompt names **no roles**: `Install the starter pack? [Y/n]`. (Rev 1's prompt read `(dev, reviewer, committer)` — three role names in a line of Rust, violating AGENTS.md's *"zero roles in code"* and master spec §11, two decisions after arguing no code path names an agent.)
 12. **The default starter source is a constant, pinned to a commit.** gc pairs every public pack source with a `sha:`-pinned version so fresh-init output is reproducible; rev 1 defaulted to the mutable `main`. Camp does the same: source `https://github.com/Liquescent-Development/gascamp/tree/main/packs/starter`, `version = "sha:<pinned>"`, moved deliberately by a PR.
@@ -73,14 +89,19 @@ Camp is "what k3s is to k8s" for Gas City (README), so this surface is modelled 
 
 ```
 <pack>/
-  pack.toml          [pack] name / schema = 2 / description      (required)
-  agents/*.md        Claude Code agent definitions               → layered
-  formulas/*.toml    Gas City formula-v2 subset                  → layered
-  orders.toml        [[order]] tables                            → layered, INERT (§7)
-  skills/ commands/  Claude Code content                         → IGNORED by camp
+  pack.toml          [pack] name / schema ≤ 2 (+ optional [imports.*], umbrella §7.2)
+  agents/<name>/     Gas City agent directories (umbrella §5.1)  → layered, binding-qualified
+  formulas/*.toml    Gas City formula-v2 files                   → layered
+  orders/*.toml      order files (gc's v2 layout)                → layered, INERT (§7)
+  skills/            pack skill catalog                          → INSTALLED (umbrella §5.3)
+  commands/          Claude Code slash commands                  → ignored, reported
 ```
 
-`skills/` and `commands/` are for Claude Code to install as a plugin; camp has no use for them. That is a design decision, not an oversight — so `camp import add` **reports what it ignored**. Dead content is never silent.
+*(This table is the umbrella's; rev 2 of this spec said `agents/*.md`, `orders.toml`,
+and "`skills/` IGNORED — a design decision, not an oversight". All three were wrong —
+the last one materially: 13 of the 51 v1 agents' prompts name a skill from their
+pack's catalog.)* `commands/` remains out of scope, and `camp import add` **reports
+what it ignored**. Dead content is never silent.
 
 ## 5. Config surface
 
@@ -136,11 +157,11 @@ Layout:
 
 ## 6. Resolution
 
-**Agents** — layers, lowest to highest: each import's `agents/`, then `<camp>/agents/`. Order within the import group is irrelevant *by construction*: a name defined by two imports is an error (decision 9), so no import can shadow another. Only `<camp>/agents/` may shadow, and it does so explicitly.
+**Agents** — namespaced, not layered: an import's agents are `<binding>.<dirname>` (umbrella §7.1); `<camp>/agents/` are bare names, a disjoint namespace. No import can shadow another *by construction*, and no resolution order exists to depend on. Routes (`gc.run_target`, `assignee`) split at the first dot — binding names contain no `.` — and an unbound binding is a fail-fast error naming the `camp import add … --name <binding>` remedy.
 
-**Formulas** — the same shape, replacing the dead `formula_path()`. `resolve_formula(cfg, name)` searches each import's `formulas/`, then `<camp>/formulas/` (highest). Cross-import collision is an error. Every caller that resolves a formula — `camp sling --formula`, and an order's `formula` field — goes through it, so a pack's formula is finally reachable.
+**Formulas** — layers, lowest to highest, replacing the dead `formula_path()`: each transitive import's `formulas/` (umbrella §7.2), each import's `formulas/`, then `<camp>/formulas/` (highest). Bare names, gc's model; cross-import collision is an error. Every caller that resolves a formula — `camp sling --formula`, an order's `formula` field, `extends`, `drain.formula` — goes through it, so a pack's formula is finally reachable.
 
-**Orders** — an import's `orders.toml` is parsed and its orders are namespaced `<import>.<name>` (so two imports can never collide). Camp-local `[[order]]` tables in `camp.toml` keep their bare names and stay active, exactly as today: the operator wrote them.
+**Orders** — an import's `orders/` directory is scanned (gc's v2 layout) and its orders are namespaced `<import>.<name>` (so two imports can never collide). Camp-local `[[order]]` tables in `camp.toml` keep their bare names and stay active, exactly as today: the operator wrote them.
 
 **Symlinks must be dereferenced on materialization.** `packs/starter/formulas/guarded-change.toml` is a *relative symlink* into the gc-validated corpus (`../../../crates/camp-core/tests/fixtures/formulas/valid/`) — Phase 12 decision D3, one source of truth. Its target lives **outside the pack subpath**, so materializing `packs/starter` alone would produce a **dangling symlink** and formula layering would break on the very pack we ship. Materialization therefore **copies with symlinks dereferenced**, and fails fast on a dangling link or one whose target escapes the *repository* root.
 
@@ -207,7 +228,9 @@ Not implemented (nothing in camp for them to operate on — #84): `why`, `list -
 | `[imports.x]` declared, `.camp/imports/x/` absent | hard error: `import "x" is not installed — run \`camp import install\`` |
 | `camp.toml` ↔ `packs.lock` disagree | `camp import check` fails, naming the drift |
 | fetch/clone fails | fail fast: name the source and git's own stderr |
-| two imports define one agent **or formula** name | hard error naming both imports and the name |
+| one **binding** acquires two agents of one name, or two imports define one **formula** name | hard error naming both providers and the name (decision 9 — cross-import *agent* names cannot collide; they are binding-qualified) |
+| a route names a binding no `[imports.*]` declares | fail fast at cook/dispatch, naming the binding and the `camp import add … --name <binding>` command |
+| a transitive import escapes its repository root, ships `agents/`, or declares its own `[imports.*]` | hard error (umbrella §7.2 — all three are 0 in the corpus) |
 | pack has no `pack.toml` | hard error — it is not a pack |
 | materialized symlink dangles or escapes the repo root | hard error (§6) |
 | an imported order names a formula no layer provides | hard error at load, naming the order and the formula |
@@ -262,4 +285,6 @@ Touched in the same wave: `packs/starter/` gains `pack.toml`; `contrib/docker/en
 
 ## 14. Out of scope
 
-Tracked in #84: the transitive import graph, `[[exports]]`/namespaces, semver constraint solving, registry catalog handles, a shared machine-local cache, credentials for private pack repos, and `why`/`--tree`/`prune`/`status`/`migrate`.
+Tracked in #84: `[[exports]]` (re-exporting a nested binding under a new name), semver constraint solving, registry catalog handles, a shared machine-local cache, credentials for private pack repos, and `why`/`--tree`/`prune`/`status`/`migrate`.
+
+**No longer out of scope** (umbrella rev 4): single-level transitive imports (§7.2 there) and the binding namespace (§7.1 there) — rev 2 listed both here while the corpus requires both for every route and 24 of the 32 v1-pack formulas.
