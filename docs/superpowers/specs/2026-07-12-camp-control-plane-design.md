@@ -36,7 +36,23 @@ That pipe carries a **bidirectional control protocol**. This is not in the publi
 | CLI → parent | same, `subtype: "request_user_dialog"` |
 | parent → CLI | `{"type":"control_response","response":{"subtype":"success"\|"error","request_id":"…","response":…}}` |
 
-Other subtypes present in the shipped CLI (v2.1.207) and the SDK: `set_model`, `set_permission_mode`, `control_cancel_request`, `mcp_message`.
+Other subtypes present in the shipped CLI (v2.1.207) and the SDK: `set_model`, `set_permission_mode`, `control_cancel_request`, `mcp_message`, and an `initialize` handshake the parent sends first (carrying hooks, MCP servers, and the system prompt).
+
+### 2.0 The permission flow must be OPTED INTO at spawn — it is not automatic
+
+**`can_use_tool` does not fire unless camp asks for it.** The SDK, when given a `canUseTool` callback, passes:
+
+```
+--permission-prompt-tool stdio
+```
+
+That flag is what tells the worker *"ask your parent over stdio for permission decisions."* Without it the CLI decides from `--permission-mode` / `--allowedTools` and never asks — the worker simply proceeds or refuses on its own.
+
+So camp's worker argv gains `--permission-prompt-tool stdio`, and camp must implement the **parent side**: receive `control_request{subtype:"can_use_tool"}`, and reply with a `control_response`.
+
+The SDK also enforces that `canUseTool` and a named `--permission-prompt-tool <mcp-tool>` are **mutually exclusive** ("use one or the other") — camp uses the `stdio` form, and must not also configure a permission-prompt MCP tool.
+
+Without this section, an implementer builds the whole `BLOCKED` state, wires the ledger append, renders it in the fleet view — and it never triggers, because nothing ever asked the worker to ask.
 
 **Consequences:**
 
@@ -173,6 +189,7 @@ That it needs no new machinery is the strongest argument that the protocol is fa
 
 ## 9. Open questions
 
+- **The `initialize` handshake** — the SDK always sends one before anything else. Does the CLI require it, or is it optional for a parent that only wants `interrupt` + `can_use_tool`? Verify against a fake worker; if required, camp sends it and the payload shape gets pinned like the rest.
 - **`--verbose`** (§2.2) — required for fine-grained events, or not? Verify against a fake worker first.
 - **Event history bound.** `session.subscribe` from a cursor implies retention. The stream file is already on disk and already unbounded — is that acceptable, or does it need a cap? (Note issue #64: `output_bounded` is time-bounded but not byte-bounded. Same class of problem.)
 - **Multiple deciders.** Two operators attached, one permission request. First answer wins, or explicit ownership? First-wins is simplest and probably right, but it should be *decided*, not defaulted.
