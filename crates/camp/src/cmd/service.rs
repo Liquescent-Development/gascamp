@@ -401,8 +401,16 @@ fn lookup(candidate: &Path) -> Lookup {
 /// and once for a typo'd `camp.toml`), both times as a one-site patch — so the
 /// third one was always going to be shipped by whoever added the next arm.
 ///
-/// So it is not a per-arm rule any more: every foreign string goes through
-/// `indent` on the way in, and there is no way into this report that does not.
+/// So it is not a per-arm rule any more: every foreign string in THIS function
+/// goes through `indent` on the way in, and
+/// `no_foreign_string_can_break_the_report_shape_in_any_arm` holds all four arms
+/// to it — including the arm that does not exist yet.
+///
+/// The rule is the report's, not this function's: `campd_path_report` indents its
+/// two foreign strings for the same reason, and is pinned by
+/// `a_corrupted_path_in_a_unit_cannot_break_the_report_shape`. If you add another
+/// writer to this report, indent what you did not author, and pin it — an
+/// unpinned promise is how the last three of these shipped.
 fn worker_command_warning(problem: &WorkerCommand, camp_root: &Path) -> String {
     let toml = format!("{}/camp.toml", camp_root.display());
     let indent = |foreign: &str| indented_detail(foreign, "      ");
@@ -1348,6 +1356,57 @@ mod tests {
             unit_path.exists(),
             "and another camp's unit is never removed"
         );
+    }
+
+    /// The other half of the column-0 rule: `campd_path_report` reads the PATH
+    /// out of a FILE, and a file is not a promise.
+    ///
+    /// campd's own gate refuses to WRITE a newline into a unit — but a unit is a
+    /// plain text file that an operator, a config manager, or another tool can
+    /// edit, and "we wrote it, so it must be well-formed" is the assumption every
+    /// one of these bugs has started from. A corrupted PATH must wobble the
+    /// report's alignment at worst, never break its shape.
+    #[test]
+    fn a_corrupted_path_in_a_unit_cannot_break_the_report_shape() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        install(&launchd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        // Hand-corrupt the unit the way something outside camp could.
+        let id = CampId::for_camp(&camp.root).unwrap();
+        let unit_path = launchd.unit_path(&id);
+        let text = std::fs::read_to_string(&unit_path).unwrap();
+        let corrupted = text.replace(
+            "<key>PATH</key>",
+            "<key>PATH</key>\n    <string>/usr/bin\nINJECTED-AT-COLUMN-0</string>\n    <key>X</key>",
+        );
+        std::fs::write(&unit_path, corrupted).unwrap();
+
+        let runner = FakeRunner::new(vec![FakeRunner::ok("\tstate = running\n")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &runner);
+        let report = status(Some(&launchd), &camp).unwrap();
+
+        assert!(
+            report.contains("INJECTED-AT-COLUMN-0"),
+            "the corrupted PATH must still be SHOWN — hiding it would be worse: {report}"
+        );
+        for line in report.lines() {
+            assert!(
+                line.starts_with("unit:")
+                    || line.starts_with("campd:")
+                    || line.starts_with("campd PATH:")
+                    || line.starts_with("WARNING:")
+                    || line.starts_with("NOTE:")
+                    || line.starts_with(' ')
+                    || line.is_empty(),
+                "a PATH read off disk dropped a line to column 0: {line:?}\nin:\n{report}"
+            );
+        }
     }
 
     /// The column-0 invariant, established for EVERY arm instead of patched at
