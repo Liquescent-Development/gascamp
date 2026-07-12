@@ -218,55 +218,181 @@ pub fn install(supervisor: &dyn Supervisor, camp_root: &Path, exe: &Path) -> Res
         root.display()
     );
     // The PATH is a SNAPSHOT of this shell, not a live link to it. Say so, and
-    // say what to do about it — a supervised campd that cannot find `claude` is
-    // a camp that dispatches nothing, and the operator would otherwise learn
-    // that from a `session.crashed` in the ledger, one sling too late.
+    // name the command that RE-captures it. `camp service install` on its own is
+    // not that command — it refuses to clobber an existing unit — so telling the
+    // operator to "re-run install" would hand them an error at the exact moment
+    // they need a fix. `camp service status` re-checks all of this later, which
+    // is what catches the snapshot going stale.
     report.push_str(&format!(
-        "campd's PATH (a snapshot of this shell — re-run `camp service install` after you \
-         change it): {path_text}\n"
+        "campd's PATH (a snapshot of this shell — to re-capture it: \
+         `camp service uninstall && camp service install`): {path_text}\n"
     ));
-    if let Some(missing) = worker_command_not_on(&root, &path_text) {
-        report.push_str(&format!(
-            "WARNING: the worker command `{missing}` is not on that PATH. campd will start, \
-             but every bead it dispatches will die with `spawn failed: spawning {missing}: \
-             No such file or directory`. Install it, or set an absolute path in \
-             [dispatch] command in {}/camp.toml — then `camp service install` again to \
-             re-capture the PATH.\n",
-            root.display()
-        ));
+    if let Some(problem) = worker_command_problem(&root, &path_text) {
+        report.push_str(&worker_command_warning(&problem, &root));
     }
     Ok(report)
 }
 
-/// The worker command campd will spawn, IF it cannot be found on the PATH the
-/// unit will carry. `None` means it resolves — which is the answer we want.
+/// The PATH half of `camp service status`: what campd will actually run with,
+/// and whether it can find the worker.
+///
+/// This is the line that stops a broken camp from LOOKING healthy. A unit
+/// installed before campd's PATH was baked into it carries none at all, so campd
+/// runs with the supervisor's minimal environment, finds no `claude`, and fails
+/// every dispatch — while `status` cheerfully reports `loaded=true running=true`
+/// and `campd: listening`. That is precisely the state a user shipped a bead
+/// into. `install` warning at install time cannot help them: they already
+/// installed.
+///
+/// It is also the only thing that catches the baked PATH going STALE. It is a
+/// snapshot: the day a version-managed bin directory moves, campd's PATH still
+/// names the old one and the camp quietly returns to the original bug. Checking
+/// once, at install, is a one-shot net under a permanent hazard. Checking here
+/// means every `camp service status` re-asks the question.
+///
+/// A failure to read the unit is reported, not swallowed: the unit IS the
+/// registry, and a registry we cannot read is a fact the operator needs.
+fn campd_path_report(supervisor: &dyn Supervisor, unit: &ManagedUnit, camp_root: &Path) -> String {
+    let text = match std::fs::read_to_string(&unit.path) {
+        Ok(text) => text,
+        Err(e) => {
+            return format!(
+                "campd PATH: cannot read the unit ({}): {e}\n",
+                unit.path.display()
+            );
+        }
+    };
+    let Some(path) = supervisor.parse_path(&text) else {
+        return format!(
+            "campd PATH: NONE — this unit predates campd's PATH being baked into it, so campd \
+             runs with {}'s minimal environment and will NOT find `claude`: every bead it \
+             dispatches dies with `spawn failed: spawning claude: No such file or directory`, \
+             while this command reports perfect health. Fix it with \
+             `camp service uninstall && camp service install`.\n",
+            supervisor.name()
+        );
+    };
+    let mut report = format!("campd PATH: {path}\n");
+    if let Some(problem) = worker_command_problem(camp_root, &path) {
+        report.push_str(&worker_command_warning(&problem, camp_root));
+    }
+    report
+}
+
+/// What is wrong with the worker command campd will spawn, if anything.
 ///
 /// This is a preflight, not a gate: a camp is still worth supervising without a
-/// worker (the ledger, `camp ls`, `camp search` all work), so a missing `claude`
-/// is a loud statement at the one moment the operator can act on it, not a hard
-/// refusal to install. What it must never be is silent — that is how this bug
-/// reached a user: campd came up, the camp looked healthy, and the failure only
-/// surfaced as a `session.crashed` event after work had been slung at it.
-fn worker_command_not_on(camp_root: &Path, path: &str) -> Option<String> {
+/// worker (the ledger, `camp ls`, `camp search` all work), so a `claude` campd
+/// cannot run is a loud statement at the one moment the operator can act on it,
+/// not a hard refusal to install. What it must never be is SILENT — that is how
+/// this bug reached a user: campd came up, the camp looked healthy, and the
+/// failure only surfaced as a `session.crashed` event after work had already
+/// been slung at it.
+///
+/// And it must never be falsely REASSURING. A preflight that says "your camp is
+/// fine" for a camp where every bead will die is worse than no preflight: it is
+/// the same lie, now with a second source. So it answers exactly the question
+/// campd asks at spawn time — `Command::new(argv[0])` — and no easier one.
+enum WorkerCommand {
+    /// Not on the PATH campd will run with (or, for an absolute path, not there).
+    NotFound(String),
+    /// It is there, and campd cannot execute it: `Command` fails with
+    /// "Permission denied", not "No such file or directory". A file with the
+    /// right name and no `+x` is the classic half-finished install.
+    NotExecutable(String),
+    /// A RELATIVE command (`./bin/worker`). campd spawns with its cwd set to the
+    /// rig's path, not to wherever `camp service install` was run — so this verb
+    /// cannot resolve it, and must not pretend to. Say what we don't know.
+    RelativeToTheRig(String),
+}
+
+fn worker_command_problem(camp_root: &Path, path: &str) -> Option<WorkerCommand> {
     let camp = CampDir {
         root: camp_root.to_path_buf(),
     };
     // A camp whose config will not load is not this verb's problem to report —
-    // `camp doctor` and campd itself both say so, loudly. Skip the preflight
-    // rather than invent a second opinion about it.
+    // campd and `camp doctor` both say so, loudly, and inventing a second
+    // opinion here would just be a worse copy of theirs. Nothing is swallowed:
+    // no error is being discarded, the preflight simply has nothing to check.
     let config = camp_core::config::CampConfig::load(&camp.config_path()).ok()?;
     let command = config.dispatch.command;
-    // An absolute (or explicitly relative) path is not a PATH lookup at all:
-    // campd hands it to the OS as-is, so PATH has no say. Ask the filesystem.
-    if command.components().count() > 1 {
-        return (!command.exists()).then(|| command.display().to_string());
+    let shown = command.display().to_string();
+
+    if command.is_absolute() {
+        return match lookup(&command) {
+            Lookup::Executable => None,
+            Lookup::NotExecutable => Some(WorkerCommand::NotExecutable(shown)),
+            Lookup::Missing => Some(WorkerCommand::NotFound(shown)),
+        };
     }
+    // A command with a slash but no root is resolved by the OS against the
+    // process's cwd — and campd's cwd at spawn is the RIG (spawn.rs), not this
+    // one. We genuinely cannot answer for it from here.
+    if command.components().count() > 1 {
+        return Some(WorkerCommand::RelativeToTheRig(shown));
+    }
+    // A bare name: exactly the PATH search campd's `Command::new` will do.
+    // `is_file()` alone was wrong — a non-executable file with the right name
+    // resolves, and then the spawn dies with "Permission denied".
     let name = command.as_os_str();
-    let found = std::env::split_paths(path).any(|dir| {
-        let candidate = dir.join(name);
-        std::fs::metadata(&candidate).is_ok_and(|m| m.is_file())
-    });
-    (!found).then(|| command.display().to_string())
+    let mut saw_non_executable = false;
+    for dir in std::env::split_paths(path) {
+        match lookup(&dir.join(name)) {
+            Lookup::Executable => return None,
+            // Keep looking: the OS does too — a later directory on the PATH may
+            // hold a real one, and only if none does is this the reason.
+            Lookup::NotExecutable => saw_non_executable = true,
+            Lookup::Missing => {}
+        }
+    }
+    Some(if saw_non_executable {
+        WorkerCommand::NotExecutable(shown)
+    } else {
+        WorkerCommand::NotFound(shown)
+    })
+}
+
+enum Lookup {
+    Executable,
+    NotExecutable,
+    Missing,
+}
+
+fn lookup(candidate: &Path) -> Lookup {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(candidate) {
+        Ok(m) if !m.is_file() => Lookup::Missing,
+        Ok(m) if m.permissions().mode() & 0o111 != 0 => Lookup::Executable,
+        Ok(_) => Lookup::NotExecutable,
+        Err(_) => Lookup::Missing,
+    }
+}
+
+/// The one thing an operator with a broken camp needs to read: what is wrong,
+/// and the command that fixes it. Shared by `install` (before the fact) and
+/// `status` (after it), so the two can never drift apart.
+fn worker_command_warning(problem: &WorkerCommand, camp_root: &Path) -> String {
+    let toml = format!("{}/camp.toml", camp_root.display());
+    match problem {
+        WorkerCommand::NotFound(cmd) => format!(
+            "WARNING: the worker command `{cmd}` is not on the PATH campd runs with. campd \
+             will serve this camp, and every bead it dispatches will die with `spawn failed: \
+             spawning {cmd}: No such file or directory`. Install it, or set an absolute path \
+             in [dispatch] command in {toml} — then re-capture campd's PATH with \
+             `camp service uninstall && camp service install`.\n"
+        ),
+        WorkerCommand::NotExecutable(cmd) => format!(
+            "WARNING: the worker command `{cmd}` is on campd's PATH but is not executable. \
+             Every bead will die with `spawn failed: spawning {cmd}: Permission denied`. \
+             `chmod +x` it — then `camp service uninstall && camp service install`.\n"
+        ),
+        WorkerCommand::RelativeToTheRig(cmd) => format!(
+            "NOTE: [dispatch] command is the relative path `{cmd}`, which campd resolves \
+             against the RIG's directory at spawn time — not against this one, so this verb \
+             cannot check it for you. An absolute path in {toml} is checkable, and does not \
+             depend on which rig a bead lands in.\n"
+        ),
+    }
 }
 
 /// After the unit file has been written, undo it: no failure between "the
@@ -382,6 +508,7 @@ pub fn status(supervisor: Option<&dyn Supervisor>, camp: &CampDir) -> Result<Str
                     state.will_restart_campd,
                     indented_detail(&state.detail, "       ")
                 ));
+                report.push_str(&campd_path_report(supervisor, &unit, &camp.root));
             }
             None => {
                 let id = CampId::for_camp(&camp.root)?;
@@ -1173,6 +1300,148 @@ mod tests {
         );
     }
 
+    /// The installed base. Every unit written before campd's PATH was baked
+    /// into it carries none — so campd runs with the supervisor's minimal
+    /// environment, cannot find `claude`, and fails every dispatch, while
+    /// `status` reports `loaded=true running=true` and `campd: listening`.
+    /// Perfect health, zero throughput. That is the state a user shipped a bead
+    /// into, and warning at INSTALL time cannot reach them: they already
+    /// installed. `status` is the only verb that can, so it must look.
+    #[test]
+    fn status_says_so_when_the_unit_carries_no_path_at_all() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let camp = crate::campdir::CampDir {
+            root: camp_dir.path().to_path_buf(),
+        };
+        let install_runner = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &install_runner);
+        install(&launchd, &camp.root, Path::new("/usr/local/bin/camp")).unwrap();
+
+        // Rewrite the unit as a PRE-FIX one: no EnvironmentVariables at all.
+        let id = CampId::for_camp(&camp.root).unwrap();
+        let unit_path = launchd.unit_path(&id);
+        let text = std::fs::read_to_string(&unit_path).unwrap();
+        let start = text.find("  <key>EnvironmentVariables</key>").unwrap();
+        let end = text[start..].find("  </dict>\n").unwrap() + start + "  </dict>\n".len();
+        let old = format!("{}{}", &text[..start], &text[end..]);
+        assert!(
+            !old.contains("PATH"),
+            "the fixture must have no PATH: {old}"
+        );
+        std::fs::write(&unit_path, &old).unwrap();
+
+        let runner = FakeRunner::new(vec![FakeRunner::ok("\tstate = running\n")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &runner);
+        let report = status(Some(&launchd), &camp).unwrap();
+
+        assert!(
+            report.contains("campd PATH: NONE"),
+            "a unit with no PATH must not be reported as healthy — that is the whole bug: \
+             {report}"
+        );
+        assert!(
+            report.contains("camp service uninstall && camp service install"),
+            "and it must name the remedy that actually WORKS — `camp service install` alone \
+             refuses to clobber an existing unit, so telling them to re-run it hands them an \
+             error: {report}"
+        );
+    }
+
+    /// The remedy `install` prints must be a command that runs. `camp service
+    /// install` on a camp that already has a unit is a hard error ("already
+    /// installed") — so "re-run `camp service install`" was an instruction that
+    /// fails, printed at the exact moment the operator needs it to work.
+    #[test]
+    fn the_re_capture_remedy_is_a_command_that_actually_works() {
+        let camp_dir = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let fake = FakeRunner::new(vec![FakeRunner::ok("")]);
+        let launchd = Launchd::new(units.path().to_path_buf(), 501, &fake);
+        let report = install(&launchd, camp_dir.path(), Path::new("/usr/local/bin/camp")).unwrap();
+
+        assert!(
+            report.contains("camp service uninstall && camp service install"),
+            "install must name the working re-capture path: {report}"
+        );
+        // And prove the naive one really does fail, so this test is guarding a
+        // real hazard rather than a style preference.
+        let fake2 = FakeRunner::new(vec![]);
+        let launchd2 = Launchd::new(units.path().to_path_buf(), 501, &fake2);
+        let err = install(&launchd2, camp_dir.path(), Path::new("/usr/local/bin/camp"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("already installed"),
+            "a bare `camp service install` on an installed camp errors — which is why the \
+             message may not tell people to run it: {err}"
+        );
+    }
+
+    /// A preflight that says "your camp is fine" when every bead will die is
+    /// worse than no preflight: it is the same lie with a second source. It must
+    /// answer the question campd actually asks at spawn — `Command::new(argv[0])`
+    /// — and no easier one.
+    #[test]
+    fn the_worker_preflight_never_gives_false_reassurance() {
+        let camp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let path = bin.path().display().to_string();
+
+        let write = |name: &str, mode: u32| {
+            use std::os::unix::fs::PermissionsExt;
+            let p = bin.path().join(name);
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        write("realtool", 0o755);
+        write("notexec", 0o644);
+
+        let set = |command: &str| {
+            std::fs::write(
+                camp.path().join("camp.toml"),
+                format!("[camp]\nname = \"x\"\n\n[dispatch]\ncommand = \"{command}\"\n"),
+            )
+            .unwrap();
+        };
+
+        set("realtool");
+        assert!(
+            worker_command_problem(camp.path(), &path).is_none(),
+            "an executable on the PATH resolves"
+        );
+
+        // The hole: a file with the right name and no +x. `is_file()` said
+        // "resolves"; campd's spawn says "Permission denied".
+        set("notexec");
+        assert!(
+            matches!(
+                worker_command_problem(camp.path(), &path),
+                Some(WorkerCommand::NotExecutable(_))
+            ),
+            "a non-executable file is NOT a worker campd can spawn"
+        );
+
+        set("nothing-here");
+        assert!(matches!(
+            worker_command_problem(camp.path(), &path),
+            Some(WorkerCommand::NotFound(_))
+        ));
+
+        // The other hole: campd spawns with its cwd set to the RIG, not to
+        // wherever this verb ran. We cannot resolve a relative command from
+        // here, and must say so rather than answer confidently.
+        set("./bin/worker");
+        assert!(
+            matches!(
+                worker_command_problem(camp.path(), &path),
+                Some(WorkerCommand::RelativeToTheRig(_))
+            ),
+            "a relative command is resolved against the rig's cwd — this verb must not pretend \
+             to know"
+        );
+    }
+
     /// Design §5: status is TWO independent truths — the unit's load/run state
     /// AND the campd liveness answer. A loaded unit whose campd does not
     /// answer is exactly the fault this command exists to show.
@@ -1240,11 +1509,16 @@ mod tests {
             report.contains("Could not find service in domain"),
             "{report}"
         );
-        // …and no continuation line escapes to column 0.
+        // …and no continuation line escapes to column 0. The allowlist is the
+        // report's legitimate TOP-LEVEL lines; anything else at column 0 is a
+        // continuation that has escaped its indent.
         for line in report.lines() {
             assert!(
                 line.starts_with("unit:")
                     || line.starts_with("campd:")
+                    || line.starts_with("campd PATH:")
+                    || line.starts_with("WARNING:")
+                    || line.starts_with("NOTE:")
                     || line.starts_with(' ')
                     || line.is_empty(),
                 "a continuation line must not drop to column 0: {line:?}\nin:\n{report}"

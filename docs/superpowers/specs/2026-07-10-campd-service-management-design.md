@@ -195,9 +195,19 @@ A new subcommand group. Each operates on the resolved camp (`--camp` /
   nothing replaced it.** So `install` captures the PATH of the shell that runs
   it — the one environment where the operator's tools demonstrably resolve —
   writes it into the unit (`EnvironmentVariables`/`PATH`, `Environment=`), prints
-  it, and warns when the configured worker command is not on it. It is a
-  snapshot: a changed PATH means `camp service install` again, which is stated at
-  install rather than left to be discovered.
+  it, and warns when the configured worker command is not on it.
+
+  It is a **snapshot**, and a snapshot goes stale — a version manager retires a
+  bin directory and the camp quietly returns to the original bug. So checking
+  once, at install, is a one-shot net under a permanent hazard: **`status` reads
+  the PATH back out of the unit and re-asks the question every time it runs.** A
+  unit carrying no PATH at all — every unit installed before this existed — is
+  reported as the fault it is rather than as `loaded=true running=true`, which is
+  what the installed base would otherwise keep seeing while dispatching nothing.
+  The re-capture command is `camp service uninstall && camp service install`:
+  `install` alone refuses to clobber an existing unit, so any message that tells
+  an operator to "re-run `camp service install`" is handing them an error at the
+  moment they need a fix.
 - **`uninstall`** — stop + unload + remove the unit.
 - **`status`** — the unit's load/run state (wraps `launchctl print` /
   `systemctl --user show`), plus the campd liveness answer (a status

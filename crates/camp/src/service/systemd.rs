@@ -58,6 +58,21 @@ impl Supervisor for Systemd<'_> {
         Ok(PathBuf::from(root))
     }
 
+    fn parse_path(&self, unit_text: &str) -> Option<String> {
+        // The exact inverse of `unit_text`'s `Environment=` line: undo the
+        // quoting first (as `parse_camp_root` does for ExecStart), then the
+        // `%%` escaping, then strip the `PATH=` the value carries. A unit from
+        // before campd's PATH was baked in has no Environment= line and says so
+        // by returning None.
+        let value = unit_text
+            .lines()
+            .find_map(|line| line.strip_prefix("Environment="))?;
+        let unquoted = split_exec(value).into_iter().next()?;
+        unescape_percent(&unquoted)
+            .strip_prefix("PATH=")
+            .map(str::to_owned)
+    }
+
     fn state(&self, id: &CampId) -> Result<UnitState> {
         // One machine-readable call. `show` exits 0 even for a unit systemd
         // has never heard of (LoadState=not-found), so this is a state query,
@@ -553,6 +568,34 @@ mod tests {
         assert!(
             !text.contains("/opt/100%h/bin"),
             "an unescaped `%` in the PATH is a systemd specifier — it would expand: {text}"
+        );
+    }
+
+    /// `parse_path` must undo BOTH layers `unit_text` applied — the quoting and
+    /// the `%%` escaping — in that order, or a PATH with a `%` in it reads back
+    /// wrong. And it answers `None` for a unit that carries no PATH, which is
+    /// how `camp service status` spots the pre-fix installed base.
+    #[test]
+    fn parse_path_round_trips_through_quoting_and_percent_escaping() {
+        let fake = FakeRunner::new(vec![]);
+        let systemd = Systemd::new(PathBuf::from("/units"), &fake);
+        let path = "/home/x/.local/bin:/opt/100%h/bin:/usr/bin";
+        let text = systemd.unit_text(&id(), "/c/.camp", "/usr/local/bin/camp", path);
+        assert_eq!(
+            systemd.parse_path(&text).as_deref(),
+            Some(path),
+            "the PATH must read back byte-exact, `%` and all"
+        );
+
+        let old = text
+            .lines()
+            .filter(|l| !l.starts_with("Environment="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            systemd.parse_path(&old),
+            None,
+            "a unit with no Environment= line must report NONE, not a wrong answer"
         );
     }
 

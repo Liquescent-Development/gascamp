@@ -133,6 +133,14 @@ pub trait Supervisor {
     /// `service::campd_path`.
     fn unit_text(&self, id: &CampId, camp_root: &str, exe: &str, path: &str) -> String;
 
+    /// The PATH a unit bakes, read back out of it — the exact inverse of what
+    /// `unit_text` wrote. `None` means the unit carries no PATH at all, which is
+    /// what every unit installed before that was a thing looks like: campd runs
+    /// with the supervisor's minimal environment, finds no `claude`, and fails
+    /// every dispatch while reporting perfect health. `status` has to be able to
+    /// SEE that, or the installed base stays broken and silent.
+    fn parse_path(&self, unit_text: &str) -> Option<String>;
+
     /// Tell the service manager the unit DIRECTORY changed. Called after a
     /// unit file is written and after one is removed. launchd reads the plist
     /// at bootstrap, so it is a no-op there; systemd needs `daemon-reload`.

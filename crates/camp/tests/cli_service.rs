@@ -203,6 +203,17 @@ fn service_lifecycle_against_the_real_host_manager() {
         init_out.contains("installed"),
         "on a host WITH a service manager, `camp init` installs the unit: {init_out}"
     );
+    // The unit MUST carry a PATH, and this is the only test that would ever
+    // notice against a REAL supervisor. Without one, campd comes up under
+    // launchd/systemd with their minimal environment (`/usr/bin:/bin:…`), never
+    // finds `claude`, and fails every dispatch with `spawn failed: spawning
+    // claude: No such file or directory` — while every other assertion in this
+    // file still passes, because campd itself is perfectly healthy. That is
+    // exactly how it reached a user.
+    assert!(
+        init_out.contains("campd's PATH"),
+        "install must bake and report the PATH campd will run with: {init_out}"
+    );
 
     // The supervisor started campd; status shows BOTH truths.
     wait_for_campd(&root, true);

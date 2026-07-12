@@ -79,6 +79,19 @@ impl Supervisor for Launchd<'_> {
         Ok(PathBuf::from(root))
     }
 
+    fn parse_path(&self, unit_text: &str) -> Option<String> {
+        // The `<string>` right after `<key>PATH</key>` — the exact inverse of
+        // what `unit_text` writes. A unit installed before campd's PATH was
+        // baked in has no such key at all, and says so by returning None.
+        let after_key = unit_text.split("<key>PATH</key>").nth(1)?;
+        let value = after_key
+            .split("<string>")
+            .nth(1)?
+            .split("</string>")
+            .next()?;
+        Some(xml_unescape(value))
+    }
+
     fn state(&self, id: &CampId) -> Result<UnitState> {
         let target = self.service_target(id);
         let out = self
@@ -504,6 +517,33 @@ mod tests {
             text.contains("<key>PATH</key>") && text.contains(&format!("<string>{path}</string>")),
             "the plist must carry the PATH campd runs with — without it campd finds no \
              `claude` and dispatches nothing: {text}"
+        );
+    }
+
+    /// `parse_path` is the exact inverse of what `unit_text` wrote — including
+    /// through XML escaping — and it answers `None` for a unit that carries no
+    /// PATH at all. That `None` is what lets `camp service status` tell an
+    /// operator their pre-fix unit is the reason nothing dispatches, instead of
+    /// reporting it as healthy.
+    #[test]
+    fn parse_path_round_trips_and_reports_a_unit_that_has_none() {
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        let path = "/opt/R&D <b>/bin:/Users/x/.local/bin:/usr/bin";
+        let text = launchd.unit_text(&id(), "/c/.camp", "/usr/local/bin/camp", path);
+        assert_eq!(launchd.parse_path(&text).as_deref(), Some(path));
+
+        // A unit from before the PATH was baked in: no EnvironmentVariables.
+        let old = text
+            .split("  <key>EnvironmentVariables</key>")
+            .next()
+            .unwrap()
+            .to_owned()
+            + "</dict>\n</plist>\n";
+        assert_eq!(
+            launchd.parse_path(&old),
+            None,
+            "a unit with no PATH must report NONE, not a wrong answer"
         );
     }
 

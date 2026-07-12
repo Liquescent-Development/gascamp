@@ -411,9 +411,35 @@ prints what it captured, and warns if the configured worker command is not on
 it, because the alternative is finding out from a `session.crashed` event after
 you have already slung work at a camp that was never going to run it.
 
-It is a **snapshot, not a live link**. Change your PATH, move `claude`, and the
-unit still names the old one — re-run `camp service install` to re-capture it.
-(`camp service restart` only cycles the daemon; it does not re-read your shell.)
+It is a **snapshot, not a live link**. Change your PATH, move `claude`, or let a
+version manager retire a bin directory, and the unit still names the old one. To
+re-capture it:
+
+```
+camp service uninstall && camp service install
+```
+
+Both commands, in that order: `camp service install` on its own refuses to
+clobber an existing unit, and `camp service restart` only cycles the daemon — it
+does not re-read your shell.
+
+**`camp service status` re-asks the question every time you run it.** It prints
+the PATH the unit actually bakes and warns if the worker command is not on it, so
+a snapshot that has gone stale — or a unit installed before campd carried a PATH
+at all — shows up as a problem instead of as a healthy-looking camp that
+dispatches nothing:
+
+```
+$ camp service status
+unit:  com.gascamp.campd.myproj-a1b2 (launchd, ~/Library/LaunchAgents/…)
+       loaded=true running=true will-restart-campd=true  [state = running]
+campd PATH: NONE — this unit predates campd's PATH being baked into it, so campd
+runs with launchd's minimal environment and will NOT find `claude` …
+campd: listening (pid 47117) — 0 live sessions, 0 ready, 0 red
+```
+
+If you installed a camp before this landed, that is what you will see, and
+`camp service uninstall && camp service install` is the fix.
 
 > **What has actually been exercised against a live service manager:** both.
 > The end-to-end lifecycle test (`make service-e2e`) runs against **launchd on
