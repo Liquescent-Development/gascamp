@@ -145,6 +145,34 @@ fn write_fixture(dir: &Path) {
     .unwrap();
 }
 
+/// Zombies in the container, read straight out of `/proc` — the image is slim
+/// and ships no `ps`. Field 3 of `/proc/<pid>/stat` is the state character.
+fn zombie_count(container: &str) -> usize {
+    let out = docker_ok(&[
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "for d in /proc/[0-9]*; do [ -r $d/stat ] || continue; \
+         set -- $(cat $d/stat 2>/dev/null); echo $3; done",
+    ]);
+    out.lines().filter(|s| s.trim() == "Z").count()
+}
+
+/// Is the orphaned `sleep` still running? Distinguishes "reaped" from
+/// "hasn't exited yet", so the zombie assertion cannot pass vacuously.
+fn any_sleep_alive(container: &str) -> bool {
+    docker_ok(&[
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "for d in /proc/[0-9]*; do cat $d/comm 2>/dev/null; done",
+    ])
+    .lines()
+    .any(|c| c.trim() == "sleep")
+}
+
 fn events(container: &str) -> Vec<serde_json::Value> {
     docker_ok(&["exec", container, "camp", "events", "--json"])
         .lines()
@@ -293,7 +321,29 @@ fn reference_container_serves_a_camp_and_stops_gracefully() {
         "the worker closed the bead pass; events were: {evs:#?}"
     );
 
-    // 7. `docker stop` = SIGTERM to campd (tini forwards it to its only child,
+    // 7. PID 1 reaps orphans. campd does NOT: it reaps the workers it tracks
+    //    (`Child::try_wait` per known pid), and it has no way to wait on a pid
+    //    it never spawned. A worker's own subprocess, orphaned when the worker
+    //    dies first, is reparented to PID 1 — so if campd were PID 1 it would
+    //    sit there as a zombie forever. That is the whole job tini does here,
+    //    and it is why the ENTRYPOINT is `tini -- camp-entrypoint` and not the
+    //    entrypoint alone. Verified: with campd as PID 1, this leaves zombies.
+    docker_ok(&["exec", CONTAINER, "sh", "-c", "( sleep 1 & ) ; exit 0"]);
+    wait_for(
+        "the orphaned process to exit",
+        Duration::from_secs(15),
+        || zombie_count(CONTAINER) == 0 && !any_sleep_alive(CONTAINER),
+    );
+    assert_eq!(
+        zombie_count(CONTAINER),
+        0,
+        "an orphaned process was reparented to PID 1 and never reaped — PID 1 is not an init. \
+         campd cannot reap a pid it did not spawn, so the container needs tini (or `docker run \
+         --init` / compose `init: true`); without one, every worker subprocess that outlives its \
+         parent leaks a zombie."
+    );
+
+    // 8. `docker stop` = SIGTERM to campd (tini forwards it to its only child,
     //    which the entrypoint exec'd). Graceful means: quick, exit 0, and the
     //    shutdown is IN THE LEDGER.
     let stop_started = Instant::now();
