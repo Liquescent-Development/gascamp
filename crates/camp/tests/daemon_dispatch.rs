@@ -236,13 +236,28 @@ fn tier0_sling_runs_the_whole_contract_with_a_causal_trail() {
         .unwrap();
     assert_eq!(st["data"]["exit_code"], 0);
 
-    // Envelope capture existed during the run (decision G); cp-0 (§2.3,
-    // amendment fix 10) disposes the stream file at reap, so after the
-    // session stops the file is gone — the capture-during-run is already
-    // proven by the milestone + transcript checks above.
+    // The stdout capture existed during the run (phase-8 decision G) and is
+    // DISPOSED AT REAP, so it is gone once the session stops.
+    //
+    // This assertion was inverted deliberately, under an operator ruling
+    // (2026-07-13, cp-0 review finding 4): decision G promised the capture
+    // was "kept for forensics", but the control-plane spec §2.3/§9 makes that
+    // same file campd's live read channel and mandates reap-time disposal,
+    // and its phase-0 roadmap assigns that disposal to cp-0 by name. The
+    // control-plane spec GOVERNS. The supersession is recorded in the v1
+    // design spec §7.1 (`docs/design/2026-07-05-gas-camp-design.md`,
+    // amendment 2026-07-13) — spec and code do not diverge silently.
+    //
+    // Decision G's forensics intent is preserved by a different mechanism:
+    // campd drains a reaped session's stream to EOF BEFORE disposing it, so
+    // the worker's final bytes survive as durable ledger events. The raw file
+    // is what goes, not the record. The capture-during-run is proven by the
+    // milestone + transcript checks above; the drain-before-disposal ordering
+    // is proven by `read_channel.rs`'s worker-lifecycle test.
     assert!(
         !root.join("sessions").join("t-dev-1.json").exists(),
-        "cp-0: the stream file is disposed at reap (§2.3)"
+        "the stream file is disposed at reap — control-plane §2.3, and design \
+         spec §7.1 as amended 2026-07-13"
     );
 
     // The state fold agrees with the whole story.
