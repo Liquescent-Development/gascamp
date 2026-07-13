@@ -430,23 +430,45 @@ fn a_hot_reload_updates_dispatch_routing_without_a_restart() {
         "expected a routing hole before the reload; got {failed:?}"
     );
 
-    // Hot-add the starter pack (ships agent "dev") + a default agent. `packs`
-    // is a top-level key, so it must precede every `[table]` header (TOML).
+    // Pre-materialize the starter import's agent directory: the daemon's hot
+    // reload only RE-PARSES camp.toml (it does not call `camp import add`), so
+    // `imports/starter/agents/dev/` must already exist for `resolve_agent` to
+    // find `starter.dev` after the reload. (compat: a pack is now an import
+    // bound under `<root>/imports/<binding>/`, not a `packs = [...]` entry.)
+    let dev_dir = root.join("imports/starter/agents/dev");
+    std::fs::create_dir_all(&dev_dir).unwrap();
+    std::fs::copy(
+        starter_pack().join("agents/dev/agent.toml"),
+        dev_dir.join("agent.toml"),
+    )
+    .unwrap();
+    std::fs::copy(
+        starter_pack().join("agents/dev/prompt.md"),
+        dev_dir.join("prompt.md"),
+    )
+    .unwrap();
+
+    // Hot-add the starter import + a qualified default agent. The reloaded
+    // camp.toml carries `[imports.starter]` (the binding) and
+    // `default_agent = "starter.dev"` (binding-qualified); `[agent_defaults].tools`
+    // is required (compat §5.2 — no tools ⇒ no spawn).
     let before = last_seq(&root);
     let reloaded = format!(
-        "packs = [\"{}\"]\n\n[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\n\
-         prefix = \"gc\"\n\n[dispatch]\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
-        starter_pack().display(),
+        "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+         [imports.starter]\nsource = \"{}\"\n\n\
+         [agent_defaults]\ntools = [\"Read\", \"Bash\"]\n\n\
+         [dispatch]\ncommand = \"{}\"\ndefault_agent = \"starter.dev\"\n",
         rig.display(),
+        starter_pack().display(),
         fake_agent(),
     );
     std::fs::write(root.join("camp.toml"), &reloaded).unwrap();
     wait_for_config_changed(&root, before, |d| d["applied"] == true, "applied");
 
-    // After the reload, with NO restart: a new bead routes to the pack's
-    // "dev" agent. This exercises BOTH routing-affecting changes — the
-    // dispatcher's [dispatch].default_agent AND pack resolution for the
-    // agent definition — on the reloaded config.
+    // After the reload, with NO restart: a new bead routes to the imported
+    // `starter.dev` agent. This exercises BOTH routing-affecting changes —
+    // the dispatcher's [dispatch].default_agent AND binding-qualified agent
+    // resolution — on the reloaded config.
     let bead = run_ok(&root, &["create", "route me"]).trim().to_owned();
     let woke = wait_for(&root, "session.woke", Duration::from_secs(10));
     let for_bead = woke
@@ -454,8 +476,8 @@ fn a_hot_reload_updates_dispatch_routing_without_a_restart() {
         .find(|e| e["data"]["bead"] == bead.as_str())
         .unwrap_or_else(|| panic!("no session.woke for {bead}; saw: {woke:?}"));
     assert_eq!(
-        for_bead["data"]["agent"], "dev",
-        "the hot-reloaded default_agent + pack must route dispatch without a restart"
+        for_bead["data"]["agent"], "starter.dev",
+        "the hot-reloaded default_agent + import must route dispatch without a restart"
     );
 
     // Let the worker finish so no fake-agent process outlives the daemon.

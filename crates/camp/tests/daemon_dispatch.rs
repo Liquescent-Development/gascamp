@@ -51,6 +51,7 @@ fn scaffold(dir: &Path, max_workers: usize, rig_extra: &str) -> (PathBuf, PathBu
         root.join("camp.toml"),
         format!(
             "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n{rig_extra}\n\
+             [agent_defaults]\ntools = [\"Read\", \"Bash\"]\n\n\
              [dispatch]\nmax_workers = {max_workers}\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
             rig.display(),
             fake_agent(),
@@ -60,22 +61,33 @@ fn scaffold(dir: &Path, max_workers: usize, rig_extra: &str) -> (PathBuf, PathBu
     // Post-flip (spec §12) the scaffold's dev agent PINS the live-tree
     // opt-out: these tests exercise worker mechanics (crash, cap, routing,
     // canonicalization) on the rig cwd, not the isolation contract — which
-    // has its own tests below. Tests about the DEFAULT overwrite dev.md
-    // with write_agent(&root, "dev", "").
+    // has its own tests below. Tests about the DEFAULT overwrite the dev
+    // agent dir with write_agent(&root, "dev", "").
     write_agent(&root, "dev", "isolation: none\n");
     // create the ledger so every verb (and campd) finds it
     camp_ok(&root, &["events", "--json"]);
     (root, rig)
 }
 
+/// Write an agent DIRECTORY (compat §5.1): `agents/<name>/agent.toml` carries
+/// the `isolation` opt-out (the only frontmatter key these tests use); model
+/// and tools come from `[agent_defaults]` in camp.toml. Each call resets the
+/// agent dir so a flip (none↔worktree, or default) is clean.
 fn write_agent(root: &Path, name: &str, front_extra: &str) {
-    let agents = root.join("agents");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(
-        agents.join(format!("{name}.md")),
-        format!("---\nname: {name}\n{front_extra}---\nDo the work.\n"),
-    )
-    .unwrap();
+    let dir = root.join("agents").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let agent_toml = if front_extra.contains("isolation: none") {
+        Some("isolation = \"none\"\n")
+    } else if front_extra.contains("isolation: worktree") {
+        Some("isolation = \"worktree\"\n")
+    } else {
+        None
+    };
+    if let Some(t) = agent_toml {
+        std::fs::write(dir.join("agent.toml"), t).unwrap();
+    }
+    std::fs::write(dir.join("prompt.md"), "Do the work.\n").unwrap();
 }
 
 fn events_json(root: &Path) -> Vec<serde_json::Value> {
@@ -1125,6 +1137,7 @@ fn worker_cwd_is_canonicalized_so_patrol_watches_the_real_transcript_path() {
         root.join("camp.toml"),
         format!(
             "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+             [agent_defaults]\ntools = [\"Read\", \"Bash\"]\n\n\
              [dispatch]\nmax_workers = 2\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
             link.display(), // the rig path IS a symlink
             fake_agent(),
@@ -1192,19 +1205,17 @@ fn worktree_worker_cwd_is_canonicalized_on_a_symlinked_camp_root() {
         real_root.join("camp.toml"),
         format!(
             "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+             [agent_defaults]\ntools = [\"Read\", \"Bash\"]\n\n\
              [dispatch]\nmax_workers = 2\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
             rig.display(),
             fake_agent(),
         ),
     )
     .unwrap();
-    let agents = real_root.join("agents");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(
-        agents.join("dev.md"),
-        "---\nname: dev\nisolation: worktree\n---\nDo the work.\n",
-    )
-    .unwrap();
+    let dev = real_root.join("agents/dev");
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::write(dev.join("agent.toml"), "isolation = \"worktree\"\n").unwrap();
+    std::fs::write(dev.join("prompt.md"), "Do the work.\n").unwrap();
 
     // Reach the camp through a symlink: campd's self.camp.root is the symlink
     // spelling; canonicalize must resolve it for the worktree cwd.

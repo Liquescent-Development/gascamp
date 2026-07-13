@@ -46,12 +46,18 @@ fn starter_formula_is_the_corpus_file_and_doctor_accepts_it() {
 
 #[test]
 fn starter_pack_ships_agent_definitions() {
+    // compat §5.1: an agent is a directory (agent.toml + prompt.md).
     for a in ["dev", "reviewer"] {
-        let p = repo_root().join(format!("packs/starter/agents/{a}.md"));
-        let s = std::fs::read_to_string(&p).unwrap_or_else(|_| panic!("{a}.md must exist"));
+        let dir = repo_root().join(format!("packs/starter/agents/{a}"));
+        let toml = std::fs::read_to_string(dir.join("agent.toml"))
+            .unwrap_or_else(|_| panic!("agents/{a}/agent.toml must exist"));
         assert!(
-            s.starts_with("---") && s.contains("description:"),
-            "{a}.md must be a Claude Code agent definition with frontmatter"
+            toml.contains("description"),
+            "agents/{a}/agent.toml must carry a description: {toml}"
+        );
+        assert!(
+            dir.join("prompt.md").is_file(),
+            "agents/{a}/prompt.md must exist"
         );
     }
 }
@@ -62,31 +68,32 @@ fn starter_dev_agent_scopes_test_first_to_code_changes() {
     // hardcode a blanket "test-first" mandate onto every task, even
     // non-code ones (e.g. "give this repo a proper README.md"), pushing
     // the worker to invent tests for documentation.
-    let p = repo_root().join("packs/starter/agents/dev.md");
-    let s = std::fs::read_to_string(&p).expect("dev.md must exist");
+    let p = repo_root().join("packs/starter/agents/dev/prompt.md");
+    let s = std::fs::read_to_string(&p).expect("dev/prompt.md must exist");
     let lower = s.to_lowercase();
 
     assert!(
         !s.contains("implement the change test-first"),
-        "dev.md must not hardcode a blanket, unconditional test-first mandate: {s}"
+        "dev prompt must not hardcode a blanket, unconditional test-first mandate: {s}"
     );
     assert!(
         lower.contains("code") && s.contains("test-first"),
-        "dev.md must scope the test-first guidance to code changes"
+        "dev prompt must scope the test-first guidance to code changes"
     );
     assert!(
         lower.contains("docs") || lower.contains("documentation"),
-        "dev.md must call out non-code changes (docs/config) as a distinct case"
+        "dev prompt must call out non-code changes (docs/config) as a distinct case"
     );
     assert!(
         lower.contains("verify") || lower.contains("verif"),
-        "dev.md must instruct the worker to verify non-code changes appropriately"
+        "dev prompt must instruct the worker to verify non-code changes appropriately"
     );
 }
 
 #[test]
 fn starter_dev_agent_carries_the_delivery_contract() {
-    let dev = std::fs::read_to_string(repo_root().join("packs/starter/agents/dev.md")).unwrap();
+    let dev =
+        std::fs::read_to_string(repo_root().join("packs/starter/agents/dev/prompt.md")).unwrap();
     for needle in ["camp/", "work outcome", "shipped", "blocked", "never push"] {
         assert!(dev.contains(needle), "dev agent must state `{needle}`");
     }
@@ -94,9 +101,10 @@ fn starter_dev_agent_carries_the_delivery_contract() {
 
 #[test]
 fn starter_pack_ships_a_committer_role_and_the_plugin_still_ships_none() {
-    let committer =
-        std::fs::read_to_string(repo_root().join("packs/starter/agents/committer.md")).unwrap();
-    assert!(committer.contains("name: committer"));
+    // compat §5.1: identity is the directory name; the prompt carries the role.
+    let dir = repo_root().join("packs/starter/agents/committer");
+    assert!(dir.is_dir(), "agents/committer/ must exist");
+    let committer = std::fs::read_to_string(dir.join("prompt.md")).unwrap();
     assert!(committer.contains("git"));
     // the role-free-plugin policy is enforced by plugin_policy.rs; this is
     // the positive control that the new role landed in the PACK.
@@ -104,10 +112,13 @@ fn starter_pack_ships_a_committer_role_and_the_plugin_still_ships_none() {
 
 #[test]
 fn starter_pack_orders_example_exists() {
-    let orders = repo_root().join("packs/starter/orders.toml");
-    let s = std::fs::read_to_string(&orders).expect("packs/starter/orders.toml must exist");
+    // compat: pack orders live in an `orders/` directory (gc `[order]` shape).
+    let orders_dir = repo_root().join("packs/starter/orders");
+    assert!(orders_dir.is_dir(), "packs/starter/orders/ must exist");
+    let nightly = std::fs::read_to_string(orders_dir.join("morning-triage.toml"))
+        .expect("orders/morning-triage.toml must exist");
     assert!(
-        s.contains("[[order]]"),
-        "orders.toml must use the §9 [[order]] form"
+        nightly.contains("[order]"),
+        "orders/morning-triage.toml must use the gc [order] form"
     );
 }

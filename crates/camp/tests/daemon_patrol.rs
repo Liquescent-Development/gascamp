@@ -53,6 +53,7 @@ fn scaffold(dir: &Path, patrol_toml: &str, agents: &[(&str, &str)]) -> (PathBuf,
         root.join("camp.toml"),
         format!(
             "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+             [agent_defaults]\ntools = [\"Read\", \"Bash\"]\n\n\
              [dispatch]\nmax_workers = 4\ncommand = \"{}\"\ndefault_agent = \"dev\"\n\n\
              [patrol]\n{patrol_toml}\n",
             rig.display(),
@@ -68,14 +69,35 @@ fn scaffold(dir: &Path, patrol_toml: &str, agents: &[(&str, &str)]) -> (PathBuf,
     (root, rig)
 }
 
+/// Write an agent DIRECTORY (compat §5.1): `agents/<name>/agent.toml` carries
+/// the `isolation` opt-out (the only frontmatter key these tests use); the
+/// `stall_after` override also lives in agent.toml. Model + tools come from
+/// `[agent_defaults]`. Each call resets the agent dir.
 fn write_agent(root: &Path, name: &str, front_extra: &str) {
-    let agents = root.join("agents");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(
-        agents.join(format!("{name}.md")),
-        format!("---\nname: {name}\n{front_extra}---\nDo the work.\n"),
-    )
-    .unwrap();
+    let dir = root.join("agents").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut agent_toml = String::new();
+    if front_extra.contains("isolation: none") {
+        agent_toml.push_str("isolation = \"none\"\n");
+    } else if front_extra.contains("isolation: worktree") {
+        agent_toml.push_str("isolation = \"worktree\"\n");
+    }
+    if let Some(idx) = front_extra.find("stall_after:") {
+        let rest = &front_extra[idx + "stall_after:".len()..];
+        let val = rest
+            .trim_start()
+            .split(|c: char| c == '\n' || c == ' ')
+            .next()
+            .unwrap_or("");
+        if !val.is_empty() {
+            agent_toml.push_str(&format!("stall_after = {val:?}\n"));
+        }
+    }
+    if !agent_toml.is_empty() {
+        std::fs::write(dir.join("agent.toml"), agent_toml).unwrap();
+    }
+    std::fs::write(dir.join("prompt.md"), "Do the work.\n").unwrap();
 }
 
 fn git_rig(rig: &Path) {
@@ -521,12 +543,33 @@ fn a_hot_reloaded_pack_agent_is_resolved_by_patrol_without_a_restart() {
     );
 
     // A throwaway pack shipping agent "sentry" with a DISTINCT 700ms
-    // stall_after override. camp's pack loader needs only <pack>/agents/*.md.
+    // stall_after override. Compat: a pack is an import bound under
+    // `<root>/imports/<binding>/`; the daemon's hot reload only RE-PARSES
+    // camp.toml (it does not materialize), so pre-materialize the agent dir.
     let pack = dir.path().join("sentrypack");
-    std::fs::create_dir_all(pack.join("agents")).unwrap();
+    std::fs::create_dir_all(pack.join("agents/sentry")).unwrap();
     std::fs::write(
-        pack.join("agents/sentry.md"),
-        "---\nname: sentry\nisolation: none\nstall_after: 700ms\n---\nWork.\n",
+        pack.join("pack.toml"),
+        "[pack]\nname = \"sentrypack\"\nschema = 2\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pack.join("agents/sentry/agent.toml"),
+        "isolation = \"none\"\nstall_after = \"700ms\"\n",
+    )
+    .unwrap();
+    std::fs::write(pack.join("agents/sentry/prompt.md"), "Work.\n").unwrap();
+    // Pre-materialize the import so the reloaded [imports.sentry] resolves.
+    let sentry_dir = root.join("imports/sentry/agents/sentry");
+    std::fs::create_dir_all(&sentry_dir).unwrap();
+    std::fs::copy(
+        pack.join("agents/sentry/agent.toml"),
+        sentry_dir.join("agent.toml"),
+    )
+    .unwrap();
+    std::fs::copy(
+        pack.join("agents/sentry/prompt.md"),
+        sentry_dir.join("prompt.md"),
     )
     .unwrap();
 
@@ -538,14 +581,18 @@ fn a_hot_reloaded_pack_agent_is_resolved_by_patrol_without_a_restart() {
         &[("FAKE_AGENT_NUDGE_CLOSE", "1")],
     );
 
-    // Hot-add the pack and route new beads to its agent — NO restart. `packs`
-    // is a top-level key, so it precedes every [table] header (TOML).
+    // Hot-add the import and route new beads to its agent — NO restart. The
+    // reloaded camp.toml carries `[imports.sentry]` (the binding) and a
+    // binding-qualified `default_agent = "sentry.sentry"`; `[agent_defaults].tools`
+    // is required (compat §5.2).
     let reloaded = format!(
-        "packs = [\"{}\"]\n\n[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\n\
-         path = \"{}\"\nprefix = \"gc\"\n\n[dispatch]\nmax_workers = 4\n\
-         command = \"{}\"\ndefault_agent = \"sentry\"\n\n[patrol]\nstall_after = \"5s\"\n",
-        pack.display(),
+        "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+         [imports.sentry]\nsource = \"{}\"\n\n\
+         [agent_defaults]\ntools = [\"Read\", \"Bash\"]\n\n\
+         [dispatch]\nmax_workers = 4\ncommand = \"{}\"\ndefault_agent = \"sentry.sentry\"\n\n\
+         [patrol]\nstall_after = \"5s\"\n",
         rig.display(),
+        pack.display(),
         fake_agent(),
     );
     std::fs::write(root.join("camp.toml"), &reloaded).unwrap();
@@ -557,20 +604,20 @@ fn a_hot_reloaded_pack_agent_is_resolved_by_patrol_without_a_restart() {
     // Dispatch a bead to the freshly added agent.
     camp_ok(&root, &["sling", "watch me"]);
 
-    // Patrol must resolve "sentry" from the reloaded pack: the first stall it
-    // declares for this worker carries the agent's 700ms threshold.
+    // Patrol must resolve "sentry.sentry" from the reloaded import: the first
+    // stall it declares for this worker carries the agent's 700ms threshold.
     wait_until(&root, "the sentry stall", |e| {
         e.iter()
-            .any(|ev| ev["type"] == "agent.stalled" && ev["data"]["agent"] == "sentry")
+            .any(|ev| ev["type"] == "agent.stalled" && ev["data"]["agent"] == "sentry.sentry")
     });
     let events = events_json(&root);
     let first_stall = events
         .iter()
-        .find(|e| e["type"] == "agent.stalled" && e["data"]["agent"] == "sentry")
+        .find(|e| e["type"] == "agent.stalled" && e["data"]["agent"] == "sentry.sentry")
         .unwrap();
     assert_eq!(
         first_stall["data"]["threshold"], "700ms",
-        "patrol must arm at the reloaded pack agent's stall_after, not the camp default; events: {events:#?}"
+        "patrol must arm at the reloaded import agent's stall_after, not the camp default; events: {events:#?}"
     );
     assert_eq!(
         count(&events, "patrol.degraded"),
