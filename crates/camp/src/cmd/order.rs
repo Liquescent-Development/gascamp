@@ -186,21 +186,6 @@ fn rewrite_orders_block(camp_toml: &std::path::Path, enabled: &[String]) -> Resu
     Ok(())
 }
 
-fn format_window(window: std::time::Duration) -> String {
-    if window.is_zero() {
-        "off".to_owned()
-    } else {
-        let secs = window.as_secs();
-        if secs.is_multiple_of(3600) {
-            format!("{}h", secs / 3600)
-        } else if secs.is_multiple_of(60) {
-            format!("{}m", secs / 60)
-        } else {
-            format!("{secs}s")
-        }
-    }
-}
-
 pub fn run_order(camp: &CampDir, name: &str) -> Result<()> {
     let orders = load_orders(camp)?;
     let Some(order) = orders.iter().find(|o| o.name == name) else {

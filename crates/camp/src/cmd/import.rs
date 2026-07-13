@@ -702,4 +702,63 @@ mod verb_tests {
         let other = format!("file://{}//bmad", repo2.path().display());
         assert!(run_add(camp.path(), &other, Some("bmad"), None).is_err(), "same name, different source");
     }
+
+    // ---- §3 two-command recipe — end-to-end acceptance (file://, no network) -
+
+    #[test]
+    fn two_command_recipe_materializes_bmad_transitive_gascity_and_roles_bound_gc() {
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(repo.path(), &[
+            ("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n"),
+            ("bmad/agents/architect/agent.toml", "scope=\"rig\"\nfallback=true\n"),
+            ("bmad/agents/architect/prompt.template.md", "architect {{.Var}}"),
+            ("bmad/skills/bmad-create-architecture/SKILL.md", "# skill"),
+            ("gascity/formulas/build-base.formula.toml", "formula=\"build-base\"\n"),
+            ("gascity/roles/pack.toml", "[pack]\nname=\"gc-roles\"\nschema=2\n"),
+            ("gascity/roles/agents/run-operator/prompt.md", "operate"),
+            ("gascity/roles/agents/review-synthesizer/prompt.md", "gc synth"),
+            ("gstack/pack.toml", "[pack]\nname=\"gstack\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n"),
+            ("gstack/agents/review-synthesizer/prompt.md", "gstack synth"),
+        ]);
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp.path();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\",\"Skill\"]\n").unwrap();
+        camp_core::ledger::Ledger::open(&root.join("camp.db")).unwrap();
+        let base = format!("file://{}", repo.path().display());
+
+        // The two commands (§3), against LOCAL file:// (never the network):
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), None).unwrap();
+        run_add(root, &format!("{base}//gascity/roles"), Some("gc"), None).unwrap();
+
+        let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+        assert_eq!(camp_core::pack::resolve_agent(&cfg, "bmad.architect").unwrap().name, "bmad.architect");
+        let lock = camp_core::import::lock::PacksLock::read(&root.join("packs.lock")).unwrap();
+        assert!(lock.imports.iter().any(|e| e.subpath.as_deref() == Some("gascity") && e.via.as_deref() == Some("bmad")),
+            "transitive gascity materialized with via=bmad");
+        assert_eq!(camp_core::pack::resolve_agent(&cfg, "gc.run-operator").unwrap().name, "gc.run-operator");
+        assert!(camp_core::orders::resolve_formula(&cfg, "build-base").is_ok(), "gascity contributes formula layers");
+
+        // add gstack too: the cross-binding collision coexists:
+        run_add(root, &format!("{base}//gstack"), Some("gstack"), None).unwrap();
+        let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+        assert!(camp_core::pack::resolve_agent(&cfg, "gstack.review-synthesizer").unwrap().prompt.contains("gstack"));
+        assert!(camp_core::pack::resolve_agent(&cfg, "gc.review-synthesizer").unwrap().prompt.contains("gc"));
+        // an unbound binding fails naming the remedy:
+        assert!(camp_core::pack::resolve_agent(&cfg, "superpowers.implementer").unwrap_err().to_string().contains("camp import add"));
+    }
+
+    #[test]
+    fn transitive_relative_source_escaping_the_repo_is_refused_at_add() {
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(repo.path(), &[
+            ("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n[imports.gc]\nsource=\"../../etc\"\n"),
+            ("bmad/agents/a/prompt.md", "a"),
+        ]);
+        let camp = tempfile::tempdir().unwrap();
+        std::fs::write(camp.path().join("camp.toml"), "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n").unwrap();
+        camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let url = format!("file://{}//bmad", repo.path().display());
+        let err = run_add(camp.path(), &url, Some("bmad"), None).unwrap_err().to_string();
+        assert!(err.to_lowercase().contains("escape") || err.contains("repo"), "{err}");
+    }
 }
