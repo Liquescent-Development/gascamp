@@ -545,7 +545,29 @@ pub fn run(
         // `apply_tracking` used to do inside `settle`, before this whole
         // block — unlinked the file first and deleted the worker's last
         // output unread.
-        read_channel.apply_pending_unregisters(ledger)?;
+        //
+        // Lead ruling (a): this call also ENFORCES the ordering it depends on.
+        // A session queued for unregister after `drain_all` (which today
+        // cannot happen — the reap appends session.stopped/crashed BEFORE
+        // settle — but which a future phase could introduce) is drained before
+        // disposal and the violated ordering is recorded as a durable fault
+        // event. It returns `true` when it appended anything, so the campd
+        // cursor is advanced past those events in this same wake rather than
+        // waiting for a wake that an idle campd may never take.
+        if read_channel.apply_pending_unregisters(ledger)?
+            && let Err(e) = settle(
+                ledger,
+                processor,
+                runtime,
+                clock,
+                dispatcher,
+                graph,
+                patrol,
+                read_channel,
+            )
+        {
+            eprintln!("campd: read-channel disposal settle failed: {e:#}");
+        }
     }
 }
 

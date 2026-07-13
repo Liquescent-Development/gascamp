@@ -254,11 +254,24 @@ fn tier0_sling_runs_the_whole_contract_with_a_causal_trail() {
     // is what goes, not the record. The capture-during-run is proven by the
     // milestone + transcript checks above; the drain-before-disposal ordering
     // is proven by `read_channel.rs`'s worker-lifecycle test.
-    assert!(
-        !root.join("sessions").join("t-dev-1.json").exists(),
-        "the stream file is disposed at reap — control-plane §2.3, and design \
-         spec §7.1 as amended 2026-07-13"
-    );
+    //
+    // POLLED, not asserted instantaneously: `session.stopped` is appended by
+    // the reap, which runs EARLIER IN THE SAME WAKE than the drain block that
+    // disposes the file. So a test that observes the event in the ledger can
+    // legitimately look at the filesystem before campd has reached disposal.
+    // The bare `exists()` check was racy by construction and passed only on
+    // timing luck. The assertion is unchanged in meaning — the file MUST be
+    // gone — it just gives campd the moment it is entitled to.
+    let stream_file = root.join("sessions").join("t-dev-1.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while stream_file.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stream file was never disposed at reap — control-plane §2.3, and \
+             design spec §7.1 as amended 2026-07-13"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 
     // The state fold agrees with the whole story.
     let out = camp(&root, &["doctor", "--refold"]);

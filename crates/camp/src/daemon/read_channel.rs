@@ -254,12 +254,103 @@ impl ReadChannelRuntime {
     ///
     /// Idempotent: the queue is drained by `mem::take`, and `unregister` is
     /// a no-op for a session that is no longer tailed.
-    pub fn apply_pending_unregisters(&mut self, ledger: &mut Ledger) -> Result<()> {
+    ///
+    /// # The ordering invariant, ENFORCED HERE (lead ruling (a))
+    ///
+    /// Disposing a session is only safe once its stream has been read to EOF.
+    /// Fix 1 achieves that by ordering: the reap appends
+    /// `session.stopped`/`session.crashed` BEFORE `settle`, so the unregister
+    /// is always queued before this wake's `drain_all`. But that is a property
+    /// of the *callers*. A future phase that appends one of those events from
+    /// inside `settle` — or a worker that writes after `drain_all` and before
+    /// disposal — would slip bytes past the drain and have them unlinked
+    /// unread, silently reintroducing the very bug fix 1 removed.
+    ///
+    /// So this does not *assume* the ordering, it *removes the dependency on
+    /// it*: every session is drained to EOF immediately before it is disposed,
+    /// unconditionally. Normally that read returns zero bytes (the wake's
+    /// `drain_all` already reached EOF) and costs one seek — but it means no
+    /// caller ordering can ever destroy unread bytes again.
+    ///
+    /// The ordering violation is still reported, and now with a *precise*
+    /// signal rather than a heuristic: if this final drain actually ADVANCES
+    /// the offset, then bytes existed that the wake's `drain_all` missed —
+    /// which is exactly the bug — and that is recorded as a durable fault
+    /// event. An ordering bug that silently self-heals is one nobody ever
+    /// fixes (invariant 5: never silent).
+    ///
+    /// A `debug_assert!` was considered and rejected: it would panic campd's
+    /// hot loop in debug builds, and would make the guard itself untestable
+    /// (the test proving the guard works could not run). Recover-and-shout is
+    /// safer in production and verifiable.
+    ///
+    /// A **capped** session is exempt from the final drain: refusing to read an
+    /// over-cap file IS the RSS bound (see the hard stop in `drain_one`), so
+    /// its bytes are deliberately never read. That exemption is what makes
+    /// `queue_unregister` — the fix-3 undeliverable-kill path, which
+    /// legitimately queues after the drain — a non-violation, not a false alarm.
+    ///
+    /// Returns `true` when it appended events (the caller settles to advance
+    /// the campd cursor past them).
+    pub fn apply_pending_unregisters(&mut self, ledger: &mut Ledger) -> Result<bool> {
         let pending = std::mem::take(&mut self.pending_unregisters);
-        for session in pending {
-            self.unregister(ledger, &session)?;
+        let mut appended = false;
+        for session in &pending {
+            // The unconditional final drain. `drain_one` is itself a no-op for
+            // a capped session (the hard stop) and for one already at EOF.
+            let before = self.tailed.get(session).map(|t| t.offset);
+            self.drain_one(ledger, session)?;
+            let after = self.tailed.get(session).map(|t| t.offset);
+            if before == after || before.is_none() {
+                continue; // nothing was left unread — the normal path
+            }
+            // The final drain FOUND unread bytes: this wake's `drain_all` did
+            // not cover this session. The bytes are saved (just read above);
+            // the ordering bug that hid them is now on the record.
+            let mut note = format!(
+                "read_channel: ORDERING VIOLATION: session {session} still had unread \
+                 stdout bytes when it was disposed — this wake's drain_all did not cover \
+                 it (offset {} -> {}). The bytes were drained at disposal, so nothing was \
+                 lost, but a session.stopped/session.crashed must be appended by the reap \
+                 path BEFORE settle, never from inside it (see apply_pending_unregisters)",
+                before.unwrap_or(0),
+                after.unwrap_or(0),
+            );
+            // That late drain can itself breach the cap. The worker is already
+            // terminal, so there is nothing left to kill — but the breach is
+            // never silently dropped.
+            for b in std::mem::take(&mut self.cap_breaches) {
+                note.push_str(&format!(
+                    "; the late drain also found the stream over max_stream_bytes \
+                     ({} bytes > cap {})",
+                    b.file_size, b.cap_bytes
+                ));
+            }
+            ledger.append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::PatrolDegraded,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({ "session": session, "error": note }),
+            })?;
+            appended = true;
         }
-        Ok(())
+        // The late drain may have surfaced parse/drain faults. Append them HERE
+        // rather than leaving them in the collector: the session is about to be
+        // disposed, and an idle campd may never wake again to flush them — that
+        // is the data-stranding trade this design exists to avoid.
+        for input in self.take_drain_error_events() {
+            ledger.append(input)?;
+            appended = true;
+        }
+        for input in self.take_parse_error_events() {
+            ledger.append(input)?;
+            appended = true;
+        }
+        for session in &pending {
+            self.unregister(ledger, session)?;
+        }
+        Ok(appended)
     }
 
     /// review fix 3: queue a session for disposal from outside the observe
@@ -371,6 +462,17 @@ impl ReadChannelRuntime {
         // entire over-cap file into memory — the unbounded read the guards
         // exist to prevent. Refusing to read IS the RSS bound, and it also
         // dedupes the breach (no duplicate `session.stream_capped`).
+        //
+        // DELIBERATE EXCEPTION to "a session's final bytes are drained before
+        // its stream file is disposed" (fix 1). A cap-killed session IS
+        // disposed with its file unread, and that is correct, not a bug:
+        // reading an over-cap file is exactly the unbounded read the cap
+        // exists to prevent, so refusing to read IS the RSS bound. The loss is
+        // not silent — `session.stream_capped` names the file, its size, and
+        // the cap, and `session.crashed` carries that event's seq as its
+        // `cause_seq`. Do NOT "fix" this by draining a capped session on its
+        // way out: that reintroduces the OOM (control-plane §2.3, the live
+        // ceiling). `apply_pending_unregisters` knows about this exemption.
         if t.capped {
             return Ok(());
         }
@@ -804,6 +906,93 @@ mod tests {
             "and only THEN is the stream file disposed"
         );
         assert!(rc.tailed_sessions().is_empty());
+    }
+
+    /// Lead ruling (a): the ordering invariant is ENFORCED, not assumed. A
+    /// session queued for unregister AFTER this wake's `drain_all` has had its
+    /// final bytes read by nobody — disposing it would destroy them (the fix-1
+    /// bug, re-entering through a different door). The guard drains it before
+    /// disposal AND records the violated ordering as a durable fault event.
+    ///
+    /// Delete the guard in `apply_pending_unregisters` and this test fails on
+    /// both counts: the final line is never parsed, and no fault event is
+    /// appended.
+    #[test]
+    fn a_session_queued_for_unregister_after_the_drain_is_still_drained_and_shouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        std::fs::write(&stdout, "{\"type\":\"assistant\"}\n").unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        // This wake's drain runs...
+        rc.drain_all(&mut ledger).unwrap();
+        assert_eq!(rc.parsed_lines("t/dev/1"), 1);
+        // ...and only AFTERWARDS does the worker's last line land and the
+        // session get queued for disposal. This is the future-phase mistake
+        // the guard exists to catch: the unregister arrives too late to be
+        // covered by drain_all.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stdout)
+            .unwrap()
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n")
+            .unwrap();
+        rc.queue_unregister("t/dev/1");
+        let appended = rc.apply_pending_unregisters(&mut ledger).unwrap();
+        // Recovered: the final line was read rather than unlinked unread.
+        assert_eq!(
+            rc.parsed_lines("t/dev/1"),
+            2,
+            "the late-queued session's final line was drained before disposal"
+        );
+        // And loud: the ordering violation is durable, not silently self-healed.
+        assert!(appended, "the guard appended a fault event");
+        let events = ledger.events_range(1, None).unwrap();
+        let violation = events
+            .iter()
+            .find(|e| e.kind == EventType::PatrolDegraded)
+            .expect("a durable patrol.degraded names the ordering violation");
+        let msg = violation.data["error"].as_str().unwrap();
+        assert!(
+            msg.contains("ORDERING VIOLATION") && msg.contains("t/dev/1"),
+            "the fault event names the violation and the session: {msg}"
+        );
+        // Disposed, as intended.
+        assert!(!stdout.exists(), "the stream file is disposed");
+        assert!(rc.tailed_sessions().is_empty());
+    }
+
+    /// Lead ruling (a) + (b): the fix-3 undeliverable-kill path legitimately
+    /// queues an unregister AFTER the drain — but for a CAPPED session, whose
+    /// bytes are deliberately never read. It must NOT trip the ordering guard.
+    /// Without the `capped` exemption this would be a permanent false alarm on
+    /// a correct path.
+    #[test]
+    fn a_capped_session_queued_after_the_drain_is_not_an_ordering_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        let cap: u64 = 128;
+        std::fs::write(&stdout, vec![b'x'; 64 * 1024]).unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, cap).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        assert_eq!(rc.take_cap_breaches().len(), 1, "the session capped");
+        // The kill could not be delivered (no live child) — fix 3 queues the
+        // unregister here, after the drain.
+        rc.queue_unregister("t/dev/1");
+        let appended = rc.apply_pending_unregisters(&mut ledger).unwrap();
+        assert!(
+            !appended,
+            "a capped session is EXEMPT — refusing to read the over-cap file is \
+             the RSS bound, not a lost-bytes bug, so no ordering violation is raised"
+        );
+        assert!(rc.tailed_sessions().is_empty(), "disposed");
     }
 
     /// review fix 2: a capped session is a HARD STOP — a second drain does
