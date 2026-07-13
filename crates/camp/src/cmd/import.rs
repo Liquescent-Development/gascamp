@@ -12,9 +12,21 @@
 //! PATH and leaves campd unable to spawn workers — invariant: the unit
 //! carries campd's PATH).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use camp_core::config::ImportDecl;
+use camp_core::event::{EventInput, EventType};
+use camp_core::import::inventory::ExecItem;
+use camp_core::import::lock::{LockEntry, PacksLock};
+use camp_core::import::manifest::read_manifest;
+use camp_core::import::manifest::{PackManifest, PackMeta};
+use camp_core::import::materialize::materialize_tree;
+use camp_core::import::resolve_transitive;
+use camp_core::import::source::normalize;
+use camp_core::import::ResolvedImport;
+use camp_core::ledger::Ledger;
+use camp_core::pack::parse_agent_dir;
 
 /// The hardened git argv, byte-for-byte: ten `-c KEY=VALUE` pairs, in order.
 /// Pinned by `hardened_git_argv_is_exact`; do not reorder.
@@ -102,7 +114,439 @@ pub fn git_clone(repository: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Test-only fixture builder: init a git repo at `dir`, write each file
+/// A binding name: `[A-Za-z0-9_-]+`, non-empty, not `.`/`..`.
+fn valid_binding(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Derive a binding name: `--name`, else the source's last subpath
+/// component, else the repo's last path segment. Validated; on failure the
+/// operator is told to pass `--name`.
+fn derive_binding(name: Option<&str>, src: &camp_core::import::source::Source) -> Result<String> {
+    let derived = name
+        .map(|s| s.to_owned())
+        .or_else(|| {
+            src.subpath
+                .as_ref()
+                .and_then(|s| s.rsplit('/').next().map(|s| s.to_owned()))
+        })
+        .or_else(|| {
+            src.repository
+                .rsplit(['/', ':'])
+                .find(|s| !s.is_empty())
+                .map(|s| s.trim_end_matches(".git").to_owned())
+        });
+    match derived {
+        Some(b) if valid_binding(&b) => Ok(b),
+        Some(b) => bail!(
+            "derived binding {b:?} is not a valid binding name ([A-Za-z0-9_-]+); pass --name"
+        ),
+        None => bail!("cannot derive a binding name from {src:?}; pass --name"),
+    }
+}
+
+/// `camp import add <source> [--name <binding>] [--version <ref>]` (component
+/// §9): normalize → derive/validate binding → hardened clone (or local-path
+/// read) → resolve commit → read manifest → resolve transitive → materialize
+/// self + deduped transitive into `<root>/imports/<binding>/` (refusing a
+/// transitive `agents/` dir) → append `[imports.<n>]` to camp.toml → write
+/// lock entries → inventory executable content → collect §5.4 refusals →
+/// append `import.added` + one `import.refused` per refusal. Idempotent for
+/// the same `(name, source, subpath, version)`; a different source for the
+/// same name → error.
+pub fn run_add(camp_root: &Path, source: &str, name: Option<&str>, version: Option<&str>) -> Result<()> {
+    let src = normalize(source, version)
+        .with_context(|| format!("source {source:?}"))?;
+    let binding = derive_binding(name, &src)?;
+    let lock_path = camp_root.join("packs.lock");
+    let mut lock = PacksLock::read(&lock_path).context("packs.lock")?;
+
+    // Idempotency / conflict on DIRECT entries (via = None) for this binding.
+    if let Some(direct) = lock.imports.iter().find(|e| e.name == binding && e.via.is_none()) {
+        let same = direct.source == src.repository
+            && direct.subpath == src.subpath
+            && direct.version == src.reference.clone().unwrap_or_default();
+        if same {
+            return Ok(()); // idempotent
+        }
+        bail!(
+            "import {:?} is already bound to source {:?} (subpath {:?}); \
+             `camp import remove {binding}` first to rebind",
+            binding,
+            direct.source,
+            direct.subpath
+        );
+    }
+
+    // Clone (remote) or read (local path). Resolve commit for remotes. The
+    // clone tempdir is held in `_checkout` for the duration of materialization
+    // (it drops at the end of run_add, after run_add_materialize has copied
+    // out of it).
+    let (repo_dir, commit, _checkout) = if src.is_local_path {
+        (PathBuf::from(&src.repository), String::new(), None)
+    } else {
+        let checkout = tempfile::tempdir().context("clone scratch dir")?;
+        let dest = checkout.path().join("repo");
+        git_clone(&src.repository, &dest).with_context(|| format!("clone {source:?}"))?;
+        let commit = resolve_commit(&src.repository, src.reference.as_deref())
+            .with_context(|| format!("resolve {source:?}"))?;
+        (dest, commit, Some(checkout))
+    };
+
+    run_add_materialize(camp_root, &src, &binding, &repo_dir, &commit, &mut lock, source)?;
+    lock.write(&lock_path).context("write packs.lock")?;
+    Ok(())
+}
+
+/// Materialize + lock + camp.toml + ledger events, shared by `add`/`install`.
+fn run_add_materialize(
+    camp_root: &Path,
+    src: &camp_core::import::source::Source,
+    binding: &str,
+    repo_dir: &Path,
+    commit: &str,
+    lock: &mut PacksLock,
+    source_str: &str,
+) -> Result<()> {
+    let subpath_dir = match &src.subpath {
+        Some(s) => repo_dir.join(s),
+        None => repo_dir.to_path_buf(),
+    };
+    // Fail fast if the DIRECT source is not a pack (manifest_of re-reads it
+    // for transitive resolution, so this is the explicit direct-source gate).
+    read_manifest(&subpath_dir)
+        .with_context(|| format!("source {source_str:?}: not a pack"))?;
+
+    // Transitive: relative sources anchor at the declaring subpath within the
+    // cloned repo (same repo + commit). The manifest closure reads each
+    // resolved import's pack.toml from <repo_dir>/<subpath>.
+    let direct = vec![ResolvedImport {
+        binding: binding.to_owned(),
+        source: src.repository.clone(),
+        subpath: src.subpath.clone(),
+        reference: src.reference.clone(),
+        via: None,
+        is_local: src.is_local_path,
+    }];
+    let manifest_of = |ri: &ResolvedImport| {
+        let dir = match &ri.subpath {
+            Some(s) => repo_dir.join(s),
+            None => repo_dir.to_path_buf(),
+        };
+        match read_manifest(&dir) {
+            Ok(m) => Ok(m),
+            // A transitive content layer (no pack.toml — e.g. gascity, which
+            // is formulas + a nested roles pack, not itself a pack) has no
+            // imports → depth-1 holds. A DIRECT import without pack.toml is a
+            // real error (the source is not a pack), so we only relax for the
+            // transitive case (via.is_some()).
+            Err(camp_core::error::CoreError::Import { ref reason, .. })
+                if ri.via.is_some() && reason.contains("pack.toml") =>
+            {
+                Ok(PackManifest {
+                    pack: PackMeta {
+                        name: ri.binding.clone(),
+                        schema: 2,
+                        description: None,
+                        version: None,
+                    },
+                    imports: std::collections::BTreeMap::new(),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    };
+    let all = resolve_transitive(&direct, &manifest_of)?;
+
+    // Materialize self + transitive (merge into imports/<binding>/; refuse a
+    // transitive agents/ dir — transitive packs contribute content only).
+    let imports_root = camp_root.join("imports");
+    for imp in &all {
+        let dest = imports_root.join(&imp.binding);
+        let src_subtree = match &imp.subpath {
+            Some(s) => repo_dir.join(s),
+            None => repo_dir.to_path_buf(),
+        };
+        if imp.via.is_some() && src_subtree.join("agents").is_dir() {
+            bail!(
+                "transitive import {:?} carries an agents/ dir — transitive packs contribute \
+                 content layers only (umbrella §7.2)",
+                imp.binding
+            );
+        }
+        materialize_tree(repo_dir, &src_subtree, &dest)
+            .with_context(|| format!("materialize {source_str:?} into {}", dest.display()))?;
+    }
+
+    // Append [imports.<binding>] to camp.toml (once).
+    append_import_decl(&camp_root.join("camp.toml"), binding, &ImportDecl {
+        source: src.repository.clone(),
+        subpath: src.subpath.clone(),
+        version: src.reference.clone(),
+        trust_exec: false,
+        skills: None,
+    })?;
+
+    // Lock: drop this binding's direct + its-declared-transitive entries, then
+    // add self (direct) + transitive (via = binding).
+    let fetched = jiff::Timestamp::now().to_string();
+    lock.imports.retain(|e| {
+        let is_direct_self = e.via.is_none() && e.name == binding;
+        let is_declared_transitive = e.via.as_deref() == Some(binding);
+        !(is_direct_self || is_declared_transitive)
+    });
+    lock.imports.push(LockEntry {
+        name: binding.to_owned(),
+        source: src.repository.clone(),
+        subpath: src.subpath.clone(),
+        version: src.reference.clone().unwrap_or_default(),
+        commit: commit.to_owned(),
+        fetched: fetched.clone(),
+        via: None,
+    });
+    for imp in all.iter().filter(|i| i.via.is_some()) {
+        lock.imports.push(LockEntry {
+            name: imp.binding.clone(),
+            source: src.repository.clone(),
+            subpath: imp.subpath.clone(),
+            version: src.reference.clone().unwrap_or_default(),
+            commit: commit.to_owned(),
+            fetched: fetched.clone(),
+            via: Some(binding.to_owned()),
+        });
+    }
+
+    // Inventory executable content across EVERY materialized dir (self +
+    // transitive — §14.10), and collect §5.4 agent refusals.
+    let mut exec_inventory: Vec<ExecItem> = Vec::new();
+    let mut refusals: Vec<(String, String, String)> = Vec::new(); // (binding, agent, key)
+    let mut ignored_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for imp in &all {
+        let dir = imports_root.join(&imp.binding);
+        if dir.join("agents").is_dir() {
+            for entry in std::fs::read_dir(dir.join("agents"))?.flatten() {
+                if entry.path().is_dir() {
+                    let (raw, agent_refusals) = parse_agent_dir(&entry.path())?;
+                    for r in agent_refusals {
+                        ignored_keys.insert(r.key.clone());
+                        refusals.push((imp.binding.clone(), raw.name.clone(), r.key));
+                    }
+                }
+            }
+        }
+        if dir.is_dir() {
+            exec_inventory.extend(camp_core::import::inventory::inventory_executable(&dir)?);
+        }
+    }
+
+    // Ledger events: import.added (aggregated) + one import.refused per key.
+    let mut ledger = Ledger::open(&camp_root.join("camp.db")).context("open ledger")?;
+    let exec_json: Vec<serde_json::Value> = exec_inventory
+        .iter()
+        .map(|i| serde_json::json!({ "kind": i.kind, "path": i.path, "detail": i.detail }))
+        .collect();
+    ledger.append(EventInput {
+        kind: EventType::ImportAdded,
+        rig: None,
+        actor: "cli".into(),
+        bead: None,
+        data: serde_json::json!({
+            "binding": binding,
+            "source": src.repository,
+            "commit": commit,
+            "ignored_keys": ignored_keys.iter().cloned().collect::<Vec<_>>(),
+            "reported": serde_json::Value::Array(Vec::new()),
+            "exec_inventory": exec_json,
+        }),
+    })?;
+    for (imp_binding, agent, key) in &refusals {
+        ledger.append(EventInput {
+            kind: EventType::ImportRefused,
+            rig: None,
+            actor: "cli".into(),
+            bead: None,
+            data: serde_json::json!({
+                "binding": imp_binding,
+                "pack": imp_binding,
+                "agent": agent,
+                "key": key,
+                "reason": format!("agent {agent:?}: key {key:?} is not supported (umbrella §5.4)"),
+            }),
+        })?;
+    }
+
+    println!(
+        "imported {binding} from {source_str} (commit {commit:.12}){}",
+        if all.iter().any(|i| i.via.is_some()) {
+            format!(" + {} transitive", all.iter().filter(|i| i.via.is_some()).count())
+        } else {
+            String::new()
+        }
+    );
+    if !exec_inventory.is_empty() {
+        eprintln!(
+            "trust_exec: {} executable item(s) inventoried — none run unless [imports.{binding}] \
+             sets trust_exec = true",
+            exec_inventory.len()
+        );
+    }
+    Ok(())
+}
+
+/// Append an `[imports.<binding>]` section to camp.toml once (idempotent on
+/// the header line). Surgical text edit — the rest of the file is untouched.
+fn append_import_decl(camp_toml: &Path, binding: &str, decl: &ImportDecl) -> Result<()> {
+    let text = std::fs::read_to_string(camp_toml)
+        .with_context(|| format!("cannot read {}", camp_toml.display()))?;
+    let header = format!("[imports.{binding}]");
+    if text.lines().any(|l| l.trim() == header) {
+        return Ok(());
+    }
+    let body = toml::to_string(decl).context("serialize import decl")?;
+    let mut out = text;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&body);
+    std::fs::write(camp_toml, out).with_context(|| format!("cannot write {}", camp_toml.display()))?;
+    Ok(())
+}
+
+/// `camp import install` — re-materialize every locked import (never
+/// re-resolves a ref; `upgrade` is the only ref-mover).
+pub fn run_install(camp_root: &Path) -> Result<()> {
+    let lock = PacksLock::read(&camp_root.join("packs.lock"))?;
+    for entry in &lock.imports {
+        if entry.via.is_some() {
+            continue; // transitive — materialized with its declaring import
+        }
+        let src = normalize(&entry.source, Some(&entry.version))
+            .with_context(|| format!("locked import {:?}", entry.name))?;
+        let (repo_dir, commit) = if src.is_local_path {
+            (PathBuf::from(&src.repository), entry.commit.clone())
+        } else {
+            let checkout = tempfile::tempdir().context("clone scratch dir")?;
+            let dest = checkout.path().join("repo");
+            git_clone(&src.repository, &dest)?;
+            (dest, entry.commit.clone())
+        };
+        let mut new_lock = PacksLock::read(&camp_root.join("packs.lock"))?;
+        run_add_materialize(camp_root, &src, &entry.name, &repo_dir, &commit, &mut new_lock, &entry.source)?;
+        // install re-writes the lock; persist after the loop instead
+    }
+    PacksLock::read(&camp_root.join("packs.lock"))?.write(&camp_root.join("packs.lock"))?;
+    Ok(())
+}
+
+/// `camp import upgrade [<name>]` — re-resolve the ref and move the commit.
+pub fn run_upgrade(camp_root: &Path, name: Option<&str>) -> Result<()> {
+    let lock = PacksLock::read(&camp_root.join("packs.lock"))?;
+    for entry in lock.imports.iter().filter(|e| e.via.is_none()) {
+        if let Some(n) = name {
+            if entry.name != n {
+                continue;
+            }
+        }
+        let src = normalize(&entry.source, Some(&entry.version))?;
+        if src.is_local_path {
+            bail!("upgrade is a no-op for a local-path import {:?}", entry.name);
+        }
+        let commit = resolve_commit(&src.repository, src.reference.as_deref())?;
+        let checkout = tempfile::tempdir().context("clone scratch dir")?;
+        let dest = checkout.path().join("repo");
+        git_clone(&src.repository, &dest)?;
+        run_add_materialize(camp_root, &src, &entry.name, &dest, &commit, &mut PacksLock::read(&camp_root.join("packs.lock"))?, &entry.source)?;
+    }
+    Ok(())
+}
+
+/// `camp import check` — offline: verify every locked import's materialized
+/// tree exists and matches the lock's recorded subpath.
+pub fn run_check(camp_root: &Path) -> Result<()> {
+    let lock = PacksLock::read(&camp_root.join("packs.lock"))?;
+    let mut missing = 0;
+    for entry in &lock.imports {
+        let dir = camp_root.join("imports").join(&entry.name);
+        if !dir.is_dir() {
+            eprintln!("missing: {} (import {:?})", dir.display(), entry.name);
+            missing += 1;
+        }
+    }
+    if missing > 0 {
+        bail!("{missing} materialized import(s) missing — run `camp import install`");
+    }
+    println!("{} import(s) present", lock.imports.len());
+    Ok(())
+}
+
+/// `camp import list` — the lock entries with provenance.
+pub fn run_list(camp_root: &Path) -> Result<()> {
+    let lock = PacksLock::read(&camp_root.join("packs.lock"))?;
+    if lock.imports.is_empty() {
+        println!("no imports (add one with `camp import add <source> --name <binding>`)");
+        return Ok(());
+    }
+    println!("{:<16} {:<48} {:<14} {:<10}", "NAME", "SOURCE", "SUBPATH", "VIA");
+    for e in &lock.imports {
+        println!(
+            "{:<16} {:<48} {:<14} {:<10}",
+            e.name,
+            e.source,
+            e.subpath.as_deref().unwrap_or("-"),
+            e.via.as_deref().unwrap_or("-"),
+        );
+    }
+    Ok(())
+}
+
+/// `camp import remove <name>` — drop the lock entry + `<root>/imports/<n>/`.
+pub fn run_remove(camp_root: &Path, name: &str) -> Result<()> {
+    let lock_path = camp_root.join("packs.lock");
+    let mut lock = PacksLock::read(&lock_path)?;
+    let before = lock.imports.len();
+    lock.imports.retain(|e| e.name != name);
+    if lock.imports.len() == before {
+        bail!("no import named {name:?}");
+    }
+    lock.write(&lock_path)?;
+    let dir = camp_root.join("imports").join(name);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+    }
+    // Best-effort: drop the [imports.<name>] block from camp.toml.
+    let camp_toml = camp_root.join("camp.toml");
+    if camp_toml.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&camp_toml) {
+            let header = format!("[imports.{name}]");
+            let mut out = String::new();
+            let mut skipping = false;
+            for line in text.lines() {
+                if line.trim() == header {
+                    skipping = true;
+                    continue;
+                }
+                if skipping && line.starts_with('[') && line.trim() != header {
+                    skipping = false;
+                }
+                if !skipping {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            let _ = std::fs::write(&camp_toml, out);
+        }
+    }
+    println!("removed import {name}");
+    Ok(())
+}
 /// (creating parent dirs), then add + commit. Reused by the verb tests and
 /// the end-to-end acceptance test.
 #[cfg(test)]
@@ -174,5 +618,65 @@ mod tests {
         let dest = tempfile::tempdir().unwrap();
         git_clone(&url, &dest.path().join("clone")).unwrap();
         assert!(dest.path().join("clone/pack.toml").exists());
+    }
+}
+#[cfg(test)]
+mod verb_tests {
+    use super::*;
+
+    #[test]
+    fn add_from_file_repo_clones_locks_materializes() {
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(repo.path(), &[
+            ("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n"),
+            ("bmad/agents/architect/agent.toml", "scope=\"rig\"\nfallback=true\npre_start=\"boot\"\n"),
+            ("bmad/agents/architect/prompt.template.md", "You are the architect."),
+            ("bmad/skills/bmad-create-architecture/SKILL.md", "# skill"),
+            ("gascity/formulas/build-base.formula.toml",
+             "formula=\"build-base\"\n[[steps]]\nid=\"s\"\ntitle=\"t\"\n[steps.check]\nmode=\"exec\"\npath=\"scripts/parent-verify.sh\"\n"),
+        ]);
+        let camp = tempfile::tempdir().unwrap();
+        std::fs::write(camp.path().join("camp.toml"), "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\",\"Skill\"]\n").unwrap();
+        camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let url = format!("file://{}//bmad", repo.path().display());
+        run_add(camp.path(), &url, Some("bmad"), None).unwrap();
+
+        let cfg = camp_core::config::CampConfig::load(&camp.path().join("camp.toml")).unwrap();
+        assert!(cfg.imports.contains_key("bmad"));
+        assert!(!cfg.imports["bmad"].trust_exec, "an import is untrusted unless the operator opts in");
+        let lock = camp_core::import::lock::PacksLock::read(&camp.path().join("packs.lock")).unwrap();
+        assert!(lock.entry("bmad").is_some());
+        let gc = lock.imports.iter().find(|e| e.subpath.as_deref()==Some("gascity")).unwrap();
+        assert_eq!(gc.via.as_deref(), Some("bmad"));
+        assert_eq!(camp_core::pack::resolve_agent(&cfg, "bmad.architect").unwrap().name, "bmad.architect");
+
+        let led = camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let added = led.events_of_type(camp_core::event::EventType::ImportAdded).unwrap();
+        assert!(!added.is_empty());
+        let inventory = added[0].data["exec_inventory"].to_string();
+        assert!(inventory.contains("parent-verify.sh"), "transitive check.path must be inventoried: {inventory}");
+        let refused = led.events_of_type(camp_core::event::EventType::ImportRefused).unwrap();
+        assert!(refused.iter().any(|e|
+            e.data["key"] == "pre_start" && e.data["agent"] == "architect" && e.data["binding"] == "bmad"),
+            "one import.refused per refused key: {refused:?}");
+    }
+
+    #[test]
+    fn re_adding_same_source_is_idempotent_and_different_source_errors() {
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(repo.path(), &[
+            ("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n"),
+            ("bmad/agents/a/prompt.md", "a"),
+        ]);
+        let camp = tempfile::tempdir().unwrap();
+        std::fs::write(camp.path().join("camp.toml"), "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n").unwrap();
+        camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let url = format!("file://{}//bmad", repo.path().display());
+        run_add(camp.path(), &url, Some("bmad"), None).unwrap();
+        run_add(camp.path(), &url, Some("bmad"), None).unwrap(); // idempotent
+        let repo2 = tempfile::tempdir().unwrap();
+        testsupport::init_repo(repo2.path(), &[("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n"), ("bmad/agents/a/prompt.md","a")]);
+        let other = format!("file://{}//bmad", repo2.path().display());
+        assert!(run_add(camp.path(), &other, Some("bmad"), None).is_err(), "same name, different source");
     }
 }

@@ -264,6 +264,11 @@ enum Command {
         #[command(subcommand)]
         command: OrderCommand,
     },
+    /// Manage pack imports (compat §7: the binding namespace)
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
+    },
     /// Run the daemon in the foreground (also reachable via a campd symlink,
     /// or as `camp campd` — the two names are the same command)
     #[command(visible_alias = "campd")]
@@ -380,6 +385,37 @@ enum OrderCommand {
     /// Fire an order now (manual trigger; campd cooks it)
     Run {
         /// Order name from camp.toml
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportCommand {
+    /// Add a pack import under a binding (clones, materializes, locks)
+    Add {
+        /// Pack source (path, file://, https://…, git@…)
+        source: String,
+        /// The binding name (agents resolve as <binding>.<agent>)
+        #[arg(long)]
+        name: Option<String>,
+        /// A pinned ref (sha:<sha>, tag, branch) — overrides any #ref in the source
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Re-materialize every locked import (never re-resolves a ref)
+    Install,
+    /// Re-resolve a ref and move an import's commit
+    Upgrade {
+        /// Limit the upgrade to one named import
+        name: Option<String>,
+    },
+    /// Offline: verify every locked import's materialized tree exists
+    Check,
+    /// List locked imports with provenance
+    List,
+    /// Drop an import's lock entry + materialized tree
+    Remove {
+        /// The binding to remove
         name: String,
     },
 }
@@ -636,6 +672,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             match command {
                 OrderCommand::Ls { json } => cmd::order::ls(&camp, json),
                 OrderCommand::Run { name } => cmd::order::run_order(&camp, &name),
+            }
+        }
+        Command::Import { command } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            match command {
+                ImportCommand::Add { source, name, version } => {
+                    cmd::import::run_add(&camp.root, &source, name.as_deref(), version.as_deref())
+                }
+                ImportCommand::Install => cmd::import::run_install(&camp.root),
+                ImportCommand::Upgrade { name } => {
+                    cmd::import::run_upgrade(&camp.root, name.as_deref())
+                }
+                ImportCommand::Check => cmd::import::run_check(&camp.root),
+                ImportCommand::List => cmd::import::run_list(&camp.root),
+                ImportCommand::Remove { name } => cmd::import::run_remove(&camp.root, &name),
             }
         }
         Command::Daemon => run_daemon(cli.camp.as_deref()),
