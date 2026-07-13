@@ -293,6 +293,12 @@ pub fn run(
                         if applied {
                             dispatcher.apply_config(runtime.config().clone());
                             graph.apply_config(runtime.config());
+                            // Issue #81: patrol resolves agents/rigs/
+                            // thresholds against its own cached config too —
+                            // an applied reload must reach it, or a worker
+                            // dispatched to a freshly added pack agent draws a
+                            // spurious patrol.degraded "unknown agent".
+                            patrol.apply_config(runtime.config().clone())?;
                         }
                     }
                 }
