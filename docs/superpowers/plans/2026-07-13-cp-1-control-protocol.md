@@ -1,130 +1,140 @@
 # cp-1: the control protocol — one module owns the wire, four verbs on the socket — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task (this stream is planning-only; a FRESH implementer session executes after plan-gate APPROVE). Steps use checkbox (`- [ ]`) syntax for tracking. Branch: `cp-1-control-protocol`.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task (this stream is planning-only; a FRESH implementer session executes after plan-gate APPROVE). Steps use checkbox (`- [ ]`) syntax. Branch: `cp-1-control-protocol`.
 
 **Goal:** Give campd a control plane: ONE module that owns the undocumented `claude` control wire format (pinned by fixtures whose provenance is labelled), and the first four socket verbs — `sessions.list`, `session.send_turn`, `session.interrupt`, `session.subscribe` — with `interrupt`'s `control_response` round-tripping back over cp-0's read channel, and `subscribe` as a bounded, drop-loudly, streaming connection MODE.
 
-**Architecture:** A new `crates/camp/src/daemon/control.rs` is the ONLY place in camp that constructs or parses a control message (spec §2.1). It holds `ControlRuntime`: the pending-request table (rebuilt from the ledger at startup, with a response deadline that joins `min_deadline`), the subscriber registry (per-connection output buffers with a HARD cap enforced at append time, plus a per-subscriber history cursor so a late joiner catches up progressively rather than by a slurped `Vec`), and every socket-verb handler body — so `event_loop.rs`'s new match arms are one-line delegations. campd writes control requests into the worker's already-held stdin pipe (the `nudge_via_stdin` bounded-write mold); the worker's `control_response` comes back as a line in its stdout file, which cp-0's `ReadChannelRuntime` tails to EOF on every wake — cp-1 adds a hand-off (`take_stream_lines`) so those lines reach `ControlRuntime`, **ingested on every path that can produce one, including the disposal-time final drain.**
+**Architecture:** `crates/camp/src/daemon/control.rs` is the ONLY place in camp that constructs or parses a control message (spec §2.1). It holds `ControlRuntime`: the pending-request table (rebuilt from the ledger at startup; its deadline joins `min_deadline` and is RESET by session activity), the subscriber registry (**one monotone byte cursor per subscriber, fed only from the stream file, never past what campd has drained** — rev 3's central simplification), and every socket-verb handler body, so `event_loop.rs`'s new arms are one-line delegations. campd writes control requests into the worker's already-held stdin (the `nudge_via_stdin` bounded-write mold); the worker's `control_response` returns as a line in its stdout file, which cp-0's `ReadChannelRuntime` tails to EOF on every wake.
 
-**Tech Stack:** Rust (workspace edition), `mio`, `serde`/`serde_json`, `uuid`, `jiff`, `rusqlite` via `camp_core::ledger`, `tempfile` (dev-dep). **No new dependencies. No new cargo features** (notably NOT `serde_json/preserve_order` — see B1).
+**Tech Stack:** Rust (workspace edition), `mio`, `serde`/`serde_json`, `uuid`, `jiff`, `rusqlite` via `camp_core::ledger`, `tempfile` (dev-dep). **No new dependencies. No new cargo features** — and rev 3 makes that constraint *achievable* (C2) instead of merely asserted.
 
 ---
 
-## What changed in this revision, and why (rev 2 — after plan-gate REJECT, 2026-07-13)
+## What changed in rev 3, and why (after the rev-2 REJECT at a2ca188)
 
-The first panel returned a unanimous BLOCK with 14 blocking defects. All five decisions D1–D5 were RATIFIED and are unchanged. **D6 was REJECTED and is replaced by D6′.** Every defect is answered below with the task that carries the fix. Three of them (B1, B14, B15) were settled by running experiments against the pinned `claude` 2.1.207 that is installed on this machine — results recorded inline, reproducible with the commands given.
+Rev 2 closed **B2, B5, B6, B7, B8, B9, B11, B13, B15** (panel-verified). D1–D5 and the architecture hold. The panel then found that **four of rev 2's fixes each introduced a new defect inside the answer to a rev-1 defect** (C5, C6, C7, C8 live in the fixes for B4, B9/B10, B12), each invisible to the very test written to prove the fix worked.
 
-| # | Defect | Fix, and where |
-|---|---|---|
-| **B1** | `serde_json::json!` sorts keys (serde_json 1.0.150 locked, no `preserve_order` ⇒ `Map` is a `BTreeMap`), so every byte-pinning `assert_eq!` in Task 1 was unreachable | **Task 1** — `ParentMessage` is now built from `#[derive(Serialize)]` **structs**, whose field DECLARATION order is preserved. Fixtures rewritten to match. `preserve_order` is explicitly NOT enabled (it would change every `Value` serialization in camp). A second, order-independent `Value`-equality assertion backs up the byte pin. |
-| **B2** | `camp` is a binary-only crate ⇒ the `socket::subscribe` client API had no consumer ⇒ `dead_code` ⇒ the clippy gate fails, and Task 8/9's helpers were uncompilable | **RULED: option (c).** The client API is **deleted from cp-1.** Subscribe is driven from tests by a concrete raw-`UnixStream` helper (`SubClient`, specified in Task 8), the idiom every existing harness uses (`tests/read_channel.rs`). The typed `CampdUnresponsive`/`kill -9` mapping arrives with phase 2's `camp watch`, its first real client. The wedged-campd exit criterion is proven directly: the hello read is bounded by `REQUEST_TIMEOUT` and the test asserts it fails inside that bound rather than hanging. |
-| **B3** | Every task's own clippy gate would fail on `dead_code` for items introduced before their consumer | **Global Constraints → "The dead_code discipline"** — an exhaustive per-item table: which annotation, which justification, **and at which task it is DELETED**. Task 11 greps to prove none of the temporary ones survived. |
-| **B4** | **CRITICAL.** The disposal-time final drain's lines were never ingested ⇒ an ordinary "worker answers the interrupt and exits" **lost the `control_response`**, then manufactured two false `control.failed`s | **Task 6 Step 5** — the post-drain block runs a control step **twice**, through one shared helper: after `drain_all`, and again **after `apply_pending_unregisters`** — the other `drain_one` caller. Named test: `a_worker_that_answers_and_exits_immediately_still_yields_control_responded` (Task 6 Step 8). **The rev-1 claim "the disposal ordering is untouched" is WITHDRAWN — it was false.** |
-| **B5** | `expire_pending` ran at the TOP of the wake ⇒ a response sitting unread (coalesced notify) was declared "never arrived" | **Task 6 Step 5** — `expire_pending` now runs in the post-drain block, **after both ingests**. cp-0's law (event_loop.rs:406) holds: correctness never depends on a delivered event. |
-| **B6** | The pending table was in-memory only ⇒ a restart both manufactured a false fault AND silently forgot a genuinely unanswered request (the "swallowed timeout" §2.1 forbids) | **Task 3 + Task 6 Step 6** — `ControlRuntime::rehydrate(ledger, now)` rebuilds `pending` from the ledger (a `session.interrupted` with no matching `control.responded`/`control.failed` — the ledger-derived-suppression pattern merged in fix-83/#92), called at startup after `adopt`. Tests: `a_restart_across_an_in_flight_interrupt_neither_lies_nor_forgets` (unit) + `a_campd_restart_across_an_in_flight_interrupt_invents_no_fault` (integration, real kill -9). |
-| **B7** | The subscriber short-circuit bypassed `serve_connection` — the ONLY place EOF is detected ⇒ a detached `camp watch` leaked an fd + a buffer forever, then was libeled with a `subscriber.dropped` backpressure event | **Task 8 Step 4** — the short-circuit is GONE. A subscriber token pumps first and then **falls through into `serve_connection` like any other connection**, so cp-0's existing `ReadStop::Eof ⇒ ConnState::Closed` detects the hangup; `control.forget(token)` runs on every close path. A normal detach appends **no event at all** (§5.2 "Detach freely" — the ledger records faults, not client lifecycle). Named test: `a_hung_up_subscriber_is_forgotten_and_is_never_libeled_as_backpressure`. |
-| **B8** | The backpressure test could not pass at ANY cursor, and even with timing fixed the kernel socket buffer would absorb everything so `sub.out` never grew | **Task 8 Step 1/4** — new fake-agent mode `FAKE_AGENT_SPAM_ON_TURN` spams only **after** a `send_turn` arrives (the subscriber is registered by then), the subscriber joins at the **tail** (empty history ⇒ a clean hello), and the volume is **8000 lines ≈ 720 KB**, chosen to exceed *kernel socket buffer + app cap* on both platforms (macOS `net.local.stream.sendspace` ≈ 8 KiB; Linux ≈ 200 KiB). Cap: 512 B. Both halves are now deterministic. |
-| **B9** | `read_history` allocated `to - from` bytes (up to `max_stream_bytes` = 256 MiB) and read synchronously ON the event loop, checking the cap only afterwards ⇒ a one-line request DoSes campd | **Task 8 Step 3** — history is never slurped (see B10/D6′). Reads are chunked at `HISTORY_CHUNK_BYTES` (64 KiB), refilled only as the socket drains. No unbounded allocation and no unbounded read anywhere on the loop. |
-| **B10** | **D6 REJECTED.** `sub.out` was history+live in one `Vec` ⇒ the cap was SOFT (a whole wake's drain was appended before the cap was tested), and any join-from-zero on a session past 1 MiB was REFUSED — redefining §4.1's "a late joiner gets history, then follows" via an error message | **Task 8 Step 3 — D6′ replaces D6.** The `Subscriber` holds an open `File` + a `history_cursor` and streams history in bounded chunks, so **no history size is ever refused**. The cap is enforced **at append time** (a frame that would cross it drops the subscriber; the attempted size is the reported high-water). `high_water` is now READ — it is `buffered_bytes` in the `subscriber.dropped` payload (§4.4: "naming the session and the high-water mark"). §9's explicit-error rule is applied where it belongs: a **reaped/disposed** stream, and a cursor **past the tail**. |
-| **B11** | The hello's buffered history was flushed by nothing (the WRITABLE edge was consumed at accept, before the subscription existed) ⇒ the history test would HANG | **Task 8 Step 3/4** — a single `pump()` (refill-from-history → flush → repeat until WouldBlock or exhausted) at **three** sites: right after the hello is written, on every WRITABLE readiness, and after every fanout. The hello-precedes-bytes invariant is stated: `respond()` uses `write_all` on a NON-BLOCKING stream (event_loop.rs:997), so the hello must be the first bytes and nothing may be buffered before it. |
-| **B12** | Nothing told a subscriber its session had ended ⇒ `next_frame()` blocks forever, campd holds the entry for life — and the frame shape had no room for a terminal frame, so cp-2/cp-4 would inherit a wire needing a breaking change | **Task 8 Step 3 — decided in cp-1.** The frame is **tagged from birth**: `{"frame":"event",…}` / `{"frame":"end","reason":…}`. On disposal campd emits the `end` frame, pumps, and closes. Pinned by `subscribe_frame_shapes_are_pinned`. Named test: `a_subscriber_gets_an_end_frame_when_its_session_ends`. |
-| **B13** | Two shapes on the exit criterion's own list were pinned by nothing: the **subscribe frame** (a dangling reference to a test that did not exist) and the **post-hello timeout exemption** | **Task 8 Step 1** — `subscribe_frame_shapes_are_pinned` (both frame types) now exists, and `a_subscription_survives_a_quiet_period_longer_than_request_timeout` (a 6 s quiet window > the 5 s `REQUEST_TIMEOUT`) proves the exemption. |
-| **B14** | **Fixture provenance.** Invented bytes were labelled "RECORDED"; Task 10 closed the loop (camp pinning camp's bytes against camp's bytes); the `error` key was a guess; `can_use_tool`/`request_user_dialog` were invented and cp-3 would inherit them as "the pinned shape" | **Task 1 — every fixture is now provenance-labelled, and the shapes are DERIVED FROM THE SHIPPED CLI at the pinned version.** `sdk.mjs` is not vendored here, but something strictly better is on the machine: the **actual peer**, `~/.local/share/claude/versions/2.1.207`, whose bundle is `strings`-greppable. Extraction commands + the recovered source lines are in Task 1 Step 0; `tests/fixtures/control/PROVENANCE.md` records them per fixture. **Findings: the `error:<string>` key is CORRECT (verified); `request_user_dialog` was WRONG (real keys `dialog_kind`/`payload`/`tool_use_id`, not the invented `prompt`); `can_use_tool` was incomplete (also carries `display_name`, `tool_use_id`).** |
-| **B15** | The `initialize` deferral shipped a configuration nothing had ever verified: every recorded ack in the repo is POST-initialize, and the fake acks anything (§8's named trap) | **RULED: option (b) — and it is now EMPIRICALLY SETTLED.** I ran the exact shipped configuration against the pinned CLI at $0 (command + verbatim output in Task 10 Step 1): a pre-turn interrupt with **no `initialize` ever sent** is **acked `subtype:"success"`**, exit 0. Task 10 adds that arm to the $0 gate (`no_initialize_pre_turn_interrupt_is_acked`) so it is a standing gate. The `subtype!=="initialize"` rejection in the binary belongs to the `[bridge:repl]` Remote-Control transport (*"This session is outbound-only…"*), not camp's stdio path. |
+**Standing instruction, adopted:** every fix below states **what new failure it permits, and the test that catches THAT** — not the test that proves the old bug is gone. That is the last column.
 
-**Non-blocking notes — all adopted.** `MAX_SUBSCRIBERS` bounds the connection COUNT, not just the bytes (Task 8) · fault dedupe stops unbounded ledger write-amplification (Task 6) · D3 strictness re-keyed to `type.starts_with("control")` · the real dispatch scaffolds (`test_insert_held_cat`/`test_insert_held_sleeper`) with a torn-pipe test for `ControlWrite::Failed` (Task 5) · `refold_check()` not `refold()` (Task 2) · the borrow-checker hedging paragraph DELETED (it was a non-issue) · the test count and `mod.rs` placement corrected · `serve_sessions_list` no longer promises a third `state` value · `subscriber_buffer_bytes_from_env` is defined in the task that first needs it (Task 6) · D4 now says why `send_turn` keeps emitting `session.nudged` · the WRITABLE-interest cost is described precisely (an accept-time edge, not an idle cost — and that already-consumed edge is exactly why B11 broke) · the "every touch is additive" oversell is **withdrawn** and replaced with an itemized list of the four non-additive `event_loop.rs` touches.
+**The lead's correction to B4 is accepted and carried:** the `control_response` of an answer-and-exit worker is **not** lost forever. `stream_lines` is `mem::take`-drained and the post-drain block runs on every wake; and the reap appends `session.stopped`/`session.crashed` **before** `settle`, so the unregister is queued before `drain_all`, which reads the worker's final bytes while the session is still in `tailed` (merged law: `read_channel.rs:258-273`; merged test: `read_channel.rs:509 a_workers_final_stdout_line_is_drained_before_the_reap_disposes_the_file`). **Harvest 2 stays — as defense-in-depth, with an honest justification (C5).** Rev 2's "delete harvest 2 and it goes red" claim is **WITHDRAWN**.
+
+| # | Defect | Fix, and where | **What the fix could newly break, and the test for it** |
+|---|---|---|---|
+| **C1** | The B1 fix reintroduced B1: `spawn::user_message` is still `serde_json::json!` (spawn.rs:105-113), so its byte pin can never go green. **Verified by running it:** produced `{"message":{"content":"status?","role":"user"},"type":"user"}` vs the fixture's CLI-ordered bytes. Also a provenance falsehood — `user_turn.json` was labelled *recorded-from-CLI* but is bytes camp SENDS, and not the bytes it sends. | **Task 1 — option (a), chosen.** `user_turn.json` is rewritten to `json!`'s ACTUAL (alphabetical) output and relabelled `camp-authored (ACCEPTED by CLI 2.1.207; in production since Phase 8)`. **`spawn.rs` is NOT touched** — option (b) would change the bytes every production dispatch already sends: a behavioural change with no upside, in a file cp-1 does not own. | The fixture now pins bytes that are *correct but ugly*; a future dev may "tidy" `user_message` into a struct and silently change the launch wire. **The pin IS that test** — it goes red on any reordering, and a comment on the fixture says exactly that. |
+| **C2** | `subscribe_frame_shapes_are_pinned` also cannot pass: the nested `event` is a raw stream-json line, and ANY `Value` round-trip sorts it. **Verified:** produced `…"event":{"subtype":"init","type":"system"}`. The clean escape (`serde_json/raw_value`) needs a cargo feature the Global Constraints forbid — the implementer was boxed in, on the wire cp-2/cp-4 inherit. | **Task 8 — byte-splicing, specified exactly.** `event_frame` builds the prefix with a `#[derive(Serialize)]` struct and **splices the worker's line in VERBATIM**, never re-serializing it. No new cargo feature — and it makes the stronger guarantee a subscriber actually needs: *the bytes it sees are the bytes the worker wrote.* | Splicing emits invalid JSON if the raw line is not a JSON object. `event_frame` therefore **validates before splicing** and returns `None` otherwise (matching cp-0's `Ok(_v)` arm, so the history path and the live path agree). Test: `event_frame_splices_verbatim_and_refuses_a_non_object_line`. |
+| **C3** | **The plan's primary TDD command does not run.** Seven `cargo test -p camp --lib …` → *"no library targets found in package `camp`"*. Uniquely nasty: it exits nonzero, so a diligent implementer records a FALSE RED and marches on. | **All seven replaced with `cargo test -p camp --bins …`** — **verified by running it** (`--bins daemon::read_channel` → `22 passed`). | A `--bins` filter that matches nothing runs 0 tests and exits 0 — a false GREEN. **Every run step now states the expected test COUNT**, and Task 11 checks the totals. |
+| **C4** | The dead_code table tracked ITEMS, not FIELDS. `ControlRuntime.subscriber_buffer_bytes` (stored Task 3, first read Task 8), `StreamLine.offset_after` (added Task 4, first read Task 8), `ControlWireError.line` — each is a *field is never read* failure at an intermediate task's `-D warnings` gate. Worse, Task 6 Step 7's own text pushed the implementer to DELETE the field Task 8 needs. | **The dead_code discipline is now FIELD-LEVEL**, naming each field's first *production* read and its removal task. **Task 6 Step 7's "delete it or it doesn't belong" text is REMOVED — it was wrong.** | A field-level allow can mask a genuinely dead field forever. Task 11's grep is the enforcement: every temporary allow carries the literal `first read in Task N`, and the grep fails the build if one survives. |
+| **C5** | B4's regression test is theatre: under merged law `drain_all` already reads the final bytes, so harvest 1 gets the response and deleting harvest 2 leaves the test GREEN. Worse, harvest 2 sat AFTER `unregister` (which unlinks), and it fires under exactly the condition that makes cp-0's guard append a durable `patrol.degraded` "ORDERING VIOLATION". | **Task 4 + Task 6.** (1) The falsifiability claim is **WITHDRAWN**; harvest 2 is re-justified as **defense-in-depth for a path cp-0 declares cannot currently occur**. (2) `apply_pending_unregisters` is **SPLIT** (`final_drain_pending` → harvest → `dispose_pending`), so the harvest sits **before the unlink** — restoring cp-0's own discipline (read_channel.rs:328-340) and giving the `end` frame a defined final offset (C7). (3) The `patrol.degraded` interaction is **neither libel nor suppressed**: harvest 2 non-empty ⟺ the guard fires ⟺ a real caller-ordering bug exists. They must co-occur. | If harvest 2 ever silently starts firing, a real ordering regression is being masked. **Test 2 now asserts BOTH `control.responded` AND the absence of any `patrol.degraded` "ORDERING VIOLATION"** — so the normal path proves the merged law still holds, and a future phase that breaks it goes red *here*. That is what test 2 actually proves, stated plainly. |
+| **C6** | D6′'s catch-up→live boundary had no cursor guard: `caught_up_at` was a hello snapshot, so a burst during catch-up made `fanout` skip lines that history then ran past — **silent truncation**, the very thing §9 forbids — and `pump` could read bytes campd had not drained, delivering them twice. No test could see it: test 3 had a one-line history; test 6 joined at the tail. | **Task 8 — D6″ replaces D6′ and DELETES the catch-up/live distinction entirely.** A subscriber has **ONE monotone cursor** and is fed **only from the stream file**, over `[cursor, tail)` where `tail` is what campd has actually drained. `fanout` no longer appends lines at all — **a "live" line is just `tail` advancing.** Truncation impossible (the cursor never skips); duplication impossible (it is monotone and is the sole delivery gate); reading undrained bytes impossible (bounded by `tail`). **The bug class is designed out, not patched.** | The pump now does file I/O on the event loop per subscriber, so a large catch-up could stall campd (#55's class). Bounded by `MAX_PUMP_BYTES_PER_WAKE` (256 KiB/subscriber/wake); when work remains, `poll_timeout` returns `Some(ZERO)` — an ARMED continuation, `None` the instant nobody is behind (invariant 1). **Test: `a_subscriber_catching_up_across_a_live_burst_gets_every_line_exactly_once_in_order`** — >64 KiB of history, live lines appended DURING catch-up, assert exactly-once and in-order. **This is the window nothing in rev 2 exercised.** |
+| **C7** | `end_sessions` closed a subscriber mid-catch-up after a single `pump` (dropping unstreamed history behind an indistinguishable `end` frame), could drop the connection without ever writing the `end` frame at all (contradicting test 4's own assertion), contradicted `Subscriber.file`'s "can finish its history" doc, and had **no defined source** for the `end` frame's `offset`. | **Task 8 — an explicit `Closing` state.** Disposal sets `closing = Some(reason)` and pins `tail = final_offset` (captured by `dispose_pending` — C5's split). The subscriber keeps pumping across wakes until `cursor == tail` **and** `out` is empty; only THEN is the `end` frame appended, and the connection closes when that flush completes. Progress is guaranteed by socket-writability edges plus the `Some(ZERO)` continuation — no timer. | A Closing subscriber that never drains could hold an fd forever. It cannot: the hard cap drops it exactly like any other slow subscriber, with `subscriber.dropped` — honestly, because it *is* backpressure. **Test 8 now asserts the FULL history arrives before the `end` frame**, plus `a_closing_subscriber_that_stops_reading_is_still_dropped_at_the_cap`. |
+| **C8** | No policy for a single frame larger than the cap. A `Read`/`Bash` result line > 1 MiB drops **every** subscriber to that session **permanently** (a re-subscribe re-reads it and drops again), reported as `subscriber.dropped` — libelling a subscriber that was reading perfectly. The B7 class, through a different door. | **Task 8 — an explicit skip policy, ON THE WIRE.** A line whose frame exceeds the cap is **never delivered and never fatal**: campd emits `{"frame":"skipped","session":…,"offset":…,"bytes":N,"reason":…}`, advances the cursor past it, and keeps the subscriber. Recorded durably once per `(session, offset)` as `patrol.degraded` (cp-0's precedent for a fault with no dedicated event). **It is NOT `subscriber.dropped`.** | A silent skip would be §9's truncation again — so the skip is *in a pinned frame the client must handle* and *in the ledger*. **Test: `a_line_larger_than_the_cap_is_skipped_loudly_and_the_subscriber_survives`** (asserts the `skipped` frame, that the NEXT line still arrives, and that **no** `subscriber.dropped` was appended). |
+| **C9** | B14 still laundered one fixture: the `strings` window (110 chars) **truncated the object it claimed to recover**. `can_use_tool` really also carries `description` and `requires_user_interaction`, plus conditional `permission_suggestions` / `blocked_path` — omitted while labelled "KEYS from the bundle". | **Task 1 Step 0 — every probe re-run at a 400-char window** (verbatim output pasted below). The fixture is completed; PROVENANCE.md marks conditional keys as CONDITIONAL, records **both** construction sites, and states the method's limit: a fixed-window grep of a minified bundle recovers one site and cannot prove key-completeness. | A wider window still cannot prove completeness. So the parse is **tolerant by design** (the envelope is NOT `deny_unknown_fields`; camp reads only `request_id` + `tool_name`). **Test: `can_use_tool_with_unknown_extra_keys_still_parses`** — camp may never depend on the fixture being complete. |
+| **C10** | **cp-3's OUTBOUND permission-response shape was never extracted** — the one message whose wrongness hangs a worker forever (§5.3: the CLI parks on a promise with no timer) — from a bundle sitting open on the machine. | **Task 1 Step 0 — extracted and pinned.** The CLI's own validator string IS the contract: `Expected {behavior: 'allow', updatedInput?: object} or {behavior: 'deny', message: string}.`, wrapped by `sendControlResponse({type:"control_response",response:{subtype:"success",request_id:r,response:o}})`. Two new fixtures (`permission_allow_response.json`, `permission_deny_response.json`) are pinned and labelled. **cp-1 does not wire them** (phase 3 does) — it hands phase 3 *evidence* instead of a guess. | An unwired fixture can rot. It is pinned by `the_permission_response_fixtures_match_the_cli_validator_contract`, which parses each and asserts the `behavior`/`message`/`updatedInput` contract — so a future edit cannot quietly corrupt what cp-3 inherits. |
+| **C11** | A late `control_response` (after the deadline fired) was **silently discarded** as a duplicate. It is not: it is new information saying the fault was premature. And it binds to the unverified mid-turn claim — if the CLI queues control messages until a turn completes, any mid-turn interrupt on a >30 s turn yields a FALSE `control.failed` **and** a swallowed answer. | **Task 3 — two fixes. (1) D7, the activity-reset rule:** a pending request's deadline is RESET by ANY stream line from its session, so **the deadline measures SILENCE, not elapsed time** — which makes the mid-turn queueing question **non-load-bearing for correctness**. **(2)** `resolved` is SPLIT into `answered` and `timed_out`: a late answer for a timed-out id appends a **correction** (`control.responded{late:true}` naming the fault it corrects), never `None`. Invariant 3 restored. | The activity-reset could keep a request pending forever against a chatty-but-broken worker. It cannot: the reset is bounded by the session's own lifetime (a disposed session's rows are dropped), and the stall ladder still owns a worker that outputs but never answers. **Tests: `session_activity_resets_a_pending_control_deadline`** and **`a_late_control_response_after_the_deadline_appends_a_correction`**. |
+| **C12** | `serve_interrupt`'s body was deleted, pointing at "rev 1's Task 6" — a document the fresh implementer will never have. `ControlWrite::Failed` was never specified: a §2.1 loudness surface left to invention. | **Task 6 Step 4 — the body is INLINED IN FULL**, covering all three `ControlWrite` arms. `Failed` ⇒ a `Response::Error` to the caller **AND** a durable `control.failed`: the write was attempted, bytes may have reached the pipe, and `write_control` tore the pipe down — that is a campd action with a consequence (invariant 3) and a protocol fault (§2.1). | The `Failed` arm appends an event on a path a caller may retry. Bounded: one socket request ⇒ one event, and each attempt mints a fresh `request_id` so nothing dedupe-collides. **Test: `an_interrupt_whose_pipe_write_fails_is_loud_in_both_the_response_and_the_ledger`.** |
+
+**Non-blocking notes, all addressed:** `MAX_SUBSCRIBERS` arithmetic stated and the number fixed (8 × 1 MiB = 8 MiB worst case; **the <20 MB gate is explicitly an IDLE bound**, and the perf gate measures the wakeup profile, not memory) · a `fleet.subscribe` seam paragraph · **SECURITY: the socket has no permissions/peer-cred check, and `subscribe` is a new exposure class — NAMED in the PR body + an issue for the phase that owns it** · `rehydrate`'s three scans, the `answered` set's pruning, and a `MAX_PENDING_CONTROL_REQUESTS` cap · the restart-EOF-without-an-`end`-frame gap is named · B6's residual false-cause window is named · `make compat` is LOCAL-ONLY and the PR says so · `RefoldReport` has `drift`, not `is_clean()` · `is_stalled` uses `stalled_count`'s own `tracked` intersection · `SubClient` gets real bodies · D4's dependent list now includes `patrol.rs:788` (and says why it is NOT orphaned) · concurrency (two interrupts; `send_turn` racing an interrupt) is specified and its non-guarantee stated · the untagged-`Response` versioning seam is named · `event_loop.rs` is explicitly **no longer additive** · no `SCHEMA_VERSION` bump is needed — confirmed.
 
 ---
 
 ## Global Constraints
 
-- **TDD, strictly.** Write the failing test, RUN it, watch it fail, implement, RUN it, watch it pass.
+- **TDD, strictly.** Write the failing test, RUN it, watch it fail, implement, RUN it, watch it pass. **Every run step states the expected test COUNT** — a filter that matches nothing exits 0 and is a false green (C3).
 - **Never commit to main.** All work on `cp-1-control-protocol`; one reviewable PR.
 - **Gates green at EVERY commit:** `cargo fmt --all --check` && `cargo clippy --workspace --all-targets --all-features -- -D warnings` && `cargo test --workspace`.
+- **`camp` is a BINARY-ONLY crate.** No lib target. Three load-bearing consequences: unit tests run under **`cargo test -p camp --bins <filter>`** (`--lib` errors out — C3); integration tests **cannot link `daemon::*`**, so no wire client lives in `socket.rs` (B2); and `dead_code` fires on unread **fields**, not just items (C4).
 - **No panics in library code** (clippy `unwrap_used`/`expect_used`/`panic` denied; `unsafe_code` forbidden). Test modules opt out with `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`.
-- **Invariant 1 (idle is free).** No ticks. The response deadline is an ARMED timer in `min_deadline`; an idle subscriber costs zero wakeups.
-- **Invariant 3 (nothing hidden).** Every campd action is an event with its cause — and an event must name its TRUE cause (B6's whole point).
+- **Invariant 1 (idle is free).** No ticks. Both armed deadlines (`CONTROL_RESPONSE_TIMEOUT`; the subscriber catch-up continuation) return `None` when nothing is pending.
+- **Invariant 3 (nothing hidden).** Every campd action is an event, and **an event must name its TRUE cause** (B6/C11).
 - **Invariant 5 (fail fast).** §2.1: *"An unrecognized control message, or a control response that never arrives, is an evented, operator-visible fault — never a swallowed timeout."*
-- **Extend, don't rework.** cp-0's read channel is the transport; fix-86's `--verbose` argv makes worker stdout parseable. **But "extend" is not a licence to leave a second caller of a function whose side effects you changed unaccounted for — that was B4.**
+- **Extend, don't rework.** cp-0's read channel is the transport. **"Extend" is not a licence to leave a second caller of a function whose side effects you changed unaccounted for** (B4) — nor to re-derive a property cp-0 already proved (C5).
 - **New events use `deny_unknown_fields` payload structs**, keep the one-transaction event+state property, satisfy the vocab-pin partition tests, keep the refold property test green.
-- **No new cargo features.** Specifically NOT `serde_json/preserve_order` (B1).
+- **No new dependencies and no new cargo features.** In particular NOT `serde_json/preserve_order` and NOT `serde_json/raw_value` — Task 8's byte-splicing (C2) is what makes the second unnecessary.
 - **No test may spawn a real `claude` or spend API money**, except the `#[ignore]`d, `CAMP_COMPAT=1`-gated $0 tier (Task 10), which sends no turn.
-- **Spec and code never silently diverge.** If reality contradicts `docs/superpowers/specs/2026-07-12-camp-control-plane-design.md`, STOP and escalate — do not edit the spec without operator sign-off.
+- **Spec and code never silently diverge.** If reality contradicts the control-plane spec, STOP and escalate.
 - **No co-author lines in commits. Never mention the assistant in a commit message.**
 
-### The `dead_code` discipline (B3)
+### The dead_code discipline — FIELD-LEVEL (C4)
 
-`camp` is a **binary-only** crate: reachability is computed from `main`, and `pub` does NOT exempt an item. Every item introduced before its consumer trips `-D warnings`. The precedent is in the tree (`read_channel.rs:445,451,682`; `dispatch.rs:2193`; `fold.rs:541`). **Every annotation is temporary except where marked PERMANENT; Task 11 greps to prove the temporary ones are gone.**
+`dead_code` fires on an item OR a **field** never read from a path reachable from `main`. `--all-targets` still compiles the plain bin target, so a test-only read does not save it (hence `read_channel.rs:445,451`'s PERMANENT allows). Every temporary allow carries the literal text `first read in Task N`; **Task 11 greps for it and fails if any survive.**
 
-| Item | Added | Annotation | Deleted at |
+| Item / **field** | Added | Annotation | Deleted at |
 |---|---|---|---|
-| `control.rs` items: `ParentMessage`, `WorkerMessage`, `parse_worker_line`, `ControlWireError`, `new_request_id`, `REQUEST_ID_PREFIX`, `ControlRuntime` + `track_pending`/`poll_timeout`/`expire_pending`/`resolve`/`rehydrate` | 1, 3 | ONE module-level `#![allow(dead_code)] // cp-1: wired in Task 6 — DELETE this attribute there` | **Task 6 Step 7** (delete it; clippy must pass without it) |
-| `read_channel::StreamLine`, `take_stream_lines`, `last_activity`, `tail_state`, `take_disposed` | 4 | per-item `#[allow(dead_code)] // cp-1: consumed in Task N` | the task each comment names (6, 6, 7, 8, 8) |
-| `dispatch::write_control`, `ControlWrite` | 5 | per-item `#[allow(dead_code)] // cp-1: consumed in Task 6` | Task 6 |
-| `ControlRuntime::subscriber_count` | 8 | `#[allow(dead_code)] // test observable` — **PERMANENT** (the `read_channel.rs:445` precedent) | never |
-| `fold.rs` payload structs `SessionInterrupted`, `ControlResponded`, `ControlFailed`, `SubscriberDropped` | 2 | `#[allow(dead_code)] // audit-only: the fields exist to VALIDATE the shape (deny_unknown_fields), never to be read` — **PERMANENT** (the `fold.rs:541` precedent) | never |
+| `control.rs` items: `ParentMessage`, `WorkerMessage`, `parse_worker_line`, `ControlWireError`, `new_request_id`, `REQUEST_ID_PREFIX`, `ControlRuntime` + methods | 1, 3 | ONE module-level `#![allow(dead_code)] // cp-1: first read in Task 6 — DELETE this attribute there` | **Task 6 Step 7** |
+| **`ControlWireError.line`** (field) | 1 | covered by the module-level attribute | Task 6 Step 7 (read by `ingest`'s fault arm) |
+| **`ControlRuntime.subscriber_buffer_bytes`** (field) | 3 | `#[allow(dead_code)] // cp-1: first read in Task 8 (the subscriber hard cap)` — **the module-level attribute is gone by Task 6, so this field needs its OWN** | **Task 8** |
+| **`StreamLine.offset_after`** (field) | 4 | `#[allow(dead_code)] // cp-1: first read in Task 8 (event_frame's cursor)` — `ingest` reads only `session` + `line` | **Task 8** |
+| `read_channel::take_stream_lines` / `last_activity` / `tail_state` / `take_disposed` / `final_drain_pending` / `dispose_pending` | 4 | per-item `#[allow(dead_code)] // cp-1: first read in Task N` (6 / 7 / 8 / 8 / 6 / 6) | the task each names |
+| `dispatch::write_control`, `ControlWrite` | 5 | `#[allow(dead_code)] // cp-1: first read in Task 6` | Task 6 |
+| `ControlRuntime::subscriber_count` | 8 | `#[allow(dead_code)] // PERMANENT: test observable (the read_channel.rs:445 precedent)` | never |
+| `fold.rs` payload structs (4) | 2 | `#[allow(dead_code)] // PERMANENT: audit-only — the fields exist to VALIDATE the shape (deny_unknown_fields), never to be read (the fold.rs:541 precedent)` | never |
 
 ### Parallel-stream file ownership (wave-2, window W2)
 
 - **cp-1 OWNS:** `daemon/control.rs` (new), `daemon/read_channel.rs`, `daemon/socket.rs`, `daemon/patrol.rs` (one accessor), `tests/control.rs` (new), `tests/fixtures/control/**` (new), `tests/claude_compat.rs`, `tests/fake-agent.sh`, `tests/perf_daemon.rs`.
-- **SHARED — minimal touches, expect a real rebase:** `daemon/event_loop.rs`, `daemon/dispatch.rs`, `daemon/mod.rs`, `main.rs`, `camp-core/src/{event,vocab}.rs`, `camp-core/src/ledger/fold.rs`, `Cargo.toml`/`Cargo.lock`. **Do NOT refactor these files.**
+- **SHARED:** `daemon/event_loop.rs`, `daemon/dispatch.rs`, `daemon/mod.rs`, `camp-core/src/{event,vocab}.rs`, `camp-core/src/ledger/fold.rs`. **Do NOT refactor these.**
+- **NOT touched, deliberately:** `daemon/spawn.rs` (C1 chose option (a) precisely to avoid it), `Cargo.toml`/`Cargo.lock` (no new deps, no new features), `camp-core/src/config.rs` (D5).
 - **compat-2 OWNS — DO NOT TOUCH:** `camp-core/src/formula/**`, `ci/gc-compat/**`.
 
-**Honest accounting of the `event_loop.rs` touches** (rev 1 oversold these as "all additive"; they are not, and compat-2 is in flight in the same file):
-1. *Additive:* four new `Request` arms in `drain_lines`; the post-drain control block; `control.forget` on the close paths.
-2. *Rewrite (7 lines):* the `min_deadline` composition (event_loop.rs:153-159) gains a fourth nesting.
-3. *Signature change:* `run`/`serve_connection`/`drain_lines` gain a `control: &mut ControlRuntime` parameter; the latter two also gain the connection's `Token`.
-4. *Visibility change:* `struct Conn` and its two fields become `pub(super)`.
-5. *Interest change:* the accept arm registers `READABLE | WRITABLE`.
-6. *Deletion:* the `Request::Nudge` arm (event_loop.rs:796-844) moves verbatim into `control.rs` — a net REDUCTION.
-7. *Move:* `appended_read_channel_events` is declared once, higher in the block.
+**`event_loop.rs` is NOT additive — expect a real conflict with compat-2.** The non-additive touches: (1) `min_deadline` gains a fourth nesting; (2) `run`/`serve_connection`/`drain_lines` gain a `control` parameter, the latter two a `Token`; (3) `struct Conn` and its fields become `pub(super)`; (4) the accept arm registers `READABLE | WRITABLE`; (5) the post-drain block is restructured (`control_step` needs `&mut conns` + `&mut poll`); (6) the `Request::Nudge` arm is DELETED (a net reduction). Resolve by keeping both sides; if impossible, STOP and ask the lead.
 
 ---
 
 ## Root-cause analysis (verified against this branch at `f6b248c`)
 
-1. **campd can hear but cannot speak.** cp-0 tails every live session's stdout by byte offset on every wake and parses each complete line — into a `Value` it merely *counts* (`read_channel.rs:635-650`). Nothing correlates a `control_response`, and nothing writes a `control_request`: `nudge_via_stdin` (dispatch.rs:208-227) writes only `spawn::user_message` turns.
-2. **The socket has no session verbs.** `Request` (socket.rs:26-45) is `poke|status|stop|adopt|nudge`.
-3. **The socket is one-shot.** `respond()` (event_loop.rs:997-1006) documents *"Responses are a few bytes; a WouldBlock here means the client is not reading"* — no outbound buffering anywhere. §4.4 requires it.
-4. **`drain_one` has TWO callers.** `drain_all` (event_loop.rs:428) and `apply_pending_unregisters` (read_channel.rs:301, called at event_loop.rs:557 — AFTER `persist_offsets`). Any per-line side effect must be harvested on **both**. That is B4, and it is the same bug class cp-0's own review caught.
+1. **campd can hear but cannot speak.** cp-0 tails each live session's stdout by byte offset on every wake and parses each complete line — into a `Value` it merely *counts* (`read_channel.rs:635-650`). Nothing correlates a `control_response`; nothing writes a `control_request` (`nudge_via_stdin`, dispatch.rs:208-227, writes only `spawn::user_message` turns).
+2. **The socket has no session verbs** (`Request`, socket.rs:26-45, is `poke|status|stop|adopt|nudge`).
+3. **The socket is one-shot.** `respond()` (event_loop.rs:997) assumes *"Responses are a few bytes"* — no outbound buffering. §4.4 requires it.
+4. **`drain_one` has TWO callers** — `drain_all` (event_loop.rs:428) and `apply_pending_unregisters` (read_channel.rs:301) — so a per-line side effect must be harvested on both. **But cp-0 already proves the normal path is covered by the first** (read_channel.rs:258-273 + the merged test at read_channel.rs:509); harvest 2 is defense-in-depth for a path cp-0 declares cannot currently occur (C5).
 
 ---
 
 ## Design decisions
 
-**D1 — `interrupt` is ACK-then-ASYNC** (RATIFIED). The socket answers `{"ok":true,"request_id":…}` immediately; the `control_response` arrives later on the read channel and appends `control.responded`. campd's loop is single-threaded — a handler that waits on a filesystem-latency line is issue #55's wedge class, and §4.4 makes bounded-answer the law for every verb. **The ledger-mediated round trip is only honest if the async half survives a restart — that is B6, fixed in Tasks 3/6.**
+**D1 — `interrupt` is ACK-then-ASYNC** (RATIFIED). campd's loop is single-threaded; a handler waiting on a filesystem-latency line is issue #55's wedge class, and §4.4 makes bounded-answer the law. The round trip is proven through the ledger, survives a restart (B6), and repairs a late answer (C11).
 
-**D2 — deliver-then-record for interrupt and send_turn** (RATIFIED). §5.3's ledger-FIRST ordering exists to make *"pending in the ledger"* prove *"never written to the pipe"* for §5.3.4's adoption kill. No kill hangs off `session.interrupted`, so interrupt/send_turn follow the merged `Request::Nudge` precedent (deliver → record → respond).
+**D2 — deliver-then-record** (RATIFIED). §5.3's ledger-FIRST rule is scoped by its own rationale to permission *decisions* (making "pending in the ledger" prove "never written to the pipe" for §5.3.4's adoption kill). No kill hangs off `session.interrupted`.
 
-**D3 — strict control surface, transparent stream surface** (RATIFIED, hardened). §2.1's loudness is scoped to *control messages*. Strictness now keys on **`type.starts_with("control")`**, not a fixed list — so a future `control_notify` is a loud fault instead of being forwarded to subscribers as content. Every other `type` is opaque stream data camp never claimed to interpret.
+**D3 — strict control surface, transparent stream surface** (RATIFIED, hardened). Strictness keys on `type.starts_with("control")`, so a future `control_notify` is a loud fault rather than content forwarded to subscribers.
 
-**D4 — `session.send_turn` REPLACES `Request::Nudge`** (RATIFIED). One verb (§4.1: *"this is `camp nudge`, promoted to the protocol"*); no back-compat is required. The five dependents: `cmd/nudge.rs:42,47,59`, `event_loop.rs:796`, and the `nudge_wire_format_is_pinned` test. **The `camp nudge` CLI verb survives unchanged** — only the wire op it sends changes. **`send_turn` keeps emitting `session.nudged`**, deliberately: it is the merged vocabulary for "a turn was injected"; renaming it would churn `vocab.rs`, `fold.rs` and `cli_nudge.rs` for nothing.
+**D4 — `session.send_turn` REPLACES the `nudge` SOCKET VERB** (RATIFIED). Dependents: `cmd/nudge.rs:42,47,59`, `event_loop.rs:796`, the `nudge_wire_format_is_pinned` test — **and `patrol.rs:788`, which calls `dispatcher.nudge_via_stdin` DIRECTLY. D4 deletes only the socket verb; the `Dispatcher` method survives untouched, so patrol has NO orphaned caller.** The `camp nudge` CLI verb is unchanged. `send_turn` keeps emitting `session.nudged` — the merged vocabulary for "a turn was injected"; renaming it would churn vocab/fold/`cli_nudge.rs` for nothing.
 
-**D5 — `subscriber_buffer_bytes` = 1 MiB module constant + test-only env override** (RATIFIED) — the cp-0 `max_stream_bytes` precedent (plan-gate ruling (b)). A `camp.toml` field is deferred to a phase owning `config.rs`.
+**D5 — `subscriber_buffer_bytes` = 1 MiB module constant + test-only env override** (RATIFIED) — the cp-0 `max_stream_bytes` precedent.
 
-**~~D6~~ REJECTED. D6′ — history is STREAMED, not slurped; the cap is HARD and enforced at append time.**
-A `Subscriber` owns an open `File` on the stream and a `history_cursor`. It is *catching up* while `history_cursor < caught_up_at`; during catch-up, live fanout lines are **ignored** — they are already in the append-only file and the history reader will reach them, so nothing is duplicated and nothing is reordered. `pump()` refills from history in 64 KiB chunks only as the socket drains, so **no history size is ever refused, and campd never allocates or reads unboundedly on its event loop** (B9). A frame that would push `out` past `subscriber_buffer_bytes` **drops the subscriber before it is appended** — a hard cap — and the attempted size is reported as the high-water mark (B10). §9's *"explicit error, never a silently truncated stream"* applies where it belongs: a **reaped/disposed** stream and a cursor **past the tail** are errors at the hello; ordinary history is not.
+**~~D6~~ ~~D6′~~ → D6″ — ONE MONOTONE CURSOR; the stream file is the only source (C6).**
+A `Subscriber` holds an open `File`, a single `cursor: u64` (the next byte it needs), and `tail: u64` (what campd has actually drained, refreshed every wake from `read_channel.tail_state`). **`pump` reads only `[cursor, tail)`, frames each complete line, and advances the cursor.** `fanout` no longer appends lines at all — **a "live" line is just `tail` advancing.** There is no catch-up/live distinction, hence no boundary to get wrong:
+- **Truncation impossible** — the cursor never skips a byte.
+- **Duplication impossible** — the cursor is monotone and is the sole delivery gate.
+- **Reading undrained bytes impossible** — reads are bounded by `tail`.
+- **Ordinary history is never refused** (B10's fix survives): a late joiner simply starts with a low cursor.
+Bounded on the event loop by `MAX_PUMP_BYTES_PER_WAKE`; while a subscriber is behind, `poll_timeout` returns `Some(ZERO)` — an armed continuation, `None` the moment nobody is behind (invariant 1).
 
-### Deliberately DEFERRED (all nine verified honest by the panel)
+**D7 (new) — the deadline measures SILENCE, not elapsed time (C11).** A pending control request's deadline is RESET by ANY stream line from its session. A worker producing output is alive, and its interrupt may simply be queued behind its turn. This makes the (genuinely untested) question of whether the CLI reads stdin mid-turn **non-load-bearing for correctness**: `control.failed` now means *"the session went silent for 30 s with an unanswered request"* — a real fault under either semantics. The residual (a worker that goes silent mid-turn with the interrupt queued) is **repaired, not hidden**: a late answer appends a correction.
 
-`--permission-prompt-tool stdio`, `permission.pending`/BLOCKED/stall-disarm/adoption-kill (phase 3, §5.3–§5.3.4) · the `initialize` handshake (phase 3 — **and cp-1's no-initialize configuration is now PROVEN against the real CLI**, Task 10) · `--include-partial-messages` (phase 4, §2.2) · `fleet.subscribe`, `session.permission_decision`, `set_model`, `set_permission_mode` (§4.1, later phases) · `camp watch`/`camp attach` (phases 2/4) · `subscriber_buffer_bytes` as config (a phase owning `config.rs`).
+### Deliberately DEFERRED
 
-**Consequence, stated plainly in the PR body:** after cp-1 merges, **an operator still cannot interrupt anything by hand** — no `camp interrupt`, no `camp sessions`, no subscribe CLI. cp-1 ships the protocol and its proofs; phase 2 ships the first human client.
+`--permission-prompt-tool stdio`, `permission.pending`/BLOCKED/stall-disarm/adoption-kill (phase 3) · the `initialize` handshake (phase 3 — **and cp-1's no-initialize configuration is EMPIRICALLY PROVEN against the pinned CLI**, Task 10) · `--include-partial-messages` (phase 4) · `fleet.subscribe`, `session.permission_decision`, `set_model`, `set_permission_mode` (later phases — **but cp-3's outbound permission bytes are pinned here**, C10) · `camp watch`/`camp attach` (phases 2/4) · `subscriber_buffer_bytes` as config.
+
+**Stated plainly in the PR body:** after cp-1 merges, **an operator still cannot interrupt anything by hand.** cp-1 ships the protocol and its proofs; phase 2 ships the first human client.
+
+### The `fleet.subscribe` seam (non-blocking note, adopted)
+
+The `{"frame":…}` tag lets cp-2 add `frame:"ledger"` with no breaking wire change — but `Subscriber` is hard-wired to a stream file (`file`, `cursor`, `tail`: byte offsets), while `fleet.subscribe` (§4.1: session transitions, stalls, permission requests, completions) is **ledger-event-sourced**: no file, no byte offset. **cp-2 will therefore generalize `Subscriber` into an enum over two cursor kinds (byte-offset-into-a-stream-file, and ledger-seq), inside `control.rs`.** Expected and sanctioned; named here so it is a design, not a surprise.
 
 ---
 
 ## Task 1: `control.rs` — the wire format, and fixtures whose provenance is labelled
 
-Spec: §2 (the protocol table), §2.1 (one module owns it; shapes pinned by fixtures; failures loud), §9 (`request_user_dialog` gets a deterministic error).
+Spec: §2, §2.1, §9.
 
-**Files:** Create `crates/camp/src/daemon/control.rs`, `crates/camp/tests/fixtures/control/*.json`, `crates/camp/tests/fixtures/control/PROVENANCE.md`. Modify `crates/camp/src/daemon/mod.rs` (add `pub mod control;` alphabetically, after `pub mod bounded;`).
+**Files:** Create `crates/camp/src/daemon/control.rs`, `crates/camp/tests/fixtures/control/*.json`, `crates/camp/tests/fixtures/control/PROVENANCE.md`. Modify `crates/camp/src/daemon/mod.rs` (`pub mod control;`, alphabetically after `pub mod bounded;`).
 
 **Interfaces produced:**
 ```rust
 pub const REQUEST_ID_PREFIX: &str = "camp-";
 pub fn new_request_id() -> String;                          // "camp-<uuid-v4>"
 pub enum ParentMessage { Interrupt { request_id: String }, DialogRefusal { request_id: String } }
-impl ParentMessage { pub fn to_line(&self) -> anyhow::Result<String>; }   // NDJSON, '\n'-terminated
+impl ParentMessage { pub fn to_line(&self) -> anyhow::Result<String>; }
 pub enum WorkerMessage<'a> {
     ControlResponse { request_id: String, ok: bool, detail: String },
     CanUseTool { request_id: String, tool_name: String },
@@ -135,436 +145,109 @@ pub fn parse_worker_line(line: &str) -> Result<WorkerMessage<'_>, ControlWireErr
 pub struct ControlWireError { pub line: String, pub reason: String }
 ```
 
-- [ ] **Step 0: RECOVER the real shapes from the pinned CLI (B14).** The spec cites `@anthropic-ai/claude-agent-sdk@0.3.207 package/sdk.mjs`; that file is not vendored here. The **actual peer** is on the machine at the pinned version, and its bundle is `strings`-greppable. Run these and paste the output into `PROVENANCE.md`:
+- [ ] **Step 0: RECOVER the shapes from the pinned CLI — at a 400-char window (C9).** `sdk.mjs` is not vendored; the **actual peer** is on the machine and its bundle is `strings`-greppable. **A 110-char window truncates the object mid-construction — that was C9. Use 400.**
 
 ```bash
-CLI=$(readlink -f "$(command -v claude)")     # must equal ci/claude-compat/CLAUDE_VERSION
-strings -a "$CLI" | grep -o 'type:"control_response",response:{subtype:"success".\{0,60\}'
+CLI=$(readlink -f "$(command -v claude)")     # MUST equal ci/claude-compat/CLAUDE_VERSION
+strings -a "$CLI" | grep -o 'subtype:"can_use_tool".\{0,400\}'
+strings -a "$CLI" | grep -o 'subtype:"request_user_dialog".\{0,300\}'
 strings -a "$CLI" | grep -o 'type:"control_response",response:{subtype:"error".\{0,60\}'
-strings -a "$CLI" | grep -o 'subtype:"can_use_tool".\{0,110\}'
-strings -a "$CLI" | grep -o 'subtype:"request_user_dialog".\{0,80\}'
 strings -a "$CLI" | grep -o 'type==="control_request"&&.\{0,40\}'
+strings -a "$CLI" | grep -o '.\{0,150\}updatedInput?: object}.\{0,60\}'     # C10
+strings -a "$CLI" | grep -o 'sendResponse(r,n).\{0,120\}'                    # C10
 ```
-These are the lines they returned on 2026-07-13 against 2.1.207 — **the ground truth this task pins**:
+**Verbatim output, 2026-07-13, claude 2.1.207 — this is what the fixtures pin:**
 ```
-type:"control_response",response:{subtype:"success",request_id:e.request_id}
-type:"control_response",response:{subtype:"error",request_id:e.request_id,error:k.error}
-subtype:"can_use_tool",tool_name:n,display_name:s1e(n),input:o,tool_use_id:i,description:s,...a&&{permission_suggestions:a}
+subtype:"can_use_tool",tool_name:n,display_name:s1e(n),input:o,tool_use_id:i,description:s,
+  ...a&&{permission_suggestions:a},...l&&{blocked_path:l},requires_user_interaction:c||void 0
+
 subtype:"request_user_dialog",dialog_kind:o,payload:i,...s&&{tool_use_id:s}
+
+type:"control_response",response:{subtype:"error",request_id:e.request_id,error:k.error}
+
 type==="control_request"&&"request_id" in e&&"request" in e
+
+Expected {behavior: 'allow', updatedInput?: object} or {behavior: 'deny', message: string}.
+
+sendResponse(r,n){let o={...n};e.sendControlResponse({type:"control_response",
+  response:{subtype:"success",request_id:r,response:o}})}
 ```
-Four findings, and they change the fixtures:
-- **The `error:<string>` key is CORRECT.** Rev 1 guessed it; it is now verified. `body["error"].as_str()` is the right parse.
-- **`request_user_dialog` was WRONG.** Real keys: `dialog_kind`, `payload`, optional `tool_use_id` — **not** the invented `prompt`. (`dialog_kind`'s *values* are a minified variable and could not be recovered, so **camp must never key on it**: it refuses every dialog regardless of kind and reads only `request_id`.)
-- **`can_use_tool` was incomplete.** It also carries `display_name` and `tool_use_id`. camp reads only `request_id` and `tool_name`, and the parse must tolerate the rest — which is why the envelope is NOT `deny_unknown_fields` (D3's strictness lives in the subtype match).
-- The CLI's own inbound validator (`"request_id" in e && "request" in e`) confirms camp's outbound envelope: top-level `type`, `request_id`, `request`.
+Findings:
+- **`error:<string>` is CORRECT** (verified in rev 2, re-verified here).
+- **`can_use_tool`** carries `tool_name`, `display_name`, `input`, `tool_use_id`, `description`, `requires_user_interaction`, plus **CONDITIONAL** `permission_suggestions` and `blocked_path` (the `...x&&{…}` spreads). A **second** construction site adds `decision_reason`, `decision_reason_type`, `classifier_approvable`, `agent_id`. **camp reads only `request_id` and `tool_name`, and the envelope is deliberately NOT `deny_unknown_fields` — because a fixed-window grep of a minified bundle can never prove key-completeness, and the parse must not depend on it.**
+- **`request_user_dialog`** carries `dialog_kind`, `payload`, conditional `tool_use_id`. **`dialog_kind`'s VALUES are a minified variable and were NOT recovered — camp must never key on it**; it refuses every dialog and reads only `request_id`.
+- **C10 — cp-3's OUTBOUND permission answer, now pinned:** the parent answers a `can_use_tool` with a **success** `control_response` whose inner `response` is the decision object, and the CLI's own validator names the contract: `{behavior:"allow", updatedInput?: object}` or `{behavior:"deny", message: string}`. **cp-1 does not wire this** — it hands phase 3 pinned bytes instead of a guess.
 
-- [ ] **Step 1: Write the fixtures and `PROVENANCE.md`.** One line each, no trailing newline.
+- [ ] **Step 1: Write the fixtures + `PROVENANCE.md`.** One line each, no trailing newline. **Every file carries a label; `PROVENANCE.md` carries the command that produced it and the limits of the method.**
 
-`interrupt_request.json` — *provenance: `camp-authored`; **accepted** by CLI 2.1.207 (Task 10's $0 gate sends exactly these bytes and asserts the ack). The claim is ACCEPTANCE, not recording.*
+`interrupt_request.json` — *`camp-authored`; **ACCEPTED** by CLI 2.1.207 (Task 10's $0 gate sends exactly these bytes and asserts the ack). The claim is ACCEPTANCE, not recording.*
 ```json
 {"type":"control_request","request_id":"camp-fixture-1","request":{"subtype":"interrupt"}}
 ```
-`control_response_success.json` — *provenance: `recorded-from-CLI-2.1.207` (observed on the wire, live $0 run)*
+`control_response_success.json` — *`recorded-from-CLI-2.1.207` (observed on the wire, live $0 run)*
 ```json
 {"type":"control_response","response":{"subtype":"success","request_id":"camp-fixture-1","response":{"still_queued":[]}}}
 ```
-`control_response_error.json` — *provenance: `derived-from-CLI-2.1.207` (bundle: `subtype:"error",request_id:e.request_id,error:k.error`)*
+`control_response_error.json` — *`derived-from-CLI-2.1.207`*
 ```json
 {"type":"control_response","response":{"subtype":"error","request_id":"camp-fixture-1","error":"no turn in progress"}}
 ```
-`can_use_tool_request.json` — *provenance: `derived-from-CLI-2.1.207` (KEYS from the bundle; VALUES illustrative)*
+`can_use_tool_request.json` — *`derived-from-CLI-2.1.207` (400-char window). KEYS from the bundle; VALUES illustrative. `permission_suggestions` / `blocked_path` are CONDITIONAL and omitted; a second site adds four more keys. **Completeness is NOT claimed — the parse is tolerant by design.***
 ```json
-{"type":"control_request","request_id":"cli-fixture-2","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"cargo publish"},"tool_use_id":"toolu_fixture"}}
+{"type":"control_request","request_id":"cli-fixture-2","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"cargo publish"},"tool_use_id":"toolu_fixture","description":"run cargo publish","requires_user_interaction":true}}
 ```
-`request_user_dialog_request.json` — *provenance: KEYS `derived-from-CLI-2.1.207`; `dialog_kind`'s VALUE is `camp-invented` and **camp never reads it***
+`request_user_dialog_request.json` — *KEYS `derived-from-CLI-2.1.207`; `dialog_kind`'s VALUE is `camp-invented` and **camp never reads it***
 ```json
 {"type":"control_request","request_id":"cli-fixture-3","request":{"subtype":"request_user_dialog","dialog_kind":"unknown","payload":{},"tool_use_id":"toolu_fixture"}}
 ```
-`dialog_refusal_response.json` — *provenance: `camp-authored`, shape mirrored from the CLI's OWN error-response construction. **UNVALIDATED against the real CLI**: camp only ever sends this under `--permission-prompt-tool stdio`, which is phase 3, so no $0 gate in cp-1 can exercise it. **PHASE-3 OBLIGATION: validate it.** If the shape is wrong the CLI ignores it and the worker hangs forever — the precise outcome §9 exists to prevent.*
+`dialog_refusal_response.json` — *`camp-authored`, shape mirrored from the CLI's OWN error-response construction. **UNVALIDATED against the real CLI**: camp sends it only under `--permission-prompt-tool stdio`, which is phase 3, so no $0 gate here can exercise it. **PHASE-3 OBLIGATION.** If the shape is wrong the CLI ignores it and the worker hangs forever — the outcome §9 exists to prevent.*
 ```json
 {"type":"control_response","response":{"subtype":"error","request_id":"cli-fixture-3","error":"camp does not support interactive dialogs"}}
 ```
-`user_turn.json` — *provenance: `recorded-from-CLI-2.1.207` via probe P2 (the merged `spawn::user_message`, in production since Phase 8)*
+**`permission_allow_response.json`** (C10) — *`derived-from-CLI-2.1.207`. **For phase 3. cp-1 does not send it.** Validator: `Expected {behavior: 'allow', updatedInput?: object} or {behavior: 'deny', message: string}.`*
 ```json
-{"type":"user","message":{"role":"user","content":"status?"}}
+{"type":"control_response","response":{"subtype":"success","request_id":"cli-fixture-2","response":{"behavior":"allow"}}}
 ```
-`stream_assistant.json` — *provenance: `camp-authored` (a representative non-control stream line; camp never interprets it — D3)*
+**`permission_deny_response.json`** (C10) — *`derived-from-CLI-2.1.207`. For phase 3.*
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"cli-fixture-2","response":{"behavior":"deny","message":"denied by the operator"}}}
+```
+`user_turn.json` — **(C1)** *`camp-authored` — the bytes `spawn::user_message` ACTUALLY produces (`serde_json::json!` sorts keys: serde_json 1.0.150 has no `preserve_order`). ACCEPTED by the CLI: this exact envelope is probe P2 and has been in production since Phase 8. **The key order is ugly and it is CORRECT. Do not "tidy" `user_message` into a struct to make it prettier — that would change the bytes every production dispatch sends. This pin is what catches such a change.***
+```json
+{"message":{"content":"status?","role":"user"},"type":"user"}
+```
+`stream_assistant.json` — *`camp-authored` (a representative non-control stream line; camp never interprets it — D3)*
 ```json
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}
 ```
-`PROVENANCE.md` records, per fixture: the label, the extraction command, and — for `dialog_refusal_response.json` — the phase-3 validation obligation. **cp-3 inherits labelled claims, not laundered guesses.**
 
-- [ ] **Step 2: Write the failing test.** Create `control.rs` with the module doc, the module-level `dead_code` allow, and ONLY this test module.
+- [ ] **Step 2: Write the failing test.** Create `control.rs` with the module doc, the module-level dead_code allow (`// cp-1: first read in Task 6 — DELETE this attribute there`), and ONLY the test module. **7 tests:**
 
-```rust
-//! cp-1 (control-plane spec §2.1): THE module that owns the `claude` control
-//! wire format. Nothing else in camp constructs or parses a control message.
-//! Shapes are pinned against fixtures whose provenance is LABELLED
-//! (tests/fixtures/control/PROVENANCE.md) — recorded from, or derived from, the
-//! shipped CLI at the version pinned in ci/claude-compat/CLAUDE_VERSION. A
-//! protocol change is a red build, not a silent misbehaviour.
+1. `parent_messages_serialize_to_the_pinned_fixture_bytes` — `ParentMessage::{Interrupt, DialogRefusal}` byte-equal their fixtures, **and** `spawn::user_message("status?")` byte-equals `user_turn.json` (C1: the fixture is now the ACTUAL output, so this CAN pass). The test carries a comment explaining why these are structs and why `user_turn.json` looks the way it does.
+2. `parent_messages_are_semantically_equal_to_their_fixtures` — the order-independent `Value` guard.
+3. `worker_messages_parse_from_the_pinned_fixtures` — all four inbound shapes; asserts `detail == "no turn in progress"` (the verified `error` key).
+4. **`can_use_tool_with_unknown_extra_keys_still_parses`** (C9's new-failure test) — a `can_use_tool` carrying `permission_suggestions`, `blocked_path`, `decision_reason` **and a made-up `future_key`** parses cleanly to `CanUseTool { request_id, tool_name }`. **camp may never depend on the fixture being complete.**
+5. `non_control_stream_lines_pass_through_verbatim_and_never_fault` (D3).
+6. `an_unrecognized_control_message_is_a_loud_error` — unknown subtype, missing request_id, non-JSON, `control_cancel_request`, and a not-yet-existing `control_notify` (the prefix rule).
+7. **`the_permission_response_fixtures_match_the_cli_validator_contract`** (C10) — parses both permission fixtures; asserts `type=="control_response"`, `response.subtype=="success"`, and an inner `response` that is either `{behavior:"allow"}` (optional `updatedInput`) or `{behavior:"deny", message:<string>}`. **These bytes are cp-3's contract; this test stops them rotting before cp-3 arrives.**
 
-// cp-1: wired in Task 6 — DELETE this attribute there (the dead_code
-// discipline). `camp` is a binary crate: `pub` does not exempt an item from
-// dead_code, and nothing here is reached until the event loop calls it.
-#![allow(dead_code)]
+- [ ] **Step 3: Run it and watch it fail.** Add `pub mod control;` to `daemon/mod.rs` FIRST, or nothing compiles and the failure is vacuous.
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
-
-    const INTERRUPT: &str = include_str!("../../tests/fixtures/control/interrupt_request.json");
-    const OK: &str = include_str!("../../tests/fixtures/control/control_response_success.json");
-    const ERR: &str = include_str!("../../tests/fixtures/control/control_response_error.json");
-    const CAN_USE_TOOL: &str =
-        include_str!("../../tests/fixtures/control/can_use_tool_request.json");
-    const DIALOG: &str =
-        include_str!("../../tests/fixtures/control/request_user_dialog_request.json");
-    const REFUSAL: &str = include_str!("../../tests/fixtures/control/dialog_refusal_response.json");
-    const USER_TURN: &str = include_str!("../../tests/fixtures/control/user_turn.json");
-    const STREAM: &str = include_str!("../../tests/fixtures/control/stream_assistant.json");
-
-    /// §2.1: every shape camp SENDS is pinned to the byte.
-    ///
-    /// B1 — why these are STRUCTS and not `serde_json::json!`: serde_json
-    /// 1.0.150 is locked WITHOUT `preserve_order`, so its `Map` is a `BTreeMap`
-    /// and `Value::to_string()` emits keys ALPHABETICALLY — `request` before
-    /// `request_id` before `type`, which is not the CLI's key order. Struct
-    /// field DECLARATION order is preserved, so it is. Do NOT "fix" a future
-    /// mismatch by enabling `preserve_order`: that would change every `Value`
-    /// serialization in camp.
-    #[test]
-    fn parent_messages_serialize_to_the_pinned_fixture_bytes() {
-        let interrupt = ParentMessage::Interrupt {
-            request_id: "camp-fixture-1".to_owned(),
-        };
-        assert_eq!(
-            interrupt.to_line().unwrap(),
-            format!("{}\n", INTERRUPT.trim_end()),
-            "byte-for-byte, in the CLI's key order"
-        );
-        let refusal = ParentMessage::DialogRefusal {
-            request_id: "cli-fixture-3".to_owned(),
-        };
-        assert_eq!(refusal.to_line().unwrap(), format!("{}\n", REFUSAL.trim_end()));
-        // §2.1 pins EVERY shape camp sends — including the turn envelope, whose
-        // constructor is shared with the dispatch launch path.
-        assert_eq!(
-            crate::daemon::spawn::user_message("status?"),
-            format!("{}\n", USER_TURN.trim_end())
-        );
-    }
-
-    /// The order-INDEPENDENT guard: the bytes are also semantically the same
-    /// object. If serde ever reorders keys, this still holds and the byte test
-    /// above says exactly what moved.
-    #[test]
-    fn parent_messages_are_semantically_equal_to_their_fixtures() {
-        let line = ParentMessage::Interrupt {
-            request_id: "camp-fixture-1".to_owned(),
-        }
-        .to_line()
-        .unwrap();
-        let produced: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
-        let pinned: serde_json::Value = serde_json::from_str(INTERRUPT.trim_end()).unwrap();
-        assert_eq!(produced, pinned);
-    }
-
-    /// §2.1: every shape camp PARSES is pinned. NOTE the nesting the real CLI
-    /// uses: `request_id` is INSIDE `response` on a control_response, and at the
-    /// TOP level on a control_request (both verified against the 2.1.207
-    /// bundle — PROVENANCE.md).
-    #[test]
-    fn worker_messages_parse_from_the_pinned_fixtures() {
-        match parse_worker_line(OK.trim_end()).unwrap() {
-            WorkerMessage::ControlResponse { request_id, ok, .. } => {
-                assert_eq!(request_id, "camp-fixture-1");
-                assert!(ok);
-            }
-            other => panic!("expected a control_response, got {other:?}"),
-        }
-        match parse_worker_line(ERR.trim_end()).unwrap() {
-            WorkerMessage::ControlResponse { ok, detail, .. } => {
-                assert!(!ok);
-                // B14: the `error` key is VERIFIED against the CLI bundle. If
-                // this ever regresses to the "unspecified control error"
-                // placeholder, camp is swallowing the detail on the exact
-                // surface §2.1 says must be loud.
-                assert_eq!(detail, "no turn in progress");
-            }
-            other => panic!("expected an error control_response, got {other:?}"),
-        }
-        match parse_worker_line(CAN_USE_TOOL.trim_end()).unwrap() {
-            WorkerMessage::CanUseTool { request_id, tool_name } => {
-                assert_eq!(request_id, "cli-fixture-2");
-                assert_eq!(tool_name, "Bash");
-            }
-            other => panic!("expected can_use_tool, got {other:?}"),
-        }
-        // camp reads ONLY the request_id of a dialog: it refuses every dialog
-        // regardless of `dialog_kind`, whose values could not be recovered and
-        // which camp must therefore never key on.
-        match parse_worker_line(DIALOG.trim_end()).unwrap() {
-            WorkerMessage::RequestUserDialog { request_id } => {
-                assert_eq!(request_id, "cli-fixture-3");
-            }
-            other => panic!("expected request_user_dialog, got {other:?}"),
-        }
-    }
-
-    /// D3: the stream surface is TRANSPARENT. A non-control line passes through
-    /// verbatim and is never a fault — new claude releases add stream types
-    /// routinely, and §2.1's strictness is written about CONTROL messages.
-    #[test]
-    fn non_control_stream_lines_pass_through_verbatim_and_never_fault() {
-        let line = STREAM.trim_end();
-        match parse_worker_line(line).unwrap() {
-            WorkerMessage::Stream(raw) => assert_eq!(raw, line),
-            other => panic!("expected a passthrough Stream line, got {other:?}"),
-        }
-        let future = r#"{"type":"stream_event","event":{"type":"content_block_delta"}}"#;
-        assert!(matches!(parse_worker_line(future).unwrap(), WorkerMessage::Stream(_)));
-    }
-
-    /// D3 (hardened) + §2.1: the CONTROL surface is STRICT, keyed on the
-    /// `control` PREFIX — so a control-family type camp has never heard of is a
-    /// LOUD fault, not content forwarded to a subscriber.
-    #[test]
-    fn an_unrecognized_control_message_is_a_loud_error() {
-        let unknown =
-            r#"{"type":"control_request","request_id":"x","request":{"subtype":"teleport"}}"#;
-        assert!(parse_worker_line(unknown).unwrap_err().reason.contains("teleport"));
-        let headless = r#"{"type":"control_response","response":{"subtype":"success"}}"#;
-        assert!(parse_worker_line(headless).is_err(), "missing request_id");
-        assert_eq!(parse_worker_line("not json at all").unwrap_err().line, "not json at all");
-        // control_cancel_request is real in the CLI (it handles it explicitly)
-        // and camp does not implement it => loud, never a silent pass-through.
-        assert!(parse_worker_line(r#"{"type":"control_cancel_request","request_id":"x"}"#).is_err());
-        // A control-family type that DOES NOT EXIST YET must also be loud — the
-        // PREFIX rule, not a fixed list (D3's residual hole, closed).
-        assert!(parse_worker_line(r#"{"type":"control_notify","payload":{}}"#).is_err());
-    }
-
-    #[test]
-    fn request_ids_are_unique_and_prefixed() {
-        let (a, b) = (new_request_id(), new_request_id());
-        assert_ne!(a, b);
-        assert!(a.starts_with(REQUEST_ID_PREFIX), "{a}");
-    }
-}
-```
-
-- [ ] **Step 3: Run it and watch it fail.** Add `pub mod control;` to `daemon/mod.rs` FIRST, or the module is never compiled and the failure is vacuous.
-
-Run: `cargo test -p camp --lib daemon::control 2>&1 | tail -20`
+Run: `cargo test -p camp --bins daemon::control 2>&1 | tail -20`   ← **`--bins`, NOT `--lib` (C3)**
 Expected: FAIL — compile errors naming `ParentMessage`, `parse_worker_line`, `WorkerMessage`, `new_request_id`.
 
-- [ ] **Step 4: Implement.** Prepend to `control.rs`:
+- [ ] **Step 4: Implement.** `ParentMessage` is built from `#[derive(Serialize)]` structs — `InterruptEnvelope { #[serde(rename="type")] kind, request_id, request: InterruptBody { subtype } }` and `ErrorResponseEnvelope { kind, response: ErrorResponseBody { subtype, request_id, error } }` — so field order is DECLARATION order (B1). `to_line()` returns `anyhow::Result<String>` (no `unwrap` in library code) and appends `'\n'`.
 
-```rust
-use serde::{Deserialize, Serialize};
-
-pub const REQUEST_ID_PREFIX: &str = "camp-";
-
-/// A fresh, globally unique control request id. UUID-backed (the
-/// `spawn::new_session_id` mold) because a RESTARTED campd rebuilds its pending
-/// table from the ledger (B6) and must never collide with an id its predecessor
-/// left there.
-pub fn new_request_id() -> String {
-    format!("{REQUEST_ID_PREFIX}{}", uuid::Uuid::new_v4())
-}
-
-// ---- the outbound wire (B1: STRUCTS — field order is declaration order) ----
-
-#[derive(Serialize)]
-struct InterruptBody {
-    subtype: &'static str,
-}
-
-#[derive(Serialize)]
-struct InterruptEnvelope<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    request_id: &'a str,
-    request: InterruptBody,
-}
-
-#[derive(Serialize)]
-struct ErrorResponseBody<'a> {
-    subtype: &'static str,
-    request_id: &'a str,
-    error: &'a str,
-}
-
-#[derive(Serialize)]
-struct ErrorResponseEnvelope<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    response: ErrorResponseBody<'a>,
-}
-
-/// camp -> worker. Serialize ONLY: camp never parses what it sends.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParentMessage {
-    /// §2: the SDK's `interrupt()`.
-    Interrupt { request_id: String },
-    /// §9 (settled): the CLI genuinely sends `request_user_dialog` under stdio.
-    /// Camp answers with a deterministic error — neither ignoring it (a §2.1
-    /// fault) nor hanging the worker forever.
-    DialogRefusal { request_id: String },
-}
-
-impl ParentMessage {
-    /// One NDJSON line, newline-terminated — what the held stdin pipe expects.
-    /// Fallible: serializing these fixed structs cannot fail in practice, but
-    /// the error is propagated, never unwrapped (no panics in library code).
-    pub fn to_line(&self) -> anyhow::Result<String> {
-        let mut line = match self {
-            ParentMessage::Interrupt { request_id } => serde_json::to_string(&InterruptEnvelope {
-                kind: "control_request",
-                request_id,
-                request: InterruptBody { subtype: "interrupt" },
-            })?,
-            ParentMessage::DialogRefusal { request_id } => {
-                serde_json::to_string(&ErrorResponseEnvelope {
-                    kind: "control_response",
-                    response: ErrorResponseBody {
-                        subtype: "error",
-                        request_id,
-                        error: "camp does not support interactive dialogs",
-                    },
-                })?
-            }
-        };
-        line.push('\n');
-        Ok(line)
-    }
-}
-
-// ---- the inbound wire -----------------------------------------------------
-
-#[derive(Debug)]
-pub enum WorkerMessage<'a> {
-    ControlResponse { request_id: String, ok: bool, detail: String },
-    /// §2/§5.3. cp-1 cannot answer one: `--permission-prompt-tool stdio` is
-    /// phase 3 (§5.3.1), so this is structurally unreachable — and if it arrives
-    /// anyway it is a LOUD fault, never a silent drop.
-    CanUseTool { request_id: String, tool_name: String },
-    /// §9: answered with `ParentMessage::DialogRefusal`. camp reads ONLY the
-    /// request_id — never `dialog_kind`, whose values are not recoverable from
-    /// the shipped bundle, because it refuses every dialog regardless of kind.
-    RequestUserDialog { request_id: String },
-    /// D3: any non-control stream-json line, verbatim. NOT a fault.
-    Stream(&'a str),
-}
-
-#[derive(Debug, Clone)]
-pub struct ControlWireError {
-    pub line: String,
-    pub reason: String,
-}
-
-/// The control envelope as the real CLI writes it. Deliberately NOT
-/// `deny_unknown_fields`: the CLI is free to add keys to a control message
-/// (`can_use_tool` already carries `display_name`, `tool_use_id`,
-/// `permission_suggestions`), and camp keys off `type` + `subtype` only. The
-/// STRICTNESS lives in the subtype match — which is the §2.1 obligation.
-#[derive(Deserialize)]
-struct Envelope {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    request: Option<serde_json::Value>,
-    #[serde(default)]
-    response: Option<serde_json::Value>,
-}
-
-/// Parse ONE complete stdout line from a worker.
-///
-/// D3 — the partition that makes §2.1 implementable:
-///   `type` starting with "control" => STRICT. An unknown subtype, an unknown
-///       control type, or a missing request_id is a LOUD ControlWireError. (The
-///       PREFIX rule, not a fixed list: a future `control_notify` must fault,
-///       never be forwarded to a subscriber as content.)
-///   any other `type`               => a transparent stream line, verbatim.
-pub fn parse_worker_line(line: &str) -> Result<WorkerMessage<'_>, ControlWireError> {
-    let fail = |reason: String| ControlWireError { line: line.to_owned(), reason };
-    let envelope: Envelope = match serde_json::from_str(line) {
-        Ok(e) => e,
-        Err(e) => return Err(fail(format!("not a JSON object: {e}"))),
-    };
-    if !envelope.kind.starts_with("control") {
-        return Ok(WorkerMessage::Stream(line));
-    }
-    match envelope.kind.as_str() {
-        "control_response" => {
-            let body = envelope
-                .response
-                .ok_or_else(|| fail("control_response has no `response` object".to_owned()))?;
-            // Verified against CLI 2.1.207: request_id is nested INSIDE
-            // `response` on a control_response (PROVENANCE.md).
-            let request_id = body["request_id"]
-                .as_str()
-                .ok_or_else(|| fail("control_response carries no request_id".to_owned()))?
-                .to_owned();
-            match body["subtype"].as_str().unwrap_or_default() {
-                "success" => Ok(WorkerMessage::ControlResponse {
-                    request_id,
-                    ok: true,
-                    detail: body["response"].to_string(),
-                }),
-                "error" => Ok(WorkerMessage::ControlResponse {
-                    request_id,
-                    ok: false,
-                    // The `error` key is VERIFIED (the CLI builds `error:k.error`).
-                    // The placeholder is reachable only if the CLI stops sending
-                    // it — in which case the protocol changed and the fixture
-                    // test is already red.
-                    detail: body["error"]
-                        .as_str()
-                        .unwrap_or("the worker reported an unspecified control error")
-                        .to_owned(),
-                }),
-                other => Err(fail(format!("unrecognized control_response subtype {other:?}"))),
-            }
-        }
-        "control_request" => {
-            let request_id = envelope
-                .request_id
-                .ok_or_else(|| fail("control_request carries no request_id".to_owned()))?;
-            let body = envelope
-                .request
-                .ok_or_else(|| fail("control_request has no `request` object".to_owned()))?;
-            match body["subtype"].as_str().unwrap_or_default() {
-                "can_use_tool" => Ok(WorkerMessage::CanUseTool {
-                    request_id,
-                    tool_name: body["tool_name"].as_str().unwrap_or("<unnamed>").to_owned(),
-                }),
-                "request_user_dialog" => Ok(WorkerMessage::RequestUserDialog { request_id }),
-                other => Err(fail(format!(
-                    "unrecognized control_request subtype {other:?} — camp cannot answer it, and a \
-                     control message it cannot answer is a protocol fault, never a silent drop \
-                     (control-plane spec §2.1)"
-                ))),
-            }
-        }
-        other => Err(fail(format!(
-            "camp does not implement the {other:?} control type — a control-family message camp \
-             does not understand is a LOUD fault, never content forwarded to a subscriber \
-             (control-plane spec §2.1)"
-        ))),
-    }
-}
-```
+`parse_worker_line`: deserialize a permissive `Envelope { #[serde(rename="type")] kind: String, request_id: Option<String>, request: Option<Value>, response: Option<Value> }` — **deliberately NOT `deny_unknown_fields`** (C9). Then:
+- `!kind.starts_with("control")` ⇒ `Ok(WorkerMessage::Stream(line))` (D3 — the transparent surface).
+- `"control_response"` ⇒ `request_id` from **inside** `response` (verified nesting); `subtype == "success"` ⇒ `ok: true`, `detail = response["response"].to_string()`; `"error"` ⇒ `ok: false`, `detail = response["error"].as_str()` (the verified key; the `unwrap_or("…unspecified…")` placeholder is reachable only if the CLI stops sending it, in which case the fixture test is already red); any other subtype ⇒ `ControlWireError`.
+- `"control_request"` ⇒ `request_id` from the **top level**; `"can_use_tool"` ⇒ `(request_id, tool_name)`; `"request_user_dialog"` ⇒ `request_id` only; any other subtype ⇒ `ControlWireError`.
+- any other `control*` type ⇒ `ControlWireError` (the PREFIX rule: a future `control_notify` faults rather than being forwarded to a subscriber as content).
 
 - [ ] **Step 5: Run and watch pass.**
 
-Run: `cargo test -p camp --lib daemon::control 2>&1 | tail -20`
-Expected: PASS — **6 tests**.
+Run: `cargo test -p camp --bins daemon::control 2>&1 | tail -20`
+Expected: PASS — **7 tests**. *(A count of 0 means the filter matched nothing: a false green — C3.)*
 
 - [ ] **Step 6: fmt + clippy + commit.**
 ```bash
@@ -577,151 +260,32 @@ git commit -m "feat(control): one module owns the control wire format, pinned by
 
 ## Task 2: the four new events
 
-Spec: §2.1 (loud, evented faults), §4.4 (`subscriber.dropped` names the session and the high-water mark), invariants 3 and 7.
+Spec: §2.1, §4.4, invariants 3 and 7.
 
-**Files:** Modify `camp-core/src/event.rs`, `camp-core/src/vocab.rs`, `camp-core/src/ledger/fold.rs`. Test: `camp-core/tests/vocab_pin.rs` (existing), `camp-core/src/ledger/mod.rs` unit tests.
+**Files:** `camp-core/src/event.rs`, `camp-core/src/vocab.rs`, `camp-core/src/ledger/fold.rs`. Tests: `camp-core/tests/vocab_pin.rs` (existing), `camp-core/src/ledger/mod.rs`.
 
-**Interfaces produced:**
 ```rust
 EventType::SessionInterrupted => "session.interrupted"  // {session, request_id}
-EventType::ControlResponded   => "control.responded"    // {session, request_id, verb, ok, detail}
+EventType::ControlResponded   => "control.responded"    // {session, request_id, verb, ok, detail, late}
 EventType::ControlFailed      => "control.failed"       // {session?, request_id?, verb?, reason}
 EventType::SubscriberDropped  => "subscriber.dropped"   // {session, subscription, buffered_bytes, cap_bytes}
 ```
-None exists in `camp-core/tests/fixtures/gc-vocab.json` (checked: gc has `controller.started`/`controller.stopped`, no `control.*`, no `session.interrupted`, no `subscriber.*`) ⇒ all four are camp-specific and additive (invariant 7).
+**`late: bool` (default false) is C11's correction field.** None of the four names exists in `gc-vocab.json` ⇒ all camp-specific, additive (invariant 7).
 
-- [ ] **Step 1: Add the variants AND their fold arms together** (cp-0 plan-gate note 3: a variant without its fold arm makes the next step's red an `E0004` compile error, not a real test failure).
+- [ ] **Step 1: Add the variants AND their fold arms together** (cp-0 note 3: a variant without its arm makes the next step's red an `E0004` compile error, not a test failure). `fold.rs` gets `fn audit<T: DeserializeOwned>(event) -> Result<(), CoreError>` (parse-and-discard) and four `#[serde(deny_unknown_fields)] #[allow(dead_code)]` payload structs — `ControlResponded` carrying `#[serde(default)] late: bool` and `#[serde(default)] detail: String`.
 
-`event.rs` — after `SessionStreamCapped` (event.rs:55), add the four variants with doc comments naming their spec section; add all four to `ALL` (after `SessionStreamCapped`, before `ImportAdded`) and to `as_str`.
-
-`fold.rs` — extend the audit-only region (fold.rs:51). The payloads are **parsed and validated**, not ignored:
-```rust
-        EventType::SessionInterrupted => audit::<SessionInterrupted>(event),
-        EventType::ControlResponded => audit::<ControlResponded>(event),
-        EventType::ControlFailed => audit::<ControlFailed>(event),
-        EventType::SubscriberDropped => audit::<SubscriberDropped>(event),
-```
-```rust
-/// cp-1: the four control-plane events are AUDIT-ONLY — they project no state —
-/// but their payloads are VALIDATED on the fold, so a malformed shape is a loud
-/// error at append time rather than a surprise for a later reader.
-/// `deny_unknown_fields` makes a typo'd key a red build, not a silently ignored
-/// field.
-fn audit<T: serde::de::DeserializeOwned>(event: &Event) -> Result<(), CoreError> {
-    let _: T = payload(event)?;
-    Ok(())
-}
-
-// The fields exist to VALIDATE the shape; nothing reads them (the fold.rs:541
-// precedent). The allow is PERMANENT.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct SessionInterrupted { session: String, request_id: String }
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct ControlResponded {
-    session: String,
-    request_id: String,
-    verb: String,
-    ok: bool,
-    #[serde(default)]
-    detail: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct ControlFailed {
-    #[serde(default)]
-    session: Option<String>,
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    verb: Option<String>,
-    reason: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct SubscriberDropped {
-    session: String,
-    subscription: String,
-    buffered_bytes: u64,
-    cap_bytes: u64,
-}
-```
-
-- [ ] **Step 2: Run the vocab-pin test and watch it fail RED** (an assertion failure, not a compile error).
+- [ ] **Step 2: Run the vocab-pin test and watch it fail RED.**
 
 Run: `cargo test -p camp-core --test vocab_pin 2>&1 | tail -20`
-Expected: FAIL in `every_event_type_is_declared_mirrored_or_camp_specific_never_both`.
+Expected: FAIL in `every_event_type_is_declared_mirrored_or_camp_specific_never_both` — an assertion failure, not a compile error.
 
-- [ ] **Step 3: Declare them camp-specific.** Append to `CAMP_SPECIFIC_EVENTS` (after `"session.nudged"`): `"session.interrupted"`, `"control.responded"`, `"control.failed"`, `"subscriber.dropped"`.
+- [ ] **Step 3: Declare them camp-specific** in `CAMP_SPECIFIC_EVENTS` (after `"session.nudged"`).
 
-- [ ] **Step 4: Run and watch pass.**
+- [ ] **Step 4: Run and watch pass.** `cargo test -p camp-core --test vocab_pin` — PASS, including `camp_specific_names_do_not_collide_with_gc`.
 
-Run: `cargo test -p camp-core --test vocab_pin`
-Expected: PASS — including `camp_specific_names_do_not_collide_with_gc`.
+- [ ] **Step 5: Write the fold round-trip test** in `camp-core/src/ledger/mod.rs`'s `mod tests`, beside cp-0's `read_channel_patrol_degraded_shapes_round_trip_through_the_fold`: append all four shapes (including a `late: true` `control.responded`), assert a typo'd key (`requestId`) is REFUSED at append, then refold. **The API is `refold_check()` (refold.rs:64) returning `RefoldReport { events_replayed, drift }` — assert `report.drift.is_empty()`, exactly as `refold_prop.rs:170` does. There is no `is_clean()` and no `refold()`.**
 
-- [ ] **Step 5: Write the fold round-trip test.** Add to `mod tests` in `camp-core/src/ledger/mod.rs`, beside cp-0's `read_channel_patrol_degraded_shapes_round_trip_through_the_fold`:
-
-```rust
-    /// cp-1: the control-plane events are audit-only, but their payloads are
-    /// VALIDATED on the fold (deny_unknown_fields). Each shape appends cleanly,
-    /// the whole ledger refolds clean, and a typo'd key is a LOUD error.
-    #[test]
-    fn control_plane_event_shapes_round_trip_through_the_fold() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut l = Ledger::open(&dir.path().join("camp.db")).unwrap();
-        let shapes = [
-            (EventType::SessionInterrupted,
-             serde_json::json!({"session": "t/dev/1", "request_id": "camp-1"})),
-            (EventType::ControlResponded,
-             serde_json::json!({"session": "t/dev/1", "request_id": "camp-1",
-                                "verb": "session.interrupt", "ok": true, "detail": "{}"})),
-            (EventType::ControlFailed,
-             serde_json::json!({"session": "t/dev/1", "request_id": "camp-1",
-                                "verb": "session.interrupt",
-                                "reason": "no control_response within 30s"})),
-            (EventType::SubscriberDropped,
-             serde_json::json!({"session": "t/dev/1", "subscription": "sub-1",
-                                "buffered_bytes": 1048577u64, "cap_bytes": 1048576u64})),
-        ];
-        for (kind, data) in shapes {
-            l.append(EventInput {
-                kind,
-                rig: Some("gc".into()),
-                actor: "campd".into(),
-                bead: Some("gc-1".into()),
-                data,
-            })
-            .unwrap();
-        }
-        // A typo'd key is REFUSED at append, never silently ignored.
-        assert!(
-            l.append(EventInput {
-                kind: EventType::SessionInterrupted,
-                rig: None,
-                actor: "campd".into(),
-                bead: None,
-                data: serde_json::json!({"session": "t/dev/1", "requestId": "camp-2"}),
-            })
-            .is_err(),
-            "an unknown payload key must be a loud error"
-        );
-        // And the whole ledger refolds clean. NOTE the API: refold_check()
-        // (refold.rs:64) — there is no `refold()`.
-        let report = l.refold_check().unwrap();
-        assert!(report.is_clean(), "the refold must be clean: {report:?}");
-    }
-```
-(Match `RefoldReport`'s real API — read refold.rs:64 and mirror what `tests/refold_prop.rs` asserts on. Do not invent a method.)
-
-- [ ] **Step 6: Run it, then the refold property test.**
+- [ ] **Step 6: Run it, then the property test.**
 
 Run: `cargo test -p camp-core control_plane_event_shapes_round_trip_through_the_fold && cargo test -p camp-core --test refold_prop`
 Expected: PASS both.
@@ -735,640 +299,177 @@ git commit -m "feat(events): session.interrupted, control.responded, control.fai
 
 ---
 
-## Task 3: `ControlRuntime` — the pending table, its deadline, and its REHYDRATION (B6)
+## Task 3: `ControlRuntime` — the pending table, the SILENCE deadline (D7/C11), rehydration (B6)
 
-Spec: §2.1 (*"a control response that never arrives … never a swallowed timeout"*), invariant 1 (an ARMED timer, never a tick), invariant 3 (an event must name its TRUE cause).
+Spec: §2.1, invariants 1 and 3.
 
-**Files:** Modify `crates/camp/src/daemon/control.rs`.
+**Files:** `crates/camp/src/daemon/control.rs`.
 
 **Interfaces produced:**
 ```rust
 pub const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_PENDING_CONTROL_REQUESTS: usize = 64;
 pub struct ControlRuntime;
 impl ControlRuntime {
     pub fn new(subscriber_buffer_bytes: usize) -> ControlRuntime;
     pub fn track_pending(&mut self, request_id: String, session: String, verb: &'static str, now: Timestamp);
+    /// D7/C11: ANY stream line from a session resets its pending deadlines.
+    pub fn note_activity(&mut self, session: &str, now: Timestamp);
     pub fn poll_timeout(&self, now: Timestamp) -> Option<Duration>;
     pub fn expire_pending(&mut self, now: Timestamp) -> Vec<EventInput>;
     pub fn resolve(&mut self, request_id: &str, ok: bool, detail: String) -> Option<EventInput>;
     pub fn rehydrate(&mut self, ledger: &Ledger, now: Timestamp) -> anyhow::Result<usize>;
+    /// Prune this session's ids (bounds `answered`); called at disposal.
+    pub fn forget_session(&mut self, session: &str);
 }
 ```
-**Signature change from rev 1:** `resolve` returns `Option<EventInput>` — `None` means "already settled; saying it twice would be the false statement". That is what lets B6's restart test assert *no spurious fault* without special cases.
 
-- [ ] **Step 1: Write the failing tests.** Append to `control.rs`'s `mod tests`:
-
+**State — `resolved` is SPLIT (C11):**
 ```rust
-    use camp_core::event::{EventInput, EventType};
-    use camp_core::ledger::Ledger;
-    use jiff::{SignedDuration, Timestamp};
-
-    fn later(now: Timestamp, secs: i64) -> Timestamp {
-        now.checked_add(SignedDuration::from_secs(secs)).unwrap()
-    }
-
-    /// Invariant 1: nothing pending => NO deadline => the idle daemon blocks in
-    /// poll forever. A pending request arms exactly one deadline; an answer
-    /// disarms it.
-    #[test]
-    fn a_pending_request_arms_a_deadline_and_an_empty_table_arms_none() {
-        let now = Timestamp::now();
-        let mut rt = ControlRuntime::new(1024);
-        assert_eq!(rt.poll_timeout(now), None, "an idle campd must not wake");
-        rt.track_pending("camp-1".into(), "t/dev/1".into(), "session.interrupt", now);
-        let t = rt.poll_timeout(now).expect("a pending request arms a timer");
-        assert!(t <= CONTROL_RESPONSE_TIMEOUT && !t.is_zero());
-        assert!(rt.resolve("camp-1", true, "{}".into()).is_some());
-        assert_eq!(rt.poll_timeout(now), None, "an answered request disarms");
-    }
-
-    /// §2.1: a control response that NEVER arrives is a durable, loud fault.
-    /// Delete `expire_pending` and this dies.
-    #[test]
-    fn a_control_response_that_never_arrives_becomes_a_durable_fault() {
-        let now = Timestamp::now();
-        let mut rt = ControlRuntime::new(1024);
-        rt.track_pending("camp-1".into(), "t/dev/1".into(), "session.interrupt", now);
-        assert!(rt.expire_pending(now).is_empty(), "not due yet");
-        let expired = rt.expire_pending(later(now, 31));
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].kind, EventType::ControlFailed);
-        assert_eq!(expired[0].data["request_id"], "camp-1");
-        assert_eq!(expired[0].data["session"], "t/dev/1");
-        assert!(expired[0].data["reason"].as_str().unwrap().contains("no control_response"));
-        // Raised exactly once: the row is gone (no duplicates, no re-fire).
-        assert!(rt.expire_pending(later(now, 60)).is_empty());
-        assert_eq!(rt.poll_timeout(later(now, 60)), None);
-    }
-
-    #[test]
-    fn a_matching_control_response_resolves_the_pending_request() {
-        let now = Timestamp::now();
-        let mut rt = ControlRuntime::new(1024);
-        rt.track_pending("camp-1".into(), "t/dev/1".into(), "session.interrupt", now);
-        let input = rt.resolve("camp-1", true, "{\"still_queued\":[]}".into()).unwrap();
-        assert_eq!(input.kind, EventType::ControlResponded);
-        assert_eq!(input.data["request_id"], "camp-1");
-        assert_eq!(input.data["session"], "t/dev/1");
-        assert_eq!(input.data["verb"], "session.interrupt");
-        assert_eq!(input.data["ok"], true);
-    }
-
-    /// B6, half 1 — A RESTART MUST NOT LIE. campd dies with an interrupt in
-    /// flight. cp-0 persists the stream offset only AFTER the line's ledger
-    /// effect commits, so the worker's control_response is re-read in the next
-    /// life. Without rehydration it hits an empty table and campd emits a
-    /// `control.failed` claiming a protocol fault — an ORDINARY RESTART
-    /// manufacturing an operator-visible fault, and an event whose named cause
-    /// is FALSE (invariant 3).
-    ///
-    /// B6, half 2 — A RESTART MUST NOT FORGET. The pending row is the only thing
-    /// that would ever expire a genuinely unanswered request; losing it is
-    /// exactly the "swallowed timeout" §2.1 forbids.
-    #[test]
-    fn a_restart_across_an_in_flight_interrupt_neither_lies_nor_forgets() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
-        // campd life 1: two interrupts go out; one is answered before the crash.
-        for (id, session) in [("camp-answered", "t/dev/1"), ("camp-orphan", "t/dev/2")] {
-            ledger
-                .append(EventInput {
-                    kind: EventType::SessionInterrupted,
-                    rig: None,
-                    actor: "campd".into(),
-                    bead: None,
-                    data: serde_json::json!({"session": session, "request_id": id}),
-                })
-                .unwrap();
-        }
-        ledger
-            .append(EventInput {
-                kind: EventType::ControlResponded,
-                rig: None,
-                actor: "campd".into(),
-                bead: None,
-                data: serde_json::json!({
-                    "session": "t/dev/1", "request_id": "camp-answered",
-                    "verb": "session.interrupt", "ok": true, "detail": "{}"
-                }),
-            })
-            .unwrap();
-        // ... kill -9 ...
-        let now = Timestamp::now();
-        let mut rt = ControlRuntime::new(1024);
-        assert_eq!(
-            rt.rehydrate(&ledger, now).unwrap(),
-            1,
-            "only the UNANSWERED interrupt is still pending"
-        );
-        // MUST NOT LIE: the answered request's RE-READ control_response resolves
-        // to NOTHING — it is already a durable fact, and re-announcing it (or
-        // faulting on it) would be the false statement.
-        assert!(
-            rt.resolve("camp-answered", true, "{}".into()).is_none(),
-            "a response for an ALREADY-SETTLED request is recognized, never turned into a \
-             control.failed"
-        );
-        // MUST NOT FORGET: the orphan still expires, loudly.
-        let expired = rt.expire_pending(later(now, 31));
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].data["request_id"], "camp-orphan");
-        assert_eq!(expired[0].kind, EventType::ControlFailed);
-    }
-
-    /// An answer to a request camp NEVER sent — not merely one already settled —
-    /// is a protocol fault (§2.1). Rehydration cannot explain this one away, and
-    /// it stays loud.
-    #[test]
-    fn a_control_response_for_a_never_sent_request_id_is_a_fault() {
-        let mut rt = ControlRuntime::new(1024);
-        let input = rt.resolve("wat-1", true, "{}".into()).expect("a fault event");
-        assert_eq!(input.kind, EventType::ControlFailed);
-        assert!(input.data["reason"].as_str().unwrap().contains("never sent"));
-    }
-```
-
-- [ ] **Step 2: Run and watch it fail.** `cargo test -p camp --lib daemon::control 2>&1 | tail -20` → FAIL (`cannot find type ControlRuntime`).
-
-- [ ] **Step 3: Implement.**
-
-```rust
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
-
-use anyhow::{Context as _, Result};
-use camp_core::event::{EventInput, EventType};
-use camp_core::ledger::Ledger;
-use jiff::{SignedDuration, Timestamp};
-
-/// How long a control request may go unanswered before campd declares the
-/// protocol broken (§2.1). A BOUND on one operation, not a wakeup: the deadline
-/// joins `min_deadline` only while something is pending, so an idle campd with
-/// nothing outstanding still blocks in `poll` forever (invariant 1).
-///
-/// 30 s is generous against the transport: the answer travels worker stdout ->
-/// file -> notify -> campd wake -> drain (§2.3's "filesystem-event latency").
-/// B5 is what makes it SAFE: the deadline is evaluated AFTER this wake's drain
-/// and ingest, so a response already present in the file always beats its own
-/// deadline — correctness never depends on a delivered notify event.
-pub const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-
-struct Pending {
-    session: String,
-    verb: &'static str,
-    deadline: Timestamp,
-}
-
 pub struct ControlRuntime {
-    pending: HashMap<String, Pending>,
-    /// B6: request ids already SETTLED (answered, faulted, or settled in a
-    /// previous campd life per the ledger). A re-read `control_response` for one
-    /// of these is recognized and dropped: it is already a durable fact, and
-    /// re-announcing or faulting on it would be the false statement. This is NOT
-    /// error-silencing — an id in NEITHER map is still a loud fault.
-    resolved: HashSet<String>,
+    pending: HashMap<String, Pending>,       // { session, verb, deadline }
+    /// ANSWERED (or settled in a previous life). A re-read control_response for
+    /// one of these is a TRUE duplicate => None (B6).
+    answered: HashSet<String>,
+    /// C11: TIMED OUT — campd already appended `control.failed` saying the worker
+    /// never answered. A control_response for one of these is NOT a duplicate: it
+    /// is NEW INFORMATION saying that fault was PREMATURE, and it appends a
+    /// CORRECTION. Conflating the two sets is how rev 2 silently swallowed a real
+    /// answer on the most operationally important path the phase ships.
+    timed_out: HashMap<String, Pending>,
+    #[allow(dead_code)] // cp-1: first read in Task 8 (the subscriber hard cap)
     subscriber_buffer_bytes: usize,
-    // (Task 8 adds the subscriber registry.)
-}
-
-impl ControlRuntime {
-    pub fn new(subscriber_buffer_bytes: usize) -> ControlRuntime {
-        ControlRuntime {
-            pending: HashMap::new(),
-            resolved: HashSet::new(),
-            subscriber_buffer_bytes,
-        }
-    }
-
-    pub fn track_pending(
-        &mut self,
-        request_id: String,
-        session: String,
-        verb: &'static str,
-        now: Timestamp,
-    ) {
-        let deadline = now
-            .checked_add(
-                SignedDuration::try_from(CONTROL_RESPONSE_TIMEOUT)
-                    .unwrap_or(SignedDuration::from_secs(30)),
-            )
-            .unwrap_or(now);
-        self.pending.insert(request_id, Pending { session, verb, deadline });
-    }
-
-    /// B6: rebuild the pending table from the ledger — the ONLY durable record of
-    /// an in-flight control request (there is no sidecar state; invariant 3). A
-    /// `session.interrupted` with no matching `control.responded`/`control.failed`
-    /// is still outstanding. This is the ledger-derived suppression pattern
-    /// merged in fix-83 (#92).
-    ///
-    /// Deadlines are armed FRESH from `now`: the previous life's clock is not
-    /// ours, and a worker waiting across a restart deserves the full window
-    /// before campd calls the protocol broken.
-    pub fn rehydrate(&mut self, ledger: &Ledger, now: Timestamp) -> Result<usize> {
-        let sent = ledger
-            .events_of_type(EventType::SessionInterrupted)
-            .context("reading session.interrupted for control rehydration")?;
-        let mut settled: HashSet<String> = HashSet::new();
-        for kind in [EventType::ControlResponded, EventType::ControlFailed] {
-            for event in ledger
-                .events_of_type(kind)
-                .with_context(|| format!("reading {} for control rehydration", kind.as_str()))?
-            {
-                if let Some(id) = event.data["request_id"].as_str() {
-                    settled.insert(id.to_owned());
-                }
-            }
-        }
-        let mut restored = 0usize;
-        for event in sent {
-            let (Some(id), Some(session)) = (
-                event.data["request_id"].as_str(),
-                event.data["session"].as_str(),
-            ) else {
-                continue; // the fold's deny_unknown_fields guarantees both; be total anyway
-            };
-            if settled.contains(id) {
-                // Already settled in a previous life. Its control_response may
-                // STILL be re-read off the stream file (cp-0 persists the offset
-                // only after the ledger effect commits), so remember it as
-                // resolved — otherwise the re-read manufactures a "camp never
-                // sent this" fault (B6 half 1).
-                self.resolved.insert(id.to_owned());
-                continue;
-            }
-            self.track_pending(id.to_owned(), session.to_owned(), "session.interrupt", now);
-            restored += 1;
-        }
-        Ok(restored)
-    }
-
-    /// The earliest pending deadline as a Duration-from-now (the
-    /// `PatrolRuntime::poll_timeout` mold — `min_deadline` composes them).
-    pub fn poll_timeout(&self, now: Timestamp) -> Option<Duration> {
-        let earliest = self.pending.values().map(|p| p.deadline).min()?;
-        Some(Duration::try_from(earliest.duration_since(now)).unwrap_or(Duration::ZERO))
-    }
-
-    /// Due pending requests => durable `control.failed` events. The row is
-    /// REMOVED (raised exactly once) and remembered as resolved, so a LATE
-    /// answer is recognized rather than faulted a second time.
-    pub fn expire_pending(&mut self, now: Timestamp) -> Vec<EventInput> {
-        let due: Vec<String> = self
-            .pending
-            .iter()
-            .filter(|(_, p)| p.deadline <= now)
-            .map(|(id, _)| id.clone())
-            .collect();
-        due.into_iter()
-            .filter_map(|id| {
-                let p = self.pending.remove(&id)?;
-                self.resolved.insert(id.clone());
-                Some(EventInput {
-                    kind: EventType::ControlFailed,
-                    rig: None,
-                    actor: "campd".into(),
-                    bead: None,
-                    data: serde_json::json!({
-                        "session": p.session,
-                        "request_id": id,
-                        "verb": p.verb,
-                        "reason": format!(
-                            "no control_response for {} within {}s — the worker never answered on \
-                             its stdout stream (control-plane spec §2.1: a control response that \
-                             never arrives is a loud fault, never a swallowed timeout)",
-                            p.verb,
-                            CONTROL_RESPONSE_TIMEOUT.as_secs()
-                        ),
-                    }),
-                })
-            })
-            .collect()
-    }
-
-    /// Correlate a worker's control_response.
-    ///   Some(ControlResponded) — it answers a request we are waiting on.
-    ///   None                   — it answers one ALREADY SETTLED (re-read after a
-    ///                            restart, or a late answer past the deadline):
-    ///                            already durable, so saying it twice would be
-    ///                            the false statement.
-    ///   Some(ControlFailed)    — camp NEVER sent it: the protocol is not what
-    ///                            camp believes it to be (§2.1). Still loud.
-    pub fn resolve(&mut self, request_id: &str, ok: bool, detail: String) -> Option<EventInput> {
-        if let Some(p) = self.pending.remove(request_id) {
-            self.resolved.insert(request_id.to_owned());
-            return Some(EventInput {
-                kind: EventType::ControlResponded,
-                rig: None,
-                actor: "campd".into(),
-                bead: None,
-                data: serde_json::json!({
-                    "session": p.session,
-                    "request_id": request_id,
-                    "verb": p.verb,
-                    "ok": ok,
-                    "detail": detail,
-                }),
-            });
-        }
-        if self.resolved.contains(request_id) {
-            return None;
-        }
-        Some(EventInput {
-            kind: EventType::ControlFailed,
-            rig: None,
-            actor: "campd".into(),
-            bead: None,
-            data: serde_json::json!({
-                "request_id": request_id,
-                "reason": format!(
-                    "a worker answered control request {request_id:?}, which camp never sent — the \
-                     control protocol is not what camp believes it to be (control-plane spec §2.1)"
-                ),
-            }),
-        })
-    }
 }
 ```
 
-- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --lib daemon::control` → PASS (11 tests).
+- [ ] **Step 1: Write the failing tests** (**7**):
+
+1. `a_pending_request_arms_a_deadline_and_an_empty_table_arms_none` — invariant 1.
+2. `a_control_response_that_never_arrives_becomes_a_durable_fault` — §2.1; the row is removed, so the fault is raised exactly once.
+3. `a_matching_control_response_resolves_the_pending_request` — `late == false`.
+4. `a_restart_across_an_in_flight_interrupt_neither_lies_nor_forgets` (B6) — an answered id's re-read resolves to `None`; the orphan still expires.
+5. `a_control_response_for_a_never_sent_request_id_is_a_fault` (§2.1).
+6. **`session_activity_resets_a_pending_control_deadline`** (D7/C11) — track at T0; `note_activity` at T0+20 s; assert **nothing expires at T0+31 s** (the worker is streaming: it is alive), and that it DOES expire at T0+20 s+31 s (30 s of *silence*).
+7. **`a_late_control_response_after_the_deadline_appends_a_correction`** (C11) — track, expire (⇒ `control.failed`), then `resolve` the same id. Assert `Some(ControlResponded)` with **`late == true`** and a `detail` naming the premature fault — **not `None`.** *Rev 2 discarded this answer; this test is what makes that impossible.*
+
+- [ ] **Step 2: Run and watch fail.** `cargo test -p camp --bins daemon::control 2>&1 | tail -20` → FAIL (`cannot find type ControlRuntime`).
+
+- [ ] **Step 3: Implement.** The constant's doc comment **must state D7 and its residual assumption**:
+
+```rust
+/// How long a session may be SILENT with a control request outstanding before
+/// campd declares the protocol broken (§2.1). A BOUND on one operation, not a
+/// wakeup: it joins `min_deadline` only while something is pending (invariant 1).
+///
+/// D7/C11 — THIS MEASURES SILENCE, NOT ELAPSED TIME. `note_activity` resets it on
+/// ANY stream line from the session. That matters because of an UNVERIFIED
+/// property of the CLI: it is not known whether it reads control messages from
+/// stdin WHILE A TURN IS STREAMING (every interrupt exercised anywhere in this
+/// repo, fake or real, is PRE-turn). If the CLI queues control messages until the
+/// turn completes, an elapsed-time deadline would fire a FALSE `control.failed`
+/// on any turn longer than 30s. A SILENCE deadline does not: a worker producing
+/// output is alive, and `control.failed` now means "the session went quiet for
+/// 30s with an unanswered request" — a real fault under EITHER semantics. The
+/// residual (a worker that goes silent mid-turn with its interrupt queued) is
+/// REPAIRED, not hidden: a late answer appends a correction (C11).
+pub const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+```
+- `track_pending` — `deadline = now + CONTROL_RESPONSE_TIMEOUT` (jiff: `SignedDuration::try_from(...).unwrap_or(SignedDuration::from_secs(30))`; clippy denies `unwrap`).
+- **`note_activity(session, now)`** — every pending row of that session gets `deadline = now + CONTROL_RESPONSE_TIMEOUT`.
+- `poll_timeout` — earliest pending deadline as a `Duration`-from-now; `None` when empty. **Task 8 extends this with the subscriber continuation.**
+- `expire_pending(now)` — due rows are REMOVED from `pending`, **MOVED into `timed_out`**, each yielding a `control.failed` naming the verb and the silence bound.
+- `resolve(id, ok, detail)`:
+  - in `pending` ⇒ remove; insert into `answered`; `Some(ControlResponded { late: false, … })`.
+  - in `timed_out` ⇒ remove; insert into `answered`; **`Some(ControlResponded { late: true, detail: "… arrived after control.failed declared it unanswered — that fault was PREMATURE; this is the correction", … })`** (C11).
+  - in `answered` ⇒ `None` (a true duplicate: a restart re-read — B6).
+  - otherwise ⇒ `Some(ControlFailed { reason: "…camp never sent…" })` (§2.1).
+- `rehydrate(ledger, now)` — scan `session.interrupted`; ids also present in `control.responded`/`control.failed` go into `answered` (so a re-read is a silent no-op — B6); everything else is `track_pending`ed with a FRESH deadline (the previous life's clock is not ours). Returns the restored count.
+- `forget_session(session)` — drops that session's ids from `answered` (bounding it by live sessions).
+
+**Bounds (non-blocking notes, adopted).** `rehydrate` does three full-type ledger scans, once per campd life, bounded by ledger size — stated. `answered` is pruned at disposal. **`pending` is capped at `MAX_PENDING_CONTROL_REQUESTS` (64)**: past it, `serve_interrupt` refuses loudly, so neither an overseer loop nor a hostile client can grow the table or the ledger without bound (the `MAX_FAULTS_PER_SESSION_PER_WAKE` dedupe protects only the INBOUND path).
+
+- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --bins daemon::control` → PASS, **14 tests** (7 from Task 1 + 7 here).
 
 - [ ] **Step 5: Commit.**
 ```bash
 cargo fmt --all && cargo clippy -p camp --all-targets --all-features -- -D warnings
 git add crates/camp/src/daemon/control.rs
-git commit -m "feat(control): pending table with an armed deadline, rehydrated from the ledger across a restart (cp-1 §2.1)"
+git commit -m "feat(control): pending table with a SILENCE deadline, ledger rehydration, late-answer corrections (cp-1 §2.1)"
 ```
 
 ---
 
-## Task 4: the read channel hands its lines over — from BOTH drain paths
+## Task 4: the read channel hands its lines over, and disposal is SPLIT (C5)
 
-Spec: §2.3 (the transport), §4.1 (last activity), §9 (byte-offset cursors).
+Spec: §2.3, §4.1, §9.
 
-An EXTENSION of cp-0: the drain loop, the offsets, the cap guards, the partial-line buffering and the disposal ordering are untouched. **What IS new — and what B4 punishes — is that `drain_one` now has a per-line SIDE EFFECT, and it has TWO callers.** Task 6 harvests both.
-
-**Files:** Modify `crates/camp/src/daemon/read_channel.rs`.
+**Files:** `crates/camp/src/daemon/read_channel.rs`.
 
 **Interfaces produced:**
 ```rust
-pub struct StreamLine { pub session: String, pub line: String, pub offset_after: u64 }
+pub struct StreamLine {
+    pub session: String,
+    pub line: String,
+    #[allow(dead_code)] // cp-1: first read in Task 8 (event_frame's cursor)
+    pub offset_after: u64,
+}
+pub struct Disposed { pub session: String, pub final_offset: u64 }
 impl ReadChannelRuntime {
     pub fn take_stream_lines(&mut self) -> Vec<StreamLine>;
     pub fn last_activity(&self, session: &str) -> Option<jiff::Timestamp>;
     pub fn tail_state(&self, session: &str) -> Option<(PathBuf, u64)>;
-    pub fn take_disposed(&mut self) -> Vec<String>;   // B12: end-frame targets
+    /// C5: the final drain + cp-0's ordering guard + cp-0's fault flushes.
+    /// Does NOT dispose. Returns true when it appended events.
+    pub fn final_drain_pending(&mut self, ledger: &mut Ledger) -> Result<bool>;
+    /// C5: unlink + clear cursor — AFTER the caller has harvested.
+    pub fn dispose_pending(&mut self, ledger: &mut Ledger) -> Result<()>;
+    pub fn take_disposed(&mut self) -> Vec<Disposed>;
 }
 ```
+**`apply_pending_unregisters` is KEPT as a thin wrapper** (`final_drain_pending` then `dispose_pending`) so every merged cp-0 unit test that calls it stays green. The event loop calls the halves separately, with the harvest between them.
 
-- [ ] **Step 1: Write the failing tests.** Append to `read_channel.rs`'s `mod tests`:
+- [ ] **Step 1: Write the failing tests** (**3**):
 
-```rust
-    /// cp-1: the drain HANDS OVER the complete lines it consumed — in file
-    /// order, tagged with the session and the offset AFTER each line (the cursor
-    /// a subscriber resumes from, §9). cp-0 only counted them.
-    #[test]
-    fn drain_all_hands_over_the_complete_lines_it_consumed() {
-        let dir = tempfile::tempdir().unwrap();
-        let sessions_dir = dir.path().join("sessions");
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-        let stdout = sessions_dir.join("t-dev-1.json");
-        let a = "{\"type\":\"system\",\"subtype\":\"init\"}";
-        let b = "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"camp-1\"}}";
-        std::fs::write(&stdout, format!("{a}\n{b}\n")).unwrap();
-        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
-        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
-        rc.register(&mut ledger, "t/dev/1").unwrap();
-        assert!(rc.last_activity("t/dev/1").is_none(), "nothing read yet");
-        rc.drain_all(&mut ledger).unwrap();
+1. `drain_all_hands_over_the_complete_lines_it_consumed` — file order; `offset_after` correct; `mem::take`-drained (never redelivered); a partial line is never handed over.
+2. `the_disposal_time_final_drain_also_hands_over_its_lines` — `final_drain_pending` produces the last line **while the file still exists**; `dispose_pending` is what unlinks it; `take_disposed()` yields `Disposed { session, final_offset }` with the true final offset (**the `end` frame's offset source — C7**).
+3. **`the_final_drain_and_the_disposal_are_separable`** (C5's enabling guard) — after `final_drain_pending`, the stream file **still exists** and the session is **still tailed**; only `dispose_pending` removes both. *This is what makes harvesting before the unlink possible at all.*
 
-        let lines = rc.take_stream_lines();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].session, "t/dev/1");
-        assert_eq!(lines[0].line, a);
-        assert_eq!(lines[1].line, b, "file order is preserved");
-        assert_eq!(lines[1].offset_after, (a.len() + b.len() + 2) as u64);
-        assert!(rc.last_activity("t/dev/1").is_some(), "the offset advanced");
-        assert!(rc.take_stream_lines().is_empty(), "mem::take-drained — never redelivered");
+- [ ] **Step 2: Run and watch fail.** (`no method named take_stream_lines`.)
 
-        // A PARTIAL line is not handed over until it is complete.
-        std::fs::OpenOptions::new().append(true).open(&stdout).unwrap()
-            .write_all(b"{\"type\":\"resu").unwrap();
-        rc.drain_all(&mut ledger).unwrap();
-        assert!(rc.take_stream_lines().is_empty(), "a partial line is never handed over");
-    }
+- [ ] **Step 3: Implement.** In `drain_one`'s existing `Ok(_v)` parse arm (read_channel.rs:635-641), keep the `parsed_counts` bump and push a `StreamLine` + stamp `last_activity`. **No other line of the drain loop changes.** (This compiles: `self.parse_errors.push` already performs the same disjoint-field borrow at read_channel.rs:643 while `t` is live.)
 
-    /// B4's other half, at the unit level: the DISPOSAL-time final drain
-    /// (`apply_pending_unregisters`) also produces stream lines — and they are
-    /// the worker's LAST bytes, which in cp-1 carry the control_response to an
-    /// interrupt it answered just before exiting. This proves they are
-    /// AVAILABLE; Task 6 proves the event loop TAKES them.
-    #[test]
-    fn the_disposal_time_final_drain_also_hands_over_its_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        let sessions_dir = dir.path().join("sessions");
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-        let stdout = sessions_dir.join("t-dev-1.json");
-        std::fs::write(&stdout, "{\"type\":\"system\"}\n").unwrap();
-        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
-        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
-        rc.register(&mut ledger, "t/dev/1").unwrap();
-        rc.drain_all(&mut ledger).unwrap();
-        assert_eq!(rc.take_stream_lines().len(), 1);
+Split `apply_pending_unregisters` **at the seam cp-0 already documents** (read_channel.rs:328-340: *"every one of them must be consumed BEFORE the sessions are disposed below"*): everything up to and including the fault flushes becomes `final_drain_pending`; the `for session in &pending { self.unregister(...) }` loop becomes `dispose_pending`, which records each `Disposed { session, final_offset: t.offset }` before removal. **cp-0's ordering-violation guard stays exactly where cp-0 put it, unchanged** (C5).
 
-        // The worker answers the interrupt and EXITS. The reap queues the
-        // unregister; the last line landed after this wake's drain_all.
-        let answer = "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"camp-1\"}}";
-        std::fs::OpenOptions::new().append(true).open(&stdout).unwrap()
-            .write_all(format!("{answer}\n").as_bytes()).unwrap();
-        rc.queue_unregister("t/dev/1");
-        rc.apply_pending_unregisters(&mut ledger).unwrap();
+- [ ] **Step 4: Run the new tests AND the entire cp-0 suite.**
 
-        let final_lines = rc.take_stream_lines();
-        assert_eq!(final_lines.len(), 1, "the final drain handed over the last line");
-        assert_eq!(final_lines[0].line, answer, "the control_response survived disposal");
-        assert!(!stdout.exists(), "and the file is GONE — the line now exists ONLY here");
-        assert_eq!(rc.take_disposed(), vec!["t/dev/1".to_string()]);
-    }
-```
-
-- [ ] **Step 2: Run and watch both fail.** (`no method named take_stream_lines`.)
-
-- [ ] **Step 3: Implement.**
-
-```rust
-/// cp-1: one complete JSON line the drain consumed. `offset_after` is the byte
-/// offset PAST it — the cursor a subscriber resumes from (§9).
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // cp-1: consumed in Task 6 (ingest) and Task 8 (fanout)
-pub struct StreamLine {
-    pub session: String,
-    pub line: String,
-    pub offset_after: u64,
-}
-```
-Add to `struct ReadChannelRuntime` (after `parsed_counts`) and initialize in `new()`:
-```rust
-    /// cp-1: complete lines consumed since the last `take_stream_lines`, in file
-    /// order. BOTH `drain_one` callers fill this — `drain_all` AND the
-    /// disposal-time final drain in `apply_pending_unregisters` — and the event
-    /// loop harvests after EACH (B4).
-    stream_lines: Vec<StreamLine>,
-    /// cp-1 §4.1: when each session's offset last advanced — `sessions.list`'s
-    /// "last activity". The honest signal: the last output campd consumed.
-    last_activity: HashMap<String, jiff::Timestamp>,
-    /// cp-1 B12: sessions disposed by the last `apply_pending_unregisters` —
-    /// Task 8 sends each of their subscribers a terminal `end` frame.
-    disposed: Vec<String>,
-```
-In `drain_one`'s existing `Ok(_v) => { … }` parse arm (read_channel.rs:635-641), keep the `parsed_counts` bump and add the hand-off. **No other line of the loop changes.** (This compiles: `self.parse_errors.push(...)` already performs the same disjoint-field borrow in this loop at read_channel.rs:643 while `t` is live.)
-```rust
-                    Ok(_v) => {
-                        self.parsed_counts
-                            .entry(session.to_owned())
-                            .and_modify(|c| *c += 1)
-                            .or_insert(1);
-                        self.stream_lines.push(StreamLine {
-                            session: session.to_owned(),
-                            line: line.to_owned(),
-                            offset_after: new_offset,
-                        });
-                        self.last_activity
-                            .insert(session.to_owned(), jiff::Timestamp::now());
-                    }
-```
-In `unregister`, beside `self.tailed.remove(session)`: `self.last_activity.remove(session);` and `self.disposed.push(session.to_owned());`.
-
-Accessors — each with its `#[allow(dead_code)] // cp-1: consumed in Task N` per the discipline table:
-```rust
-    pub fn take_stream_lines(&mut self) -> Vec<StreamLine> { std::mem::take(&mut self.stream_lines) }
-
-    /// §4.1: when this session's offset last advanced. None until the first line
-    /// lands — the caller uses the registry's `spawned_ts` then, a DEFINED
-    /// semantic, not an error being swallowed.
-    pub fn last_activity(&self, session: &str) -> Option<jiff::Timestamp> {
-        self.last_activity.get(session).copied()
-    }
-
-    /// §9: the tailed file and campd's current tail offset — what
-    /// `session.subscribe` needs. None when the session is not tailed
-    /// (reaped/disposed => an explicit hello error).
-    pub fn tail_state(&self, session: &str) -> Option<(PathBuf, u64)> {
-        self.tailed.get(session).map(|t| (t.stdout_path.clone(), t.offset))
-    }
-
-    /// B12: the sessions disposed since the last call.
-    pub fn take_disposed(&mut self) -> Vec<String> { std::mem::take(&mut self.disposed) }
-```
-
-- [ ] **Step 4: Run the new tests AND the whole cp-0 suite (nothing may regress).**
-
-Run: `cargo test -p camp --lib daemon::read_channel && cargo test -p camp --test read_channel`
-Expected: PASS — the two new tests plus every cp-0 test (offsets, cap breach, disposal ordering, restart cursors).
+Run: `cargo test -p camp --bins daemon::read_channel && cargo test -p camp --test read_channel`
+Expected: PASS — 3 new + **every cp-0 test**, including `a_workers_final_stdout_line_is_drained_before_the_reap_disposes_the_file` (read_channel.rs:509) and the ordering-guard tests. **If any cp-0 test goes red, the split broke a merged invariant — STOP.**
 
 - [ ] **Step 5: Commit.**
 ```bash
 cargo fmt --all && cargo clippy -p camp --all-targets --all-features -- -D warnings
 git add crates/camp/src/daemon/read_channel.rs
-git commit -m "feat(read-channel): hand every drained complete line over, from BOTH drain paths (cp-1)"
+git commit -m "feat(read-channel): hand drained lines over; split the final drain from disposal (cp-1)"
 ```
 
 ---
 
 ## Task 5: `dispatch::write_control` — the write half
 
-Spec: §2 (campd holds the child's stdin as a live pipe), issue #55 (every blocking syscall on the loop carries a deadline).
+Spec: §2, issue #55.
 
-**Files:** Modify `crates/camp/src/daemon/dispatch.rs` (**shared — ADDITIVE ONLY**: one enum + one method beside `nudge_via_stdin` at dispatch.rs:208).
+**Files:** `crates/camp/src/daemon/dispatch.rs` (**shared — ADDITIVE ONLY**: one enum + one method beside `nudge_via_stdin`).
 
-- [ ] **Step 1: Write the failing tests.** The real scaffolds are `Dispatcher::test_insert_held_cat(...)` (dispatch.rs:352) and `Dispatcher::test_insert_held_sleeper(...)` (dispatch.rs:394 — a worker that never reads its pipe: the PR #51 finding-2 wedge shape). A `Dispatcher` is built with `Dispatcher::new(camp: CampDir, config: CampConfig)`. **Read both scaffolds' real argument lists and match them exactly.**
+- [ ] **Step 1: Write the failing tests** (**2**). The real scaffolds are `Dispatcher::test_insert_held_cat(...)` (dispatch.rs:352) and `Dispatcher::test_insert_held_sleeper(...)` (dispatch.rs:394 — a worker that never reads its pipe: the PR #51 finding-2 wedge shape). A `Dispatcher` is `Dispatcher::new(camp: CampDir, config: CampConfig)`. **Read both scaffolds' real argument lists and match them exactly.**
 
-```rust
-    /// cp-1: a control_request goes into the SAME held stdin a nudge uses, with
-    /// the SAME bounded write. A session campd holds no pipe for is NoPipe,
-    /// never a panic.
-    #[test]
-    fn write_control_delivers_into_the_held_stdin_pipe() {
-        let _no_spawns = crate::daemon::spawn_probe_guard();
-        let dir = tempfile::tempdir().unwrap();
-        let mut d = Dispatcher::new(
-            crate::campdir::CampDir { root: dir.path().to_path_buf() },
-            camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
-        );
-        d.test_insert_held_cat(dir.path(), "t/dev/1", "gc-1");
-        let line = ParentMessage::Interrupt { request_id: "camp-1".into() }.to_line().unwrap();
-        assert!(matches!(d.write_control("t/dev/1", &line), ControlWrite::Delivered));
-        assert!(matches!(d.write_control("t/nobody/9", &line), ControlWrite::NoPipe));
-    }
-
-    /// Issue #55 — the whole reason this method exists. A worker that NEVER READS
-    /// its pipe must not wedge campd's single-threaded loop: the write fails at
-    /// the STDIN_WRITE_TIMEOUT deadline, and the torn pipe is DROPPED so no later
-    /// line can interleave garbage into a half-written control message.
-    #[test]
-    fn write_control_is_bounded_and_drops_the_torn_pipe() {
-        let _no_spawns = crate::daemon::spawn_probe_guard();
-        let dir = tempfile::tempdir().unwrap();
-        let mut d = Dispatcher::new(
-            crate::campdir::CampDir { root: dir.path().to_path_buf() },
-            camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
-        );
-        d.test_insert_held_sleeper(dir.path(), "t/dev/1", "gc-1"); // never reads stdin
-        let huge = format!("{}\n", "x".repeat(2 * 1024 * 1024)); // far past any pipe buffer
-        let start = std::time::Instant::now();
-        let outcome = d.write_control("t/dev/1", &huge);
-        assert!(
-            matches!(outcome, ControlWrite::Failed(ref e) if e.contains("control write failed")),
-            "got {outcome:?}"
-        );
-        assert!(start.elapsed() < std::time::Duration::from_secs(10), "bounded, not wedged");
-        // The torn pipe is GONE: a second write finds no pipe at all.
-        assert!(matches!(d.write_control("t/dev/1", "x\n"), ControlWrite::NoPipe));
-    }
-```
+1. `write_control_delivers_into_the_held_stdin_pipe` — `Delivered` against `test_insert_held_cat`; `NoPipe` for an unknown session.
+2. **`write_control_is_bounded_and_drops_the_torn_pipe`** — against `test_insert_held_sleeper`, a 2 MiB line fails `Failed(_)` **within the deadline** (assert elapsed < 10 s), and the torn pipe is DROPPED (a second write returns `NoPipe`). *This is the whole justification for the method existing, and rev 2 left it untested.*
 
 - [ ] **Step 2: Run and watch fail.** (`no method named write_control`.)
 
-- [ ] **Step 3: Implement** — immediately AFTER `nudge_via_stdin`, inside the EXISTING `impl Dispatcher` block:
+- [ ] **Step 3: Implement** — `pub enum ControlWrite { Delivered, NoPipe, Failed(String) }` and `pub fn write_control(&mut self, session, line) -> ControlWrite`, a structural twin of `nudge_via_stdin`: bounded `write_bounded` with `STDIN_WRITE_TIMEOUT`; on error `worker.stdin = None` (never write after a torn line). Both carry `#[allow(dead_code)] // cp-1: first read in Task 6`. **`NoPipe` is a caller-visible FAILURE, not a designed degrade** — unlike a turn, an interrupt has no resume path.
 
-```rust
-/// cp-1: the disposition of a control-message write. The `NudgeOutcome` twin —
-/// SEPARATE because a control message has no resume path: `via="none"` is a
-/// legitimate answer for a turn (the CLI resumes the session instead), but there
-/// is NO way to interrupt a worker campd holds no pipe to. NoPipe is therefore a
-/// caller-visible FAILURE, not a designed degrade.
-#[derive(Debug)]
-#[allow(dead_code)] // cp-1: consumed in Task 6
-pub enum ControlWrite { Delivered, NoPipe, Failed(String) }
-```
-```rust
-    /// Write one control-protocol line into the session's held stdin (§2: the
-    /// pipe camp already holds). BOUNDED exactly as `nudge_via_stdin` is (issue
-    /// #55): an unbounded blocking write into the full pipe of a worker that
-    /// stopped reading would wedge campd's single-threaded event loop. On a
-    /// bounded failure the pipe may hold a torn partial line, so it is dropped.
-    ///
-    /// The line MUST come from `control::ParentMessage::to_line` — §2.1: nothing
-    /// outside `control.rs` constructs a control message.
-    #[allow(dead_code)] // cp-1: consumed in Task 6
-    pub fn write_control(&mut self, session: &str, line: &str) -> ControlWrite {
-        let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
-            return ControlWrite::NoPipe;
-        };
-        let Some(stdin) = worker.stdin.as_mut() else {
-            return ControlWrite::NoPipe;
-        };
-        match bounded::write_bounded(stdin, line.as_bytes(), STDIN_WRITE_TIMEOUT) {
-            Ok(()) => ControlWrite::Delivered,
-            Err(e) => {
-                worker.stdin = None; // torn pipe: never write after a failed line
-                ControlWrite::Failed(format!("control write failed: {e}"))
-            }
-        }
-    }
-```
-
-- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --lib daemon::dispatch` — the two new tests plus every existing dispatch test.
+- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --bins daemon::dispatch` — the 2 new tests plus every existing dispatch test.
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -1379,221 +480,277 @@ git commit -m "feat(dispatch): write_control — the bounded control-message wri
 
 ---
 
-## Task 6: `session.interrupt` + `session.send_turn`, and the INGEST ORDERING (B4/B5/B6)
+## Task 6: `session.interrupt` + `session.send_turn`, and the harvest ordering (B4/B5/C5/C12)
 
-Spec: §4.1, §4.2, §7 phase 1 (*"`interrupt` and `send_turn` first — the smallest end-to-end slice through the whole stack"*). D1, D2, D4.
+Spec: §4.1, §4.2, §7 phase 1. D1, D2, D4.
 
-**Files:** Modify `daemon/socket.rs`, `daemon/control.rs`, `daemon/event_loop.rs` (**shared**), `daemon/mod.rs` (**shared**), `cmd/nudge.rs`, `tests/fake-agent.sh`. Create `crates/camp/tests/control.rs`.
+**Files:** `daemon/socket.rs`, `daemon/control.rs`, `daemon/event_loop.rs` (**shared**), `daemon/mod.rs` (**shared**), `cmd/nudge.rs`, `tests/fake-agent.sh`; create `crates/camp/tests/control.rs`.
 
-- [ ] **Step 1: Pin the new socket wire (failing test).** Append `control_plane_verbs_wire_format_is_pinned` to `socket.rs`'s `mod tests` — asserting `{"op":"session.interrupt","session":"camp/dev/1"}`, `{"op":"session.send_turn","session":"camp/dev/1","text":"status?"}`, `{"ok":true,"request_id":"camp-1"}`, `{"ok":true,"via":"stdin"}`, round-trips both ways, and that **`{"op":"nudge",…}` is now REJECTED** (D4: one verb, not two). DELETE `nudge_wire_format_is_pinned` (socket.rs:672).
+- [ ] **Step 1: Pin the new socket wire (failing test).** `control_plane_verbs_wire_format_is_pinned` — `{"op":"session.interrupt","session":"camp/dev/1"}`, `{"op":"session.send_turn","session":"camp/dev/1","text":"status?"}`, `{"ok":true,"request_id":"camp-1"}`, `{"ok":true,"via":"stdin"}`, both directions, **and `{"op":"nudge",…}` now REJECTED** (D4). DELETE `nudge_wire_format_is_pinned` (socket.rs:672).
 
-- [ ] **Step 2: Run and watch fail.** (`no variant named SessionInterrupt`.)
+- [ ] **Step 2: Run and watch fail.** `cargo test -p camp --bins daemon::socket` → FAIL.
 
-- [ ] **Step 3: Implement the socket types.** In `Request`, REPLACE `Nudge` (D4):
+- [ ] **Step 3: Implement the socket types.** `Request::SessionSendTurn { session, text }` (`#[serde(rename = "session.send_turn")]`) and `Request::SessionInterrupt { session }` (`#[serde(rename = "session.interrupt")]`), REPLACING `Nudge`. `Response::SendTurn { ok, via }` and `Response::Interrupt { ok, request_id }`, both BEFORE `Ok` (the untagged variant-order rule, socket.rs:47). Update `cmd/nudge.rs:42,47,59`. **`patrol.rs:788` calls `dispatcher.nudge_via_stdin` DIRECTLY and is UNAFFECTED — the method survives; only the socket verb changes.**
+
+*(Non-blocking, recorded: `Response` is `#[serde(untagged)]` with an order-dependent match. The `Subscribed` hello is the natural — and now last — free place for a protocol version/capability field; what breaks untagged resolution is a later phase adding a field to an EXISTING variant. Named so it is a choice, not an accident.)*
+
+- [ ] **Step 4: Implement the handlers — `serve_interrupt` INLINED IN FULL (C12).**
+
+`serve_send_turn` is the `Request::Nudge` arm (event_loop.rs:796-844) **moved verbatim**: deliver → record (`session.nudged`) → respond; `NoPipe ⇒ via:"none"` (the resume path); a post-delivery append failure surfaces to the caller.
+
 ```rust
-    /// cp-1 §4.1: inject one user turn into a live worker's campd-held stdin.
-    /// This is `camp nudge`, promoted to the protocol. It still emits
-    /// `session.nudged` — the merged vocabulary for "a turn was injected";
-    /// renaming the event would churn vocab/fold/cli_nudge for nothing (D4).
-    #[serde(rename = "session.send_turn")]
-    SessionSendTurn { session: String, text: String },
-    /// cp-1 §4.1: stop the current turn. ACK-then-ASYNC (D1) — the answer carries
-    /// the request_id; the worker's control_response arrives later on the read
-    /// channel as `control.responded`.
-    #[serde(rename = "session.interrupt")]
-    SessionInterrupt { session: String },
+impl ControlRuntime {
+    /// §4.1 `session.interrupt`. D1 (ACK-then-ASYNC) + D2 (deliver -> record ->
+    /// respond). campd does NOT wait for the control_response: its loop is
+    /// single-threaded, and blocking a handler on a filesystem-latency line is
+    /// issue #55's wedge class. The answer returns on the read channel (`ingest`),
+    /// survives a restart (`rehydrate`, B6), and a late answer appends a
+    /// correction (C11).
+    ///
+    /// ORDERING, and what camp does NOT promise: an interrupt and a `send_turn`
+    /// are both LINES IN THE SAME held stdin pipe, written in socket-arrival
+    /// order. camp makes NO guarantee that an interrupt "cancels" a turn already
+    /// queued ahead of it — a caller assuming that is assuming something camp does
+    /// not promise. Two concurrent interrupts mint DISTINCT request_ids and
+    /// produce two independent pending rows and two `control.responded`s; that is
+    /// correct and needs no coordination.
+    pub fn serve_interrupt(
+        &mut self,
+        session: &str,
+        ledger: &mut Ledger,
+        dispatcher: &mut Dispatcher,
+        now: Timestamp,
+    ) -> Response {
+        // Bound the table AND the ledger: neither an overseer loop nor a hostile
+        // client may grow `pending` or append `session.interrupted` without limit.
+        if self.pending.len() >= MAX_PENDING_CONTROL_REQUESTS {
+            return Response::Error {
+                ok: false,
+                error: format!(
+                    "campd already has {} unanswered control requests outstanding (the \
+                     MAX_PENDING_CONTROL_REQUESTS cap) — something is issuing interrupts faster \
+                     than workers answer them",
+                    self.pending.len()
+                ),
+            };
+        }
+        let request_id = new_request_id();
+        let line = match (ParentMessage::Interrupt { request_id: request_id.clone() }).to_line() {
+            Ok(line) => line,
+            Err(e) => {
+                return Response::Error { ok: false, error: format!("building the interrupt: {e}") };
+            }
+        };
+        let (rig, bead) = dispatcher
+            .child_info(session)
+            .map(|(r, b)| (Some(r), Some(b)))
+            .unwrap_or((None, None));
+        match dispatcher.write_control(session, &line) {
+            // D2: deliver -> record. The ledger must not claim what was not
+            // delivered, and the caller must not believe what the ledger lacks.
+            ControlWrite::Delivered => match ledger.append(EventInput {
+                kind: EventType::SessionInterrupted,
+                rig,
+                actor: "campd".into(),
+                bead,
+                data: serde_json::json!({"session": session, "request_id": request_id}),
+            }) {
+                Ok(_) => {
+                    self.track_pending(
+                        request_id.clone(),
+                        session.to_owned(),
+                        "session.interrupt",
+                        now,
+                    );
+                    Response::Interrupt { ok: true, request_id }
+                }
+                Err(e) => Response::Error {
+                    ok: false,
+                    error: format!(
+                        "interrupt delivered into {session} but recording session.interrupted \
+                         failed: {e}"
+                    ),
+                },
+            },
+            // There is NO resume path for an interrupt (unlike a turn): a worker
+            // campd holds no pipe to CANNOT be interrupted, and pretending
+            // otherwise would be a silent no-op. Loud — and NOT evented: nothing
+            // happened, so there is no campd action to record (invariant 3 records
+            // ACTIONS; a refused verb is the caller's error).
+            ControlWrite::NoPipe => Response::Error {
+                ok: false,
+                error: format!(
+                    "campd holds no stdin pipe for {session} — it is not a live campd-spawned \
+                     worker (exited, released, attended, or adopted from a previous campd life), \
+                     and there is no other way to interrupt a turn (control-plane spec §2.3)"
+                ),
+            },
+            // C12 — THE ARM REV 2 NEVER SPECIFIED. The write was ATTEMPTED and
+            // FAILED, so bytes may already have reached the pipe and `write_control`
+            // has torn it down (worker.stdin = None). That IS a campd action with a
+            // consequence — the worker just lost its write channel — so it is BOTH
+            // an error to the caller AND a durable fault (§2.1 loudness; invariant
+            // 3). Bounded: one socket request => one event, and the request_id is
+            // fresh, so a retrying caller cannot dedupe-collide.
+            ControlWrite::Failed(e) => {
+                let reason = format!(
+                    "writing an interrupt into {session}'s held stdin failed: {e}. The pipe may \
+                     hold a torn partial line, so campd dropped it — this worker can no longer be \
+                     sent turns or control messages, and patrol's stall ladder now owns it"
+                );
+                match ledger.append(EventInput {
+                    kind: EventType::ControlFailed,
+                    rig,
+                    actor: "campd".into(),
+                    bead,
+                    data: serde_json::json!({
+                        "session": session,
+                        "request_id": request_id,
+                        "verb": "session.interrupt",
+                        "reason": reason,
+                    }),
+                }) {
+                    Ok(_) => Response::Error { ok: false, error: reason },
+                    // A failing append must not MASK the write failure being
+                    // reported — carry both.
+                    Err(append_err) => Response::Error {
+                        ok: false,
+                        error: format!(
+                            "{reason} (and recording control.failed ALSO failed: {append_err})"
+                        ),
+                    },
+                }
+            }
+        }
+    }
+}
 ```
-(The enum is `#[serde(tag="op", rename_all="snake_case")]`; a per-variant `rename` gives the dotted verb the spec names.) In `Response`, REPLACE `Nudge` with `SendTurn { ok: bool, via: String }` and add `Interrupt { ok: bool, request_id: String }` — both BEFORE `Ok` (the untagged variant-order rule at socket.rs:47). Update `cmd/nudge.rs:42` and its two `Response::Nudge` matches (nudge.rs:47,59). **The `camp nudge` CLI verb itself is unchanged.**
 
-- [ ] **Step 4: Implement the handlers in `control.rs`.** `serve_send_turn` is the `Request::Nudge` arm (event_loop.rs:796-844) **moved verbatim**: deliver → record → respond; `NoPipe ⇒ via:"none"` (the resume path); a post-delivery append failure surfaced to the caller. Then `serve_interrupt` (D1/D2 — the full body is in rev 1's Task 6 and is unchanged: build the line via `ParentMessage::Interrupt`, `dispatcher.write_control`, on `Delivered` append `session.interrupted` and `track_pending`, answer `Response::Interrupt{ok, request_id}`; `NoPipe` is a LOUD `Response::Error` naming "no stdin pipe", because there is no resume path for an interrupt).
+**`ingest(&mut self, lines: &[StreamLine], dispatcher: &mut Dispatcher, now: Timestamp) -> Vec<EventInput>`:**
+- **FIRST, for every line: `self.note_activity(&sl.session, now)`** (D7/C11 — the session is producing output, so its pending deadlines reset).
+- `ControlResponse` ⇒ `self.resolve(id, ok, detail)`, pushing the `Option` when `Some` (B6/C11).
+- `RequestUserDialog` ⇒ write `ParentMessage::DialogRefusal` via `dispatcher.write_control`; append `control.failed` naming the outcome (delivered / no pipe / write failed), **deduped per `request_id`** so a worker re-asking the same id appends once.
+- `CanUseTool` ⇒ `control.failed` stating plainly that the worker is now blocked forever holding a dispatch slot and must be killed by the operator. camp takes no automatic action: the flow is structurally unreachable in cp-1 (§5.3.1), and phase 3 owns both the answer and §5.3.2's slot rule.
+- `Stream(_)` ⇒ **nothing** (D6″: subscribers are fed from the FILE by `pump`, never from here).
+- `Err(ControlWireError)` ⇒ `control.failed`, **capped at `MAX_FAULTS_PER_SESSION_PER_WAKE` (8)** with the suppressed count named in the last event (loud is right; unbounded-loud is a self-DoS). *cp-0's `drain_one` hands over only already-parsed lines (the `Ok(_v)` arm) and surfaces non-JSON separately as `patrol.degraded`, so `ingest` never double-reports. Do not add a guard.*
 
-`ingest(&mut self, lines: &[StreamLine], dispatcher: &mut Dispatcher) -> Vec<EventInput>` matches `parse_worker_line` over five arms:
-- `ControlResponse` ⇒ `self.resolve(...)`, pushing the `Option<EventInput>` when it is `Some` (B6: `None` = already settled, and saying it twice is the false statement).
-- `RequestUserDialog` ⇒ write `ParentMessage::DialogRefusal` back through `dispatcher.write_control`, then append `control.failed` naming the outcome (delivered / no pipe / write failed), **keyed on `request_id` so a repeated ask for the SAME id appends once**.
-- `CanUseTool` ⇒ `control.failed` whose reason states plainly that the worker is blocked forever holding a dispatch slot and must be killed by the operator. camp takes no automatic action: the flow is structurally unreachable in cp-1 (§5.3.1), and the phase that can answer it (phase 3) also owns §5.3.2's slot rule.
-- `Stream(_)` ⇒ nothing here (Task 8 fans it out).
-- `Err(ControlWireError)` ⇒ `control.failed`. **Note:** cp-0's `drain_one` only hands over lines that ALREADY parsed as JSON (read_channel.rs:635, the `Ok(_v)` arm), and non-JSON lines are separately surfaced as `patrol.degraded` — so `ingest` never sees one and never double-reports. Do not add a guard for it.
+Also define here: `SUBSCRIBER_BUFFER_BYTES_DEFAULT: usize = 1024 * 1024` and `subscriber_buffer_bytes_from_env(default) -> Result<usize>` (`CAMP_SUBSCRIBER_BUFFER_BYTES`) — the exact `max_stream_bytes_from_env` twin (read_channel.rs:34-50), failing fast on a malformed or zero value.
 
-**FAULT DEDUPE (non-blocking note, adopted).** A worker looping on `request_user_dialog`, or spraying malformed control lines, would otherwise drive one synchronous SQLite append per line on the event loop — loud is right, unbounded-loud is a self-DoS. So: dialog/never-sent faults are deduped per `request_id` via `self.resolved`, and a session's unparsable-control-line faults are capped at `MAX_FAULTS_PER_SESSION_PER_WAKE` (8), with the suppressed count named in the last event.
+- [ ] **Step 5: Wire the event loop — the ordering IS the fix (B4/B5/C5).**
 
-Also define here (needed by `mod.rs` in Step 6): `SUBSCRIBER_BUFFER_BYTES_DEFAULT: usize = 1024 * 1024` and `subscriber_buffer_bytes_from_env(default) -> Result<usize>` reading `CAMP_SUBSCRIBER_BUFFER_BYTES` — the exact `max_stream_bytes_from_env` twin (read_channel.rs:34-50): fail fast on a malformed or zero value, never a silent default.
+`min_deadline` gains a fourth nesting (`control.poll_timeout(poll_now)`). Thread `control` through `run`/`serve_connection`/`drain_lines` (plus the `Token`). Add the two arms; DELETE the `Request::Nudge` arm.
 
-- [ ] **Step 5: Wire the event loop — THE ORDERING IS THE FIX (B4 + B5).**
-
-`min_deadline` (event_loop.rs:153-159) gains a fourth source (`control.poll_timeout(poll_now)`). Thread `control: &mut ControlRuntime` through `run` → `serve_connection` → `drain_lines` (plus the connection's `Token` through the latter two — Task 8 needs it). Add the two `drain_lines` arms (one line of logic each) and DELETE the `Request::Nudge` arm.
-
-**The post-drain block, restated in full:**
 ```rust
         read_channel.apply_tracking(ledger)?;
-        if let Err(e) = read_channel.drain_all(ledger) {
-            eprintln!("campd: read-channel drain_all failed: {e:#}");
-        }
+        if let Err(e) = read_channel.drain_all(ledger) { eprintln!("campd: drain_all failed: {e:#}"); }
         let mut appended = false;
-        // (B4, harvest 1 of 2) the lines `drain_all` just consumed.
+        // HARVEST 1 — the lines `drain_all` just consumed. Under MERGED LAW this is
+        // the harvest that gets an answer-and-exit worker's control_response: the
+        // reap appends session.stopped/crashed BEFORE settle, so the unregister is
+        // queued before drain_all, and drain_all reads the final bytes while the
+        // session is still in `tailed` (read_channel.rs:258-273; the merged test at
+        // read_channel.rs:509).
         appended |= control_step(ledger, control, dispatcher, read_channel, &mut conns, &mut poll)?;
 
-        // ... the EXISTING cap-breach loop and the watch/drain/parse fault
-        // events, unchanged (they set `appended` where they used to set
-        // `appended_read_channel_events`) ...
+        // ... the EXISTING cap-breach loop and the watch/drain/parse fault events,
+        // unchanged (they set `appended`) ...
 
         read_channel.persist_offsets(ledger)?;
-        // cp-0 left a TODO here for phase 1: the offset must commit AFTER the
-        // line's ledger effect. That obligation is now MET — harvest 1 appended
-        // `control.responded` above, before this line.
+        // cp-0's phase-1 TODO here is now MET: harvest 1 appended control.responded
+        // above, so the offset commits AFTER the line's ledger effect.
 
-        // The disposal-time FINAL drain (cp-0 review fix 1) — the SECOND caller
-        // of `drain_one`. It produces stream lines too, and they are the
-        // worker's LAST bytes: in cp-1 those carry the control_response to an
-        // interrupt the worker answered just before exiting.
-        appended |= read_channel.apply_pending_unregisters(ledger)?;
-        // (B4, harvest 2 of 2) THE FIX. Without this, an ordinary
-        // "worker answers the interrupt and exits" loses the control_response to
-        // the unlink and then manufactures TWO false control.failed events (a
-        // "never answered" at the deadline, and a "camp never sent this" if the
-        // line is ever re-read). The lines are already in memory here — the
-        // unlink cannot take them — but ONLY if we harvest them.
+        // C5: the final drain is now SEPARATE from disposal, so the harvest sits
+        // BETWEEN them — before the unlink, restoring cp-0's own discipline.
+        appended |= read_channel.final_drain_pending(ledger)?;
+        // HARVEST 2 — DEFENSE IN DEPTH, honestly labelled. Under merged law
+        // `final_drain_pending` yields ZERO lines (harvest 1 already read them), so
+        // this is normally a no-op. It exists because `drain_one` has two callers
+        // and a future phase could append session.stopped from INSIDE settle, which
+        // would move the worker's last bytes onto this path. It is idempotent
+        // (`mem::take`): no double-ingest, no double-append, no re-fanout.
+        // DO NOT claim deleting it turns a test red — it does not (rev 2 claimed
+        // that; it was false).
+        //
+        // If this harvest is EVER non-empty, cp-0's ordering guard fires in the same
+        // breath and appends a durable patrol.degraded ORDERING VIOLATION. That is
+        // CORRECT, not libel: non-empty here MEANS the ordering really was violated.
+        // The two must co-occur, and the tests assert both directions.
         appended |= control_step(ledger, control, dispatcher, read_channel, &mut conns, &mut poll)?;
+        // Only NOW: unlink the files and clear the cursors. The `take_disposed()`
+        // inside control_step already captured each session's FINAL offset for the
+        // `end` frame (C7).
+        read_channel.dispose_pending(ledger)?;
 
-        // (B5) ONLY NOW may a deadline expire. cp-0's law (event_loop.rs:406):
-        // "correctness never depends on a delivered event" — so a response
-        // sitting in the file because its notify was coalesced must be read and
-        // ingested BEFORE campd may declare that it never arrived.
+        // B5: ONLY NOW may a deadline expire — after EVERY ingest this wake. A
+        // response sitting in the file because its notify was coalesced must be read
+        // and ingested before campd may declare it never arrived (cp-0's law,
+        // event_loop.rs:406: correctness never depends on a delivered event).
         for input in control.expire_pending(Timestamp::now()) {
             ledger.append(input)?;
             appended = true;
         }
         if appended {
-            if let Err(e) = settle(/* … */) {
-                eprintln!("campd: control/read-channel settle failed: {e:#}");
-            }
+            if let Err(e) = settle(/* … */) { eprintln!("campd: control settle failed: {e:#}"); }
         }
 ```
-with the shared helper (DRY — one harvest, two call sites):
-```rust
-/// cp-1 (B4): harvest whatever the last drain consumed — ingest the control
-/// messages, fan the rest out to subscribers, emit end-frames for disposed
-/// sessions, append the durable events. Called after EVERY `drain_one` caller
-/// (`drain_all` AND `apply_pending_unregisters`), because a line that is drained
-/// but not ingested is a line the unlink destroys.
-fn control_step(
-    ledger: &mut Ledger,
-    control: &mut super::control::ControlRuntime,
-    dispatcher: &mut Dispatcher,
-    read_channel: &mut super::read_channel::ReadChannelRuntime,
-    conns: &mut HashMap<Token, Conn>,
-    poll: &mut Poll,
-) -> Result<bool> {
-    let lines = read_channel.take_stream_lines();
-    let mut appended = false;
-    for input in control.ingest(&lines, dispatcher) {
-        ledger.append(input)?;
-        appended = true;
-    }
-    // Task 8 adds here: control.fanout(&lines, conns) -> append drop events +
-    // deregister dropped tokens; then control.end_sessions(
-    // &read_channel.take_disposed(), …) -> B12's terminal frames.
-    Ok(appended)
-}
-```
+**`control_step`** (one helper, two call sites): `take_stream_lines` → `control.ingest(...)` → append → **`control.fanout(read_channel, &mut conns)`** (Task 8: refresh each subscriber's `tail`, pump, drop over-cap ones) → **`control.close_disposed(read_channel.take_disposed(), ledger, &mut conns)`** (Task 8: mark subscribers `Closing` with the true final offset; also calls `control.forget_session` to prune `answered`) → deregister returned tokens. Returns whether it appended.
 
-- [ ] **Step 6: `mod.rs` — construct the runtime and REHYDRATE it (B6).** Beside the read channel (mod.rs:167), rehydrating AFTER `patrol::adopt` (so the ledger is reconciled first):
+- [ ] **Step 6: `mod.rs` — construct and REHYDRATE (B6).** Beside the read channel (mod.rs:167), rehydrating AFTER `patrol::adopt`:
 ```rust
     let mut control = control::ControlRuntime::new(control::subscriber_buffer_bytes_from_env(
         control::SUBSCRIBER_BUFFER_BYTES_DEFAULT,
     )?);
-    // B6: an interrupt in flight when the last campd died is still in the ledger
-    // — and the ledger is the ONLY record of it. Without this, the re-read
-    // control_response manufactures a false fault, and a genuinely unanswered
-    // request is silently forgotten (the swallowed timeout §2.1 forbids).
     let restored = control.rehydrate(&ledger, jiff::Timestamp::now())?;
     if restored > 0 {
         eprintln!("campd: restored {restored} in-flight control request(s) from the ledger");
     }
 ```
 
-- [ ] **Step 7: DELETE the module-level `#![allow(dead_code)]` from `control.rs`** (the dead_code discipline). Run `cargo clippy -p camp --all-targets --all-features -- -D warnings` and confirm it passes WITHOUT the attribute. If any item is still unreached, it is either wired here or it does not belong in cp-1.
+- [ ] **Step 7: DELETE the module-level `#![allow(dead_code)]` from `control.rs`.** Run `cargo clippy -p camp --all-targets --all-features -- -D warnings` and confirm it passes without it. **`ControlRuntime.subscriber_buffer_bytes` keeps its OWN field-level allow until Task 8 (C4). DO NOT delete that field — Task 8 reads it.** *(Rev 2's text here told the implementer to delete anything still unreached. That was wrong and is removed.)*
 
-- [ ] **Step 8: The fake worker's control loop, and the END-TO-END tests.**
+- [ ] **Step 8: The fake worker, and the END-TO-END tests.**
 
-`tests/fake-agent.sh` — add before the `FAKE_AGENT_NUDGE_CLOSE` block, documented in the header:
-```bash
-#   FAKE_AGENT_CONTROL_LOOP   cp-1: after the task line, read stdin forever. A
-#                             control_request is answered on stdout with the
-#                             control_response the real CLI sends (shape pinned in
-#                             tests/fixtures/control/). A plain user turn ends the
-#                             loop and the worker closes its bead. This is the
-#                             fake's half of the interrupt round trip: campd ->
-#                             stdin -> worker -> stdout file -> read channel.
-#   FAKE_AGENT_EXIT_AFTER_CONTROL  cp-1 (B4): answer ONE control_request and exit
-#                             IMMEDIATELY — the reap-races-the-drain shape.
-if [[ -n "${FAKE_AGENT_CONTROL_LOOP:-}" ]]; then
-  read -r _task_line
-  while read -r line; do
-    case "$line" in
-      *'"control_request"'*)
-        rid="$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')"
-        if [[ -z "$rid" ]]; then
-          echo "fake-agent: control_request with no request_id: $line" >&2
-          exit 95
-        fi
-        emit_stream "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"still_queued\":[]}}}"
-        if [[ -n "${FAKE_AGENT_EXIT_AFTER_CONTROL:-}" ]]; then
-          break   # answer and DIE: the EXIT trap emits the terminal result line
-        fi
-        ;;
-      *) break ;;   # a plain user turn: fall through to the close
-    esac
-  done
-fi
-```
+`tests/fake-agent.sh` — `FAKE_AGENT_CONTROL_LOOP` (answer any `control_request` with the pinned `control_response`, `request_id` extracted with `sed`; a plain user turn ends the loop and closes the bead) and `FAKE_AGENT_EXIT_AFTER_CONTROL` (answer ONE and exit immediately — the reap-races-the-drain shape). Document both in the header block.
 
-Create `crates/camp/tests/control.rs`, copying the harness helpers (`munge`, `stdout_path`, `camp`, `camp_ok`, `scaffold`, `fake_agent`, `Daemon`, `connect`, `request`, `events_json`, `wait_until`) **verbatim** from `tests/read_channel.rs:1-180` — the established harness. Add `fn live_session_name(root: &Path) -> String` (the `session.woke` event's `data.name`). Five tests:
+Create `crates/camp/tests/control.rs`, copying the harness (`munge`, `stdout_path`, `camp`, `camp_ok`, `scaffold`, `fake_agent`, `Daemon`, `connect`, `request`, `events_json`, `wait_until`) **verbatim** from `tests/read_channel.rs:1-180`; add `live_session_name(root)`. **6 tests here:**
 
-1. **`interrupt_round_trips_through_the_read_channel`** — the phase's exit criterion. Sling, wait for `session.woke`, send `{"op":"session.interrupt"}` over the REAL socket, assert `ok` + a `camp-`-prefixed `request_id`, then wait for `session.interrupted{request_id}` **and** `control.responded{request_id, ok:true, verb:"session.interrupt"}` in the ledger — and assert **no `control.failed` was invented** along the way.
-2. **`a_worker_that_answers_and_exits_immediately_still_yields_control_responded`** — **B4, the regression this revision exists for.** `FAKE_AGENT_EXIT_AFTER_CONTROL=1`: the worker answers and dies, so its `control_response` is the LAST line in a stdout file campd disposes in the same wake. Assert `session.stopped`/`session.crashed` lands, then `control.responded` STILL lands, and **no `control.failed`**. *Delete harvest 2 of 2 and this goes red exactly there.*
-3. **`send_turn_delivers_a_user_turn_into_the_held_pipe`** — `via:"stdin"`, `session.nudged`, and the worker's blocked `read` really unblocks (`FAKE_AGENT_NUDGE_CLOSE` ⇒ `bead.closed`).
-4. **`interrupting_a_session_with_no_held_pipe_fails_loudly`** — `ok:false`, the error names "no stdin pipe".
-5. **`a_campd_restart_across_an_in_flight_interrupt_invents_no_fault`** — **B6 end to end.** Interrupt, wait for `session.interrupted`, `campd.kill9()` (crash-only; the worker outlives campd, spawn.rs:255), spawn a fresh campd, and assert `control.responded{request_id}` lands **and no `control.failed` exists** — an ordinary restart must not manufacture a protocol fault.
+1. **`interrupt_round_trips_through_the_read_channel`** — the exit criterion. `ok` + a `camp-` `request_id`; then `session.interrupted{request_id}`; then `control.responded{request_id, ok:true, verb:"session.interrupt", late:false}`; **and no `control.failed`**.
+2. **`a_worker_that_answers_and_exits_immediately_still_yields_control_responded`** — **what this ACTUALLY proves (C5, stated honestly):** that the answer-and-exit race is covered **by harvest 1 under merged law**, and that the merged law still holds. Asserts `control.responded`, **no `control.failed`**, and — the part rev 2 omitted — **no `patrol.degraded` containing "ORDERING VIOLATION"**. A future phase that moves the reap's append inside `settle` breaks the law, harvest 2 starts firing, the guard shouts, and **this test goes red on the `patrol.degraded` assertion** — the real regression signal.
+3. **`an_interrupt_whose_pipe_write_fails_is_loud_in_both_the_response_and_the_ledger`** (C12) — drive `ControlWrite::Failed` (a worker that never reads its pipe) and assert `ok:false` **and** a durable `control.failed{verb:"session.interrupt"}`.
+4. **`send_turn_delivers_a_user_turn_into_the_held_pipe`** — `via:"stdin"`, `session.nudged`, and the worker's blocked `read` really unblocks (⇒ `bead.closed`).
+5. **`interrupting_a_session_with_no_held_pipe_fails_loudly`** — `ok:false`, "no stdin pipe".
+6. **`a_campd_restart_across_an_in_flight_interrupt_invents_no_fault`** (B6) — interrupt, wait for `session.interrupted`, `kill9()`, spawn a fresh campd, assert `control.responded{request_id}` lands **and no `control.failed` exists**.
 
-- [ ] **Step 9: Run.** `cargo test -p camp --test control 2>&1 | tail -30` → PASS (5 tests). If test 2 hangs at `control.responded`, harvest 2 of 2 is missing or misplaced.
+- [ ] **Step 9: Run.** `cargo test -p camp --test control 2>&1 | tail -30` → PASS, **6 tests**.
 
-- [ ] **Step 10: Full suite** (the D4 blast radius: `cmd/nudge.rs`, `cli_nudge.rs`, `daemon_patrol.rs`). `cargo test --workspace` → PASS; `cli_nudge.rs` MUST still pass (the CLI verb is unchanged).
+- [ ] **Step 10: Full suite** (the D4 blast radius). `cargo test --workspace` → PASS. **`cli_nudge.rs` MUST still pass** (the CLI verb is unchanged), and so must `daemon_patrol.rs` (`nudge_via_stdin` survives — D4).
 
 - [ ] **Step 11: Commit.**
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add -A
-git commit -m "feat(control): session.interrupt + session.send_turn, ingested on every drain path (cp-1 §4.1)"
+git commit -m "feat(control): session.interrupt + session.send_turn, harvested on every drain path (cp-1 §4.1)"
 ```
 
 ---
 
 ## Task 7: `sessions.list`
 
-Spec: §4.1 (name, agent, rig, bead, state, last activity, blocked), §4.2 (by NAME, never by pid), §4.3 (campd owns the truth; clients are stateless renderers).
+Spec: §4.1, §4.2, §4.3.
 
-**Files:** Modify `daemon/socket.rs`, `daemon/control.rs`, `daemon/patrol.rs` (one accessor), `daemon/event_loop.rs` (one arm). Test: `tests/control.rs`.
+**Files:** `daemon/socket.rs`, `daemon/control.rs`, `daemon/patrol.rs` (one accessor), `daemon/event_loop.rs` (one arm); test in `tests/control.rs`.
 
-- [ ] **Step 1: Write the failing tests.** In `socket.rs`, pin `{"op":"sessions.list"}`, the `SessionInfo` field order, and the full `Response::SessionsList` line — **asserting the serialized response contains no `pid`** (§4.2: *"a protocol that hands out pids is a protocol that cannot cross a machine boundary"*). In `tests/control.rs`, `sessions_list_reports_live_sessions_by_name`: sling, wait for `session.woke`, then assert exactly one session with `agent:"dev"`, `rig:"gc"`, `state:"working"`, `blocked:false`, an RFC3339 `last_activity`, a `gc-`-prefixed `bead`, a `/dev/`-containing `name`, and `s.get("pid").is_none()`.
+- [ ] **Step 1: Write the failing tests** (**2**). In `socket.rs`: pin `{"op":"sessions.list"}`, `SessionInfo`'s field order, and the full response line — **asserting it contains no `pid`** (§4.2: *"a protocol that hands out pids cannot cross a machine boundary"*). In `tests/control.rs`: `sessions_list_reports_live_sessions_by_name` — one live session with `agent:"dev"`, `rig:"gc"`, `state:"working"`, `blocked:false`, an RFC3339 `last_activity`, a `gc-` bead, a `/dev/` name, and `s.get("pid").is_none()`.
 
-- [ ] **Step 2: Run and watch both fail.** (`no variant named SessionsList`.)
+- [ ] **Step 2: Run and watch both fail.**
 
 - [ ] **Step 3: Implement.**
+- `socket.rs`: `SessionInfo { name, agent, rig: Option<String>, bead: Option<String>, state: String, last_activity: String, blocked: bool }` (declaration order IS wire order — B1); `Request::SessionsList` (`#[serde(rename = "sessions.list")]`); `Response::SessionsList { ok, sessions }` FIRST among the untagged variants.
+- `patrol.rs`: `pub fn is_stalled(&self, session: &str) -> bool` — **using the SAME `tracked` intersection `stalled_count` applies** (patrol.rs:230-237: *"a missed clear can never inflate the count"*). Divergent semantics between the count and the per-session answer would be a bug, not a shortcut.
+- `control.rs::serve_sessions_list(ledger, patrol, read_channel)` — answers from the **LEDGER's** registry (`live_sessions()`), not campd's child map: an ADOPTED worker from a previous campd life is a live session too (§4.3). `state` is **exactly two values in cp-1** (`"stalled"` / `"working"`) and the doc comment promises no third. `blocked` is `false`; its producer is phase 3 (§5.3); the flow is structurally unreachable (§5.3.1); and a `can_use_tool` that arrives anyway is a LOUD `control.failed`, never a quietly-flipped bit. **The field is in the shape because §4.1's shape requires it: a protocol field awaiting its producer, not a guess.** `last_activity` = `read_channel.last_activity(name)`, else the registry's `spawned_ts`.
+- `event_loop.rs`: one delegating arm.
 
-`socket.rs`: `SessionInfo { name, agent, rig: Option<String>, bead: Option<String>, state: String, last_activity: String, blocked: bool }` (field order IS wire order — B1); `Request::SessionsList` with `#[serde(rename = "sessions.list")]`; `Response::SessionsList { ok, sessions }` placed FIRST among the untagged variants (its `sessions` key is the discriminator).
-
-`patrol.rs` — one accessor beside `stalled_count` (patrol.rs:233), using the actual field `stalled_count` counts:
-```rust
-    /// cp-1 §4.1: is this session in patrol's stalled set? `sessions.list`'s
-    /// state column. (`stalled_count` counts them; this names one.)
-    pub fn is_stalled(&self, session: &str) -> bool { self.stalled.contains(session) }
-```
-
-`control.rs::serve_sessions_list(ledger, patrol, read_channel) -> Response` — answers from the **LEDGER's** registry (`live_sessions()`), not campd's in-memory child map: an ADOPTED worker from a previous campd life is a live session too, and a client must see it (§4.3). `state` is **exactly two values in cp-1**: `"stalled"` when patrol's ladder has fired, `"working"` otherwise. (A third, `"blocked"`, arrives with phase 3.) `blocked` is `false`, and its producer is phase 3 (§5.3): no camp worker is spawned with `--permission-prompt-tool stdio` (§5.3.1), so the flow is structurally unreachable — and a `can_use_tool` that arrives anyway is a LOUD `control.failed`, never a quietly-flipped bit. The field is in the shape because §4.1's shape requires it: **a protocol field awaiting its producer, not a guess.** `last_activity` = `read_channel.last_activity(name)`, falling back to the registry's `spawned_ts` before the first line lands.
-
-`event_loop.rs` — one arm delegating to it.
-
-- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --lib daemon::socket && cargo test -p camp --test control`
+- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --bins daemon::socket && cargo test -p camp --test control` (**7** integration tests now).
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -1603,219 +760,266 @@ git add -A && git commit -m "feat(control): sessions.list — every session by n
 
 ---
 
-## Task 8: `session.subscribe` — a streaming connection MODE (D6′; B7–B13)
+## Task 8: `session.subscribe` — one monotone cursor, a Closing state, a skip policy (D6″; C2/C6/C7/C8)
 
-Spec: §4.4 (all four bullets), §9 (byte-offset cursors; a reaped stream is an explicit error), §8 (the backpressure obligation), §5.2 (*"Detach freely"*).
+Spec: §4.4, §9, §8, §5.2.
 
-**Files:** Modify `daemon/control.rs`, `daemon/socket.rs` (wire types only — **no client API**, B2), `daemon/event_loop.rs`, `tests/fake-agent.sh`, `tests/control.rs`.
+**Files:** `daemon/control.rs`, `daemon/socket.rs` (wire types only — **no client API**, B2), `daemon/event_loop.rs`, `tests/fake-agent.sh`, `tests/control.rs`.
 
-**The frame wire — TAGGED FROM BIRTH (B12), because cp-2 and cp-4 inherit it and a retrofitted terminal frame would be a breaking change:**
+### The frame wire — TAGGED FROM BIRTH, and now THREE frames (B12/C8)
+
 ```json
-{"frame":"event","session":"t/dev/1","offset":123,"event":{ …the raw stream-json line, verbatim… }}
-{"frame":"end","session":"t/dev/1","offset":456,"reason":"stopped"}
+{"frame":"event","session":"t/dev/1","offset":123,"event":{ …the worker's line, VERBATIM BYTES… }}
+{"frame":"skipped","session":"t/dev/1","offset":456,"bytes":2097152,"reason":"line exceeds subscriber_buffer_bytes"}
+{"frame":"end","session":"t/dev/1","offset":789,"reason":"stopped"}
 ```
-After the `end` frame campd pumps and closes the connection (EOF).
+**`event`'s payload is the worker's line SPLICED IN VERBATIM (C2)** — never re-serialized through a `Value`, which would sort its keys and hand cp-2/cp-4 a wire camp invented by accident. After the `end` frame campd flushes and closes (EOF).
 
-**Interfaces produced:**
+### Constants, with their arithmetic
+
 ```rust
+pub const SUBSCRIBER_BUFFER_BYTES_DEFAULT: usize = 1024 * 1024;  // §4.4's number
 pub const HISTORY_CHUNK_BYTES: usize = 64 * 1024;
-pub const MAX_SUBSCRIBERS: usize = 16;   // bound the COUNT, not just the bytes
-pub enum PumpOutcome { Ok, Drop(EventInput), Gone }
-impl ControlRuntime {
-    pub fn serve_subscribe(&mut self, token: Token, session: &str, cursor: Option<u64>,
-                           read_channel: &ReadChannelRuntime) -> Response;
-    pub fn pump(&mut self, token: Token, conn: &mut Conn) -> PumpOutcome;
-    pub fn fanout(&mut self, lines: &[StreamLine], conns: &mut HashMap<Token, Conn>)
-        -> (Vec<Token>, Vec<EventInput>);
-    pub fn end_sessions(&mut self, sessions: &[String], ledger: &Ledger,
-                        conns: &mut HashMap<Token, Conn>) -> Vec<Token>;
-    pub fn forget(&mut self, token: Token);
-    pub fn is_subscriber(&self, token: Token) -> bool;
-    pub fn subscriber_count(&self) -> usize;   // #[allow(dead_code)] — test observable, PERMANENT
-}
-// socket.rs (wire types only)
-Request::SessionSubscribe { session: String, cursor: Option<u64> }
-Response::Subscribed { ok: bool, subscription: String, cursor: u64 }
+pub const MAX_PUMP_BYTES_PER_WAKE: usize = 256 * 1024;           // per subscriber (C6)
+/// §4.4 bounds BYTES PER CONNECTION; nothing bounded the CONNECTION COUNT.
+/// WORST CASE, STATED: MAX_SUBSCRIBERS * SUBSCRIBER_BUFFER_BYTES = 8 MiB of
+/// outbound buffers on top of campd's idle RSS. That CAN approach the spec's
+/// <20 MB figure — so, plainly: <20 MB is an IDLE bound (and it is exactly what
+/// `make perf` measures: N subscribers with EMPTY buffers). A campd with 8
+/// SATURATED subscribers is outside that bound BY DESIGN, and this cap is what
+/// keeps it bounded at all. Raising it is a spec question, not a local call.
+pub const MAX_SUBSCRIBERS: usize = 8;
 ```
 
-- [ ] **Step 1: Write the failing tests.**
-
-`socket.rs`: `subscribe_wire_format_is_pinned` — the request with `cursor: Some(4096)` and with `cursor: None` (⇒ `"cursor":null`), and the `Subscribed` hello.
-
-`control.rs` unit test — **B13(a), the pin whose absence the panel caught**:
-```rust
-    /// §4.4/B13: the FRAME is a shape camp SENDS (and cp-2/cp-4 will parse), so
-    /// it is pinned like every other. Tagged from birth: the `end` frame was
-    /// DESIGNED IN, not retrofitted (B12).
-    #[test]
-    fn subscribe_frame_shapes_are_pinned() {
-        let event = event_frame("t/dev/1", 123, r#"{"type":"system","subtype":"init"}"#).unwrap();
-        assert_eq!(
-            String::from_utf8(event).unwrap(),
-            "{\"frame\":\"event\",\"session\":\"t/dev/1\",\"offset\":123,\
-             \"event\":{\"type\":\"system\",\"subtype\":\"init\"}}\n"
-        );
-        let end = end_frame("t/dev/1", 456, "stopped").unwrap();
-        assert_eq!(
-            String::from_utf8(end).unwrap(),
-            "{\"frame\":\"end\",\"session\":\"t/dev/1\",\"offset\":456,\"reason\":\"stopped\"}\n"
-        );
-    }
-```
-Plus a unit test for the HARD cap (B10): a `Subscriber` at `cap-1` bytes offered a frame that would cross the cap is dropped **before** the append, and the `subscriber.dropped` event's `buffered_bytes` is the ATTEMPTED size (the high-water), not the pre-append size.
-
-`tests/control.rs` — the subscribe client is a **test helper** (B2: there is NO `socket::subscribe`; phase 2's `camp watch` is the first real client):
-```rust
-/// The subscribe client, as a TEST helper (B2). `camp` is a binary crate, so a
-/// public wire client with no consumer would be dead code and the clippy gate
-/// would reject it. This is the idiom every existing harness uses (raw
-/// UnixStream + BufReader — tests/read_channel.rs).
-///
-/// The HELLO is read under REQUEST_TIMEOUT (5 s, socket.rs:148). AFTERWARDS the
-/// read deadline is CLEARED — that is §4.4's timeout exemption, and the reason a
-/// quiet stream is not a wedged daemon.
-struct SubClient {
-    reader: BufReader<UnixStream>,
-    stream: UnixStream,
-    subscription: String,
-    cursor: u64,
-}
-impl SubClient {
-    fn open(root: &Path, session: &str, cursor: Option<u64>) -> std::io::Result<SubClient>;
-    /// The next frame, or None at EOF. Returns `end` frames too (the caller
-    /// decides) — the B12 test needs to SEE one.
-    fn next_frame(&mut self) -> Option<serde_json::Value>;
-}
-```
-Seven integration tests:
-
-1. **`a_wedged_campd_fails_the_subscribe_hello_fast`** — the EXIT CRITERION. A bare bound `UnixListener` IS the wedge simulator (socket.rs:751): the kernel backlog accepts, nothing answers. `SubClient::open` must return `Err` of kind `WouldBlock`/`TimedOut` **within REQUEST_TIMEOUT**, never hang. Assert elapsed < 15 s.
-2. **`a_subscription_survives_a_quiet_period_longer_than_request_timeout`** — **B13(b).** Open at the tail, sleep **6 s** (> the 5 s `REQUEST_TIMEOUT`), then trigger an interrupt and assert a frame still arrives. The subscription is timeout-exempt after the hello.
-3. **`a_subscriber_gets_history_from_its_cursor_then_follows_live`** — **B11.** Subscribe at cursor 0 to a session that has ALREADY emitted its `system/init` line, and assert the history frame arrives **with no new activity** (it must not sit in campd's memory waiting for a WRITABLE edge that was consumed at accept). Then interrupt and assert the live `control_response` frame follows. **D6′: ordinary history is NEVER refused.**
-4. **`a_subscriber_gets_an_end_frame_when_its_session_ends`** — **B12.** `FAKE_AGENT_EXIT_AFTER_CONTROL=1`; drain frames until `{"frame":"end"}`; assert it names the session and a `reason`, and that EOF never arrives without one.
-5. **`a_hung_up_subscriber_is_forgotten_and_is_never_libeled_as_backpressure`** — **B7.** Open a subscription, DROP it (the operator's Ctrl-C), drive three wakes, assert campd still answers `status` promptly and that **no `subscriber.dropped` event exists**. A normal detach is not a fault (§5.2).
-6. **`a_subscriber_that_stops_reading_is_dropped_loudly_and_campd_keeps_serving`** — **§8 + B8.** Env: `FAKE_AGENT_SPAM_ON_TURN=8000`, `CAMP_SUBSCRIBER_BUFFER_BYTES=512`. Subscribe at the **tail** (`cursor: None` ⇒ empty history ⇒ a clean hello), read NOTHING, then `send_turn` to trigger the spam. Assert `subscriber.dropped{session, cap_bytes: 512, buffered_bytes > 512}`, then assert campd answers a `status` on a FRESH connection in < 5 s (it never blocked). **The 8000 lines ≈ 720 KB are chosen to exceed kernel-socket-buffer + app-cap on both platforms — macOS `net.local.stream.sendspace` ≈ 8 KiB, Linux ≈ 200 KiB. A smaller spam is absorbed entirely by the kernel, `sub.out` never grows, and the test becomes theatre.**
-7. **`a_cursor_into_a_reaped_stream_or_past_the_tail_is_an_explicit_error`** — §9. Both errors, both explicit, neither a silent truncation nor a silent seek to EOF.
-
-- [ ] **Step 2: Run and watch them fail.** (`bad request: unknown variant session.subscribe`.)
-
-- [ ] **Step 3: Implement the registry (D6′).**
+### `Subscriber` — ONE cursor (D6″/C6), and a `Closing` state (C7)
 
 ```rust
-/// D6′/B9: history is read in bounded chunks, only as the socket drains — never
-/// slurped. A 256 MiB stream file (the max_stream_bytes ceiling) must never
-/// become a 256 MiB allocation or a 256 MiB synchronous read on campd's
-/// single-threaded event loop.
-pub const HISTORY_CHUNK_BYTES: usize = 64 * 1024;
-
-/// §4.4 bounds BYTES PER CONNECTION, but nothing bounded the CONNECTION COUNT —
-/// and 20 subscribers x 1 MiB is the entire <20 MB RSS budget the perf gate
-/// asserts. A subscribe past this cap is an explicit, loud error at the hello.
-pub const MAX_SUBSCRIBERS: usize = 16;
-
 struct Subscriber {
     id: String,
     session: String,
-    /// D6′: the open stream file. Held across disposal ON PURPOSE — on Unix an
-    /// unlinked inode survives while an fd is open, so a subscriber still
-    /// catching up when its session is reaped can finish its history.
+    /// The open stream file. Held across disposal ON PURPOSE — on Unix an unlinked
+    /// inode survives while an fd is open, so a Closing subscriber FINISHES ITS
+    /// HISTORY (C7: rev 2's text promised this and its code foreclosed it).
     file: std::fs::File,
-    /// The next byte of HISTORY to read. While `history_cursor < caught_up_at`
-    /// the subscriber is CATCHING UP and live fanout lines are IGNORED — they
-    /// are already in the append-only file and the history reader will reach
-    /// them, so nothing is duplicated and nothing is reordered.
-    history_cursor: u64,
-    /// The tail offset at hello: where catch-up ends and live begins.
-    caught_up_at: u64,
+    /// THE ONE CURSOR (D6″): the next byte this subscriber needs. MONOTONE, and the
+    /// SOLE delivery gate — there is no separate live path, so there is no boundary
+    /// to get wrong (C6: rev 2's catch-up/live split could BOTH duplicate AND
+    /// silently truncate, and no test could see either).
+    cursor: u64,
+    /// What campd has actually DRAINED. Refreshed every wake from
+    /// `read_channel.tail_state`; PINNED to the final offset once the session is
+    /// disposed. `pump` reads ONLY [cursor, tail) — so it can never read bytes campd
+    /// has not drained (rev 2 could, and delivered them twice).
+    tail: u64,
+    /// C7: set at disposal (stopped | crashed | capped). A Closing subscriber keeps
+    /// pumping until `cursor == tail` AND `out` is empty; only THEN does the `end`
+    /// frame go out, and the connection closes when that flush completes.
+    closing: Option<String>,
     /// Bytes queued for this socket. HARD-capped: a frame that would cross
-    /// `subscriber_buffer_bytes` drops the subscriber BEFORE it is appended
-    /// (B10 — the old code appended a whole wake's drain and only THEN tested
-    /// the cap, which made the cap soft by up to max_stream_bytes).
+    /// `subscriber_buffer_bytes` drops the subscriber BEFORE it is appended (B10).
     out: Vec<u8>,
-    /// The largest `out` WOULD have reached — reported as `buffered_bytes` in
+    /// The largest `out` WOULD have reached — `buffered_bytes` in
     /// `subscriber.dropped` (§4.4: "naming the session and the high-water mark").
     high_water: usize,
 }
 ```
-`event_frame(session, offset, raw_line) -> Option<Vec<u8>>` and `end_frame(session, offset, reason) -> Option<Vec<u8>>` build the two pinned shapes with `#[derive(Serialize)]` structs (B1 — declaration order).
 
-**`serve_subscribe`:** (1) `MAX_SUBSCRIBERS` reached ⇒ explicit error; (2) `read_channel.tail_state(session)` is `None` ⇒ **not tailed** (never existed, or reaped and disposed) ⇒ explicit error citing §9; (3) `cursor > tail` ⇒ explicit error ("past the N bytes campd has consumed"); (4) **no history-size check** (D6′ — ordinary history is never refused); (5) open the file, insert the `Subscriber` with `history_cursor = cursor.unwrap_or(tail)` and `caught_up_at = tail`, return the hello. **It registers; it never writes.**
+- [ ] **Step 1: Write the failing tests.**
 
-**`pump(token, conn)` — B11's fix, and the ONLY place bytes reach a socket:**
-```
-loop {
-    if out is empty && history_cursor < caught_up_at {
-        read <= HISTORY_CHUNK_BYTES from `file` at history_cursor; split COMPLETE
-        lines; frame each, appending UNDER THE HARD CAP (a frame that would cross
-        it => return Drop(subscriber.dropped)); advance history_cursor
+**Unit (`control.rs`, 4):**
+1. **`event_frame_splices_verbatim_and_refuses_a_non_object_line`** (C2's new-failure test) — `event_frame("t/dev/1", 123, r#"{"type":"system","subtype":"init"}"#)` produces **exactly** `{"frame":"event","session":"t/dev/1","offset":123,"event":{"type":"system","subtype":"init"}}\n` — **key order preserved, because the line is SPLICED, not re-serialized.** And `event_frame(_, _, "not json")` ⇒ `None` (so the history path agrees with cp-0's `Ok(_v)` arm).
+2. `subscribe_frame_shapes_are_pinned` — all three frames (`event`, `skipped`, `end`).
+3. `a_frame_that_would_cross_the_cap_drops_the_subscriber_before_it_is_appended` (B10) — the HARD cap; `buffered_bytes` is the ATTEMPTED size.
+4. **`a_line_larger_than_the_cap_is_skipped_not_fatal`** (C8) — a single line bigger than the whole cap yields a `skipped` frame, the cursor advances past it, and the subscriber SURVIVES.
+
+**Integration (`tests/control.rs`, 7):**
+5. **`a_wedged_campd_fails_the_subscribe_hello_fast`** — the EXIT CRITERION. A bare bound `UnixListener` is the wedge simulator (socket.rs:751). `SubClient::open` returns `Err` (`WouldBlock`/`TimedOut`) **inside REQUEST_TIMEOUT**; assert elapsed < 15 s.
+6. **`a_subscription_survives_a_quiet_period_longer_than_request_timeout`** (B13) — open at the tail, sleep **6 s** (> the 5 s `REQUEST_TIMEOUT`), then interrupt and assert a frame still arrives.
+7. **`a_subscriber_catching_up_across_a_live_burst_gets_every_line_exactly_once_in_order`** — **C6's test: the window rev 2 never exercised.** A session with **>64 KiB** of history (more than one `HISTORY_CHUNK_BYTES`, so catch-up spans several pumps); subscribe at **cursor 0**; the worker appends **live lines DURING catch-up** (a second `send_turn` fired immediately after the hello). Assert every line arrives **exactly once**, **in file order**, with **strictly increasing `offset`s**. *Rev 2's design silently dropped a burst here and could double-deliver.*
+8. **`a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends`** (B12/C7) — `FAKE_AGENT_EXIT_AFTER_CONTROL`; assert **every** line arrives BEFORE the `end` frame (not a truncated prefix), the `end` frame names the session and a `reason`, its `offset` equals the session's final offset, and **EOF never arrives without an `end` frame**.
+9. **`a_closing_subscriber_that_stops_reading_is_still_dropped_at_the_cap`** (C7's new-failure test) — a Closing subscriber gets NO backpressure exemption, so it can never hold an fd forever.
+10. **`a_hung_up_subscriber_is_forgotten_and_is_never_libeled_as_backpressure`** (B7) — drop the subscription, drive three wakes, assert campd still answers `status` promptly and **no `subscriber.dropped` exists**. A normal detach is not a fault (§5.2).
+11. **`a_subscriber_that_stops_reading_is_dropped_loudly_and_campd_keeps_serving`** (§8/B8) — `FAKE_AGENT_SPAM_ON_TURN=8000` (≈720 KB, chosen to exceed *kernel socket buffer + app cap* on both platforms: macOS `net.local.stream.sendspace` ≈ 8 KiB, Linux ≈ 200 KiB — **a smaller spam is absorbed entirely by the kernel and the test becomes theatre**), `CAMP_SUBSCRIBER_BUFFER_BYTES=512`. Subscribe at the **tail** (clean hello), read NOTHING, `send_turn` to trigger the spam. Assert `subscriber.dropped{session, cap_bytes:512, buffered_bytes>512}`, then that campd answers `status` on a FRESH connection in < 5 s.
+12. **`a_cursor_into_a_reaped_stream_or_past_the_tail_is_an_explicit_error`** (§9) — both, both explicit.
+
+**`SubClient` — real bodies** (non-blocking note, adopted). `camp` is a binary crate, so there is no `socket::subscribe` (B2); this is the harness's own idiom.
+```rust
+struct SubClient { reader: BufReader<UnixStream>, stream: UnixStream, subscription: String, cursor: u64 }
+
+impl SubClient {
+    fn open(root: &Path, session: &str, cursor: Option<u64>) -> std::io::Result<SubClient> {
+        let stream = UnixStream::connect(root.join("campd.sock"))?;
+        // The HELLO is bounded by REQUEST_TIMEOUT (5 s, socket.rs:148) — a wedged
+        // campd fails HERE, which is the exit criterion.
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let req = serde_json::json!({"op":"session.subscribe","session":session,"cursor":cursor});
+        (&stream).write_all(format!("{req}\n").as_bytes())?;
+        // try_clone: the BufReader owns one handle; `stream` keeps the other so the
+        // read deadline can be CLEARED after the hello.
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut hello = String::new();
+        reader.read_line(&mut hello)?;                       // times out on a wedge
+        let v: serde_json::Value = serde_json::from_str(hello.trim_end())
+            .map_err(|e| std::io::Error::other(format!("bad hello {hello:?}: {e}")))?;
+        if v["ok"] != true {
+            return Err(std::io::Error::other(format!("subscribe refused: {v}")));
+        }
+        // §4.4: TIMEOUT-EXEMPT after the hello — a quiet stream is not a wedged
+        // daemon. THIS LINE is the exemption, and test 6 is what proves it.
+        stream.set_read_timeout(None)?;
+        Ok(SubClient {
+            subscription: v["subscription"].as_str().unwrap_or_default().to_owned(),
+            cursor: v["cursor"].as_u64().unwrap_or(0),
+            reader,
+            stream,
+        })
     }
-    if out is empty { return Ok }                     // nothing to send
-    match write(out) {
-        Ok(n)        => drain n,
-        Ok(0)/EPIPE/ECONNRESET => return Gone,
-        WouldBlock   => return Ok,                    // the kernel is full; the
-                                                      // WRITABLE edge re-arms and
-                                                      // calls us again
+
+    /// The next frame, or None at EOF. `end` frames ARE returned — test 8 must SEE one.
+    fn next_frame(&mut self) -> Option<serde_json::Value> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => serde_json::from_str(line.trim_end()).ok(),
+        }
     }
 }
 ```
-Called at exactly **three** sites: (a) immediately after the hello is written, (b) on every WRITABLE readiness for a subscriber token, (c) after every `fanout`. **Invariant, stated because `respond()` uses `write_all` on a NON-BLOCKING stream (event_loop.rs:997) and a WouldBlock there drops the connection: the hello must be the FIRST bytes on the socket, and nothing may be buffered before it.**
 
-**`fanout(lines, conns)`:** for each subscriber — if it is still CATCHING UP, skip (the history reader will get those bytes from the file); otherwise append each matching line's frame **under the hard cap**, then `pump`. Returns the tokens to close and the `subscriber.dropped` events (`buffered_bytes: high_water`, `cap_bytes`).
+- [ ] **Step 2: Run and watch them fail.** (`bad request: unknown variant session.subscribe`.)
 
-**`end_sessions(sessions, ledger, conns)` (B12):** for every subscriber of a disposed session, append the `end` frame (exempt from the cap — it is the last thing that connection will ever receive), `pump` once, and return the token so the event loop deregisters and drops it. The `reason` comes from `ledger.session_status(name)` (mod.rs:341): `stopped` / `crashed` / `capped`.
+- [ ] **Step 3: Implement.**
 
-- [ ] **Step 4: Wire the event loop — B7's fix is here.**
+**`event_frame` — the byte splice (C2): the only way to keep the worker's bytes verbatim without a new cargo feature.**
+```rust
+#[derive(Serialize)]
+struct FramePrefix<'a> { frame: &'static str, session: &'a str, offset: u64 }
 
-- `struct Conn` → `pub(super) struct Conn { pub(super) stream: UnixStream, pub(super) buf: Vec<u8> }`.
-- The accept arm registers `Interest::READABLE | Interest::WRITABLE`. (Precisely: edge-triggered epoll/kqueue reports writability ONCE at registration — an **accept-time** cost, not an idle one. That already-consumed edge is exactly why the hello's history needs an explicit `pump` — B11.)
-- **The token arm — NO SHORT-CIRCUIT (B7).** If `control.is_subscriber(token)`, `pump` FIRST (a WRITABLE wake is why we are here) and handle `Drop`/`Gone` — **then fall through into `serve_connection` exactly like any other connection.** cp-0's existing `ReadStop::Eof ⇒ ConnState::Closed` is what detects a hangup; rev 1's short-circuit bypassed it, which is why a detached subscriber leaked an fd and a buffer forever and was later libeled as a backpressure drop.
-- `control.forget(token)` on EVERY close path: `ConnState::Closed`, the error arm, `PumpOutcome::Gone`, and a backpressure drop. **A normal detach appends NO event** (§5.2 "Detach freely" — the ledger records faults, not client lifecycle).
-- The new `drain_lines` arm: `serve_subscribe` → `respond(hello)` → `pump` (site (a)).
-- In `control_step` (Task 6), after `ingest`: `fanout` (append the drop events; deregister the dropped tokens), then `end_sessions(&read_channel.take_disposed(), ledger, conns)` (B12) and deregister those tokens too.
-
-`tests/fake-agent.sh` — the B8 mode:
-```bash
-#   FAKE_AGENT_SPAM_ON_TURN  cp-1 (B8): on the first USER TURN (a send_turn),
-#                            emit N stream-json lines. The spam MUST come after
-#                            the subscriber is registered, or the backpressure
-#                            gate tests nothing (at worker start it is all
-#                            drained before any subscriber exists).
+/// The worker's line is SPLICED IN VERBATIM — never round-tripped through a
+/// `serde_json::Value`, which would SORT its keys (serde_json 1.0.150 has no
+/// `preserve_order`, and `raw_value` is a cargo feature this plan does not add).
+/// A subscriber therefore sees EXACTLY the bytes the worker wrote — the guarantee
+/// cp-2/cp-4 actually need, and stronger than any re-serialized pin could be.
+///
+/// Returns None when `raw_line` is not a JSON OBJECT: splicing it would emit
+/// invalid JSON. cp-0's `drain_one` only hands over lines that already parsed, but
+/// `pump` reads the FILE directly — so the history path must check too. That is
+/// what keeps history and live in agreement.
+fn event_frame(session: &str, offset: u64, raw_line: &str) -> Option<Vec<u8>> {
+    let trimmed = raw_line.trim();
+    if !trimmed.starts_with('{') || serde_json::from_str::<serde_json::Value>(trimmed).is_err() {
+        return None;
+    }
+    let prefix = serde_json::to_string(&FramePrefix { frame: "event", session, offset }).ok()?;
+    // prefix == {"frame":"event","session":"…","offset":N} — replace its final '}'
+    // with ,"event":<raw>} so the raw bytes land untouched.
+    let mut out = prefix.into_bytes();
+    out.pop()?;                                  // drop the closing '}'
+    out.extend_from_slice(b",\"event\":");
+    out.extend_from_slice(trimmed.as_bytes());
+    out.extend_from_slice(b"}\n");
+    Some(out)
+}
 ```
-It reads the task line, blocks on stdin, and on the first non-control line emits N `{"type":"assistant",…}` lines, then closes the bead.
+(`skipped_frame` and `end_frame` are plain `#[derive(Serialize)]` structs — they carry no verbatim payload.)
 
-- [ ] **Step 5: Run.** `cargo test -p camp --test control 2>&1 | tail -40` → PASS (12 tests in the file).
+**`serve_subscribe(token, session, cursor, read_channel)`:**
+1. `subscribers.len() >= MAX_SUBSCRIBERS` ⇒ explicit error naming the cap.
+2. `read_channel.tail_state(session)` is `None` ⇒ **not tailed** (never existed, or reaped and disposed) ⇒ explicit error citing §9.
+3. `cursor > tail` ⇒ explicit error ("past the N bytes campd has consumed"). **Ordinary history is NOT an error** (B10/D6″).
+4. Open the file; insert `Subscriber { cursor: cursor.unwrap_or(tail), tail, closing: None, out: Vec::new(), high_water: 0, … }`; return the hello. **It registers; it never writes** — the hello must be the FIRST bytes on the socket (`respond()` uses `write_all` on a NON-BLOCKING stream, event_loop.rs:997, and a WouldBlock there drops the connection — B11).
+
+**`pump(token, conn) -> PumpOutcome` — the ONE data path (D6″) and the only place bytes reach a socket (B11):**
+```
+pumped = 0
+loop {
+    if out.is_empty() && cursor < tail {
+        if pumped >= MAX_PUMP_BYTES_PER_WAKE { return Ok }        // C6: bounded on the loop
+        read <= min(HISTORY_CHUNK_BYTES, tail - cursor) bytes at `cursor`
+        for each COMPLETE line in the chunk:
+            frame = event_frame(...) or (skipped_frame if the line is not a JSON object)
+            if frame.len() > cap  => append skipped_frame; record patrol.degraded ONCE
+                                     per (session, offset)                       // C8
+            else if out.len() + frame.len() > cap
+                                  => return Drop(subscriber.dropped{ high_water }) // B10
+            else                  => append frame
+            cursor = offset_after; pumped += line.len()
+    }
+    if out.is_empty() {
+        if closing.is_some() && cursor == tail {
+            append end_frame(session, tail, reason)                 // C7: history FIRST
+            keep flushing; when `out` drains => return Gone (close the connection)
+        }
+        return Ok                                                   // nothing to send
+    }
+    match write(out) {
+        Ok(n) => drain n,
+        Ok(0) | EPIPE | ECONNRESET => return Gone,
+        WouldBlock => return Ok,          // the kernel is full; the WRITABLE edge re-arms
+    }
+}
+```
+Called at **three** sites: right after the hello is written; on every WRITABLE readiness; after every `fanout`.
+
+**`poll_timeout` (extended, C6):** `min(earliest pending control deadline, ZERO if any subscriber has cursor < tail OR a non-empty out)`. **`None` when neither holds** — so an idle campd with idle subscribers still blocks forever (invariant 1; Task 9's perf gate is what proves it).
+
+**`fanout(read_channel, conns)`** (D6″ — it no longer touches `lines` at all): for each subscriber, refresh `tail` from `read_channel.tail_state(session)` (leaving it PINNED when `closing`), then `pump`. Returns the tokens to close and the `subscriber.dropped` events.
+
+**`close_disposed(disposed: Vec<Disposed>, ledger, conns)`** (B12/C7): for each disposed session, every subscriber gets `closing = Some(reason)` (from `ledger.session_status(name)`: stopped / crashed / capped) and `tail = final_offset` (**C7's defined offset source, produced by Task 4's `dispose_pending`**), then `pump`. It does **not** close the connection — `pump` does, once the history is finished and the `end` frame has flushed. It also calls `control.forget_session(session)` to prune `answered`.
+
+**`forget(token)`** — drop the subscription (every close path calls it). **`is_subscriber(token)`**; **`subscriber_count()`** (PERMANENT test-observable allow).
+
+- [ ] **Step 4: Wire the event loop — B7's fix stays.**
+- `struct Conn` → `pub(super)` (fields too).
+- The accept arm registers `READABLE | WRITABLE`. *(Precisely: edge-triggered epoll/kqueue reports writability ONCE at registration — an accept-time cost, not an idle one. That already-consumed edge is exactly why the hello's first bytes need an explicit `pump` — B11.)*
+- **The token arm — NO SHORT-CIRCUIT (B7).** If `control.is_subscriber(token)`, `pump` first (a WRITABLE wake is why we are here) and handle `Drop`/`Gone` — **then fall through into `serve_connection` like any other connection**, so cp-0's `ReadStop::Eof ⇒ ConnState::Closed` still detects a hangup.
+- `control.forget(token)` on EVERY close path (`Closed`, the error arm, `Gone`, a cap drop). **A normal detach appends NO event** (§5.2).
+- The new `drain_lines` arm: `serve_subscribe` → `respond(hello)` → `pump`.
+- `control_step` gains `fanout` + `close_disposed` (Task 6 Step 5).
+
+`tests/fake-agent.sh` — `FAKE_AGENT_SPAM_ON_TURN=N`: on a USER TURN, emit N stream-json lines. **The spam must come after the subscriber is registered** (B8); test 7 fires a second turn during catch-up.
+
+- [ ] **Step 5: Run.**
+
+Run: `cargo test -p camp --bins daemon::control && cargo test -p camp --test control 2>&1 | tail -40`
+Expected: PASS — unit **18** (7 + 7 + 4); integration **14** (6 from Task 6 + 1 from Task 7 + 7 here).
 
 - [ ] **Step 6: Full suite + commit.**
 ```bash
 cargo test --workspace 2>&1 | tail -20
 cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add -A
-git commit -m "feat(control): session.subscribe — streamed history, a hard cap, drop-loudly, end-framed (cp-1 §4.4/§9)"
+git commit -m "feat(control): session.subscribe — one monotone cursor, a Closing state, a skip policy (cp-1 §4.4/§9)"
 ```
 
 ---
 
 ## Task 9: the §4.3 perf gate grows N idle subscribers
 
-Spec: §4.3 (*"extend the `make perf` idle gate to hold M quiescent workers with tailed stdout files and N connected subscribers … and assert the same 0.0% CPU / <20 MB RSS numbers. Then §4.3 is a measured property, not an argument."*). cp-0 built the M half and its gate deferred the N half to the phase that builds `subscribe` — **this one** (the lead has confirmed the claim).
+Spec: §4.3. cp-0 built the M-workers half; its gate deferred the N-subscribers half to the phase that builds `subscribe` — **this one** (lead-confirmed).
 
-**Files:** Modify `crates/camp/tests/perf_daemon.rs`.
+**Files:** `crates/camp/tests/perf_daemon.rs`.
 
-- [ ] **Step 1: Extend the EXISTING idle gate** (one measured property, one test — do not add a second gate). `perf_daemon.rs` cannot link `daemon::socket` (B2); it already talks to campd over a raw `UnixStream`. Open **N = 4** raw connections, send `{"op":"session.subscribe","session":"<s>","cursor":null}` on each (joining at the TAIL ⇒ no history, no traffic), read each hello, and HOLD them open — reading nothing, with nothing to read — across the existing idle window. Assert the existing 0.0% CPU-delta and <20 MB RSS numbers, unchanged.
+- [ ] **Step 1: Extend the EXISTING idle gate** (one measured property, one test). `perf_daemon.rs` cannot link `daemon::*` (B2) and already speaks raw `UnixStream`. Open **N = 4** connections, send `{"op":"session.subscribe","session":"<s>","cursor":null}` on each (joining at the TAIL ⇒ nothing to stream), read each hello, HOLD them open across the existing idle window, and assert the existing 0.0% CPU-delta and <20 MB RSS numbers.
 
+**State what this measures — and what it does not:**
 ```rust
-    // cp-1 §4.3: N CONNECTED SUBSCRIBERS, held open, on QUIESCENT sessions. A
-    // subscription must cost ZERO wakeups when its session is quiet: campd sleeps
-    // on the read-channel self-pipe, a quiet worker writes nothing, so no notify
-    // event fires and no fanout runs. This is the property herdr could not offer
-    // (its events.wait is a 100 ms sleep loop with no fd to block on). If this
-    // gate goes RED on CPU, something in the subscriber path is waking campd with
-    // nothing to do — that is a REAL invariant-1 bug and it gets FIXED, never
-    // accommodated.
+    // cp-1 §4.3: N CONNECTED SUBSCRIBERS, held open, on QUIESCENT sessions. This
+    // measures the WAKEUP PROFILE — the property §4.3 asks for: a subscription must
+    // cost ZERO wakeups when its session is quiet (campd sleeps on the read-channel
+    // self-pipe; a quiet worker writes nothing, so no notify fires, no pump runs,
+    // and `poll_timeout` returns None). RED on CPU here means something in the
+    // subscriber path wakes campd with nothing to do — a REAL invariant-1 bug, to be
+    // FIXED, never accommodated.
+    //
+    // It does NOT measure the MEMORY ceiling: these four buffers are EMPTY. The
+    // loaded worst case is MAX_SUBSCRIBERS * SUBSCRIBER_BUFFER_BYTES = 8 MiB on top
+    // of idle RSS, which can approach the spec's <20 MB figure — so <20 MB is an
+    // IDLE bound, stated plainly in the PR body rather than implied away.
 ```
 
-- [ ] **Step 2: Run the perf gate (LOCAL-ONLY, per AGENTS.md).** `make perf 2>&1 | tail -30` → PASS: 0.0% CPU delta, <20 MB RSS, with M tailed workers AND N idle subscribers.
+- [ ] **Step 2: Run it (LOCAL-ONLY, per AGENTS.md).** `make perf 2>&1 | tail -30` → PASS.
 
 - [ ] **Step 3: Commit.**
 ```bash
@@ -1825,70 +1029,43 @@ git commit -m "test(perf): the idle gate now holds N connected subscribers (cp-1
 
 ---
 
-## Task 10: the $0 real-claude gate — camp's own bytes, and the NO-INITIALIZE arm (B14/B15)
+## Task 10: the $0 real-claude gate — camp's own bytes, and the NO-INITIALIZE arm (B15)
 
-Spec: §2.1 (fixtures), §8 (*"Without the real layer, §2.1's mitigations are theatre: fixtures pin what camp SENDS and PARSES, never what the CLI ACCEPTS and EMITS"*), §9.
+Spec: §2.1, §8, §9.
 
-**Files:** Modify `crates/camp/tests/claude_compat.rs`.
+**Files:** `crates/camp/tests/claude_compat.rs`.
 
-- [ ] **Step 1: Read the evidence that settles B15 — then encode it as a standing gate.** The panel required proof that camp's SHIPPED configuration (an interrupt with NO `initialize` ever sent) is acked by the real CLI, because every recorded ack in the repo is POST-initialize and `FAKE_AGENT_CONTROL_LOOP` acks anything — §8's named trap: *"a fake ignores argv, ignores the protocol, and agrees with whatever camp does."*
-
-**This was run against the pinned CLI on 2026-07-13 and it PASSES.** Reproduce:
+- [ ] **Step 1: The evidence that settles B15 (panel-reproduced).** Camp's shipped configuration is an interrupt with **no `initialize` ever sent**, while every recorded ack in the repo is POST-initialize and `FAKE_AGENT_CONTROL_LOOP` acks anything — §8's named trap. **Run against the pinned CLI, 2026-07-13:**
 ```bash
 export CLAUDE_CONFIG_DIR=$(mktemp -d)   # hermetic: `verbose` defaults to false
 printf '{"type":"control_request","request_id":"camp-b15","request":{"subtype":"interrupt"}}\n' \
   | claude -p --output-format stream-json --verbose --input-format stream-json \
            --session-id 7bd2befc-b018-4080-8738-429d541b3646
 ```
-Verbatim output (claude 2.1.207), exit 0, empty stderr:
+Verbatim output (exit 0, empty stderr):
 ```
 {"type":"control_response","response":{"subtype":"success","request_id":"camp-b15","response":{"still_queued":[]}}}
 ```
-**Ruling (b) is therefore satisfiable and is TAKEN:** camp does not send `initialize` in cp-1, and the $0 gate PROVES the exact configuration camp ships. (The `subtype!=="initialize"` rejection that does exist in the binary belongs to the `[bridge:repl]` Remote-Control transport — its error string is *"This session is outbound-only. Enable Remote Control locally to allow inbound control."* — and has nothing to do with camp's stdio path.)
+The `subtype!=="initialize"` rejection that exists in the binary is the `[bridge:repl]` Remote-Control transport (*"This session is outbound-only…"*), **not** camp's stdio path.
 
-- [ ] **Step 2: Make the gate send camp's OWN bytes, and add the no-initialize arm.** `camp` is a binary crate, so an integration test cannot call `ParentMessage::to_line` (the constraint `gate_core_flags_match_build_spec_held_stream_arm` already works around at claude_compat.rs:132). **The fixture is the shared truth:** Task 1's unit test asserts `ParentMessage::Interrupt{id}.to_line() == interrupt_request.json`, and this gate sends `interrupt_request.json` to the real CLI. Transitively, **the bytes camp produces are the bytes the real CLI accepts.**
+- [ ] **Step 2: Make the gate send camp's OWN bytes, and add the arm.** An integration test cannot call `ParentMessage::to_line` (B2 — the same constraint `gate_core_flags_match_build_spec_held_stream_arm` works around at claude_compat.rs:132). **The fixture is the shared truth:** Task 1 pins the constructor against `interrupt_request.json`, and this gate sends `interrupt_request.json` to the real CLI. Transitively, **the bytes camp produces are the bytes the CLI accepts.** *Precisely (B14): this does NOT make the fixture "recorded" — camp authored it. The gate proves ACCEPTANCE, and PROVENANCE.md says exactly that and no more.*
 
-**Be precise about the claim (B14):** this does NOT make `interrupt_request.json` a *recorded* shape — camp authored it. What the gate proves is **ACCEPTANCE**: the real pinned CLI takes these exact bytes and acks them. `PROVENANCE.md` says exactly that, and no more.
-
-Replace the hand-written literal (claude_compat.rs:387-390) with `const INTERRUPT_FIXTURE: &str = include_str!("fixtures/control/interrupt_request.json");` + `fn interrupt_line(id: &str) -> String` (templating `camp-fixture-1` → `id`), and add a CI-runnable guard `the_interrupt_fixture_is_a_well_formed_control_request` (asserts `type`, `request.subtype`, the templated `request_id`, and that the fixture id is gone). Then add the third `#[ignore]`d, `CAMP_COMPAT=1`-gated arm:
-
+Replace the hand-written literal (claude_compat.rs:387-390) with `include_str!("fixtures/control/interrupt_request.json")` + `fn interrupt_line(id)` (templating `camp-fixture-1`); add the CI-runnable guard `the_interrupt_fixture_is_a_well_formed_control_request`; and add:
 ```rust
-/// B15 — THE CONFIGURATION CAMP ACTUALLY SHIPS. cp-1 defers the `initialize`
-/// handshake to phase 3 (§9's stated purpose for it — redelivering
-/// `pending_permission_requests` — cannot exist before phase 3 wires
-/// `--permission-prompt-tool stdio`, §5.3.1). But EVERY interrupt ack recorded
-/// anywhere in this repo is POST-initialize, and the fake worker acks anything —
-/// §8's named trap verbatim. So: no initialize, ever. Just camp's own interrupt
-/// bytes, straight at the real pinned CLI, before any turn. $0 (no turn is sent).
+/// B15 — THE CONFIGURATION CAMP ACTUALLY SHIPS: no initialize, ever. Just camp's
+/// own interrupt bytes, straight at the real pinned CLI, before any turn. $0.
 ///
-/// If this ever goes RED, cp-1's interrupt path is broken against the real CLI
-/// and camp MUST start sending `initialize` (§9's "Camp sends it anyway"). Do NOT
-/// paper over it by adding the handshake to this test.
+/// If this ever goes RED, cp-1's interrupt path is broken against the real CLI and
+/// camp MUST start sending `initialize` (§9's "Camp sends it anyway"). Do NOT paper
+/// over it by adding the handshake to this test.
 #[test]
 #[ignore = "real-claude $0 gate: run via `make compat` (CAMP_COMPAT=1)"]
-fn no_initialize_pre_turn_interrupt_is_acked() {
-    assert_eq!(std::env::var("CAMP_COMPAT").as_deref(), Ok("1"));
-    let claude = resolve_claude();
-    assert_eq!(claude_version(&claude), PINNED_VERSION.trim());
-    let (mut cmd, _cfg) = claude_command(&claude, &held_stream_flags(SESSION_ID, true));
-    let mut worker = Worker { child: cmd.spawn().unwrap() };
-    let rx = stdout_lines(&mut worker.child);
-    // NO initialize handshake. This is exactly what campd does today.
-    send(&mut worker.child, &interrupt_line("camp-no-init"));
-    await_success(&rx, "camp-no-init");
-    eprintln!("[compat] pre-turn interrupt acked with NO initialize — cp-1's shipped config");
-    worker.child.stdin.take(); // EOF
-    assert!(wait_within_timeout(&mut worker.child).success());
-}
+fn no_initialize_pre_turn_interrupt_is_acked() { /* spawn; send interrupt_line; await_success */ }
 ```
-Also update `claude_compat_zero_cost` to send `interrupt_line("camp-compat-interrupt")` instead of its literal.
 
 - [ ] **Step 3: Run the CI-runnable half.** `cargo test -p camp --test claude_compat` → PASS (the ignored gates stay ignored).
 
-- [ ] **Step 4: Run the $0 gate locally.** It costs $0 (no turn). If the installed `claude` does not match `ci/claude-compat/CLAUDE_VERSION`, it fails loudly by design — **do NOT widen the pin**; report the mismatch to the lead.
-
-Run: `make compat 2>&1 | tail -30`
-Expected: PASS, printing `[compat] pre-turn interrupt acked with NO initialize — cp-1's shipped config`. If no pinned `claude` is available, SAY SO in the PR — never claim the gate ran.
+- [ ] **Step 4: Run the $0 gate locally.** `make compat 2>&1 | tail -30` → PASS, printing `[compat] pre-turn interrupt acked with NO initialize`. If the installed `claude` does not match the pin, it fails loudly by design — **do NOT widen the pin**; report to the lead. If no pinned `claude` exists, **SAY SO in the PR** — never claim a gate ran.
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -1900,43 +1077,39 @@ git commit -m "test(compat): the \$0 gate sends camp's own bytes and proves the 
 
 ## Task 11: gates, PR, honest description
 
-- [ ] **Step 1: Rebase onto main.**
-```bash
-git fetch origin && git rebase origin/main
-```
-`event_loop.rs` and `dispatch.rs` are shared with compat-2. The **four non-additive** `event_loop.rs` touches (the `min_deadline` nesting, `Conn`'s visibility, the accept `Interest`, the parameter/Token threading) are the likely conflict sites — resolve by keeping BOTH sides. If a conflict cannot be resolved that way, STOP and ask the lead.
+- [ ] **Step 1: Rebase onto main.** `git fetch origin && git rebase origin/main`. **`event_loop.rs` is NOT additive** — expect a real conflict with compat-2. Keep both sides; if impossible, STOP and ask the lead.
 
-- [ ] **Step 2: Prove the dead_code discipline held (B3).**
+- [ ] **Step 2: Prove the dead_code discipline held (C4).**
 ```bash
-! grep -rn "wired in Task\|consumed in Task" crates/camp/src/ \
+! grep -rn "first read in Task" crates/camp/src/ \
   || { echo "TEMPORARY dead_code allows survived — remove them"; exit 1; }
 ```
-Expected: no matches. The only surviving `#[allow(dead_code)]`s are the two PERMANENT ones (`subscriber_count`; the four `fold.rs` audit payload structs).
+The only surviving allows must be the two marked `PERMANENT`.
 
-- [ ] **Step 3: The three gates, in order.**
+- [ ] **Step 3: The three gates.**
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
-Do not proceed on a single failure.
+Confirm the counts: `daemon::control` **18** unit tests; `tests/control.rs` **14**.
 
-- [ ] **Step 4: The local-only gates** (this PR adds standing state to campd and a new real-CLI claim).
-```bash
-make perf 2>&1 | tail -20
-make compat 2>&1 | tail -20
-```
+- [ ] **Step 4: The local-only gates.** `make perf` and `make compat`.
 
-- [ ] **Step 5: Push and open the PR.** The body MUST carry these four honesty statements:
+- [ ] **Step 5: Push and open the PR.** The body MUST carry **six** honesty statements:
 
 1. **The exit-criteria table** (criterion → the named test that proves it).
-2. **"After cp-1, an operator still cannot interrupt anything by hand."** No `camp interrupt`, no `camp sessions`, no subscribe CLI — cp-1 ships the protocol and its proofs; phase 2 ships the first human client. `interrupt` "works end to end" **between campd and a worker**, not between a human and a worker.
-3. **The unverified claim, stated plainly:** *"Every interrupt exercised anywhere in this repo — fake or real — is PRE-TURN (a no-op interrupt whose ack carries `still_queued:[]`). Whether the CLI reads control messages from stdin WHILE A TURN IS STREAMING — the operationally meaningful interrupt, stopping a RUNNING turn — is untested at every layer and cannot be tested at $0, because it requires a real turn. **cp-1 proves the TRANSPORT; the mid-turn semantics of interrupt are UNPROVEN against the real CLI.** The paid `make e2e` tier (§8) is where that gets settled, and it is a named obligation for the phase that needs it."*
-4. **Fixture provenance:** every fixture is labelled `recorded-from-CLI-2.1.207`, `derived-from-CLI-2.1.207`, or `camp-authored` in `tests/fixtures/control/PROVENANCE.md`; `interrupt_request.json` is camp-authored and the $0 gate proves **acceptance**, not recording; and `dialog_refusal_response.json` carries an explicit **phase-3 validation obligation** (camp only sends it under the stdio flag, which cp-1 does not set, so no gate here can exercise it — and if its shape is wrong the worker hangs forever, the precise outcome §9 exists to prevent).
+2. **"After cp-1, an operator still cannot interrupt anything by hand."** No `camp interrupt`, no `camp sessions`, no subscribe CLI. `interrupt` works end to end **between campd and a worker**, not between a human and a worker.
+3. **The unverified claim:** *"Every interrupt exercised anywhere in this repo — fake or real — is PRE-TURN (a no-op interrupt whose ack carries `still_queued:[]`). Whether the CLI reads control messages from stdin WHILE A TURN IS STREAMING — the operationally meaningful interrupt — is untested at every layer and cannot be tested at $0. **cp-1 proves the TRANSPORT; the mid-turn semantics of interrupt are UNPROVEN against the real CLI.** D7 is what keeps that from mattering for correctness: the response deadline measures SILENCE, not elapsed time, so an interrupt queued behind a long turn cannot produce a false fault — and a late answer appends a correction rather than being swallowed. The paid `make e2e` tier (§8) is where the semantics get settled."*
+4. **Fixture provenance:** every fixture labelled (`recorded-` / `derived-from-CLI-2.1.207` / `camp-authored`); `interrupt_request.json` is camp-authored and the $0 gate proves **acceptance**, not recording; **`can_use_tool`'s key set is NOT claimed complete** (a fixed-window grep of a minified bundle cannot prove it — the parse is tolerant by design); `dialog_refusal_response.json` carries a **phase-3 validation obligation**; and **cp-3's outbound permission bytes are pinned here** (`permission_allow_response.json` / `permission_deny_response.json`, against the CLI's own validator string).
+5. **`make compat` is LOCAL-ONLY — CI does not run it.** `no_initialize_pre_turn_interrupt_is_acked` is a standing gate only as far as an operator runs it (the cp-0 precedent). Say it; do not imply CI protection.
+6. **SECURITY — named, not solved.** `UnixListener::bind` (socket.rs:125/136) does **no** `set_permissions`, no umask discipline, no peer-credential check. Before cp-1 the socket exposed `poke`/`status`/`stop`/`adopt`/`nudge`. **`session.subscribe` is a NEW EXPOSURE CLASS:** any local process that can open the socket path now streams the complete raw stream-json of every session — assistant reasoning, tool inputs, file contents. **And cp-3 will put `session.permission_decision` on the same socket, at which point anyone who can connect can approve `cargo publish`.** cp-1 does not solve this; it **names** it and **files an issue** for the phase that owns it, so cp-3 does not inherit it as settled.
+
+**Also record in the PR:** (a) a campd restart kills every subscription with a bare EOF and **no `end` frame** — the client's byte cursor stays valid (§9's point) but nothing tells it campd went away; cp-2's `camp watch` will meet this immediately. (b) B6's residual: if campd AND the worker both die during the outage, the session is never re-tailed, so the answered `control_response` is never read and the rehydrated pending expires into a `control.failed` whose stated cause is false. Narrow, named, not hidden.
 
 - [ ] **Step 6: CI to green.** `gh pr checks --watch`. Work is NOT complete until it is.
 
-- [ ] **Step 7: Report to the lead** — plan doc path, branch, pushed SHA, PR number, and whether `make perf` / `make compat` ran locally and what they said. Never claim a gate ran that did not.
+- [ ] **Step 7: Report to the lead** — plan doc, branch, SHA, PR number, and whether `make perf` / `make compat` ran and what they said. Never claim a gate ran that did not.
 
 ---
 
@@ -1944,13 +1117,13 @@ make compat 2>&1 | tail -20
 
 | Contract item | Task |
 |---|---|
-| §2/§2.1 — one module owns the wire; shapes pinned by fixtures; failures loud | 1 (module + labelled fixtures), 3 (never-arrived ⇒ durable fault; a restart neither lies nor forgets), 6 (`ingest`: unrecognized/unanswerable control messages ⇒ `control.failed`, deduped) |
-| §4.1 `sessions.list` / `session.send_turn` / `session.interrupt` / `session.subscribe` | 7 / 6 / 6 / 8 |
-| §4.4 — per-connection buffering, 1 MiB HARD cap, drop-loudly with `subscriber.dropped`, hello within `REQUEST_TIMEOUT`, timeout-exempt after | 8 — **one test each, and all four now exist** |
-| §8 fixture tests / backpressure test | 1 + 10 / 8 (B8: deterministic at last) |
-| §4.3 perf obligation (N subscribers) | 9 |
-| §9 — byte-offset cursors; a reaped stream is an explicit error; ordinary history is NOT | 8 (D6′) |
-| Exit: interrupt + send_turn end to end over the real socket vs a fake worker | 6 — **including B4's answer-and-exit race and B6's restart** |
+| §2/§2.1 — one module owns the wire; shapes pinned by fixtures; failures loud | 1 (module + labelled fixtures, incl. **cp-3's outbound shape**), 3 (never-answered ⇒ durable fault; a restart neither lies nor forgets; **a late answer is corrected, not swallowed**), 6 (`ingest`; **and `ControlWrite::Failed` is loud in both channels**) |
+| §4.1 `sessions.list` / `send_turn` / `interrupt` / `subscribe` | 7 / 6 / 6 / 8 |
+| §4.4 — per-connection buffering, 1 MiB HARD cap, drop-loudly, hello within `REQUEST_TIMEOUT`, timeout-exempt after | 8 — one test each; all four exist |
+| §8 fixture tests / backpressure | 1 + 10 / 8 |
+| §4.3 perf obligation (N subscribers) | 9 — and it states what it does NOT measure |
+| §9 — byte-offset cursors; a reaped stream is an explicit error; **ordinary history is never refused and never truncated** | 8 (D6″: one monotone cursor) |
+| Exit: interrupt + send_turn end to end over the real socket vs a fake worker | 6 (incl. the answer-and-exit race, a restart, and a failed pipe write) |
 | Exit: a wedged-campd subscribe fails fast at the hello | 8 |
-| Exit: fixtures pin every shape camp sends or parses | 1 (interrupt, dialog refusal, user turn OUT; control_response ok/err, can_use_tool, request_user_dialog, stream IN) + 8 (**the subscribe frames — B13's missing pin**) + 10 |
+| Exit: fixtures pin every shape camp sends or parses | 1 + 8 (**the three subscribe frames, spliced verbatim**) + 10 |
 | Exit: CI green | 11 |
