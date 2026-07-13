@@ -607,7 +607,20 @@ fn write_pack(
 
     let agents_src = camp_root.join("agents");
     if agents_src.is_dir() {
-        report.agents = copy_tree(&agents_src, &agents_dest)?;
+        // gc discovers agents as immediate SUBDIRECTORIES of agents/ (compat
+        // §5.1 — an agent is a directory). Count one per immediate subdir; the
+        // verbatim copy recurses into them and refuses symlinks (copy_tree).
+        let agent_count = std::fs::read_dir(&agents_src)
+            .map_err(|e| export_io("read", &agents_src, &e))?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_type()
+                    .map(|t| t.is_dir())
+                    .unwrap_or(false)
+            })
+            .count();
+        copy_tree(&agents_src, &agents_dest)?;
+        report.agents = agent_count;
     }
     if report.agents == 0 {
         report.notes.push(format!(
@@ -1061,4 +1074,30 @@ prefix = "gc"
         assert_eq!(reasons[2].0, "caught-up");
         assert!(reasons[2].1.contains("catch_up_window"), "{}", reasons[2].1);
     }
+
+    #[test]
+    fn exported_pack_is_gc_discoverable_directory_shaped() {
+        let (dir, ledger) = temp_ledger();
+        let camp_root = dir.path();
+        let adir = camp_root.join("agents/dev");
+        std::fs::create_dir_all(&adir).unwrap();
+        std::fs::write(adir.join("agent.toml"), "description = \"dev\"\n").unwrap();
+        std::fs::write(adir.join("prompt.md"), "do the work").unwrap();
+        std::fs::write(camp_root.join("camp.toml"), "[camp]\nname=\"golden\"\n").unwrap();
+        let cfg = crate::config::CampConfig::load(&camp_root.join("camp.toml")).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let report = export_city(
+            &ledger,
+            &cfg,
+            camp_root,
+            &out.path().join("city"),
+            &ExportOptions { skip_untranslatable: false },
+        )
+        .unwrap();
+        let exported = out.path().join("city/pack/agents/dev");
+        assert!(exported.is_dir(), "exported agent must be a DIRECTORY gc discovers");
+        assert!(exported.join("prompt.md").exists());
+        assert_eq!(report.agents, 1);
+    }
 }
+
