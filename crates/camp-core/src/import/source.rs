@@ -43,7 +43,8 @@ pub fn normalize(source: &str, version: Option<&str>) -> Result<Source, CoreErro
     // Local path: starts with '.' or '/', or has no scheme/git@///subdir/::
     // (the `::` exclusion sends git's `ext::` transport to the remote path,
     // where the allowlist rejects it).
-    let is_local_path = s.starts_with('.') || s.starts_with('/')
+    let is_local_path = s.starts_with('.')
+        || s.starts_with('/')
         || (!s.contains("://") && !s.starts_with("git@") && !s.contains("//") && !s.contains("::"));
     if is_local_path {
         if let Some(v) = version {
@@ -180,7 +181,11 @@ mod tests {
     }
     #[test]
     fn github_tree_url_is_the_convenience_form() {
-        let s = normalize("https://github.com/gastownhall/gascity-packs/tree/main/bmad", None).unwrap();
+        let s = normalize(
+            "https://github.com/gastownhall/gascity-packs/tree/main/bmad",
+            None,
+        )
+        .unwrap();
         assert_eq!(s.repository, "https://github.com/gastownhall/gascity-packs");
         assert_eq!(s.subpath.as_deref(), Some("bmad"));
         assert_eq!(s.reference.as_deref(), Some("main"));
@@ -195,16 +200,32 @@ mod tests {
     #[test]
     fn local_path_carries_no_ref_and_rejects_version() {
         let s = normalize("../packs/house", None).unwrap();
-        assert!(s.is_local_path && s.repository == "../packs/house" && s.subpath.is_none() && s.reference.is_none());
+        assert!(
+            s.is_local_path
+                && s.repository == "../packs/house"
+                && s.subpath.is_none()
+                && s.reference.is_none()
+        );
         assert!(normalize("../packs/house", Some("v1")).is_err());
     }
     #[test]
     fn version_supplies_the_ref_when_the_source_omits_it() {
-        assert_eq!(normalize("https://github.com/o/r", Some("sha:abc")).unwrap().reference.as_deref(), Some("sha:abc"));
+        assert_eq!(
+            normalize("https://github.com/o/r", Some("sha:abc"))
+                .unwrap()
+                .reference
+                .as_deref(),
+            Some("sha:abc")
+        );
     }
     #[test]
     fn conflicting_refs_are_an_error() {
-        assert!(normalize("https://github.com/o/r//p#v1", Some("v2")).unwrap_err().to_string().contains("ref"));
+        assert!(
+            normalize("https://github.com/o/r//p#v1", Some("v2"))
+                .unwrap_err()
+                .to_string()
+                .contains("ref")
+        );
     }
     #[test]
     fn ext_transport_is_rejected() {

@@ -39,8 +39,8 @@ pub fn inventory_executable(pack_dir: &Path) -> Result<Vec<ExecItem>, CoreError>
             let rel = f.strip_prefix(pack_dir).unwrap_or(&f).display().to_string();
             let text = std::fs::read_to_string(&f)
                 .map_err(|e| import_err(&f, format!("cannot read: {e}")))?;
-            let doc: toml::Value = toml::from_str(&text)
-                .map_err(|e| import_err(&f, format!("invalid TOML: {e}")))?;
+            let doc: toml::Value =
+                toml::from_str(&text).map_err(|e| import_err(&f, format!("invalid TOML: {e}")))?;
             if let Some(steps) = doc.get("steps").and_then(|s| s.as_array()) {
                 for step in steps {
                     if let Some(check) = step.get("check").and_then(|c| c.as_table()) {
@@ -86,14 +86,11 @@ pub fn inventory_executable(pack_dir: &Path) -> Result<Vec<ExecItem>, CoreError>
             let rel = f.strip_prefix(pack_dir).unwrap_or(&f).display().to_string();
             let text = std::fs::read_to_string(&f)
                 .map_err(|e| import_err(&f, format!("cannot read: {e}")))?;
-            let doc: toml::Value = toml::from_str(&text)
-                .map_err(|e| import_err(&f, format!("invalid TOML: {e}")))?;
+            let doc: toml::Value =
+                toml::from_str(&text).map_err(|e| import_err(&f, format!("invalid TOML: {e}")))?;
             if let Some(order) = doc.get("order").and_then(|o| o.as_table()) {
                 if order.get("trigger").and_then(|t| t.as_str()) == Some("exec") {
-                    let path = order
-                        .get("path")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("");
+                    let path = order.get("path").and_then(|p| p.as_str()).unwrap_or("");
                     items.push(ExecItem {
                         kind: "order.exec",
                         path: rel.clone(),
@@ -126,7 +123,12 @@ mod tests {
         std::fs::write(pack.join("formulas/build.toml"),
             "formula=\"b\"\n[[steps]]\nid=\"s\"\ntitle=\"t\"\n[steps.check]\nmode=\"exec\"\npath=\"scripts/verify.sh\"\n").unwrap();
         let items = inventory_executable(&pack).unwrap();
-        assert!(items.iter().any(|i| i.kind == "check.path" && i.detail.contains("verify.sh")), "{items:?}");
+        assert!(
+            items
+                .iter()
+                .any(|i| i.kind == "check.path" && i.detail.contains("verify.sh")),
+            "{items:?}"
+        );
         let decl = crate::config::ImportDecl {
             source: "x".into(),
             subpath: None,

@@ -613,11 +613,7 @@ fn write_pack(
         let agent_count = std::fs::read_dir(&agents_src)
             .map_err(|e| export_io("read", &agents_src, &e))?
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_type()
-                    .map(|t| t.is_dir())
-                    .unwrap_or(false)
-            })
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .count();
         copy_tree(&agents_src, &agents_dest)?;
         report.agents = agent_count;
@@ -1091,13 +1087,17 @@ prefix = "gc"
             &cfg,
             camp_root,
             &out.path().join("city"),
-            &ExportOptions { skip_untranslatable: false },
+            &ExportOptions {
+                skip_untranslatable: false,
+            },
         )
         .unwrap();
         let exported = out.path().join("city/pack/agents/dev");
-        assert!(exported.is_dir(), "exported agent must be a DIRECTORY gc discovers");
+        assert!(
+            exported.is_dir(),
+            "exported agent must be a DIRECTORY gc discovers"
+        );
         assert!(exported.join("prompt.md").exists());
         assert_eq!(report.agents, 1);
     }
 }
-

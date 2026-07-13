@@ -27,7 +27,11 @@ pub struct CampConfig {
     /// `[orders] enabled = [...]` (compat §14): the money invariant — an
     /// imported order is INERT until this list names it. Distinct from the
     /// `[[order]]` array above (`rename = "order"`).
-    #[serde(default, rename = "orders", skip_serializing_if = "OrdersSection::is_default")]
+    #[serde(
+        default,
+        rename = "orders",
+        skip_serializing_if = "OrdersSection::is_default"
+    )]
     pub orders_section: OrdersSection,
     /// `[agent_defaults]` (compat §5.2): model/permission_mode/tools come
     /// ONLY from the operator, never from a pack — camp never inherits gc's
@@ -249,7 +253,8 @@ impl CampConfig {
         // `deny_unknown_fields` rejects it with a generic unknown-field
         // error (component §13): a local pack is now an import whose
         // source is a path.
-        let doc: toml::Value = toml::from_str(text).map_err(|e| CoreError::Config(e.to_string()))?;
+        let doc: toml::Value =
+            toml::from_str(text).map_err(|e| CoreError::Config(e.to_string()))?;
         if doc.get("packs").is_some() {
             return Err(CoreError::Config(
                 "`packs = [...]` was removed. Rewrite each pack as an import:\n  \
@@ -511,14 +516,21 @@ tools = ["Read", "Edit", "Bash", "Skill"]
         let gc = &cfg.imports["gc"];
         assert!(gc.trust_exec);
         assert_eq!(gc.skills, Some(false));
-        assert_eq!(cfg.orders_section.enabled, vec!["bmad.nightly", "gc.triage"]);
+        assert_eq!(
+            cfg.orders_section.enabled,
+            vec!["bmad.nightly", "gc.triage"]
+        );
         assert_eq!(cfg.agent_defaults.model.as_deref(), Some("sonnet"));
-        assert_eq!(cfg.agent_defaults.tools.as_deref().unwrap(), ["Read", "Edit", "Bash", "Skill"]);
+        assert_eq!(
+            cfg.agent_defaults.tools.as_deref().unwrap(),
+            ["Read", "Edit", "Bash", "Skill"]
+        );
     }
 
     #[test]
     fn legacy_packs_key_is_a_specific_rewrite_error() {
-        let err = CampConfig::parse("packs = [\"packs/starter\"]\n[camp]\nname = \"d\"\n").unwrap_err();
+        let err =
+            CampConfig::parse("packs = [\"packs/starter\"]\n[camp]\nname = \"d\"\n").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("packs"), "{msg}");
         assert!(msg.contains("[imports."), "must show the rewrite: {msg}");

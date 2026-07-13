@@ -55,17 +55,17 @@ impl PacksLock {
                 });
             }
         };
-        let lock: PacksLock =
-            toml::from_str(&text).map_err(|e| CoreError::Import {
-                binding: path.display().to_string(),
-                reason: format!("packs.lock is not valid TOML: {e}"),
-            })?;
+        let lock: PacksLock = toml::from_str(&text).map_err(|e| CoreError::Import {
+            binding: path.display().to_string(),
+            reason: format!("packs.lock is not valid TOML: {e}"),
+        })?;
         if lock.schema != Self::SCHEMA {
             return Err(CoreError::Import {
                 binding: path.display().to_string(),
                 reason: format!(
                     "packs.lock schema {} is unsupported (this build supports {}); re-import to regenerate",
-                    lock.schema, Self::SCHEMA
+                    lock.schema,
+                    Self::SCHEMA
                 ),
             });
         }
@@ -132,7 +132,12 @@ mod tests {
         lock.write(&p).unwrap();
         assert_eq!(PacksLock::read(&p).unwrap(), lock);
         assert_eq!(
-            PacksLock::read(&p).unwrap().entry("gc").unwrap().via.as_deref(),
+            PacksLock::read(&p)
+                .unwrap()
+                .entry("gc")
+                .unwrap()
+                .via
+                .as_deref(),
             Some("bmad")
         );
         let text = std::fs::read_to_string(&p).unwrap();
@@ -149,6 +154,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("packs.lock");
         std::fs::write(&p, "schema = 2\n").unwrap();
-        assert!(PacksLock::read(&p).unwrap_err().to_string().contains("schema"));
+        assert!(
+            PacksLock::read(&p)
+                .unwrap_err()
+                .to_string()
+                .contains("schema")
+        );
     }
 }

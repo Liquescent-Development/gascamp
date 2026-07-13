@@ -767,12 +767,20 @@ mod tests {
     fn camp_with_formula_layers() -> (tempfile::TempDir, crate::config::CampConfig) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(root.join("camp.toml"), "[camp]\nname=\"t\"\n[imports.bmad]\nsource=\"file:///x\"\n").unwrap();
+        std::fs::write(
+            root.join("camp.toml"),
+            "[camp]\nname=\"t\"\n[imports.bmad]\nsource=\"file:///x\"\n",
+        )
+        .unwrap();
         let f = root.join("imports/bmad/formulas");
         std::fs::create_dir_all(&f).unwrap();
         std::fs::write(f.join("build.toml"), "formula = \"imported-build\"\n").unwrap();
         std::fs::create_dir_all(root.join("formulas")).unwrap();
-        std::fs::write(root.join("formulas/build.toml"), "formula = \"local-build\"\n").unwrap();
+        std::fs::write(
+            root.join("formulas/build.toml"),
+            "formula = \"local-build\"\n",
+        )
+        .unwrap();
         let cfg = crate::config::CampConfig::load(&root.join("camp.toml")).unwrap();
         (dir, cfg)
     }
@@ -781,13 +789,21 @@ mod tests {
         let (_d, cfg) = camp_with_formula_layers();
         let p = resolve_formula(&cfg, "build").unwrap();
         assert!(!p.to_string_lossy().contains("imports"), "{}", p.display());
-        assert_eq!(std::fs::read_to_string(&p).unwrap().trim(), "formula = \"local-build\"");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap().trim(),
+            "formula = \"local-build\""
+        );
     }
     #[test]
     fn an_imported_formula_is_reachable_without_a_local_override() {
         let (_d, cfg) = camp_with_formula_layers();
         std::fs::remove_file(cfg.root.as_ref().unwrap().join("formulas/build.toml")).unwrap();
-        assert!(resolve_formula(&cfg, "build").unwrap().to_string_lossy().contains("imports/bmad/formulas"));
+        assert!(
+            resolve_formula(&cfg, "build")
+                .unwrap()
+                .to_string_lossy()
+                .contains("imports/bmad/formulas")
+        );
     }
     #[test]
     fn cross_import_formula_collision_is_a_hard_error() {
@@ -812,7 +828,10 @@ mod tests {
         // assert active is empty.
         let (dir, cfg) = crate::orders::parse::tests::camp_with_imported_order(&[]);
         let inv = crate::orders::parse::compile_all_orders(&cfg).unwrap();
-        assert!(inv.active.is_empty(), "no active order ⇒ execute_fire never reachable");
+        assert!(
+            inv.active.is_empty(),
+            "no active order ⇒ execute_fire never reachable"
+        );
         let _ = dir;
     }
 

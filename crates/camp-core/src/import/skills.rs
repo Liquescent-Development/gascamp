@@ -80,12 +80,10 @@ pub fn install_skills(pack_dir: &Path, worktree: &Path) -> Result<usize, CoreErr
 /// Is `path` tracked by the worktree's git? `git ls-files --error-unmatch`
 /// exits 0 when tracked, non-zero otherwise.
 fn tracked(worktree: &Path, path: &Path) -> Result<bool, CoreError> {
-    let rel = path
-        .strip_prefix(worktree)
-        .map_err(|_| CoreError::Import {
-            binding: worktree.display().to_string(),
-            reason: format!("{} is not inside the worktree", path.display()),
-        })?;
+    let rel = path.strip_prefix(worktree).map_err(|_| CoreError::Import {
+        binding: worktree.display().to_string(),
+        reason: format!("{} is not inside the worktree", path.display()),
+    })?;
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(worktree)
@@ -149,12 +147,16 @@ mod tests {
                 .arg("-C")
                 .arg(dir)
                 .args([
-                    "-c", "user.email=t@t",
-                    "-c", "user.name=t",
-                    "-c", "commit.gpgsign=false",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
                     // Neutralize the operator's global gitignore (e.g. one that
                     // excludes .claude/) so the test repo's staging is deterministic.
-                    "-c", "core.excludesfile=",
+                    "-c",
+                    "core.excludesfile=",
                 ])
                 .args(args)
                 .status()
@@ -166,7 +168,11 @@ mod tests {
     fn pack_with_skill(root: &Path) -> std::path::PathBuf {
         let p = root.join("pack");
         std::fs::create_dir_all(p.join("skills/bmad-create-architecture")).unwrap();
-        std::fs::write(p.join("skills/bmad-create-architecture/SKILL.md"), "# skill").unwrap();
+        std::fs::write(
+            p.join("skills/bmad-create-architecture/SKILL.md"),
+            "# skill",
+        )
+        .unwrap();
         p
     }
     #[test]
@@ -178,8 +184,14 @@ mod tests {
         std::fs::write(wt.join("file.txt"), "work").unwrap();
         let n = install_skills(&pack_with_skill(dir.path()), &wt).unwrap();
         assert_eq!(n, 1);
-        assert!(wt.join(".claude/skills/bmad-create-architecture/SKILL.md").exists());
-        assert_eq!(std::fs::read_to_string(wt.join(".claude/.gitignore")).unwrap(), "*\n");
+        assert!(
+            wt.join(".claude/skills/bmad-create-architecture/SKILL.md")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".claude/.gitignore")).unwrap(),
+            "*\n"
+        );
         git(&wt, &["add", "-A"]);
         let out = Command::new("git")
             .arg("-C")
@@ -188,7 +200,10 @@ mod tests {
             .output()
             .unwrap();
         let s = String::from_utf8(out.stdout).unwrap();
-        assert!(!s.contains(".claude/"), "nothing under .claude/ staged: {s:?}");
+        assert!(
+            !s.contains(".claude/"),
+            "nothing under .claude/ staged: {s:?}"
+        );
         assert!(s.contains("file.txt"), "real work still staged: {s:?}");
     }
     #[test]

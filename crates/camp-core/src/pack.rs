@@ -102,12 +102,19 @@ pub fn parse_agent_dir(dir: &Path) -> Result<(RawAgent, Vec<AgentRefusal>), Core
             let p = dir.join(f);
             p.is_file().then(|| p)
         })
-        .ok_or_else(|| pack_err(dir, "no prompt file (expected prompt.template.md, prompt.md.tmpl, or prompt.md)"))?;
-    let prompt = std::fs::read_to_string(&prompt).map_err(|e| {
-        pack_err(dir, format!("cannot read {}: {e}", prompt.display()))
-    })?;
+        .ok_or_else(|| {
+            pack_err(
+                dir,
+                "no prompt file (expected prompt.template.md, prompt.md.tmpl, or prompt.md)",
+            )
+        })?;
+    let prompt = std::fs::read_to_string(&prompt)
+        .map_err(|e| pack_err(dir, format!("cannot read {}: {e}", prompt.display())))?;
     if prompt.trim().is_empty() {
-        return Err(pack_err(dir, "empty prompt — an agent must say what it does"));
+        return Err(pack_err(
+            dir,
+            "empty prompt — an agent must say what it does",
+        ));
     }
 
     let mut scope = None;
@@ -117,8 +124,8 @@ pub fn parse_agent_dir(dir: &Path) -> Result<(RawAgent, Vec<AgentRefusal>), Core
     if agent_toml.is_file() {
         let text = std::fs::read_to_string(&agent_toml)
             .map_err(|e| pack_err(dir, format!("cannot read agent.toml: {e}")))?;
-        let doc: toml::Value =
-            toml::from_str(&text).map_err(|e| pack_err(dir, format!("agent.toml is not valid TOML: {e}")))?;
+        let doc: toml::Value = toml::from_str(&text)
+            .map_err(|e| pack_err(dir, format!("agent.toml is not valid TOML: {e}")))?;
         if let Some(table) = doc.as_table() {
             for (key, value) in table {
                 match key.as_str() {
@@ -220,7 +227,11 @@ pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError
                      `camp import add <source> --name {binding}`"
                 ))
             })?;
-            let dir = root.join("imports").join(binding).join("agents").join(suffix);
+            let dir = root
+                .join("imports")
+                .join(binding)
+                .join("agents")
+                .join(suffix);
             if !dir.is_dir() {
                 return Err(CoreError::UnknownAgent {
                     name: name.to_owned(),
@@ -228,9 +239,8 @@ pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError
                 });
             }
             let (raw, _refusals) = parse_agent_dir(&dir)?;
-            let pack_ships_skills =
-                root.join("imports").join(binding).join("skills").is_dir()
-                    && decl.skills != Some(false);
+            let pack_ships_skills = root.join("imports").join(binding).join("skills").is_dir()
+                && decl.skills != Some(false);
             resolve_agent_def(&cfg.agent_defaults, &raw, name, pack_ships_skills)
         }
         None => {
@@ -252,7 +262,13 @@ pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError
 mod tests {
     use super::*;
 
-    fn write_agent_dir(root: &Path, name: &str, agent_toml: Option<&str>, prompt_file: &str, prompt: &str) {
+    fn write_agent_dir(
+        root: &Path,
+        name: &str,
+        agent_toml: Option<&str>,
+        prompt_file: &str,
+        prompt: &str,
+    ) {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         if let Some(t) = agent_toml {
@@ -290,8 +306,20 @@ mod tests {
     #[test]
     fn identity_is_the_directory_name_not_a_field() {
         let dir = tempfile::tempdir().unwrap();
-        write_agent_dir(dir.path(), "run-operator", Some("name = \"something-else\"\n"), "prompt.md", "operate");
-        assert_eq!(parse_agent_dir(&dir.path().join("run-operator")).unwrap().0.name, "run-operator");
+        write_agent_dir(
+            dir.path(),
+            "run-operator",
+            Some("name = \"something-else\"\n"),
+            "prompt.md",
+            "operate",
+        );
+        assert_eq!(
+            parse_agent_dir(&dir.path().join("run-operator"))
+                .unwrap()
+                .0
+                .name,
+            "run-operator"
+        );
     }
 
     #[test]
@@ -306,7 +334,12 @@ mod tests {
         );
         let (_a, refusals) = parse_agent_dir(&dir.path().join("pooled")).unwrap();
         let keys: std::collections::BTreeSet<_> = refusals.iter().map(|r| r.key.as_str()).collect();
-        assert!(keys.contains("work_dir") && keys.contains("max_active_sessions") && keys.contains("pre_start"), "{keys:?}");
+        assert!(
+            keys.contains("work_dir")
+                && keys.contains("max_active_sessions")
+                && keys.contains("pre_start"),
+            "{keys:?}"
+        );
         assert!(refusals.iter().all(|r| r.agent == "pooled"));
     }
 
@@ -316,7 +349,12 @@ mod tests {
         let a = dir.path().join("a");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::write(a.join("agent.toml"), "scope=\"rig\"\n").unwrap();
-        assert!(parse_agent_dir(&a).unwrap_err().to_string().contains("prompt"));
+        assert!(
+            parse_agent_dir(&a)
+                .unwrap_err()
+                .to_string()
+                .contains("prompt")
+        );
     }
 
     fn defaults(tools: Option<Vec<&str>>) -> AgentDefaults {
@@ -336,7 +374,13 @@ mod tests {
     }
     #[test]
     fn agent_def_takes_model_permission_tools_from_operator_defaults() {
-        let def = resolve_agent_def(&defaults(Some(vec!["Read", "Edit", "Bash"])), &raw("architect"), "bmad.architect", false).unwrap();
+        let def = resolve_agent_def(
+            &defaults(Some(vec!["Read", "Edit", "Bash"])),
+            &raw("architect"),
+            "bmad.architect",
+            false,
+        )
+        .unwrap();
         assert_eq!(def.name, "bmad.architect");
         assert_eq!(def.model.as_deref(), Some("sonnet"));
         assert_eq!(def.permission_mode.as_deref(), Some("acceptEdits"));
@@ -351,14 +395,30 @@ mod tests {
     }
     #[test]
     fn skill_missing_from_allowlist_is_refused_with_remedies() {
-        let m = resolve_agent_def(&defaults(Some(vec!["Read", "Edit"])), &raw("architect"), "bmad.architect", true)
-            .unwrap_err()
-            .to_string();
-        assert!(m.contains("Skill") && m.contains("skills = false") && m.contains("[agent_defaults]"), "{m}");
+        let m = resolve_agent_def(
+            &defaults(Some(vec!["Read", "Edit"])),
+            &raw("architect"),
+            "bmad.architect",
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            m.contains("Skill") && m.contains("skills = false") && m.contains("[agent_defaults]"),
+            "{m}"
+        );
     }
     #[test]
     fn skill_present_allows_a_skills_pack() {
-        assert!(resolve_agent_def(&defaults(Some(vec!["Read", "Skill"])), &raw("architect"), "bmad.architect", true).is_ok());
+        assert!(
+            resolve_agent_def(
+                &defaults(Some(vec!["Read", "Skill"])),
+                &raw("architect"),
+                "bmad.architect",
+                true
+            )
+            .is_ok()
+        );
     }
 
     fn camp_with_imports(kv: &[(&str, &str)]) -> (tempfile::TempDir, CampConfig) {
@@ -369,7 +429,11 @@ mod tests {
             toml.push_str(&format!("[imports.{binding}]\nsource=\"file:///unused\"\n"));
         }
         for (binding, agent) in kv {
-            let a = root.join("imports").join(binding).join("agents").join(agent);
+            let a = root
+                .join("imports")
+                .join(binding)
+                .join("agents")
+                .join(agent);
             std::fs::create_dir_all(&a).unwrap();
             std::fs::write(a.join("prompt.md"), format!("I am {binding}.{agent}")).unwrap();
         }
@@ -387,15 +451,32 @@ mod tests {
     #[test]
     fn route_to_unbound_binding_fails_naming_remedy() {
         let (_d, cfg) = camp_with_imports(&[("gc", "run-operator")]);
-        let m = resolve_agent(&cfg, "bmad.architect").unwrap_err().to_string();
-        assert!(m.contains("bmad") && m.contains("camp import add") && m.contains("--name bmad"), "{m}");
+        let m = resolve_agent(&cfg, "bmad.architect")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            m.contains("bmad") && m.contains("camp import add") && m.contains("--name bmad"),
+            "{m}"
+        );
     }
     #[test]
     fn same_name_across_bindings_coexists() {
-        let (_d, cfg) =
-            camp_with_imports(&[("gstack", "review-synthesizer"), ("gc", "review-synthesizer")]);
-        assert!(resolve_agent(&cfg, "gstack.review-synthesizer").unwrap().prompt.contains("gstack"));
-        assert!(resolve_agent(&cfg, "gc.review-synthesizer").unwrap().prompt.contains("gc"));
+        let (_d, cfg) = camp_with_imports(&[
+            ("gstack", "review-synthesizer"),
+            ("gc", "review-synthesizer"),
+        ]);
+        assert!(
+            resolve_agent(&cfg, "gstack.review-synthesizer")
+                .unwrap()
+                .prompt
+                .contains("gstack")
+        );
+        assert!(
+            resolve_agent(&cfg, "gc.review-synthesizer")
+                .unwrap()
+                .prompt
+                .contains("gc")
+        );
     }
     #[test]
     fn bare_name_resolves_a_camp_local_agent() {
@@ -409,9 +490,33 @@ mod tests {
     #[test]
     fn stall_after_validates_via_parse_duration() {
         let dir = tempfile::tempdir().unwrap();
-        write_agent_dir(dir.path(), "a", Some("stall_after = \"5m\"\n"), "prompt.md", "p");
-        assert_eq!(parse_agent_dir(&dir.path().join("a")).unwrap().0.stall_after.as_deref(), Some("5m"));
-        write_agent_dir(dir.path(), "b", Some("stall_after = \"banana\"\n"), "prompt.md", "p");
-        assert!(parse_agent_dir(&dir.path().join("b")).unwrap_err().to_string().contains("stall_after"));
+        write_agent_dir(
+            dir.path(),
+            "a",
+            Some("stall_after = \"5m\"\n"),
+            "prompt.md",
+            "p",
+        );
+        assert_eq!(
+            parse_agent_dir(&dir.path().join("a"))
+                .unwrap()
+                .0
+                .stall_after
+                .as_deref(),
+            Some("5m")
+        );
+        write_agent_dir(
+            dir.path(),
+            "b",
+            Some("stall_after = \"banana\"\n"),
+            "prompt.md",
+            "p",
+        );
+        assert!(
+            parse_agent_dir(&dir.path().join("b"))
+                .unwrap_err()
+                .to_string()
+                .contains("stall_after")
+        );
     }
 }

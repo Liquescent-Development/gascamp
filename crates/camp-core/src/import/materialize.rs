@@ -17,15 +17,25 @@ use crate::error::CoreError;
 /// Copy `src_subtree` (a pack subpath inside a checked-out repo at
 /// `repo_root`) into `dest`, dereferencing symlinks. A symlink target
 /// escaping `repo_root`, or dangling, is a hard error. Skips `.git`.
-pub fn materialize_tree(repo_root: &Path, src_subtree: &Path, dest: &Path) -> Result<(), CoreError> {
-    let repo_canon = repo_root.canonicalize().map_err(|e| import_err(repo_root, format!("cannot canonicalize repo root: {e}")))?;
-    std::fs::create_dir_all(dest).map_err(|e| import_err(dest, format!("cannot create {}: {e}", dest.display())))?;
+pub fn materialize_tree(
+    repo_root: &Path,
+    src_subtree: &Path,
+    dest: &Path,
+) -> Result<(), CoreError> {
+    let repo_canon = repo_root
+        .canonicalize()
+        .map_err(|e| import_err(repo_root, format!("cannot canonicalize repo root: {e}")))?;
+    std::fs::create_dir_all(dest)
+        .map_err(|e| import_err(dest, format!("cannot create {}: {e}", dest.display())))?;
     copy_into(&repo_canon, src_subtree, dest)
 }
 
 fn copy_into(repo_canon: &Path, src: &Path, dest: &Path) -> Result<(), CoreError> {
-    for entry in std::fs::read_dir(src).map_err(|e| import_err(src, format!("cannot read {}: {e}", src.display())))? {
-        let entry = entry.map_err(|e| import_err(src, format!("cannot read entry in {}: {e}", src.display())))?;
+    for entry in std::fs::read_dir(src)
+        .map_err(|e| import_err(src, format!("cannot read {}: {e}", src.display())))?
+    {
+        let entry = entry
+            .map_err(|e| import_err(src, format!("cannot read entry in {}: {e}", src.display())))?;
         let name = entry.file_name();
         if name == ".git" {
             continue;
@@ -37,9 +47,8 @@ fn copy_into(repo_canon: &Path, src: &Path, dest: &Path) -> Result<(), CoreError
         if meta.is_symlink() {
             // Dereference: canonicalize resolves `..` and follows the link.
             // A nonexistent target errors here → dangling.
-            let canon = std::fs::canonicalize(&path).map_err(|_| {
-                import_err(&path, format!("dangling symlink: {}", path.display()))
-            })?;
+            let canon = std::fs::canonicalize(&path)
+                .map_err(|_| import_err(&path, format!("dangling symlink: {}", path.display())))?;
             // The resolved target must stay inside the repo.
             if !canon.starts_with(repo_canon) {
                 return Err(import_err(
@@ -47,15 +56,23 @@ fn copy_into(repo_canon: &Path, src: &Path, dest: &Path) -> Result<(), CoreError
                     format!("symlink {} escapes the repo root", path.display()),
                 ));
             }
-            let target_meta = std::fs::metadata(&canon)
-                .map_err(|e| import_err(&path, format!("cannot read symlink target {}: {e}", canon.display())))?;
+            let target_meta = std::fs::metadata(&canon).map_err(|e| {
+                import_err(
+                    &path,
+                    format!("cannot read symlink target {}: {e}", canon.display()),
+                )
+            })?;
             if target_meta.is_dir() {
                 std::fs::create_dir_all(&to)
                     .map_err(|e| import_err(&to, format!("cannot create {}: {e}", to.display())))?;
                 copy_into(repo_canon, &canon, &to)?;
             } else {
-                std::fs::copy(&canon, &to)
-                    .map_err(|e| import_err(&path, format!("cannot copy symlink target {}: {e}", canon.display())))?;
+                std::fs::copy(&canon, &to).map_err(|e| {
+                    import_err(
+                        &path,
+                        format!("cannot copy symlink target {}: {e}", canon.display()),
+                    )
+                })?;
             }
         } else if meta.is_dir() {
             std::fs::create_dir_all(&to)
@@ -90,7 +107,12 @@ mod tests {
         std::fs::create_dir_all(&pack).unwrap();
         std::os::unix::fs::symlink("../../../shared/f.toml", pack.join("g.toml")).unwrap();
         let dest = tempfile::tempdir().unwrap();
-        materialize_tree(repo.path(), &repo.path().join("packs/p"), &dest.path().join("out")).unwrap();
+        materialize_tree(
+            repo.path(),
+            &repo.path().join("packs/p"),
+            &dest.path().join("out"),
+        )
+        .unwrap();
         let out = dest.path().join("out/formulas/g.toml");
         assert!(out.is_file() && !out.is_symlink());
         assert_eq!(std::fs::read(&out).unwrap(), b"formula = \"x\"\n");
@@ -103,7 +125,10 @@ mod tests {
         std::os::unix::fs::symlink("/etc/hosts", pack.join("evil")).unwrap();
         let dest = tempfile::tempdir().unwrap();
         let err = materialize_tree(repo.path(), &pack, &dest.path().join("out")).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("escape") || err.to_string().contains("repo"), "{err}");
+        assert!(
+            err.to_string().to_lowercase().contains("escape") || err.to_string().contains("repo"),
+            "{err}"
+        );
     }
     #[test]
     fn dangling_symlink_is_hard_error() {

@@ -71,7 +71,11 @@ pub fn resolve_transitive(
             }
             let declaring_sub = d.subpath.clone().unwrap_or_default();
             let trans_sub = normalize_subpath(&declaring_sub, &decl.source)?;
-            let key = (d.source.clone(), d.reference.clone(), Some(trans_sub.clone()));
+            let key = (
+                d.source.clone(),
+                d.reference.clone(),
+                Some(trans_sub.clone()),
+            );
             if let Some(existing) = binding_to_key.get(trans_binding) {
                 if existing != &key {
                     return Err(CoreError::Import {
@@ -144,9 +148,7 @@ fn normalize_subpath(declaring_sub: &str, relative: &str) -> Result<String, Core
                 if out.pop().is_none() {
                     return Err(CoreError::Import {
                         binding: relative.to_owned(),
-                        reason: format!(
-                            "transitive source {relative:?} escapes the repo root"
-                        ),
+                        reason: format!("transitive source {relative:?} escapes the repo root"),
                     });
                 }
             }
@@ -222,11 +224,13 @@ mod tests {
     fn relative_source_escaping_repo_root_is_hard_error() {
         let direct = vec![imp("bmad", "bmad")];
         let mo = |_: &ResolvedImport| Ok(manifest("bmad", Some("../../etc")));
-        assert!(resolve_transitive(&direct, &mo)
-            .unwrap_err()
-            .to_string()
-            .to_lowercase()
-            .contains("escape"));
+        assert!(
+            resolve_transitive(&direct, &mo)
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("escape")
+        );
     }
     #[test]
     fn depth_2_transitive_import_is_refused() {
@@ -241,10 +245,12 @@ mod tests {
                 }),
             ))
         };
-        assert!(resolve_transitive(&direct, &mo)
-            .unwrap_err()
-            .to_string()
-            .contains("depth"));
+        assert!(
+            resolve_transitive(&direct, &mo)
+                .unwrap_err()
+                .to_string()
+                .contains("depth")
+        );
     }
     #[test]
     fn transitive_binding_clash_is_a_hard_error() {
@@ -260,9 +266,11 @@ mod tests {
                 }),
             ))
         };
-        assert!(resolve_transitive(&direct, &mo)
-            .unwrap_err()
-            .to_string()
-            .contains("gc"));
+        assert!(
+            resolve_transitive(&direct, &mo)
+                .unwrap_err()
+                .to_string()
+                .contains("gc")
+        );
     }
 }

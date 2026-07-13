@@ -218,9 +218,12 @@ fn camp_name(root: &Path) -> String {
 /// `DEFAULT_STARTER_VERSION` so the materialization is reproducible. A fetch
 /// failure exits non-zero ("camp WAS created, pack was NOT installed").
 fn install_default_starter(root: &Path) -> Result<()> {
-    if let Err(e) =
-        crate::cmd::import::run_add(root, DEFAULT_STARTER_SOURCE, Some("starter"), Some(DEFAULT_STARTER_VERSION))
-    {
+    if let Err(e) = crate::cmd::import::run_add(
+        root,
+        DEFAULT_STARTER_SOURCE,
+        Some("starter"),
+        Some(DEFAULT_STARTER_VERSION),
+    ) {
         bail!(
             "The camp at {} WAS created, but the starter pack was NOT installed ({e:#}); \
              the camp is usable — run `camp import add {DEFAULT_STARTER_SOURCE} --name starter` yourself",
@@ -237,11 +240,25 @@ mod tests {
 
     #[test]
     fn decide_import_covers_the_matrix() {
-        assert!(matches!(decide_import(true, None, false), ImportDecision::Prompt));
-        assert!(matches!(decide_import(true, Some("file:///x"), false), ImportDecision::Install(s) if s == "file:///x"));
-        assert!(matches!(decide_import(true, None, true), ImportDecision::Skip));
-        assert!(matches!(decide_import(false, None, false), ImportDecision::HandOff));
-        assert!(matches!(decide_import(false, Some("file:///x"), false), ImportDecision::Install(_)));
+        assert!(matches!(
+            decide_import(true, None, false),
+            ImportDecision::Prompt
+        ));
+        assert!(
+            matches!(decide_import(true, Some("file:///x"), false), ImportDecision::Install(s) if s == "file:///x")
+        );
+        assert!(matches!(
+            decide_import(true, None, true),
+            ImportDecision::Skip
+        ));
+        assert!(matches!(
+            decide_import(false, None, false),
+            ImportDecision::HandOff
+        ));
+        assert!(matches!(
+            decide_import(false, Some("file:///x"), false),
+            ImportDecision::Install(_)
+        ));
     }
 
     #[test]
@@ -249,18 +266,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".camp");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("camp.toml"), "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\",\"Skill\"]\n").unwrap();
+        std::fs::write(
+            root.join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\",\"Skill\"]\n",
+        )
+        .unwrap();
         camp_core::ledger::Ledger::open(&root.join("camp.db")).unwrap();
         let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
         // #80: zero agents — the route fails (the documented dead-end).
-        assert!(camp_core::pack::resolve_agent(&cfg, "starter.dev")
-            .unwrap_err()
-            .to_string()
-            .contains("starter"));
+        assert!(
+            camp_core::pack::resolve_agent(&cfg, "starter.dev")
+                .unwrap_err()
+                .to_string()
+                .contains("starter")
+        );
         // the fix: import the LOCAL starter pack (a file source; never the network).
         let starter = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/starter");
-        crate::cmd::import::run_add(&root, &starter.to_string_lossy(), Some("starter"), None).unwrap();
+        crate::cmd::import::run_add(&root, &starter.to_string_lossy(), Some("starter"), None)
+            .unwrap();
         let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
-        assert_eq!(camp_core::pack::resolve_agent(&cfg, "starter.dev").unwrap().name, "starter.dev");
+        assert_eq!(
+            camp_core::pack::resolve_agent(&cfg, "starter.dev")
+                .unwrap()
+                .name,
+            "starter.dev"
+        );
     }
 }

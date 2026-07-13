@@ -553,7 +553,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 ServiceChoice::Auto
             };
-            cmd::init::run(cli.camp.as_deref(), choice, exists_ok, import.as_deref(), no_import)
+            cmd::init::run(
+                cli.camp.as_deref(),
+                choice,
+                exists_ok,
+                import.as_deref(),
+                no_import,
+            )
         }
         Command::Doctor {
             refold: _,
@@ -698,9 +704,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Import { command } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             match command {
-                ImportCommand::Add { source, name, version } => {
-                    cmd::import::run_add(&camp.root, &source, name.as_deref(), version.as_deref())
-                }
+                ImportCommand::Add {
+                    source,
+                    name,
+                    version,
+                } => cmd::import::run_add(&camp.root, &source, name.as_deref(), version.as_deref()),
                 ImportCommand::Install => cmd::import::run_install(&camp.root),
                 ImportCommand::Upgrade { name } => {
                     cmd::import::run_upgrade(&camp.root, name.as_deref())

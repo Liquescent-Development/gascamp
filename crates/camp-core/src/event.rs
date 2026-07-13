@@ -260,8 +260,14 @@ mod tests {
     fn import_events_roundtrip_and_are_camp_specific() {
         assert_eq!(EventType::ImportAdded.as_str(), "import.added");
         assert_eq!(EventType::ImportRefused.as_str(), "import.refused");
-        assert_eq!(EventType::parse("import.added").unwrap(), EventType::ImportAdded);
-        assert_eq!(EventType::parse("import.refused").unwrap(), EventType::ImportRefused);
+        assert_eq!(
+            EventType::parse("import.added").unwrap(),
+            EventType::ImportAdded
+        );
+        assert_eq!(
+            EventType::parse("import.refused").unwrap(),
+            EventType::ImportRefused
+        );
         assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&"import.added"));
         assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&"import.refused"));
         assert!(!crate::vocab::GC_MIRRORED_EVENTS.contains(&"import.added"));

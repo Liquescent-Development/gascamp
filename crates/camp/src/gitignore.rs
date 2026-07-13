@@ -210,7 +210,10 @@ mod tests {
 
     #[test]
     fn imports_dir_is_a_runtime_dir() {
-        assert!(RUNTIME_DIRS.contains(&"imports"), "materialized imports must be gitignored");
+        assert!(
+            RUNTIME_DIRS.contains(&"imports"),
+            "materialized imports must be gitignored"
+        );
     }
 
     #[test]

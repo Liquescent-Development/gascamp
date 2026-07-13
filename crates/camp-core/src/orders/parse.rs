@@ -320,10 +320,18 @@ pub(crate) mod tests {
     pub(crate) fn camp_with_imported_order(enabled: &[&str]) -> (tempfile::TempDir, CampConfig) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let mut toml = String::from("[camp]\nname=\"t\"\n\n[[rigs]]\nname=\"gc\"\npath=\"/p\"\nprefix=\"gc\"\n\n[imports.bmad]\nsource=\"file:///x\"\n");
+        let mut toml = String::from(
+            "[camp]\nname=\"t\"\n\n[[rigs]]\nname=\"gc\"\npath=\"/p\"\nprefix=\"gc\"\n\n[imports.bmad]\nsource=\"file:///x\"\n",
+        );
         if !enabled.is_empty() {
-            toml.push_str(&format!("\n[orders]\nenabled = [{}]\n",
-                enabled.iter().map(|e| format!("\"{e}\"")).collect::<Vec<_>>().join(", ")));
+            toml.push_str(&format!(
+                "\n[orders]\nenabled = [{}]\n",
+                enabled
+                    .iter()
+                    .map(|e| format!("\"{e}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         std::fs::write(root.join("camp.toml"), &toml).unwrap();
         let od = root.join("imports/bmad/orders");
@@ -331,7 +339,11 @@ pub(crate) mod tests {
         std::fs::write(od.join("nightly.toml"), "[order]\nformula = \"nightly-formula\"\ntrigger = \"cron\"\nschedule = \"0 2 * * *\"\n").unwrap();
         let fd = root.join("imports/bmad/formulas");
         std::fs::create_dir_all(&fd).unwrap();
-        std::fs::write(fd.join("nightly-formula.toml"), "formula = \"nightly-formula\"\n").unwrap();
+        std::fs::write(
+            fd.join("nightly-formula.toml"),
+            "formula = \"nightly-formula\"\n",
+        )
+        .unwrap();
         let cfg = CampConfig::load(&root.join("camp.toml")).unwrap();
         (dir, cfg)
     }
@@ -498,9 +510,14 @@ formula = "fix-ci"
     fn imported_order_is_inert_until_enabled() {
         let (_d, cfg) = camp_with_imported_order(&[]);
         let inv = compile_all_orders(&cfg).unwrap();
-        assert!(inv.active.iter().all(|o| o.name != "bmad.nightly"), "unenabled → NOT active");
         assert!(
-            inv.disabled.iter().any(|d| d.name == "bmad.nightly" && d.source == "bmad"),
+            inv.active.iter().all(|o| o.name != "bmad.nightly"),
+            "unenabled → NOT active"
+        );
+        assert!(
+            inv.disabled
+                .iter()
+                .any(|d| d.name == "bmad.nightly" && d.source == "bmad"),
             "disabled with source: {inv:?}"
         );
     }

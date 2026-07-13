@@ -79,7 +79,9 @@ pub fn ls(camp: &CampDir, json: bool) -> Result<()> {
         return Ok(());
     }
     if active.is_empty() && inv.disabled.is_empty() {
-        println!("no orders configured (add [[order]] tables, or `camp import add` a pack with orders/)");
+        println!(
+            "no orders configured (add [[order]] tables, or `camp import add` a pack with orders/)"
+        );
         return Ok(());
     }
     println!(
@@ -182,7 +184,8 @@ fn rewrite_orders_block(camp_toml: &std::path::Path, enabled: &[String]) -> Resu
         out.push('\n');
         out.push_str(&new_block);
     }
-    std::fs::write(camp_toml, out).with_context(|| format!("cannot write {}", camp_toml.display()))?;
+    std::fs::write(camp_toml, out)
+        .with_context(|| format!("cannot write {}", camp_toml.display()))?;
     Ok(())
 }
 
@@ -217,12 +220,24 @@ mod compat_tests {
     #[test]
     fn enable_adds_and_disable_removes_the_name() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("camp.toml"), "[camp]\nname=\"t\"\n[imports.bmad]\nsource=\"file:///x\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("camp.toml"),
+            "[camp]\nname=\"t\"\n[imports.bmad]\nsource=\"file:///x\"\n",
+        )
+        .unwrap();
         enable_order(dir.path(), "bmad.nightly").unwrap();
         let cfg = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
-        assert!(cfg.orders_section.enabled.contains(&"bmad.nightly".to_string()));
+        assert!(
+            cfg.orders_section
+                .enabled
+                .contains(&"bmad.nightly".to_string())
+        );
         disable_order(dir.path(), "bmad.nightly").unwrap();
         let cfg = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
-        assert!(!cfg.orders_section.enabled.contains(&"bmad.nightly".to_string()));
+        assert!(
+            !cfg.orders_section
+                .enabled
+                .contains(&"bmad.nightly".to_string())
+        );
     }
 }

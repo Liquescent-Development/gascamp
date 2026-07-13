@@ -85,26 +85,52 @@ mod tests {
     #[test]
     fn version_is_not_required() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("pack.toml"), "[pack]\nname = \"gastown\"\nschema = 2\n").unwrap();
+        std::fs::write(
+            dir.path().join("pack.toml"),
+            "[pack]\nname = \"gastown\"\nschema = 2\n",
+        )
+        .unwrap();
         assert!(read_manifest(dir.path()).is_ok());
     }
     #[test]
     fn schema_above_2_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("pack.toml"), "[pack]\nname = \"x\"\nschema = 3\n").unwrap();
-        assert!(read_manifest(dir.path()).unwrap_err().to_string().contains("schema"));
+        std::fs::write(
+            dir.path().join("pack.toml"),
+            "[pack]\nname = \"x\"\nschema = 3\n",
+        )
+        .unwrap();
+        assert!(
+            read_manifest(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("schema")
+        );
     }
     #[test]
     fn missing_manifest_is_not_a_pack() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_manifest(dir.path()).unwrap_err().to_string().contains("pack.toml"));
+        assert!(
+            read_manifest(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("pack.toml")
+        );
     }
     #[test]
     fn strict_pack_table_but_tolerant_top_level() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("pack.toml"), "[pack]\nname=\"x\"\nschema=2\nbogus=1\n").unwrap();
+        std::fs::write(
+            dir.path().join("pack.toml"),
+            "[pack]\nname=\"x\"\nschema=2\nbogus=1\n",
+        )
+        .unwrap();
         assert!(read_manifest(dir.path()).is_err());
-        std::fs::write(dir.path().join("pack.toml"), "[pack]\nname=\"x\"\nschema=2\n[catalog]\nx=1\n").unwrap();
+        std::fs::write(
+            dir.path().join("pack.toml"),
+            "[pack]\nname=\"x\"\nschema=2\n[catalog]\nx=1\n",
+        )
+        .unwrap();
         assert!(read_manifest(dir.path()).is_ok());
     }
 }
