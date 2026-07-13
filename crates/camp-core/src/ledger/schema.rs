@@ -95,6 +95,25 @@ CREATE TABLE cursors (
 ) STRICT;
 "#;
 
+/// cp-0 (control-plane spec §2.3): per-session stream-file byte offsets —
+/// consumer bookkeeping (the `cursors` mold), NOT fold-derived state.
+///
+/// Evolution path: this table is added idempotently (`CREATE TABLE IF NOT
+/// EXISTS`) WITHOUT a `SCHEMA_VERSION` bump, because it carries no fold
+/// truth — losing it only means campd re-reads a tailed stream from offset
+/// 0 (re-delivery, deduped by request_id in phase 1+), never corruption.
+/// This is deliberately distinct from the fold-state version-gated path:
+/// fold-state schema changes go through `FULL_DDL_PREFIX` + a
+/// `SCHEMA_VERSION` bump, which makes an existing camp fail to open so the
+/// operator re-inits (the v1 "no auto-upgrade" contract). Consumer-
+/// bookkeeping infrastructure tables like this one evolve additively.
+pub(crate) const READ_CHANNEL_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS stream_cursors (
+  session_name TEXT PRIMARY KEY,
+  byte_offset  INTEGER NOT NULL
+) STRICT;
+"#;
+
 pub(crate) fn open_db(path: &Path) -> Result<Connection, CoreError> {
     let conn = Connection::open(path)?;
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
@@ -135,10 +154,17 @@ pub(crate) fn open_db_read_only(path: &Path) -> Result<Connection, CoreError> {
 
 fn init_schema(conn: &Connection) -> Result<(), CoreError> {
     if !has_meta(conn)? {
-        conn.execute_batch(&format!("BEGIN;{FULL_DDL_PREFIX}{STATE_DDL}COMMIT;"))?;
+        conn.execute_batch(&format!(
+            "BEGIN;{FULL_DDL_PREFIX}{STATE_DDL}{READ_CHANNEL_DDL}COMMIT;"
+        ))?;
         return Ok(());
     }
-    verify_schema_version(conn)
+    verify_schema_version(conn)?;
+    // cp-0: ensure the stream_cursors table exists on pre-cp-0 camps.
+    // Idempotent and outside the fold — safe without a version bump (see
+    // READ_CHANNEL_DDL's evolution-path comment).
+    conn.execute_batch(READ_CHANNEL_DDL)?;
+    Ok(())
 }
 
 fn has_meta(conn: &Connection) -> Result<bool, CoreError> {
