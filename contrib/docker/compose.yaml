@@ -27,6 +27,11 @@ services:
     # broken the entrypoint's `exec`.
     stop_signal: SIGTERM
     stop_grace_period: 30s
+    environment:
+      # Optional: a pack source to import as the starter on each start (the
+      # entrypoint runs `camp init --import "$CAMP_PACK"` + `camp import install`
+      # before exec'ing campd). Unset → the camp starts empty.
+      CAMP_PACK: ""
     volumes:
       # The camp: the SQLite ledger, campd.sock, runs/, sessions/, worktrees/.
       # A NAMED volume, so it survives `down`/`up` and a host reboot, and so the

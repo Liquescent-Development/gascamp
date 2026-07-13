@@ -5,6 +5,44 @@ use camp_core::ledger::Ledger;
 
 use crate::service::{self, Decision, ServiceChoice, SystemProbe, SystemRunner};
 
+/// The default starter-pack source (component decision 12): the gascamp
+/// `packs/starter` on `main`. Pinned by `DEFAULT_STARTER_VERSION` to a sha
+/// that carries the rewritten directory-shaped starter (Task 20). The sha
+/// is finalized to the starter-rewrite commit when this stream merges; tests
+/// never fetch it (they import a LOCAL `packs/starter` path).
+const DEFAULT_STARTER_SOURCE: &str =
+    "https://github.com/Liquescent-Development/gascamp/tree/main/packs/starter";
+const DEFAULT_STARTER_VERSION: &str = "sha:0000000000000000000000000000000000000000";
+
+/// What `camp init` decided to do about the starter pack (component §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportDecision {
+    /// TTY + no flag: prompt the operator (default yes).
+    Prompt,
+    /// `--import <src>` (or a prompted yes): install this source.
+    Install(String),
+    /// `--no-import`: skip.
+    Skip,
+    /// Not a TTY + no flag: hand off with the exact command on stderr.
+    HandOff,
+}
+
+/// Pure decision over (is_tty, --import, --no-import) — component §8 table.
+/// Never fetches; the default source is only reached on a prompted yes.
+pub fn decide_import(is_tty: bool, import: Option<&str>, no_import: bool) -> ImportDecision {
+    if let Some(src) = import {
+        return ImportDecision::Install(src.to_owned());
+    }
+    if no_import {
+        return ImportDecision::Skip;
+    }
+    if is_tty {
+        ImportDecision::Prompt
+    } else {
+        ImportDecision::HandOff
+    }
+}
+
 /// Create a new camp: `<cwd>/.camp` by default, `--camp DIR` to choose. Then
 /// (design §6) put its campd under the host's service manager where one
 /// exists — `--service` forces it, `--no-service` skips it.
@@ -26,36 +64,80 @@ use crate::service::{self, Decision, ServiceChoice, SystemProbe, SystemRunner};
 /// the auto-migration feature design §11 rules out. The idempotent
 /// provisioning path is `camp init --exists-ok && camp service install`: two
 /// verbs, each of which means what it says.
-pub fn run(camp_flag: Option<&Path>, choice: ServiceChoice, exists_ok: bool) -> Result<()> {
+pub fn run(
+    camp_flag: Option<&Path>,
+    choice: ServiceChoice,
+    exists_ok: bool,
+    import: Option<&str>,
+    no_import: bool,
+) -> Result<()> {
     let root = match camp_flag {
         Some(dir) => dir.to_path_buf(),
         None => std::env::current_dir()
             .context("cannot determine current directory")?
             .join(".camp"),
     };
-    if root.join("camp.toml").exists() || root.join("camp.db").exists() {
+    let already_exists = root.join("camp.toml").exists() || root.join("camp.db").exists();
+    if already_exists {
         if exists_ok {
             println!("camp already exists at {} (--exists-ok)", root.display());
-            return Ok(());
+        } else {
+            bail!("a camp already exists at {}", root.display());
         }
-        bail!("a camp already exists at {}", root.display());
+    } else {
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("cannot create {}", root.display()))?;
+        let name = camp_name(&root);
+        std::fs::write(
+            root.join("camp.toml"),
+            format!("# Gas Camp configuration (spec §7.1)\n[camp]\nname = \"{name}\"\n"),
+        )
+        .with_context(|| format!("cannot write camp.toml in {}", root.display()))?;
+        Ledger::open(&root.join("camp.db"))?;
+        // When the camp lives inside a git repo, keep its live runtime state
+        // (ledger, socket, logs) out of git; `camp.toml` stays tracked (issue #35).
+        crate::gitignore::ensure_camp_runtime_ignored(&root)?;
+        println!("initialized camp at {}", root.display());
     }
-    std::fs::create_dir_all(&root).with_context(|| format!("cannot create {}", root.display()))?;
 
-    let name = camp_name(&root);
-    std::fs::write(
-        root.join("camp.toml"),
-        format!("# Gas Camp configuration (spec §7.1)\n[camp]\nname = \"{name}\"\n"),
-    )
-    .with_context(|| format!("cannot write camp.toml in {}", root.display()))?;
+    // Starter-pack decision (component §8). Composes with --exists-ok: an
+    // existing camp can still import on re-run. Never fetches the default
+    // source in a test (tests import a LOCAL path or assert the pure decision).
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let decision = decide_import(is_tty, import, no_import);
+    match decision {
+        ImportDecision::Prompt => {
+            print!("Install the starter pack? [Y/n] ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).ok();
+            if line.trim().is_empty() || line.trim().eq_ignore_ascii_case("y") {
+                install_default_starter(&root)?;
+            }
+        }
+        ImportDecision::Install(src) => {
+            if let Err(e) = crate::cmd::import::run_add(&root, &src, None, None) {
+                bail!(
+                    "The camp at {} WAS created, but the starter pack was NOT installed ({e:#}); \
+                     the camp is usable — run `camp import add <source> --name <binding>` yourself",
+                    root.display()
+                );
+            }
+        }
+        ImportDecision::Skip => {}
+        ImportDecision::HandOff => eprintln!(
+            "camp: not a TTY and no --import given; install a pack with \
+             `camp import add <source> --name <binding>` (e.g. `camp import add \
+             {DEFAULT_STARTER_SOURCE} --name starter`)"
+        ),
+    }
 
-    Ledger::open(&root.join("camp.db"))?;
-
-    // When the camp lives inside a git repo, keep its live runtime state
-    // (ledger, socket, logs) out of git; `camp.toml` stays tracked (issue #35).
-    crate::gitignore::ensure_camp_runtime_ignored(&root)?;
-
-    println!("initialized camp at {}", root.display());
+    // Service decision is a fresh-create concern only: an existing camp keeps
+    // its unit state (design §11 — no auto-migration). `--exists-ok` skips it.
+    if already_exists {
+        return Ok(());
+    }
 
     // Design §6: detect a usable HOST service manager and act on the answer.
     // A container is not a failure — it is a different supervisor — so the
@@ -130,4 +212,35 @@ fn camp_name(root: &Path) -> String {
         own_name
     };
     dir_for_name.unwrap_or("camp").to_owned()
+}
+
+/// Install the default starter pack (a prompted yes). Uses the pinned
+/// `DEFAULT_STARTER_VERSION` so the materialization is reproducible. A fetch
+/// failure exits non-zero ("camp WAS created, pack was NOT installed").
+fn install_default_starter(root: &Path) -> Result<()> {
+    if let Err(e) =
+        crate::cmd::import::run_add(root, DEFAULT_STARTER_SOURCE, Some("starter"), Some(DEFAULT_STARTER_VERSION))
+    {
+        bail!(
+            "The camp at {} WAS created, but the starter pack was NOT installed ({e:#}); \
+             the camp is usable — run `camp import add {DEFAULT_STARTER_SOURCE} --name starter` yourself",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decide_import_covers_the_matrix() {
+        assert!(matches!(decide_import(true, None, false), ImportDecision::Prompt));
+        assert!(matches!(decide_import(true, Some("file:///x"), false), ImportDecision::Install(s) if s == "file:///x"));
+        assert!(matches!(decide_import(true, None, true), ImportDecision::Skip));
+        assert!(matches!(decide_import(false, None, false), ImportDecision::HandOff));
+        assert!(matches!(decide_import(false, Some("file:///x"), false), ImportDecision::Install(_)));
+    }
 }

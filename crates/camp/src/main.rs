@@ -74,6 +74,13 @@ enum Command {
         /// existing camp under a supervisor, `camp service install`
         #[arg(long = "exists-ok", conflicts_with = "service")]
         exists_ok: bool,
+        /// Import a starter pack from this source (no prompt; composes with
+        /// --exists-ok). A local path or a git/file URL.
+        #[arg(long, conflicts_with = "no_import")]
+        import: Option<String>,
+        /// Skip the starter-pack prompt/offer entirely.
+        #[arg(long = "no-import", conflicts_with = "import")]
+        no_import: bool,
     },
     /// Verify ledger invariants
     #[command(group(
@@ -534,6 +541,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             service,
             no_service,
             exists_ok,
+            import,
+            no_import,
         } => {
             // Two bools at the CLI edge; ONE tri-state inside (clap already
             // rejected the contradictory pair).
@@ -544,7 +553,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 ServiceChoice::Auto
             };
-            cmd::init::run(cli.camp.as_deref(), choice, exists_ok)
+            cmd::init::run(cli.camp.as_deref(), choice, exists_ok, import.as_deref(), no_import)
         }
         Command::Doctor {
             refold: _,
