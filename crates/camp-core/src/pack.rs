@@ -158,6 +158,42 @@ pub fn parse_agent_dir(dir: &Path) -> Result<(RawAgent, Vec<AgentRefusal>), Core
     ))
 }
 
+/// Build an `AgentDef` from operator `[agent_defaults]` + a parsed agent
+/// directory (§5.2/§5.3). Model/permission_mode/tools come ONLY from
+/// `defaults` — camp never inherits gc's unrestricted default. No resolvable
+/// `tools` → no spawn (refused, naming the remedy). A pack that ships
+/// `skills/` (`pack_ships_skills`) requires `Skill` in the allowlist, else
+/// refused with both remedies (add `Skill`, or `skills = false` on the
+/// import). `AgentDef` keeps its existing fields so `spawn.rs` is untouched.
+pub fn resolve_agent_def(
+    defaults: &AgentDefaults,
+    raw: &RawAgent,
+    qualified_name: &str,
+    pack_ships_skills: bool,
+) -> Result<AgentDef, CoreError> {
+    let tools = defaults.tools.clone().ok_or_else(|| {
+        CoreError::Pack(format!(
+            "agent {qualified_name:?}: no tool allowlist resolves — set [agent_defaults].tools \
+             in camp.toml (camp never inherits gc's unrestricted default)"
+        ))
+    })?;
+    if pack_ships_skills && !tools.iter().any(|t| t == "Skill") {
+        return Err(CoreError::Pack(format!(
+            "agent {qualified_name:?}: the pack ships skills/ but {tools:?} lacks \"Skill\" — \
+             add `Skill` to `[agent_defaults].tools`, or set `skills = false` on the import"
+        )));
+    }
+    Ok(AgentDef {
+        name: qualified_name.to_owned(),
+        model: defaults.model.clone(),
+        tools: Some(tools),
+        permission_mode: defaults.permission_mode.clone(),
+        isolation: Isolation::Worktree,
+        stall_after: raw.stall_after.clone(),
+        prompt: raw.prompt.clone(),
+    })
+}
+
 /// The agents/ layers to search, lowest to highest (plan decision R).
 /// Phase 1 interim: the `packs` field is gone (compat §7 — packs now import
 /// under `<root>/imports/<binding>/`); the binding-qualified rewrite lands
@@ -201,15 +237,10 @@ fn load_layer(
     dirs.sort();
     for d in dirs {
         let (raw, _refusals) = parse_agent_dir(&d)?;
-        let def = AgentDef {
-            name: raw.name.clone(),
-            model: defaults.model.clone(),
-            tools: defaults.tools.clone(),
-            permission_mode: defaults.permission_mode.clone(),
-            isolation: Isolation::Worktree,
-            stall_after: raw.stall_after.clone(),
-            prompt: raw.prompt,
-        };
+        // Camp-local agents have no skills/ dir, so the Skill-allowlist gate
+        // does not apply here (pack_ships_skills = false). Binding-qualified
+        // resolution (Task 12) sets it from the import's skills/ presence.
+        let def = resolve_agent_def(defaults, &raw, &raw.name, false)?;
         if let Some(previous) = defs.insert(def.name.clone(), def) {
             return Err(pack_err(
                 dir,
@@ -306,6 +337,48 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
         std::fs::write(a.join("agent.toml"), "scope=\"rig\"\n").unwrap();
         assert!(parse_agent_dir(&a).unwrap_err().to_string().contains("prompt"));
+    }
+
+    fn defaults(tools: Option<Vec<&str>>) -> AgentDefaults {
+        AgentDefaults {
+            model: Some("sonnet".into()),
+            permission_mode: Some("acceptEdits".into()),
+            tools: tools.map(|v| v.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+    fn raw(name: &str) -> RawAgent {
+        RawAgent {
+            name: name.into(),
+            prompt: "p".into(),
+            scope: None,
+            stall_after: None,
+        }
+    }
+    #[test]
+    fn agent_def_takes_model_permission_tools_from_operator_defaults() {
+        let def = resolve_agent_def(&defaults(Some(vec!["Read", "Edit", "Bash"])), &raw("architect"), "bmad.architect", false).unwrap();
+        assert_eq!(def.name, "bmad.architect");
+        assert_eq!(def.model.as_deref(), Some("sonnet"));
+        assert_eq!(def.permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(def.tools.as_deref().unwrap(), ["Read", "Edit", "Bash"]);
+    }
+    #[test]
+    fn agent_without_resolved_tools_is_refused() {
+        let m = resolve_agent_def(&defaults(None), &raw("architect"), "bmad.architect", false)
+            .unwrap_err()
+            .to_string();
+        assert!(m.contains("tools") && m.contains("agent_defaults"), "{m}");
+    }
+    #[test]
+    fn skill_missing_from_allowlist_is_refused_with_remedies() {
+        let m = resolve_agent_def(&defaults(Some(vec!["Read", "Edit"])), &raw("architect"), "bmad.architect", true)
+            .unwrap_err()
+            .to_string();
+        assert!(m.contains("Skill") && m.contains("skills = false") && m.contains("[agent_defaults]"), "{m}");
+    }
+    #[test]
+    fn skill_present_allows_a_skills_pack() {
+        assert!(resolve_agent_def(&defaults(Some(vec!["Read", "Skill"])), &raw("architect"), "bmad.architect", true).is_ok());
     }
 
     #[test]
