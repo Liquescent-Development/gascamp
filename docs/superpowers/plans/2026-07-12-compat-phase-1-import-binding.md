@@ -1,6 +1,8 @@
 # Gas City compat phase 1 — import machinery + the binding namespace + pack loader
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task (planning and execution are separate sessions, per the kickoff amendment). Steps use checkbox (`- [ ]`) syntax for tracking. On your FIRST execution commit, record the plan-review approval note (date, verdict, non-blocking notes, accepted deviations) at the top of this file, immediately under this header.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task (planning and execution are separate sessions, per the kickoff amendment). Steps use checkbox (`- [ ]`) syntax for tracking.
+
+> **Plan review: APPROVE, 2026-07-13 (Opus 4.8 plan gate).** Corpus pin 44b2eef verified live; signatures/layout/§14 table verified. Two required amendments applied in this commit (yaml_rust2 retained additive-only; trust_exec transitive-inventory test added). Coordination items (a)-(c) accepted as surfaced: install_skills call-site deferred to phase 3, AgentDef signatures frozen, §5.2 sibling-test interaction lead-sequenced at rebase. *(Recorded by the planning session per the coordinator's directive; the wave-2 implementer verifies this note on its first execution commit.)*
 
 **Goal:** A fresh camp can run a real Gas City pack. The §3 two-command recipe — `camp import add <bmad-pack> --name bmad` then `camp import add <roles-pack> --name gc` — materializes a bmad-shaped pack, its transitive `gascity` content layer, and a roles pack bound as `gc`, against LOCAL `file://` fixtures, with agents resolvable by their qualified `<binding>.<agent>` names. Fixes #80 (fresh camp, zero agents) and #85 (export round-trip) by construction; first slice of #84.
 
@@ -76,7 +78,7 @@ Explicitly deferred (do NOT build here):
 **SHARED (additive):**
 - `crates/camp/src/main.rs`: `Import` subcommand; `init` gains `--import`/`--no-import`; `order` gains `enable`/`disable`.
 - `crates/camp-core/src/event.rs`, `vocab.rs`, `ledger/fold.rs`: the additive import audit/refusal event(s).
-- `Cargo.toml`/`Cargo.lock`: only if `yaml_rust2` becomes unused after Task 10 (see Open items).
+- `Cargo.toml`/`Cargo.lock`: NOT touched. The shared-file rule is additive-only — `yaml_rust2` stays in the workspace manifest even after Task 10 drops its last `use` (an unused workspace dep does not fail `clippy -D warnings`). See Follow-ups.
 
 ---
 
@@ -125,7 +127,8 @@ Task 24 §3 two-command recipe end-to-end acceptance    ── depends all
 | routing: `gc.run-operator` with `gc` absent fails at cook/dispatch naming the `--name gc` remedy; present → qualified resolution | 12, 13 | `pack::tests::route_to_unbound_binding_fails_naming_remedy`, `pack::tests::qualified_route_resolves_through_binding` |
 | collision: `gstack.review-synthesizer` + `gc.review-synthesizer` coexist; two agents one name **within** a binding hard-error | 12 | `pack::tests::same_name_across_bindings_coexists`, `import::tests::transitive_binding_clash_is_a_hard_error` |
 | the money invariant: an imported due-cron order fires **nothing** until `[orders] enabled` names it | 14 | `orders::parse::tests::imported_order_is_inert_until_enabled`, `orders::tests::disabled_imported_order_does_not_execute_fire` |
-| `trust_exec`: an imported (incl. transitive) formula's `check.path` is inventoried, untrusted by default | 16 | `import::inventory::tests::transitive_check_path_is_inventoried_and_untrusted_by_default` |
+| `trust_exec`: an imported formula's `check.path` — **including one reached through a transitive parent** — is inventoried, untrusted by default | 16, 17 | `import::inventory::tests::transitive_check_path_is_inventoried_and_untrusted_by_default` (per-dir mechanics), `cmd::import::tests::add_from_file_repo_clones_locks_materializes` (the transitive gascity fixture's `check.path` appears in the `import.added` exec inventory, `trust_exec` false; dies against the exec-vs-shell mutation) |
+| §5.4 refusals are appended as ledger events, never silently skipped (umbrella §5.4) | 10, 17 | `pack::tests::unsupported_keys_are_refused_and_named` (the decision), `cmd::import::tests::add_from_file_repo_clones_locks_materializes` (one `import.refused` ledger event per refused key, naming pack/agent/key) |
 | tool-allowlist refusal: no resolvable `tools` → no spawn; pack ships `skills/` but `Skill` missing → no spawn, two named remedies | 11 | `pack::tests::agent_without_resolved_tools_is_refused`, `pack::tests::skill_missing_from_allowlist_is_refused_with_remedies` |
 | skills gitignore: after install + `git add -A`, `git status --porcelain` shows nothing under `.claude/` | 15 | `import::skills::tests::installed_skills_are_self_ignored_after_add` |
 | `fallback = true` parses and is ignored | 10 | `pack::tests::agent_toml_tolerates_unknown_fallback_key` |
@@ -336,7 +339,7 @@ git commit -m "compat: gitignore .camp/imports (materialized, camp-owned)"
 
 **Interfaces:**
 - Produces: `EventType::ImportAdded` (`"import.added"`), `EventType::ImportRefused` (`"import.refused"`). **Audit-only** (no state fold — like `campd.started`), so no ledger schema change and the one-transaction property holds trivially. gc has no import-refusal event → these are **camp-specific/additive** (invariant 7), never a redefinition.
-  - `import.added` data: `{ "binding", "source", "commit", "ignored_keys": [..], "reported": [..] }`.
+  - `import.added` data: `{ "binding", "source", "commit", "ignored_keys": [..], "reported": [..], "exec_inventory": [{ "kind", "path", "detail" }, ..] }` — `exec_inventory` aggregates Task 16's `ExecItem`s across EVERY materialized dir (self + transitive), so the untrusted-content report is durable in the ledger, not just printed.
   - `import.refused` data: `{ "binding", "pack", "agent" | null, "key", "reason" }`.
 - `CoreError::Import { binding: String, reason: String }` (mirrors the `Order` variant's shape/message discipline).
 
@@ -885,7 +888,7 @@ fn missing_prompt_is_a_hard_error() {
 ```
 
 - [ ] **Step 2: Run — expect FAIL.**
-- [ ] **Step 3: Implement.** `name` = `dir.file_name()`. Read `agent.toml` (if present) as `toml::Value`; extract `scope`/`stall_after` (validate `stall_after`); collect an `AgentRefusal` for each present §5.4 key. Prompt: first existing of `prompt.template.md`, `prompt.md.tmpl`, `prompt.md`; else hard error naming `prompt`; empty → hard error. Delete `parse_agent_file`, the `yaml_rust2` import, and the deleted tests.
+- [ ] **Step 3: Implement.** `name` = `dir.file_name()`. Read `agent.toml` (if present) as `toml::Value`; extract `scope`/`stall_after` (validate `stall_after`); collect an `AgentRefusal` for each present §5.4 key. Prompt: first existing of `prompt.template.md`, `prompt.md.tmpl`, `prompt.md`; else hard error naming `prompt`; empty → hard error. Delete `parse_agent_file`, the `use yaml_rust2::...` line in `pack.rs` (owned file), and the deleted tests. **Do NOT remove `yaml_rust2` from `Cargo.toml`/`Cargo.lock`** — the shared-file rule is additive-only, and an unused workspace dep does not fail `clippy -D warnings`; its removal is a deferred follow-up (see Follow-ups).
 - [ ] **Step 4: Run — expect PASS.**
 - [ ] **Step 5: Mutation check.** Prefer `prompt.md` over `prompt.template.md`; `prompt_precedence_prefers_template_md` fails. Revert.
 - [ ] **Step 6: Commit.**
@@ -1277,7 +1280,7 @@ git commit -m "compat: install pack skills into <worktree>/.claude/skills, self-
   pub struct ExecItem { pub kind: &'static str, pub path: String, pub detail: String }
   pub fn inventory_executable(pack_dir: &Path) -> Result<Vec<ExecItem>, CoreError>;
   ```
-  Scans a materialized pack for executable content: formula `check.path` (when `check.mode == "exec"`), `pre_start`, `condition` shell; `exec`-triggered orders. **Phase-1 scope:** phase 1 runs NO formulas, so "executes nothing" holds by the absence of an execution path; the deliverable is the *inventory* (for `camp import add` to print) + `ImportDecl.trust_exec` default-false (Task 1). Transitive coverage = the caller (Task 17) runs `inventory_executable` on every materialized dir, including the transitive `gc` one.
+  Scans a materialized pack for executable content: formula `check.path` (when `check.mode == "exec"`), `pre_start`, `condition` shell; `exec`-triggered orders. **Phase-1 scope:** phase 1 runs NO formulas, so "executes nothing" holds by the absence of an execution path; the deliverable is the *inventory* (for `camp import add` to print and record in `import.added`) + `ImportDecl.trust_exec` default-false (Task 1). **Transitive coverage (§14.10, plan-gate required amendment):** the caller (Task 17) runs `inventory_executable` on EVERY materialized dir, including the transitive `gc` one — and Task 17's end-to-end test places a `check.path` in the transitively-imported gascity fixture and asserts it appears in the `import.added` exec inventory with `trust_exec` still false. That assertion flows through this function's `mode == "exec"` filter, so it dies against the same exec-vs-shell mutation as the unit test below.
 
 - [ ] **Step 1: Failing test**
 
@@ -1318,7 +1321,7 @@ git commit -m "compat: trust_exec inventory of executable pack content; default 
 
 **Interfaces:**
 - Consumes: all of Tasks 4–9, 16, plus `parse_agent_dir` refusals, and the ledger.
-- Produces (component §9): `run_add(camp_root, source, name, version)` and the verbs `add|install|upgrade|check|list|remove`. `add`: normalize → derive/validate binding → hardened clone to a temp checkout → resolve commit → `read_manifest` → `resolve_transitive` → materialize self + deduped transitive into `<root>/imports/<binding>/` (refuse a transitive `agents/` dir, umbrella §7.2) → append `[imports.<n>]` to `camp.toml` → write lock entries (self + transitive `via`) → `inventory_executable` each dir (report) → collect agent §5.4 refusals → append `import.added` (aggregated distinct ignored keys + skills/commands/nested-pack reports) + one `import.refused` per agent-key refusal → print unbound-binding warnings for the pack's route values + the `--name` remedy (umbrella §7.1) + nested-pack report (umbrella §7.3). **Idempotent** for the same `(name, source, subpath, version)`; a different source for the same name → error. `install` never re-resolves a ref; `upgrade` is the only verb that moves a commit; `check` is offline; `remove` drops the entry + lock line + `<root>/imports/<n>/`.
+- Produces (component §9): `run_add(camp_root, source, name, version)` and the verbs `add|install|upgrade|check|list|remove`. `add`: normalize → derive/validate binding → hardened clone to a temp checkout → resolve commit → `read_manifest` → `resolve_transitive` → materialize self + deduped transitive into `<root>/imports/<binding>/` (refuse a transitive `agents/` dir, umbrella §7.2) → append `[imports.<n>]` to `camp.toml` → write lock entries (self + transitive `via`) → `inventory_executable` each materialized dir, self AND transitive (report + the `exec_inventory` field of `import.added`) → collect agent §5.4 refusals → append `import.added` (aggregated distinct ignored keys + skills/commands/nested-pack reports + `exec_inventory`) + one `import.refused` per agent-key refusal → print unbound-binding warnings for the pack's route values + the `--name` remedy (umbrella §7.1) + nested-pack report (umbrella §7.3). **Idempotent** for the same `(name, source, subpath, version)`; a different source for the same name → error. `install` never re-resolves a ref; `upgrade` is the only verb that moves a commit; `check` is offline; `remove` drops the entry + lock line + `<root>/imports/<n>/`.
 
 - [ ] **Step 1: Failing test**
 
@@ -1328,10 +1331,14 @@ fn add_from_file_repo_clones_locks_materializes() {
     let repo = tempfile::tempdir().unwrap();
     testsupport::init_repo(repo.path(), &[
         ("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n"),
-        ("bmad/agents/architect/agent.toml", "scope=\"rig\"\nfallback=true\n"),
+        // a §5.4 key (pre_start) so the refusal→ledger path is exercised end-to-end:
+        ("bmad/agents/architect/agent.toml", "scope=\"rig\"\nfallback=true\npre_start=\"boot\"\n"),
         ("bmad/agents/architect/prompt.template.md", "You are the architect."),
         ("bmad/skills/bmad-create-architecture/SKILL.md", "# skill"),
-        ("gascity/formulas/build-base.formula.toml", "formula=\"build-base\"\n"),
+        // the TRANSITIVE parent carries executable content (§14.10): a check.path
+        // reached only through bmad's [imports.gc] must still be inventoried.
+        ("gascity/formulas/build-base.formula.toml",
+         "formula=\"build-base\"\n[[steps]]\nid=\"s\"\ntitle=\"t\"\n[steps.check]\nmode=\"exec\"\npath=\"scripts/parent-verify.sh\"\n"),
     ]);
     let camp = tempfile::tempdir().unwrap();
     std::fs::write(camp.path().join("camp.toml"), "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\",\"Skill\"]\n").unwrap();
@@ -1341,13 +1348,27 @@ fn add_from_file_repo_clones_locks_materializes() {
 
     let cfg = camp_core::config::CampConfig::load(&camp.path().join("camp.toml")).unwrap();
     assert!(cfg.imports.contains_key("bmad"));
+    assert!(!cfg.imports["bmad"].trust_exec, "an import is untrusted unless the operator opts in");
     let lock = camp_core::import::lock::PacksLock::read(&camp.path().join("packs.lock")).unwrap();
     assert!(lock.entry("bmad").is_some());
     let gc = lock.imports.iter().find(|e| e.subpath.as_deref()==Some("gascity")).unwrap();
     assert_eq!(gc.via.as_deref(), Some("bmad"));
     assert_eq!(camp_core::pack::resolve_agent(&cfg, "bmad.architect").unwrap().name, "bmad.architect");
+
     let led = camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
-    assert!(!led.events_of_type(camp_core::event::EventType::ImportAdded).unwrap().is_empty());
+    // import.added carries the aggregated exec inventory — INCLUDING the
+    // check.path that arrived only through the transitive gascity parent
+    // (§14.10; dies against Task 16's exec-vs-shell mutation):
+    let added = led.events_of_type(camp_core::event::EventType::ImportAdded).unwrap();
+    assert!(!added.is_empty());
+    let inventory = added[0].data["exec_inventory"].to_string();
+    assert!(inventory.contains("parent-verify.sh"),
+        "transitive check.path must be inventoried: {inventory}");
+    // §5.4 refusal appended as a ledger event, naming pack/agent/key:
+    let refused = led.events_of_type(camp_core::event::EventType::ImportRefused).unwrap();
+    assert!(refused.iter().any(|e|
+        e.data["key"] == "pre_start" && e.data["agent"] == "architect" && e.data["binding"] == "bmad"),
+        "one import.refused per refused key: {refused:?}");
 }
 #[test]
 fn re_adding_same_source_is_idempotent_and_different_source_errors() {
@@ -1372,7 +1393,7 @@ fn re_adding_same_source_is_idempotent_and_different_source_errors() {
 - [ ] **Step 2: Run — expect FAIL.**
 - [ ] **Step 3: Implement** `run_add` and the verbs, plus `main.rs`: `Commands::Import { #[command(subcommand)] cmd }` with `Add { source, #[arg(long)] name, #[arg(long)] version }`, `Install`, `Upgrade { name: Option<String> }`, `Check`, `List`, `Remove { name }`; arms call `cmd::import::run_add`/`run_install`/etc. Binding derivation: `--name`, else the source's last subpath component, else the repo name; validate `[A-Za-z0-9_-]+`, non-empty, not `.`/`..`; on failure say to pass `--name`. Append `[imports.<n>]` by editing `camp.toml` text (mirror `rig::add`'s append style). Enforce the transitive-`agents/` refusal here (the materialized tree exists). Idempotency + different-source-error per the spec.
 - [ ] **Step 4: Run — expect PASS.**
-- [ ] **Step 5: Mutation check.** Make `run_add` overwrite on a different source instead of erroring; `re_adding_same_source_is_idempotent_and_different_source_errors` fails. Revert.
+- [ ] **Step 5: Mutation check (two).** (a) Make `run_add` overwrite on a different source instead of erroring; `re_adding_same_source_is_idempotent_and_different_source_errors` fails. Revert. (b) Flip Task 16's `mode == "exec"` filter to `"shell"`; `add_from_file_repo_clones_locks_materializes` fails on the transitive `parent-verify.sh` inventory assertion (§14.10). Revert.
 - [ ] **Step 6: Commit.**
 
 ```bash
@@ -1741,4 +1762,8 @@ git commit -m "compat: end-to-end §3 two-command recipe against file:// fixture
 1. **Skills dispatch-install call-site (`spawn.rs`, sibling-owned).** Task 15 ships `install_skills` + tests; the dispatch-time call belongs in `crates/camp/src/daemon/spawn.rs` (fix-82/fix-86) and is a phase-3 integration (gc pack agents are dispatch-only; their worker env/shims are phase 3). Phase-1 acceptance is materialization, so this does not block phase 1 — but the lead should schedule the wiring when phase 3's worker-env lands. No spec ambiguity; a boundary artifact of the parallel split.
 2. **`AgentDef`/`resolve_agent` signature stability.** The plan preserves both so `dispatch.rs`/`patrol.rs`/`sling.rs`/`spawn.rs` never need editing. If a sibling changes `AgentDef`'s fields, a rebase surfaces it — re-run the full gate after any sibling merge (kickoff rebase protocol).
 3. **Existing tests that dispatch a tool-less agent** now hit §5.2's "refuse without a resolved allowlist." Any such test in a sibling-owned file must gain `[agent_defaults].tools` after rebase; flagged so the lead can sequence it. Within owned files, Tasks 10–12 update every affected test.
-4. **`yaml_rust2` dependency.** Task 10 removes the last `.md`/YAML agent parser. If no other crate consumer remains, dropping the dep touches `Cargo.toml`/`Cargo.lock` (shared) — coordinate the small rebase. (Verify with `grep -rn yaml_rust2 crates/` before removing.)
+4. **`yaml_rust2` dependency — RESOLVED by plan-gate amendment (2026-07-13).** Task 10 drops the last `use` in owned `pack.rs` only; the manifest entry in the shared `Cargo.toml`/`Cargo.lock` is NOT removed in this stream (additive-only shared-file rule; an unused workspace dep does not fail `clippy -D warnings`). See Follow-ups.
+
+## Follow-ups (post-merge, lead-sequenced)
+
+- **yaml_rust2 removal from workspace Cargo.toml deferred** — operator/lead-sequenced chore after this stream merges.
