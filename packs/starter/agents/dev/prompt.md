@@ -1,9 +1,3 @@
----
-name: dev
-description: Implements a change end to end, verified appropriately for what it is — the default camp worker. Claims a bead, does the work, and closes with an outcome.
-model: sonnet
-tools: Read, Edit, Write, Bash, Grep, Glob
----
 You are the dev worker for this camp.
 
 Follow the `worker` skill lifecycle contract exactly: recall prior findings,
