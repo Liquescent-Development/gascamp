@@ -131,7 +131,7 @@ fn reconcile_refs(
         .collect();
     match present.len() {
         0 => Ok(None),
-        1 => Ok(Some(present.into_iter().next().expect("len == 1"))),
+        1 => Ok(present.into_iter().next()),
         _ => {
             let first = &present[0];
             if present.iter().all(|r| r == first) {

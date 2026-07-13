@@ -255,6 +255,7 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 }
 
 /// Materialize + lock + camp.toml + ledger events, shared by `add`/`install`.
+#[allow(clippy::too_many_arguments)]
 fn run_add_materialize(
     camp_root: &Path,
     src: &camp_core::import::source::Source,
@@ -519,10 +520,10 @@ pub fn run_install(camp_root: &Path) -> Result<()> {
 pub fn run_upgrade(camp_root: &Path, name: Option<&str>) -> Result<()> {
     let lock = PacksLock::read(&camp_root.join("packs.lock"))?;
     for entry in lock.imports.iter().filter(|e| e.via.is_none()) {
-        if let Some(n) = name {
-            if entry.name != n {
-                continue;
-            }
+        if let Some(n) = name
+            && entry.name != n
+        {
+            continue;
         }
         let src = normalize(&entry.source, Some(&entry.version))?;
         if src.is_local_path {
@@ -607,26 +608,26 @@ pub fn run_remove(camp_root: &Path, name: &str) -> Result<()> {
     }
     // Best-effort: drop the [imports.<name>] block from camp.toml.
     let camp_toml = camp_root.join("camp.toml");
-    if camp_toml.is_file() {
-        if let Ok(text) = std::fs::read_to_string(&camp_toml) {
-            let header = format!("[imports.{name}]");
-            let mut out = String::new();
-            let mut skipping = false;
-            for line in text.lines() {
-                if line.trim() == header {
-                    skipping = true;
-                    continue;
-                }
-                if skipping && line.starts_with('[') && line.trim() != header {
-                    skipping = false;
-                }
-                if !skipping {
-                    out.push_str(line);
-                    out.push('\n');
-                }
+    if camp_toml.is_file()
+        && let Ok(text) = std::fs::read_to_string(&camp_toml)
+    {
+        let header = format!("[imports.{name}]");
+        let mut out = String::new();
+        let mut skipping = false;
+        for line in text.lines() {
+            if line.trim() == header {
+                skipping = true;
+                continue;
             }
-            let _ = std::fs::write(&camp_toml, out);
+            if skipping && line.starts_with('[') && line.trim() != header {
+                skipping = false;
+            }
+            if !skipping {
+                out.push_str(line);
+                out.push('\n');
+            }
         }
+        let _ = std::fs::write(&camp_toml, out);
     }
     println!("removed import {name}");
     Ok(())
@@ -634,6 +635,7 @@ pub fn run_remove(camp_root: &Path, name: &str) -> Result<()> {
 /// (creating parent dirs), then add + commit. Reused by the verb tests and
 /// the end-to-end acceptance test.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub(crate) mod testsupport {
     use std::path::Path;
 
@@ -728,6 +730,7 @@ mod tests {
     }
 }
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod verb_tests {
     use super::*;
 

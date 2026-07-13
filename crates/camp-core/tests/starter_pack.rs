@@ -1,5 +1,7 @@
 //! The real `packs/starter` is a valid Gas City directory pack (compat §5.1).
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::path::Path;
 
 use camp_core::import::manifest::read_manifest;

@@ -100,7 +100,7 @@ pub fn parse_agent_dir(dir: &Path) -> Result<(RawAgent, Vec<AgentRefusal>), Core
         .iter()
         .find_map(|f| {
             let p = dir.join(f);
-            p.is_file().then(|| p)
+            p.is_file().then_some(p)
         })
         .ok_or_else(|| {
             pack_err(

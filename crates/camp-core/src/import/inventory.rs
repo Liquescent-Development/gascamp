@@ -43,17 +43,15 @@ pub fn inventory_executable(pack_dir: &Path) -> Result<Vec<ExecItem>, CoreError>
                 toml::from_str(&text).map_err(|e| import_err(&f, format!("invalid TOML: {e}")))?;
             if let Some(steps) = doc.get("steps").and_then(|s| s.as_array()) {
                 for step in steps {
-                    if let Some(check) = step.get("check").and_then(|c| c.as_table()) {
-                        let mode = check.get("mode").and_then(|m| m.as_str());
-                        if mode == Some("exec") {
-                            if let Some(path) = check.get("path").and_then(|p| p.as_str()) {
-                                items.push(ExecItem {
-                                    kind: "check.path",
-                                    path: rel.clone(),
-                                    detail: path.to_owned(),
-                                });
-                            }
-                        }
+                    if let Some(check) = step.get("check").and_then(|c| c.as_table())
+                        && check.get("mode").and_then(|m| m.as_str()) == Some("exec")
+                        && let Some(path) = check.get("path").and_then(|p| p.as_str())
+                    {
+                        items.push(ExecItem {
+                            kind: "check.path",
+                            path: rel.clone(),
+                            detail: path.to_owned(),
+                        });
                     }
                     if let Some(ps) = step.get("pre_start").and_then(|p| p.as_str()) {
                         items.push(ExecItem {
@@ -88,15 +86,15 @@ pub fn inventory_executable(pack_dir: &Path) -> Result<Vec<ExecItem>, CoreError>
                 .map_err(|e| import_err(&f, format!("cannot read: {e}")))?;
             let doc: toml::Value =
                 toml::from_str(&text).map_err(|e| import_err(&f, format!("invalid TOML: {e}")))?;
-            if let Some(order) = doc.get("order").and_then(|o| o.as_table()) {
-                if order.get("trigger").and_then(|t| t.as_str()) == Some("exec") {
-                    let path = order.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                    items.push(ExecItem {
-                        kind: "order.exec",
-                        path: rel.clone(),
-                        detail: path.to_owned(),
-                    });
-                }
+            if let Some(order) = doc.get("order").and_then(|o| o.as_table())
+                && order.get("trigger").and_then(|t| t.as_str()) == Some("exec")
+            {
+                let path = order.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                items.push(ExecItem {
+                    kind: "order.exec",
+                    path: rel.clone(),
+                    detail: path.to_owned(),
+                });
             }
         }
     }

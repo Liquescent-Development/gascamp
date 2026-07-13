@@ -282,7 +282,7 @@ pub fn resolve_formula(cfg: &crate::config::CampConfig, name: &str) -> Result<Pa
             return Some(primary);
         }
         let gc = dir.join(format!("{name}.formula.toml"));
-        gc.is_file().then(|| gc)
+        gc.is_file().then_some(gc)
     };
 
     // Import tier (lowest): every materialized <root>/imports/<binding>/formulas/.
