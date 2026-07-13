@@ -128,6 +128,44 @@ fn control_response_parser_pins_the_wire_shape() {
     assert!(!control_response_is_success("not json", "req_int"));
 }
 
+#[test]
+fn gate_core_flags_match_build_spec_held_stream_arm() {
+    // `held_stream_flags` is deliberately NOT argv-for-argv parity with
+    // `build_spec` (plan note N4: the gate argv is a minimal validation argv).
+    // But its CORE flags — the HeldStream format/verbose block — must never
+    // drift from the builder's. `camp` is a binary crate (no lib target), so
+    // the gate cannot call `build_spec` directly; instead the builder's
+    // HeldStream arm is parsed out of the source, making `spawn.rs` the
+    // single source of truth. If the arm's `arg("...")` sequence changes,
+    // this test fails and forces the gate back into sync.
+    const SPAWN_RS: &str = include_str!("../src/daemon/spawn.rs");
+    const ARM: &str = "StdinMode::HeldStream => {";
+    assert_eq!(
+        SPAWN_RS.matches(ARM).count(),
+        1,
+        "expected exactly one HeldStream match arm in spawn.rs"
+    );
+    let start = SPAWN_RS.find(ARM).unwrap() + ARM.len();
+    let body = &SPAWN_RS[start..];
+    let body = &body[..body.find('}').expect("HeldStream arm closes")];
+    let builder_flags: Vec<&str> = body
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("arg(\"")?.strip_suffix("\");"))
+        .collect();
+    assert!(
+        !builder_flags.is_empty(),
+        "parsed no arg(..) calls from the HeldStream arm — parser drifted from the source shape"
+    );
+    // The gate's core = everything between the leading "-p" and the trailing
+    // "--session-id <sid>" pair.
+    let gate = held_stream_flags("sid-1", true);
+    assert_eq!(
+        gate[1..gate.len() - 2].to_vec(),
+        builder_flags,
+        "the gate's core HeldStream flags drifted from build_spec's HeldStream arm"
+    );
+}
+
 // ---- real-claude harness (used only by the #[ignore]d gate) ----------------
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -236,6 +274,39 @@ fn send(child: &mut Child, json: &str) {
     stdin.flush().unwrap();
 }
 
+/// Drain the child's stderr on a reader thread (mirrors `stdout_lines`): a
+/// child writing more than the OS pipe buffer to stderr would otherwise
+/// deadlock against a parent that only reads stderr after `wait()` (child
+/// blocked on the stderr write, parent blocked in wait). Join AFTER the child
+/// exits to collect the captured text.
+fn stderr_capture(child: &mut Child) -> thread::JoinHandle<String> {
+    let mut stderr = child.stderr.take().expect("child stderr piped");
+    thread::spawn(move || {
+        use std::io::Read;
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    })
+}
+
+/// Bounded wait: the child must exit within RESPONSE_TIMEOUT or the gate
+/// fails loud (a CLI that never exits on stdin EOF is a hang, not a pass —
+/// the panic trips `Worker::drop`, which kills the child).
+fn wait_within_timeout(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + RESPONSE_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker did not exit within {RESPONSE_TIMEOUT:?} of stdin EOF — a CLI \
+             that never exits on EOF is a hang, not a pass"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The $0 real-`claude` compatibility gate (control-plane spec §8 "the $0
 /// tier", phase 0). Opt-in and local-only: `#[ignore]`d AND gated on
 /// CAMP_COMPAT=1. Spends $0 (no turn is ever sent) and needs no auth.
@@ -294,6 +365,7 @@ fn claude_compat_zero_cost() {
             child: cmd.spawn().unwrap(),
         };
         let rx = stdout_lines(&mut worker.child);
+        let stderr_thread = stderr_capture(&mut worker.child);
 
         // initialize handshake (the SDK sends this first).
         send(
@@ -314,16 +386,12 @@ fn claude_compat_zero_cost() {
         // Clean shutdown: close stdin (EOF) and confirm the fixed argv exits 0
         // with no `requires --verbose` on stderr — argv was accepted.
         worker.child.stdin.take(); // drop -> EOF
-        let status = worker.child.wait().unwrap();
+        let status = wait_within_timeout(&mut worker.child);
         assert!(
             status.success(),
             "fixed argv worker must exit 0 on stdin EOF; got {status:?}"
         );
-        let mut stderr = String::new();
-        if let Some(mut e) = worker.child.stderr.take() {
-            use std::io::Read;
-            let _ = e.read_to_string(&mut stderr);
-        }
+        let stderr = stderr_thread.join().expect("stderr drain thread panicked");
         assert!(
             !stderr.contains("requires --verbose"),
             "fixed argv must NOT trip the #86 error; stderr was: {stderr:?}"
