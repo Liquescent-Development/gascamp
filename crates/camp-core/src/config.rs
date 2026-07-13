@@ -203,6 +203,95 @@ pub struct ImportDecl {
     pub skills: Option<bool>,
 }
 
+/// The subdirectory of `<root>/imports/` that holds TRANSITIVE (pack-level,
+/// §7.2) materializations. A leading `.` makes it unspellable as a binding
+/// (`[A-Za-z0-9_-]+`), so a pack can never shadow it — and it keeps the
+/// transitive content layers DISJOINT from the direct bindings' dirs, which
+/// is what lets a direct import override a transitive one of the same name
+/// (§7.1) without clobbering the transitive formula layers (D8).
+pub const TRANSITIVE_DIR: &str = ".transitive";
+
+/// Where a TRANSITIVE import's content layer is materialized (§7.2). Keyed by
+/// its binding, under the transitive sentinel dir. Transitive packs contribute
+/// content (formulas, fragments, skills, assets) by BARE name only — never
+/// agents (a transitive `agents/` dir is refused at import).
+pub fn transitive_layer_dir(root: &Path, binding: &str) -> PathBuf {
+    root.join("imports").join(TRANSITIVE_DIR).join(binding)
+}
+
+impl ImportDecl {
+    /// Is this import's source a LOCAL filesystem path? Delegates to the ONE
+    /// definition of "local" (`import::source::is_local_source`), so a
+    /// declared import and a CLI source can never be classified differently.
+    pub fn is_local(&self) -> bool {
+        crate::import::source::is_local_source(&self.source)
+    }
+
+    /// The directory this import's content is READ from (component §5).
+    ///
+    /// - **Local path → layered IN PLACE.** The source resolves relative to
+    ///   `camp.toml`'s root and is read where the operator keeps it: no fetch,
+    ///   no copy under `imports/`, no lock entry (§5's layout diagram). This
+    ///   is the single seam that makes read-in-place true for EVERY resolver
+    ///   (agents, formulas, orders, skills, exec inventory) at once.
+    /// - **Git-backed → the DERIVED materialization** `<root>/imports/<binding>/`.
+    ///   Never stored — storing it made a path read from a tracked file into a
+    ///   write-anywhere primitive (§5).
+    pub fn layer_dir(&self, root: &Path, binding: &str) -> PathBuf {
+        if self.is_local() {
+            let base = root.join(&self.source);
+            return match &self.subpath {
+                Some(s) => base.join(s),
+                None => base,
+            };
+        }
+        root.join("imports").join(binding)
+    }
+}
+
+impl CampConfig {
+    /// The DIRECT import layers as `(binding, dir)`, declaration-driven and
+    /// sorted by binding (§7.1: the binding IS the namespace). Driven by
+    /// `camp.toml`, NOT by listing `imports/` — a local import has no dir
+    /// there, and the transitive sentinel must never be mistaken for a
+    /// binding. Returns `None`-free pairs only when the config has a root.
+    pub fn import_layers(&self) -> Vec<(String, PathBuf)> {
+        let Some(root) = self.root.as_deref() else {
+            return Vec::new();
+        };
+        self.imports
+            .iter()
+            .map(|(binding, decl)| (binding.clone(), decl.layer_dir(root, binding)))
+            .collect()
+    }
+
+    /// The TRANSITIVE content layers as `(binding, dir)` (§7.2), sorted by
+    /// binding. These contribute formulas/fragments/skills/assets by BARE
+    /// name and sit BELOW the direct imports — so a direct import of the same
+    /// binding overrides the transitive one's agents while its content layers
+    /// survive (D8).
+    pub fn transitive_layers(&self) -> Vec<(String, PathBuf)> {
+        let Some(root) = self.root.as_deref() else {
+            return Vec::new();
+        };
+        let dir = root.join("imports").join(TRANSITIVE_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut layers: Vec<(String, PathBuf)> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .filter_map(|p| {
+                let binding = p.file_name()?.to_str()?.to_owned();
+                Some((binding, p))
+            })
+            .collect();
+        layers.sort();
+        layers
+    }
+}
+
 /// `[orders]` (compat §14): the `enabled` list that arms imported orders.
 /// An imported order is INERT until named here — the money invariant.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -294,6 +383,88 @@ impl CampConfig {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// D7 (operator ruling, issue #80): a LOCAL-path import is layered IN
+    /// PLACE — resolvers read the operator's own directory, resolved relative
+    /// to camp.toml. It is never fetched and never copied under `imports/`
+    /// (component §5's layout diagram: "local path: layered in place / no
+    /// fetch, no lock entry"). A git-backed import keeps the DERIVED
+    /// materialization path. Mutating `layer_dir` to return the materialized
+    /// path for a local source turns this red.
+    #[test]
+    fn a_local_import_layers_in_place_and_a_git_import_layers_under_imports() {
+        let root = Path::new("/camp");
+        let local = ImportDecl {
+            source: "../packs/house".to_owned(),
+            subpath: None,
+            version: None,
+            trust_exec: false,
+            skills: None,
+        };
+        assert!(local.is_local());
+        assert_eq!(
+            local.layer_dir(root, "house"),
+            PathBuf::from("/camp/../packs/house"),
+            "a local source is read in place, relative to camp.toml"
+        );
+
+        let git = ImportDecl {
+            source: "https://github.com/Liquescent-Development/gascamp".to_owned(),
+            subpath: Some("packs/starter".to_owned()),
+            version: None,
+            trust_exec: false,
+            skills: None,
+        };
+        assert!(!git.is_local());
+        assert_eq!(
+            git.layer_dir(root, "starter"),
+            PathBuf::from("/camp/imports/starter"),
+            "a git source is materialized; its location is DERIVED, never stored"
+        );
+    }
+
+    /// D8 (operator ruling, issue #80): a DIRECT import OVERRIDES a transitive
+    /// one for the same binding (§7.1 — the operator's binding always wins;
+    /// gc's own rule, pack.go:335-340). The direct import owns
+    /// `imports/<binding>/`, while the transitive layer persists under a
+    /// SEPARATE path — so a direct override never clobbers the transitive
+    /// FORMULA layers that the corpus's `extends = [...]` depend on.
+    #[test]
+    fn a_direct_import_and_a_transitive_layer_of_the_same_binding_have_disjoint_dirs() {
+        let root = Path::new("/camp");
+        let direct = ImportDecl {
+            source: "https://example.com/gc".to_owned(),
+            subpath: None,
+            version: None,
+            trust_exec: false,
+            skills: None,
+        };
+        assert_eq!(
+            direct.layer_dir(root, "gc"),
+            PathBuf::from("/camp/imports/gc")
+        );
+        assert_eq!(
+            transitive_layer_dir(root, "gc"),
+            PathBuf::from("/camp/imports/.transitive/gc"),
+            "the transitive layer is materialized OUTSIDE the direct binding's dir"
+        );
+        assert_ne!(
+            direct.layer_dir(root, "gc"),
+            transitive_layer_dir(root, "gc")
+        );
+    }
+
+    /// The transitive sentinel can never collide with a real binding: binding
+    /// names are validated `[A-Za-z0-9_-]+`, so none can equal `.transitive`.
+    #[test]
+    fn the_transitive_sentinel_is_not_a_legal_binding_name() {
+        assert!(
+            !TRANSITIVE_DIR
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "{TRANSITIVE_DIR:?} must be unspellable as a binding, or a pack could shadow it"
+        );
+    }
 
     #[test]
     fn parses_camp_and_rigs() {

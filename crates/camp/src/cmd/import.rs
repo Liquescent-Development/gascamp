@@ -315,11 +315,37 @@ fn run_add_materialize(
     };
     let all = resolve_transitive(&direct, &manifest_of)?;
 
-    // Materialize self + transitive (merge into imports/<binding>/; refuse a
-    // transitive agents/ dir — transitive packs contribute content only).
-    let imports_root = camp_root.join("imports");
+    // The declaration this import will carry in camp.toml. It is also what
+    // decides WHERE the import's content is read from (`layer_dir`), so the
+    // materialize, inventory, and route-scan passes below all agree with the
+    // resolvers by construction — one seam, not four copies of the rule.
+    let decl = ImportDecl {
+        source: src.repository.clone(),
+        subpath: src.subpath.clone(),
+        version: src.reference.clone(),
+        trust_exec: false,
+        skills: None,
+    };
+    // Where each resolved import's content lives on disk (D7/D8).
+    let layer_of = |imp: &ResolvedImport| -> PathBuf {
+        match &imp.via {
+            Some(_) => camp_core::config::transitive_layer_dir(camp_root, &imp.binding),
+            None => decl.layer_dir(camp_root, &imp.binding),
+        }
+    };
+
+    // Materialize. Two rules, both from the operator's rulings on #80:
+    //
+    // D7 — a LOCAL-path direct import is layered IN PLACE: nothing is copied,
+    //   so there is no stale duplicate of the operator's own pack to drift.
+    //   Its resolvers read `layer_dir` (= the source), so skipping the copy
+    //   here IS the implementation.
+    // D8 — a TRANSITIVE import materializes under the `.transitive` sentinel,
+    //   DISJOINT from `imports/<binding>/`. A direct import of the same binding
+    //   therefore OVERRIDES it (§7.1) without merging into or clobbering the
+    //   transitive content layer beneath (which the corpus's `extends` needs).
+    //   A transitive `agents/` dir stays refused — content layers only (§7.2).
     for imp in &all {
-        let dest = imports_root.join(&imp.binding);
         let src_subtree = match &imp.subpath {
             Some(s) => repo_dir.join(s),
             None => repo_dir.to_path_buf(),
@@ -331,59 +357,62 @@ fn run_add_materialize(
                 imp.binding
             );
         }
+        if imp.via.is_none() && src.is_local_path {
+            continue; // D7: layered in place — never copied
+        }
+        let dest = layer_of(imp);
         materialize_tree(materialize_root, &src_subtree, &dest)
             .with_context(|| format!("materialize {source_str:?} into {}", dest.display()))?;
     }
 
     // Append [imports.<binding>] to camp.toml (once).
-    append_import_decl(
-        &camp_root.join("camp.toml"),
-        binding,
-        &ImportDecl {
-            source: src.repository.clone(),
-            subpath: src.subpath.clone(),
-            version: src.reference.clone(),
-            trust_exec: false,
-            skills: None,
-        },
-    )?;
+    append_import_decl(&camp_root.join("camp.toml"), binding, &decl)?;
 
     // Lock: drop this binding's direct + its-declared-transitive entries, then
     // add self (direct) + transitive (via = binding).
-    let fetched = jiff::Timestamp::now().to_string();
+    //
+    // D7: a LOCAL-path import contributes NO lock entries — not for itself and
+    // not for anything it pulls in transitively. The lock exists to reproduce a
+    // fetch by commit; a local path has no commit to pin, and writing an entry
+    // with an empty commit would be a lock that reproduces nothing. `packs.lock`
+    // stays a truthful record of exactly what was fetched (§5).
     lock.imports.retain(|e| {
         let is_direct_self = e.via.is_none() && e.name == binding;
         let is_declared_transitive = e.via.as_deref() == Some(binding);
         !(is_direct_self || is_declared_transitive)
     });
-    lock.imports.push(LockEntry {
-        name: binding.to_owned(),
-        source: src.repository.clone(),
-        subpath: src.subpath.clone(),
-        version: src.reference.clone().unwrap_or_default(),
-        commit: commit.to_owned(),
-        fetched: fetched.clone(),
-        via: None,
-    });
-    for imp in all.iter().filter(|i| i.via.is_some()) {
+    if !src.is_local_path {
+        let fetched = jiff::Timestamp::now().to_string();
         lock.imports.push(LockEntry {
-            name: imp.binding.clone(),
+            name: binding.to_owned(),
             source: src.repository.clone(),
-            subpath: imp.subpath.clone(),
+            subpath: src.subpath.clone(),
             version: src.reference.clone().unwrap_or_default(),
             commit: commit.to_owned(),
             fetched: fetched.clone(),
-            via: Some(binding.to_owned()),
+            via: None,
         });
+        for imp in all.iter().filter(|i| i.via.is_some()) {
+            lock.imports.push(LockEntry {
+                name: imp.binding.clone(),
+                source: src.repository.clone(),
+                subpath: imp.subpath.clone(),
+                version: src.reference.clone().unwrap_or_default(),
+                commit: commit.to_owned(),
+                fetched: fetched.clone(),
+                via: Some(binding.to_owned()),
+            });
+        }
     }
 
-    // Inventory executable content across EVERY materialized dir (self +
-    // transitive — §14.10), and collect §5.4 agent refusals.
+    // Inventory executable content across EVERY import layer (self +
+    // transitive — §14.10), and collect §5.4 agent refusals. A local import is
+    // inventoried IN PLACE: read-in-place must never mean un-inspected.
     let mut exec_inventory: Vec<ExecItem> = Vec::new();
     let mut refusals: Vec<(String, String, String)> = Vec::new(); // (binding, agent, key)
     let mut ignored_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for imp in &all {
-        let dir = imports_root.join(&imp.binding);
+        let dir = layer_of(imp);
         if dir.join("agents").is_dir() {
             for entry in std::fs::read_dir(dir.join("agents"))?.flatten() {
                 if entry.path().is_dir() {
@@ -407,7 +436,7 @@ fn run_add_materialize(
     let mut unbound_bindings: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     for imp in &all {
-        let dir = imports_root.join(&imp.binding);
+        let dir = layer_of(imp);
         let formulas = dir.join("formulas");
         if !formulas.is_dir() {
             continue;
@@ -455,7 +484,7 @@ fn run_add_materialize(
         if imp.via.is_none() {
             continue;
         }
-        let dir = imports_root.join(&imp.binding);
+        let dir = layer_of(imp);
         for nested in find_nested_pack_tomls(&dir)? {
             let rel = nested
                 .strip_prefix(&dir)
@@ -673,7 +702,13 @@ pub fn run_check(camp_root: &Path) -> Result<()> {
     let lock = PacksLock::read(&camp_root.join("packs.lock"))?;
     let mut missing = 0;
     for entry in &lock.imports {
-        let dir = camp_root.join("imports").join(&entry.name);
+        // Only FETCHED imports are locked (D7: a local path has no entry), and
+        // a transitive one materializes under the sentinel dir (D8) — check
+        // each where it actually lives, or `check` invents missing imports.
+        let dir = match &entry.via {
+            Some(_) => camp_core::config::transitive_layer_dir(camp_root, &entry.name),
+            None => camp_root.join("imports").join(&entry.name),
+        };
         if !dir.is_dir() {
             eprintln!("missing: {} (import {:?})", dir.display(), entry.name);
             missing += 1;
@@ -709,19 +744,51 @@ pub fn run_list(camp_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `camp import remove <name>` — drop the lock entry + `<root>/imports/<n>/`.
+/// `camp import remove <name>` — drop the binding: its lock entries (its own
+/// and the transitive ones it pulled in), its camp-OWNED materialized dirs,
+/// and its `[imports.<name>]` block.
+///
+/// A LOCAL-path import has no lock entry (D7), so presence is decided by
+/// `camp.toml` OR the lock — keying off the lock alone would make a local
+/// import unremovable. Only camp-owned dirs under `imports/` are deleted:
+/// a local import's source is the OPERATOR'S OWN directory, and `remove`
+/// unbinds it, it does not delete their pack.
 pub fn run_remove(camp_root: &Path, name: &str) -> Result<()> {
+    let camp_toml = camp_root.join("camp.toml");
+    let declared = camp_core::config::CampConfig::load(&camp_toml)
+        .map(|cfg| cfg.imports.contains_key(name))
+        .unwrap_or(false);
+
     let lock_path = camp_root.join("packs.lock");
     let mut lock = PacksLock::read(&lock_path)?;
     let before = lock.imports.len();
-    lock.imports.retain(|e| e.name != name);
-    if lock.imports.len() == before {
+    // The transitive layers THIS binding pulled in — captured before the drop,
+    // so their materialized dirs can be reclaimed with it.
+    let transitive: Vec<String> = lock
+        .imports
+        .iter()
+        .filter(|e| e.via.as_deref() == Some(name))
+        .map(|e| e.name.clone())
+        .collect();
+    lock.imports
+        .retain(|e| e.name != name && e.via.as_deref() != Some(name));
+    let locked = lock.imports.len() != before;
+    if !locked && !declared {
         bail!("no import named {name:?}");
     }
     lock.write(&lock_path)?;
-    let dir = camp_root.join("imports").join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+
+    // Camp-owned dirs only — never the operator's in-place local source.
+    let mut owned = vec![camp_root.join("imports").join(name)];
+    owned.extend(
+        transitive
+            .iter()
+            .map(|b| camp_core::config::transitive_layer_dir(camp_root, b)),
+    );
+    for dir in owned {
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+        }
     }
     // Best-effort: drop the [imports.<name>] block from camp.toml.
     let camp_toml = camp_root.join("camp.toml");
@@ -1065,6 +1132,162 @@ mod verb_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("camp import add")
+        );
+    }
+
+    /// D7 (operator ruling, issue #80) — a LOCAL-path import is layered IN
+    /// PLACE: `add` performs NO fetch, writes NO lock entry, and copies
+    /// NOTHING under `imports/` (component §5's layout diagram). Every
+    /// resolver reads the operator's own directory, resolved relative to
+    /// camp.toml — so editing the pack in place is immediately live, with no
+    /// re-import step. Mutating `layer_dir` to materialize a local source (or
+    /// `run_add` to lock it) turns this red.
+    #[test]
+    fn a_local_path_import_is_layered_in_place_with_no_copy_and_no_lock_entry() {
+        let packs = tempfile::tempdir().unwrap();
+        let house = packs.path().join("house");
+        std::fs::create_dir_all(house.join("agents/mason")).unwrap();
+        std::fs::create_dir_all(house.join("formulas")).unwrap();
+        std::fs::write(
+            house.join("pack.toml"),
+            "[pack]\nname=\"house\"\nschema=2\n",
+        )
+        .unwrap();
+        std::fs::write(house.join("agents/mason/prompt.md"), "lay bricks").unwrap();
+        std::fs::write(house.join("formulas/brick.toml"), "formula=\"brick\"\n").unwrap();
+
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp.path();
+        std::fs::write(
+            root.join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n",
+        )
+        .unwrap();
+        camp_core::ledger::Ledger::open(&root.join("camp.db")).unwrap();
+
+        // An ABSOLUTE local path (no scheme) — a local source, not a fetch.
+        run_add(root, &house.display().to_string(), Some("house"), None).unwrap();
+
+        // No fetch, no copy: `imports/house/` must not exist at all.
+        assert!(
+            !root.join("imports").join("house").exists(),
+            "a local import must NOT be copied under imports/ — it is layered in place"
+        );
+        // No lock entry: a local path has nothing to pin (§5).
+        let lock_path = root.join("packs.lock");
+        if lock_path.exists() {
+            let lock = camp_core::import::lock::PacksLock::read(&lock_path).unwrap();
+            assert!(
+                !lock.imports.iter().any(|e| e.name == "house"),
+                "a local path has NO lock entry — there is no commit to reproduce"
+            );
+        }
+
+        // ...yet every resolver reads it, in place.
+        let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+        let agent = camp_core::pack::resolve_agent(&cfg, "house.mason").unwrap();
+        assert_eq!(agent.name, "house.mason");
+        assert!(agent.prompt.contains("lay bricks"));
+        assert!(
+            camp_core::orders::resolve_formula(&cfg, "brick").is_ok(),
+            "a local import's formulas join the layers, read in place"
+        );
+
+        // Read-in-place is LIVE: editing the source is visible with no re-import.
+        std::fs::write(house.join("agents/mason/prompt.md"), "lay MARBLE").unwrap();
+        let agent = camp_core::pack::resolve_agent(&cfg, "house.mason").unwrap();
+        assert!(
+            agent.prompt.contains("lay MARBLE"),
+            "in-place layering reads the source, not a stale copy"
+        );
+    }
+
+    /// D8 (operator ruling, issue #80) — a DIRECT import OVERRIDES a
+    /// transitive one for the SAME binding (§7.1; gc's own rule,
+    /// pack.go:335-340). This is the §3 recipe's real clash: bmad imports
+    /// `../gascity` transitively as `gc`, and the operator then imports
+    /// `gascity/roles` DIRECTLY as `gc`.
+    ///
+    /// The direct import owns `imports/gc/` (its AGENTS resolve), while the
+    /// transitive content lands on a SEPARATE path — so the transitive FORMULA
+    /// layer survives the override rather than being clobbered or merged into
+    /// it. Merging the two into one dir (the old behavior) turns this red.
+    #[test]
+    fn a_direct_import_overrides_a_transitive_binding_and_the_transitive_formulas_survive() {
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                (
+                    "bmad/pack.toml",
+                    "[pack]\nname=\"bmad\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n",
+                ),
+                ("bmad/agents/architect/prompt.md", "architect"),
+                (
+                    "gascity/formulas/build-base.formula.toml",
+                    "formula=\"build-base\"\n",
+                ),
+                (
+                    "gascity/roles/pack.toml",
+                    "[pack]\nname=\"gc-roles\"\nschema=2\n",
+                ),
+                ("gascity/roles/agents/run-operator/prompt.md", "operate"),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp.path();
+        std::fs::write(
+            root.join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n",
+        )
+        .unwrap();
+        camp_core::ledger::Ledger::open(&root.join("camp.db")).unwrap();
+        let base = format!("file://{}", repo.path().display());
+
+        // 1. bmad → transitively binds `gc` to gascity (a CONTENT layer).
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), None).unwrap();
+        assert!(
+            root.join("imports")
+                .join(camp_core::config::TRANSITIVE_DIR)
+                .join("gc")
+                .join("formulas")
+                .is_dir(),
+            "a transitive layer materializes under the transitive sentinel, \
+             NOT into the binding's own dir"
+        );
+
+        // 2. the operator DIRECTLY binds `gc` to the roles pack — the override.
+        run_add(root, &format!("{base}//gascity/roles"), Some("gc"), None).unwrap();
+
+        let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+
+        // The DIRECT import owns imports/gc/ — its agents resolve...
+        assert_eq!(
+            camp_core::pack::resolve_agent(&cfg, "gc.run-operator")
+                .unwrap()
+                .name,
+            "gc.run-operator"
+        );
+        // ...and the transitive content is NOT merged into it. Under the old
+        // merge-into-one-dir behavior this file existed, so this is the
+        // assertion that separates OVERRIDE from MERGE.
+        assert!(
+            !root
+                .join("imports")
+                .join("gc")
+                .join("formulas")
+                .join("build-base.formula.toml")
+                .exists(),
+            "the direct import's dir must hold DIRECT content only — the \
+             transitive layer lives on its own path"
+        );
+        // ...yet the transitive formula layer SURVIVES the override, resolved
+        // by BARE name (§7.2). This is the whole point of the ruling: the 24
+        // corpus formulas that `extends = [...]` gascity keep compiling.
+        assert!(
+            camp_core::orders::resolve_formula(&cfg, "build-base").is_ok(),
+            "the transitive formula layer must survive a direct override of \
+             its binding"
         );
     }
 

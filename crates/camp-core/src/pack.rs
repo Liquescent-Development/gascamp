@@ -250,11 +250,13 @@ pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError
                      `camp import add <source> --name {binding}`"
                 ))
             })?;
-            let dir = root
-                .join("imports")
-                .join(binding)
-                .join("agents")
-                .join(suffix);
+            // The import's layer dir: IN PLACE for a local path, the derived
+            // <root>/imports/<binding>/ for a git source (§5, D7). Agents come
+            // from the DIRECT import only — a transitive pack contributes
+            // content layers, never agents (§7.2), which is exactly why a
+            // direct import overrides a transitive binding (§7.1, D8).
+            let layer = decl.layer_dir(root, binding);
+            let dir = layer.join("agents").join(suffix);
             if !dir.is_dir() {
                 return Err(CoreError::UnknownAgent {
                     name: name.to_owned(),
@@ -262,8 +264,7 @@ pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError
                 });
             }
             let (raw, _refusals) = parse_agent_dir(&dir)?;
-            let pack_ships_skills = root.join("imports").join(binding).join("skills").is_dir()
-                && decl.skills != Some(false);
+            let pack_ships_skills = layer.join("skills").is_dir() && decl.skills != Some(false);
             resolve_agent_def(&cfg.agent_defaults, &raw, name, pack_ships_skills)
         }
         None => {

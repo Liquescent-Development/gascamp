@@ -32,6 +32,22 @@ pub struct Source {
 /// Normalize a raw source string plus an optional `version` (from
 /// `ImportDecl.version`) into a `Source`. Errors are `CoreError::Import`
 /// naming the source as the binding for actionable messages.
+/// Is this source a LOCAL filesystem path (as opposed to a git-backed
+/// remote)? Starts with `.` or `/`, or has no scheme / `git@` / `//` / `::`
+/// (the `::` exclusion sends git's `ext::` transport to the remote path,
+/// where the allowlist rejects it).
+///
+/// The ONE definition of "local" — `normalize` classifies a CLI source with
+/// it, and `ImportDecl::is_local` classifies an already-declared
+/// `[imports.<binding>]` with it, so `camp import add` and every resolver
+/// can never disagree about which imports are layered in place (§5).
+pub fn is_local_source(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with('.')
+        || s.starts_with('/')
+        || (!s.contains("://") && !s.starts_with("git@") && !s.contains("//") && !s.contains("::"))
+}
+
 pub fn normalize(source: &str, version: Option<&str>) -> Result<Source, CoreError> {
     let s = source.trim();
     if s.is_empty() {
@@ -40,12 +56,7 @@ pub fn normalize(source: &str, version: Option<&str>) -> Result<Source, CoreErro
             reason: "empty source".to_owned(),
         });
     }
-    // Local path: starts with '.' or '/', or has no scheme/git@///subdir/::
-    // (the `::` exclusion sends git's `ext::` transport to the remote path,
-    // where the allowlist rejects it).
-    let is_local_path = s.starts_with('.')
-        || s.starts_with('/')
-        || (!s.contains("://") && !s.starts_with("git@") && !s.contains("//") && !s.contains("::"));
+    let is_local_path = is_local_source(s);
     if is_local_path {
         if let Some(v) = version {
             return Err(CoreError::Import {

@@ -193,23 +193,16 @@ pub fn compile_all_orders(cfg: &CampConfig) -> Result<OrderInventory, CoreError>
     let Some(root) = cfg.root.as_deref() else {
         return Ok(OrderInventory { active, disabled });
     };
-    let imports_dir = root.join("imports");
-    let Ok(entries) = std::fs::read_dir(&imports_dir) else {
-        return Ok(OrderInventory { active, disabled });
-    };
-    let mut bindings: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    bindings.sort();
-    for b in bindings {
-        let binding = b
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_owned();
-        let orders_dir = b.join("orders");
+    let _ = root;
+    // Orders come from the DIRECT imports, driven by the `[imports.*]`
+    // DECLARATIONS — not by listing `imports/`. A local-path import is layered
+    // in place and has no dir there (D7), and the `.transitive` sentinel is
+    // not a binding, so listing the directory would both miss orders and
+    // invent a binding that no operator declared.
+    let mut layers = cfg.import_layers();
+    layers.sort();
+    for (binding, layer) in layers {
+        let orders_dir = layer.join("orders");
         let Ok(order_entries) = std::fs::read_dir(&orders_dir) else {
             continue;
         };

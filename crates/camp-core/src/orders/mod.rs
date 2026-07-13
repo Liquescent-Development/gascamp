@@ -285,44 +285,45 @@ pub fn resolve_formula(cfg: &crate::config::CampConfig, name: &str) -> Result<Pa
         gc.is_file().then_some(gc)
     };
 
-    // Import tier (lowest): every materialized <root>/imports/<binding>/formulas/.
-    let imports_dir = root.join("imports");
-    let mut hits: Vec<(String, PathBuf)> = Vec::new();
-    if imports_dir.is_dir() {
-        let entries = std::fs::read_dir(&imports_dir).map_err(|e| {
-            CoreError::Config(format!("cannot read {}: {e}", imports_dir.display()))
-        })?;
-        let mut bindings: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        bindings.sort();
-        for b in bindings {
-            if let Some(p) = file(&b.join("formulas")) {
-                let binding = b
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_owned();
-                hits.push((binding, p));
-            }
+    // Formulas resolve by BARE name through LAYERS (§2/§7.2), lowest first:
+    //
+    //   transitive content layers  <  direct imports  <  <camp>/formulas/
+    //
+    // The tiers are disjoint on disk (a direct import lives at its layer_dir;
+    // a transitive one under the `.transitive` sentinel), so a DIRECT import
+    // that overrides a transitive binding (§7.1, D8) takes over that binding's
+    // AGENTS without clobbering the transitive FORMULA layer beneath it — the
+    // layer the corpus's `extends = [...]` and `[vars]` defaults are built on.
+    let collect = |layers: Vec<(String, PathBuf)>| -> Vec<(String, PathBuf)> {
+        layers
+            .into_iter()
+            .filter_map(|(binding, dir)| file(&dir.join("formulas")).map(|p| (binding, p)))
+            .collect()
+    };
+    // Duplication WITHIN a tier is a hard error naming both providers (§5.4
+    // decision 9, rescoped): camp will not guess which import an operator
+    // meant. Across tiers the higher layer simply wins — that is layering.
+    let one_of = |tier: Vec<(String, PathBuf)>, what: &str| -> Result<Option<PathBuf>, CoreError> {
+        if tier.len() > 1 {
+            let providers: Vec<&str> = tier.iter().map(|(n, _)| n.as_str()).collect();
+            return Err(CoreError::Order {
+                order: name.to_owned(),
+                reason: format!(
+                    "formula {name:?} exists in multiple {what}: {providers:?} — \
+                     disambiguate or remove one"
+                ),
+            });
         }
-    }
-    if hits.len() > 1 {
-        let providers: Vec<&str> = hits.iter().map(|(n, _)| n.as_str()).collect();
-        return Err(CoreError::Order {
-            order: name.to_owned(),
-            reason: format!(
-                "formula {name:?} exists in multiple imports: {providers:?} — disambiguate or remove one"
-            ),
-        });
-    }
+        Ok(tier.into_iter().next().map(|(_, p)| p))
+    };
+    let transitive = one_of(collect(cfg.transitive_layers()), "transitive layers")?;
+    let direct = one_of(collect(cfg.import_layers()), "imports")?;
+
     // Local tier (highest): <root>/formulas/.
     if let Some(local) = file(&root.join("formulas")) {
         return Ok(local);
     }
-    if let Some((_, p)) = hits.into_iter().next() {
+    if let Some(p) = direct.or(transitive) {
         return Ok(p);
     }
     Err(CoreError::Order {
