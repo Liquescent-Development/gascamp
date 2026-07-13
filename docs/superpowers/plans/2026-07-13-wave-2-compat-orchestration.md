@@ -32,10 +32,17 @@ These bind every wave-2 stream and amend the v1 guide's flow:
    AMENDMENT: APPROVE/REJECT; the implementer holds until the lead
    relays the ruling, and the accepted deviation is appended to the plan
    doc's approval note. (Precedent: fix-82, 2026-07-13.)
-4. Everything else from the v1 guide stands: plan gate before any
+4. **Merge on clean review.** When a PR's code-review pass returns
+   CLEAN — after the lead's own verification checklist passed — the
+   lead merges it (squash, explicit `--subject`/`--body`, no co-author
+   trailers) and immediately runs the post-merge rebase protocol. A
+   pass WITH findings still goes through the fix-all loop to a fresh
+   clean pass first. The operator retains override authority at all
+   times.
+5. Everything else from the v1 guide stands: plan gate before any
    execution; auto code-review with the fix-all relay loop until clean;
-   the operator reviews and merges every PR; the lead never edits code,
-   never reads diffs, never merges.
+   the lead never edits code, never reads diffs, and merges only under
+   amendment 4.
 
 ## Prior state (what wave 1 left)
 
