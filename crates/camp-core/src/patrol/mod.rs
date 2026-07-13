@@ -1,8 +1,10 @@
 //! Health patrol state machines (spec §10): pure, deterministic, no I/O.
 //! Durations are jiff friendly strings ("10m"); the pure machines take
 //! explicit `now: Timestamp` (the CronHeap precedent). Patrol config is
-//! read at campd start; hot reload does not re-arm patrol (Phase 11 plan
-//! Decision L).
+//! swapped on an applied hot reload (issue #81): future resolutions and
+//! future timer arms follow the reloaded config; in-flight stall timers are
+//! not re-armed (the surviving half of Phase 11 plan Decision L; the
+//! config-visibility half is un-deferred by #81).
 
 pub mod timers;
 
@@ -146,6 +148,14 @@ impl Ladder {
 
     pub fn restarts(&self, bead: &str) -> u32 {
         self.states.get(bead).map_or(0, |s| s.restarts)
+    }
+
+    /// Follow a hot-reloaded `[patrol] restart_budget` (issue #81). The
+    /// ceiling is read live per fire (`on_fire`), so future fires honor the
+    /// new budget; every per-bead restart count and next-step is preserved
+    /// — a reload adjusts the ceiling, it does not rewrite history.
+    pub fn set_restart_budget(&mut self, restart_budget: u32) {
+        self.restart_budget = restart_budget;
     }
 
     /// Exponential backoff as threshold scaling (plan Decision D):
@@ -325,5 +335,40 @@ mod tests {
         l.forget("gc-1");
         assert_eq!(l.restarts("gc-1"), 0);
         assert_eq!(l.on_fire("gc-1"), LadderAction::Nudge);
+    }
+
+    #[test]
+    fn set_restart_budget_takes_effect_on_future_fires_and_preserves_state() {
+        // A budget of 0 would exhaust on the fire after the first nudge…
+        let mut ladder = Ladder::new(0);
+        assert_eq!(ladder.on_fire("gc-1"), LadderAction::Nudge);
+        // …until a hot reload raises it: the very next fire restarts instead.
+        ladder.set_restart_budget(1);
+        assert_eq!(
+            ladder.on_fire("gc-1"),
+            LadderAction::Restart,
+            "the reloaded budget must govern the next fire"
+        );
+
+        // Lowering the ceiling below a bead's existing restart count exhausts
+        // it next fire, but the per-bead restart history is NOT reset.
+        let mut ladder = Ladder::new(5);
+        assert_eq!(ladder.on_fire("gc-2"), LadderAction::Nudge);
+        assert_eq!(ladder.on_fire("gc-2"), LadderAction::Restart); // restarts -> 1
+        assert_eq!(ladder.on_fire("gc-2"), LadderAction::Nudge);
+        assert_eq!(ladder.on_fire("gc-2"), LadderAction::Restart); // restarts -> 2
+        assert_eq!(ladder.restarts("gc-2"), 2);
+        ladder.set_restart_budget(1); // now below the bead's 2 restarts
+        assert_eq!(ladder.on_fire("gc-2"), LadderAction::Nudge);
+        assert_eq!(
+            ladder.on_fire("gc-2"),
+            LadderAction::Exhausted,
+            "a lowered budget exhausts the next restart fire"
+        );
+        assert_eq!(
+            ladder.restarts("gc-2"),
+            2,
+            "the reloaded budget must not reset per-bead restart history"
+        );
     }
 }
