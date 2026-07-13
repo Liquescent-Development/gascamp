@@ -343,10 +343,109 @@ pub fn rig_base(rig_path: &Path, timeout: Duration) -> Result<Option<String>> {
     Ok((!sha.is_empty()).then_some(sha))
 }
 
+/// Detect a pre-existing `camp/<bead>` branch on `rig_path` and, if one is
+/// there, build the loud named-recovery error dispatch needs (issue #82).
+/// Bead ids are ledger-scoped but `camp/<bead>` branches are repo-permanent,
+/// so a ledger reset restarts the bead counter onto a predecessor's branch;
+/// `git worktree add -b` then dies on a raw "a branch named ... already
+/// exists". The probe is EXPLICIT — the same discipline as
+/// `ensure_worktree_base`: never delegate detection to `git worktree add`
+/// failing. Returns `Ok(None)` when there is no such branch (the common,
+/// happy path — one extra bounded rev-parse, "noise" per the module).
+///
+/// The message states whether the branch holds commits NOT reachable from
+/// the rig's base (possible unpushed work) and names the exact recovery
+/// command. It NEVER deletes the branch: a leftover branch may hold unpushed
+/// work (`remove_worktree`'s own contract), so clearing it is the operator's
+/// deliberate, informed act.
+fn branch_collision_error(
+    rig_path: &Path,
+    bead_id: &str,
+    timeout: Duration,
+) -> Result<Option<String>> {
+    let branch = format!("camp/{bead_id}");
+    let refname = format!("refs/heads/{branch}");
+
+    // Explicit existence probe: exit 0 + sha when present, nonzero when not.
+    let exists = bounded::output_bounded(
+        Command::new("git")
+            .arg("-C")
+            .arg(rig_path)
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(&refname),
+        timeout,
+    )
+    .context("running git rev-parse for the branch-collision probe")?;
+    if !exists.status.success() {
+        return Ok(None); // no camp/<bead> branch: no collision
+    }
+
+    // The branch exists. The base is guaranteed present here (create_worktree
+    // runs ensure_worktree_base first); a None now means the repo was gutted
+    // between the two probes — fail loud rather than guess (invariant 5).
+    let base = rig_base(rig_path, timeout)?
+        .context("rig carries a camp/<bead> branch but has no base commit to compare it against")?;
+
+    // Commits on the branch not reachable from the base: >0 means possible
+    // unpushed work the operator must not lose.
+    let counted = bounded::output_bounded(
+        Command::new("git")
+            .arg("-C")
+            .arg(rig_path)
+            .args(["rev-list", "--count"])
+            .arg(&refname)
+            .arg("--not")
+            .arg(&base),
+        timeout,
+    )
+    .context("running git rev-list for the branch-collision probe")?;
+    if !counted.status.success() {
+        bail!(
+            "git rev-list failed inspecting branch {branch}: {}",
+            String::from_utf8_lossy(&counted.stderr).trim()
+        );
+    }
+    let ahead: u64 = String::from_utf8_lossy(&counted.stdout)
+        .trim()
+        .parse()
+        .context("parsing git rev-list --count output")?;
+
+    let rig = rig_path.display();
+    let delete = format!("git -C {rig} branch -D {branch}");
+    let message = if ahead == 0 {
+        format!(
+            "cannot dispatch bead {bead_id}: git branch {branch} already exists on rig {rig} \
+             and holds no commits beyond the rig's base — it is leftover residue. Bead ids are \
+             ledger-scoped but camp/<bead> branches are repo-permanent, so a ledger reset \
+             restarts the bead counter onto a predecessor's branch. It is safe to delete: \
+             {delete}, then re-dispatch."
+        )
+    } else {
+        let inspect = format!("git -C {rig} log {base}..{branch}");
+        format!(
+            "cannot dispatch bead {bead_id}: git branch {branch} already exists on rig {rig} \
+             and holds {ahead} commit(s) not on the rig's base {base} — it may contain unpushed \
+             work. Bead ids are ledger-scoped but camp/<bead> branches are repo-permanent, so a \
+             ledger reset restarts the bead counter onto a predecessor's branch. Inspect it \
+             ({inspect}); once anything you need is preserved, delete it ({delete}) before \
+             re-dispatching."
+        )
+    };
+    Ok(Some(message))
+}
+
 /// `git worktree add -b camp/<bead> <camp>/worktrees/<bead>` (decision H).
-/// A pre-existing directory or branch fails fast — bead ids are unique and
-/// Phase 8 never respawns a bead. A rig with no base commit is refused
-/// before any side effect (spec §12 fail-fast).
+/// A pre-existing directory fails fast (residue hint below; this check runs
+/// FIRST — with the directory present the branch is typically checked out
+/// there, so the collision error's advice would not apply). A pre-existing
+/// `camp/<bead>` branch with no directory fails fast too, but with an
+/// actionable named-recovery error (issue #82): bead ids are ledger-scoped
+/// while branches are repo-permanent, so "bead ids are unique" is false
+/// across a ledger reset — the error names the branch, says whether it
+/// holds commits beyond the base, and gives the exact command to clear it
+/// (the branch is never deleted here — it may hold unpushed work). A rig
+/// with no base commit is refused before any side effect (spec §12
+/// fail-fast); every refusal above is side-effect-free.
 pub fn create_worktree(
     rig_path: &Path,
     worktrees_dir: &Path,
@@ -354,18 +453,28 @@ pub fn create_worktree(
     timeout: Duration,
 ) -> Result<PathBuf> {
     ensure_worktree_base(rig_path, timeout)?;
-    std::fs::create_dir_all(worktrees_dir)
-        .with_context(|| format!("creating {}", worktrees_dir.display()))?;
     let dir = worktrees_dir.join(bead_id);
     if dir.exists() {
         // The residue hint matters (PR #14 review finding 4): this branch
         // also fires when a session.woke append failed after the worktree
-        // was created, and the message must not hide that history.
+        // was created, and the message must not hide that history. It runs
+        // BEFORE the branch-collision probe: with the directory present the
+        // camp/<bead> branch is typically checked out in that live worktree,
+        // where the collision error's `branch -D` advice would be wrong.
         bail!(
             "worktree {} already exists (may be residue of an earlier failed dispatch)",
             dir.display()
         );
     }
+    // Issue #82: refuse a repo-permanent camp/<bead> branch left by a
+    // previous ledger's life BEFORE any side effect, with an actionable
+    // named-recovery error instead of the raw `git worktree add` stderr
+    // that used to permanently wedge dispatch on a reset camp's bead #1.
+    if let Some(message) = branch_collision_error(rig_path, bead_id, timeout)? {
+        bail!(message);
+    }
+    std::fs::create_dir_all(worktrees_dir)
+        .with_context(|| format!("creating {}", worktrees_dir.display()))?;
     let out = bounded::output_bounded(
         Command::new("git")
             .arg("-C")
@@ -714,6 +823,178 @@ mod tests {
         );
         remove_worktree(&rig, &wt, TEST_EXEC_TIMEOUT).unwrap();
         assert!(!wt.exists());
+    }
+
+    /// Issue #82: a leftover `camp/<bead>` branch (predecessor ledger's
+    /// residue — the worktrees dir was deleted with the ledger, the
+    /// repo-permanent branch survived) must NOT die on raw git stderr. It
+    /// fails with a loud, self-explaining, named-recovery error and the
+    /// branch is left untouched (silent deletion is forbidden — it may hold
+    /// unpushed work).
+    #[test]
+    fn create_worktree_refuses_a_stale_predecessor_branch_with_an_actionable_error() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let rig = git_rig(dir.path());
+        let worktrees = dir.path().join("worktrees");
+
+        // Predecessor residue: the branch exists at the rig's base, no
+        // worktree directory (the reset scenario). git branch <name> makes
+        // a branch at HEAD without checking it out or creating a worktree.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&rig)
+            .args(["branch", "camp/gc-1"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "seeding the stale branch");
+
+        let err = create_worktree(&rig, &worktrees, "gc-1", TEST_EXEC_TIMEOUT).unwrap_err();
+        let msg = format!("{err:#}");
+
+        // names the branch, states it is safe (no commits beyond base), and
+        // gives the exact recovery command
+        assert!(msg.contains("camp/gc-1"), "must name the branch: {msg}");
+        assert!(
+            msg.contains("already exists"),
+            "must state the collision: {msg}"
+        );
+        assert!(
+            msg.contains("safe to delete"),
+            "no-unique-commits branch is safe: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("git -C {} branch -D camp/gc-1", rig.display())),
+            "must name the exact recovery command: {msg}"
+        );
+        // explains WHY (ledger-scoped ids vs repo-permanent branches)
+        assert!(
+            msg.contains("ledger") && msg.contains("repo-permanent"),
+            "must explain the structural cause: {msg}"
+        );
+
+        // NO silent deletion: the branch still exists after the refusal
+        let still = Command::new("git")
+            .arg("-C")
+            .arg(&rig)
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/camp/gc-1"])
+            .output()
+            .unwrap();
+        assert!(still.status.success(), "the branch must NOT be deleted");
+        // no worktree residue created on the refusal
+        assert!(
+            !worktrees.join("gc-1").exists(),
+            "no worktree dir on refusal"
+        );
+    }
+
+    /// Issue #82: when the stale branch holds commits NOT on the rig's base,
+    /// it may carry unpushed work — the error says so, gives the inspect
+    /// command, and still names the delete command; the branch is preserved.
+    #[test]
+    fn create_worktree_flags_a_stale_branch_that_holds_unpushed_work() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let rig = git_rig(dir.path());
+        let worktrees = dir.path().join("worktrees");
+
+        // A stale branch with a unique commit beyond the base: add the
+        // branch via a throwaway worktree, commit onto it, then remove the
+        // worktree (leaving the branch — the repo-permanent residue).
+        let stale = dir.path().join("stale");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&rig)
+            .args(["worktree", "add", "-b", "camp/gc-1"])
+            .arg(&stale)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git worktree add: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&stale)
+            .args(["commit", "--allow-empty", "-m", "unpushed work"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git commit: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // remove the throwaway worktree; the branch (with its commit) remains
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&rig)
+            .args(["worktree", "remove", "--force"])
+            .arg(&stale)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "removing the throwaway worktree");
+
+        let err = create_worktree(&rig, &worktrees, "gc-1", TEST_EXEC_TIMEOUT).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("camp/gc-1"), "must name the branch: {msg}");
+        assert!(
+            msg.contains("unpushed work"),
+            "must warn about unpushed work: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("git -C {} log", rig.display())) && msg.contains("..camp/gc-1"),
+            "must give the inspect command: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("git -C {} branch -D camp/gc-1", rig.display())),
+            "must still name the delete command: {msg}"
+        );
+
+        // branch preserved (its commit is not lost)
+        let still = Command::new("git")
+            .arg("-C")
+            .arg(&rig)
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/camp/gc-1"])
+            .output()
+            .unwrap();
+        assert!(still.status.success(), "the branch must NOT be deleted");
+        assert!(
+            !worktrees.join("gc-1").exists(),
+            "no worktree dir on refusal"
+        );
+    }
+
+    /// Issue #82 via the real dispatch entry point: dispatch::launch calls
+    /// ensure_worktree, which on the reset scenario (worktrees dir absent,
+    /// branch present) delegates to create_worktree — so the actionable
+    /// error surfaces there too, and flows into dispatch.failed unchanged.
+    #[test]
+    fn ensure_worktree_surfaces_the_branch_collision_on_the_create_path() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let rig = git_rig(dir.path());
+        let worktrees = dir.path().join("worktrees");
+
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&rig)
+            .args(["branch", "camp/gc-1"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let err = ensure_worktree(&rig, &worktrees, "gc-1", TEST_EXEC_TIMEOUT).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("camp/gc-1") && msg.contains("already exists"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("git -C {} branch -D camp/gc-1", rig.display())),
+            "must name the recovery command: {msg}"
+        );
     }
 
     /// The dispatch-time base (Phase 3, Q4): the mechanical fact "what commit
