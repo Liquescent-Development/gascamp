@@ -56,12 +56,18 @@ fn export_fixture(dir: &Path) -> (PathBuf, String) {
         rig_path.display()
     );
     std::fs::write(camp_root.join("camp.toml"), &config_text).unwrap();
-    let config = CampConfig::parse(&config_text).unwrap();
+    let config = CampConfig::load(&camp_root.join("camp.toml")).unwrap();
 
     std::fs::create_dir_all(camp_root.join("formulas")).unwrap();
     std::fs::write(camp_root.join("formulas/one-step.toml"), FORMULA).unwrap();
-    std::fs::create_dir_all(camp_root.join("agents")).unwrap();
-    std::fs::write(camp_root.join("agents/dev.md"), AGENT).unwrap();
+    // An agent is a DIRECTORY (compat §5.1): the prompt body goes in prompt.md.
+    std::fs::create_dir_all(camp_root.join("agents/dev")).unwrap();
+    std::fs::write(
+        camp_root.join("agents/dev/agent.toml"),
+        "description = \"dev\"\n",
+    )
+    .unwrap();
+    std::fs::write(camp_root.join("agents/dev/prompt.md"), AGENT).unwrap();
 
     let mut ledger =
         Ledger::open_with_clock(&camp_root.join("camp.db"), Box::new(FixedClock::new(TS))).unwrap();

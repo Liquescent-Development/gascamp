@@ -492,6 +492,7 @@ mod tests {
     use super::*;
     use crate::event::{EventInput, EventType};
     use crate::ledger::Ledger;
+    use crate::orders::parse::compile_orders;
 
     fn ts(s: &str) -> jiff::Timestamp {
         s.parse().unwrap()
@@ -823,14 +824,22 @@ mod tests {
 
     #[test]
     fn disabled_imported_order_does_not_execute_fire() {
-        // The fire loop only iterates the ACTIVE set. A disabled imported
-        // order is never in it, so execute_fire is unreachable for it —
-        // assert active is empty.
+        // Phase 1 pins the NEGATIVE invariant at the REAL fire path: the
+        // daemon's fire loop (`daemon/orders.rs`) uses `compile_orders` (local
+        // `[[order]]` only), NOT `compile_all_orders`. So an unenabled imported
+        // order is unreachable by the daemon's actual fire source — it fires
+        // nothing. (The daemon fire loop is wired to `OrderInventory.active`
+        // in phase 2, when running a formula lands — §12.)
         let (dir, cfg) = crate::orders::parse::tests::camp_with_imported_order(&[]);
         let inv = crate::orders::parse::compile_all_orders(&cfg).unwrap();
         assert!(
-            inv.active.is_empty(),
-            "no active order ⇒ execute_fire never reachable"
+            inv.active.iter().all(|o| o.name != "bmad.nightly"),
+            "an unenabled imported order is not active"
+        );
+        let daemon_orders = compile_orders(&cfg).unwrap();
+        assert!(
+            !daemon_orders.iter().any(|o| o.name == "bmad.nightly"),
+            "the daemon's actual fire source (compile_orders) cannot reach an imported order"
         );
         let _ = dir;
     }

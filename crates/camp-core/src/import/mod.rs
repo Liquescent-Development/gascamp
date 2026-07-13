@@ -233,6 +233,18 @@ mod tests {
         );
     }
     #[test]
+    fn remote_transitive_source_is_refused() {
+        // a transitive source must stay within the declaring repo (umbrella
+        // §13); a REMOTE transitive source is refused, not followed.
+        let direct = vec![imp("bmad", "bmad")];
+        let mo = |_: &ResolvedImport| Ok(manifest("bmad", Some("https://example/other")));
+        let err = resolve_transitive(&direct, &mo).unwrap_err().to_string();
+        assert!(
+            err.contains("remote") || (err.contains("transitive") && err.contains("repo")),
+            "must name the remote-transitive refusal: {err}"
+        );
+    }
+    #[test]
     fn depth_2_transitive_import_is_refused() {
         let direct = vec![imp("a", "a")];
         let mo = |i: &ResolvedImport| {

@@ -529,4 +529,18 @@ formula = "fix-ci"
         assert!(inv.active.iter().any(|o| o.name == "bmad.nightly"));
         assert!(inv.disabled.iter().all(|d| d.name != "bmad.nightly"));
     }
+
+    #[test]
+    fn namespaced_imported_order_name_is_accepted() {
+        // The namespaced name `<binding>.<stem>` contains a `.` that
+        // `valid_name` rejects; imported names are constructed from the
+        // binding + stem directly, NOT run through `valid_name` (the
+        // `.`-in-event-actor charset is a phase-2 concern).
+        let (_d, cfg) = camp_with_imported_order(&[]);
+        let inv = compile_all_orders(&cfg).unwrap();
+        assert!(
+            inv.disabled.iter().any(|d| d.name == "bmad.nightly"),
+            "namespaced imported order name must be accepted: {inv:?}"
+        );
+    }
 }

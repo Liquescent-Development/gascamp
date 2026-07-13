@@ -58,6 +58,9 @@ pub struct RawAgent {
     pub prompt: String,
     pub scope: Option<String>,
     pub stall_after: Option<String>,
+    /// `isolation = "none"` opt-out (spec §12 dispatch-lifecycle Q1): the
+    /// agent runs on the rig's live tree. `None` → the DEFAULT (`Worktree`).
+    pub isolation: Option<Isolation>,
 }
 
 /// §5.4 refused keys (umbrella §5.4): camp reads none of these. They are
@@ -119,6 +122,7 @@ pub fn parse_agent_dir(dir: &Path) -> Result<(RawAgent, Vec<AgentRefusal>), Core
 
     let mut scope = None;
     let mut stall_after = None;
+    let mut isolation = None;
     let mut refusals = Vec::new();
     let agent_toml = dir.join("agent.toml");
     if agent_toml.is_file() {
@@ -141,6 +145,24 @@ pub fn parse_agent_dir(dir: &Path) -> Result<(RawAgent, Vec<AgentRefusal>), Core
                         })?;
                         stall_after = Some(s.to_owned());
                     }
+                    "isolation" => {
+                        let s = value.as_str().ok_or_else(|| {
+                            pack_err(dir, "agent.toml key \"isolation\" must be a string")
+                        })?;
+                        isolation = Some(match s {
+                            "worktree" => Isolation::Worktree,
+                            "none" => Isolation::None,
+                            other => {
+                                return Err(pack_err(
+                                    dir,
+                                    format!(
+                                        "agent.toml key \"isolation\" accepts only \"worktree\" or \
+                                         \"none\", got {other:?}"
+                                    ),
+                                ));
+                            }
+                        });
+                    }
                     k if REFUSED_KEYS.contains(&k) => {
                         refusals.push(AgentRefusal {
                             agent: name.clone(),
@@ -159,6 +181,7 @@ pub fn parse_agent_dir(dir: &Path) -> Result<(RawAgent, Vec<AgentRefusal>), Core
             prompt,
             scope,
             stall_after,
+            isolation,
         },
         refusals,
     ))
@@ -194,7 +217,7 @@ pub fn resolve_agent_def(
         model: defaults.model.clone(),
         tools: Some(tools),
         permission_mode: defaults.permission_mode.clone(),
-        isolation: Isolation::Worktree,
+        isolation: raw.isolation.unwrap_or(Isolation::Worktree),
         stall_after: raw.stall_after.clone(),
         prompt: raw.prompt.clone(),
     })
@@ -370,6 +393,7 @@ mod tests {
             prompt: "p".into(),
             scope: None,
             stall_after: None,
+            isolation: None,
         }
     }
     #[test]
@@ -517,6 +541,70 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("stall_after")
+        );
+    }
+
+    #[test]
+    fn agent_toml_isolation_none_is_honored() {
+        // spec §12 dispatch-lifecycle Q1: `isolation = "none"` is the explicit
+        // opt-out — the agent runs on the rig's live tree. Default is Worktree.
+        let dir = tempfile::tempdir().unwrap();
+        write_agent_dir(
+            dir.path(),
+            "live",
+            Some("isolation = \"none\"\n"),
+            "prompt.md",
+            "p",
+        );
+        let def = resolve_agent_def(
+            &defaults(Some(vec!["Read"])),
+            &parse_agent_dir(&dir.path().join("live")).unwrap().0,
+            "gc.live",
+            false,
+        )
+        .unwrap();
+        assert_eq!(def.isolation, Isolation::None);
+
+        write_agent_dir(
+            dir.path(),
+            "wt",
+            Some("isolation = \"worktree\"\n"),
+            "prompt.md",
+            "p",
+        );
+        let def = resolve_agent_def(
+            &defaults(Some(vec!["Read"])),
+            &parse_agent_dir(&dir.path().join("wt")).unwrap().0,
+            "gc.wt",
+            false,
+        )
+        .unwrap();
+        assert_eq!(def.isolation, Isolation::Worktree);
+
+        // undeclared → the DEFAULT (Worktree)
+        write_agent_dir(dir.path(), "dflt", None, "prompt.md", "p");
+        let def = resolve_agent_def(
+            &defaults(Some(vec!["Read"])),
+            &parse_agent_dir(&dir.path().join("dflt")).unwrap().0,
+            "gc.dflt",
+            false,
+        )
+        .unwrap();
+        assert_eq!(def.isolation, Isolation::Worktree);
+
+        // unknown value → hard error naming the key
+        write_agent_dir(
+            dir.path(),
+            "bad",
+            Some("isolation = \"bubble\"\n"),
+            "prompt.md",
+            "p",
+        );
+        assert!(
+            parse_agent_dir(&dir.path().join("bad"))
+                .unwrap_err()
+                .to_string()
+                .contains("isolation")
         );
     }
 }
