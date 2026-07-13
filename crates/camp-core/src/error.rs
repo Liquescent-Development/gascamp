@@ -47,6 +47,11 @@ pub enum CoreError {
     /// name the order and the field).
     #[error("order {order:?}: {reason}")]
     Order { order: String, reason: String },
+    /// A pack import failed (component §10 error table): a bad source, a
+    /// missing pack.toml, a repo-escaping transitive source, a binding
+    /// clash. The binding names the import; the reason is actionable.
+    #[error("import {binding:?}: {reason}")]
+    Import { binding: String, reason: String },
     /// A `camp export` failure that is not an order-translation finding:
     /// bad output directory, unreadable inputs, malformed run dirs.
     #[error("export: {0}")]
