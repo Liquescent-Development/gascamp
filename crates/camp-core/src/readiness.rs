@@ -153,16 +153,33 @@ pub fn dispatchable_beads(conn: &Connection) -> Result<Vec<BeadRow>, CoreError> 
 /// The number of ready TASK beads — the status surface's `ready` count
 /// (`camp top`, spec §7). Same open-and-unblocked rule as `ready_beads`,
 /// narrowed to plain work (`TASK`) so it matches what campd will actually
-/// dispatch: memory and mail beads are never counted (issue #36).
+/// dispatch: memory and mail beads are never counted (issue #36) and
+/// excluding beads whose dispatch failed (`dispatch_failure` set), which are
+/// counted as `stuck` instead (issue #83) — so `ready` means campd will
+/// actually pick it up.
 pub fn ready_task_count(conn: &Connection) -> Result<u64, CoreError> {
     let sql = format!(
         "SELECT count(*) FROM beads b
          WHERE b.status = 'open' AND {TASK}
+           AND b.dispatch_failure IS NULL
            AND NOT EXISTS (
              SELECT 1 FROM deps d LEFT JOIN beads t ON t.id = d.needs_id
              WHERE d.bead_id = b.id AND {UNMET_DEP})"
     );
     count_nonneg(conn, &sql, "ready-task")
+}
+
+/// The number of stuck TASK beads — open plain work whose dispatch failed
+/// and has not been re-armed (`beads.dispatch_failure` set). The status
+/// surface's `stuck` count (issue #83): a bead that is open in the ledger
+/// but unreachable in the runtime until `camp retry` re-arms it. Task-scoped
+/// like the other status counts.
+pub fn stuck_task_count(conn: &Connection) -> Result<u64, CoreError> {
+    let sql = format!(
+        "SELECT count(*) FROM beads b
+         WHERE b.status = 'open' AND {TASK} AND b.dispatch_failure IS NOT NULL"
+    );
+    count_nonneg(conn, &sql, "stuck-task")
 }
 
 /// The number of open TASK beads — the status surface's `open` count (blocked
