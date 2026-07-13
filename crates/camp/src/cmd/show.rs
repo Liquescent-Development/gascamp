@@ -201,13 +201,12 @@ fn render_human(view: &BeadView) {
         );
     }
     if let Some(df) = &row.dispatch_failure {
-        // Assessment finding A (PR #54): the marker alone hides the retry
-        // semantics — campd's in-memory failed set suppresses re-dispatch
-        // for its lifetime (fail-fast by design), so fixing the cause is
-        // not enough; say so where the reason is read.
+        // issue #83: the marker persists across restart and suppresses
+        // re-dispatch; `camp retry` is the explicit, evented re-arm path.
         println!("dispatch-failed  {df}");
         println!(
-            "                 (campd retries once per restart — after fixing the cause, restart campd)"
+            "                 (won't dispatch until re-armed — after fixing the cause, run `camp retry {}`)",
+            row.id
         );
     }
     if !row.labels.is_empty() {

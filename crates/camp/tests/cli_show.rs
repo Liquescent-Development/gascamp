@@ -277,11 +277,11 @@ fn show_json_emits_state_and_history() {
     assert!(v["commit"].is_null());
 }
 
-/// PR #54 assessment finding A (operator UX): the dispatch-failed marker
-/// must tell the operator HOW to retry — campd's in-memory failed set
-/// suppresses re-dispatch for its lifetime (plan decision F, by design),
-/// so fixing the rig alone does nothing until campd restarts. The show
-/// rendering states that, right where the reason is read.
+/// PR #54 assessment finding A + issue #83 (operator UX): the dispatch-failed
+/// marker must tell the operator HOW to recover — the marker persists across
+/// restart and suppresses re-dispatch until re-armed, so fixing the rig alone
+/// does nothing until `camp retry <bead>` re-arms it. The show rendering
+/// states that, right where the reason is read.
 #[test]
 fn show_prints_the_dispatch_failure_with_the_retry_hint() {
     let dir = camp_with_bead();
@@ -309,7 +309,7 @@ fn show_prints_the_dispatch_failure_with_the_retry_hint() {
             "dispatch-failed  rig repo cannot host a worktree (no base commit)",
         ))
         .stdout(predicates::str::contains(
-            "campd retries once per restart — after fixing the cause, restart campd",
+            "won't dispatch until re-armed — after fixing the cause, run `camp retry gc-1`",
         ));
 }
 

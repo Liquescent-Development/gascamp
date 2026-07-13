@@ -20,6 +20,7 @@ mod cmd {
     pub mod order;
     pub mod recall;
     pub mod remember;
+    pub mod retry;
     pub mod rig;
     pub mod search;
     pub mod service;
@@ -270,6 +271,12 @@ enum Command {
     Stop,
     /// Reconcile the session registry against reality (auto at campd start)
     Adopt,
+    /// Re-arm a bead whose dispatch failed, keeping its id and history
+    /// (campd must be running). See `camp show <bead>` / `camp top`.
+    Retry {
+        /// Bead id (the one shown as dispatch-failed by `camp show`/`camp ls`)
+        bead: String,
+    },
     /// Register or end an attended session (the plugin's SessionStart /
     /// SessionEnd hooks wrap these; spec §8.4/§13.2)
     Session {
@@ -634,6 +641,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Adopt => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::adopt::run(&camp)
+        }
+        Command::Retry { bead } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::retry::run(&camp, bead)
         }
         Command::Stop => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
