@@ -85,11 +85,7 @@ fn write_agent(root: &Path, name: &str, front_extra: &str) {
     }
     if let Some(idx) = front_extra.find("stall_after:") {
         let rest = &front_extra[idx + "stall_after:".len()..];
-        let val = rest
-            .trim_start()
-            .split(|c: char| c == '\n' || c == ' ')
-            .next()
-            .unwrap_or("");
+        let val = rest.trim_start().split(['\n', ' ']).next().unwrap_or("");
         if !val.is_empty() {
             agent_toml.push_str(&format!("stall_after = {val:?}\n"));
         }

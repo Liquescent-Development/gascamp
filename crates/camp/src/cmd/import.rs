@@ -414,7 +414,7 @@ fn run_add_materialize(
         }
         for f in std::fs::read_dir(&formulas)?.flatten() {
             let path = f.path();
-            if !path.extension().is_some_and(|x| x == "toml") {
+            if path.extension().is_none_or(|x| x != "toml") {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&path) else {
@@ -435,10 +435,11 @@ fn run_add_materialize(
                         .and_then(|v| v.as_str()),
                 ];
                 for route in routes {
-                    if let Some((b, _)) = route.unwrap_or("").split_once('.') {
-                        if !bound.contains(b) && b != binding {
-                            unbound_bindings.insert(b.to_owned());
-                        }
+                    if let Some((b, _)) = route.unwrap_or("").split_once('.')
+                        && !bound.contains(b)
+                        && b != binding
+                    {
+                        unbound_bindings.insert(b.to_owned());
                     }
                 }
             }
@@ -549,7 +550,7 @@ fn run_add_materialize(
 /// Used to report nested packs in a transitive subtree (§7.3).
 fn find_nested_pack_tomls(dir: &Path) -> Result<Vec<PathBuf>, anyhow::Error> {
     let mut found = Vec::new();
-    fn walk(dir: &Path, root: &Path, found: &mut Vec<PathBuf>) -> Result<(), anyhow::Error> {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), anyhow::Error> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -564,12 +565,12 @@ fn find_nested_pack_tomls(dir: &Path) -> Result<Vec<PathBuf>, anyhow::Error> {
                     // do not descend into the nested pack (its content is its own)
                     continue;
                 }
-                walk(&path, root, found)?;
+                walk(&path, found)?;
             }
         }
         Ok(())
     }
-    walk(dir, dir, &mut found)?;
+    walk(dir, &mut found)?;
     Ok(found)
 }
 
