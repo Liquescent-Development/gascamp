@@ -9,6 +9,7 @@ pub mod dispatch;
 pub mod event_loop;
 pub mod orders;
 pub mod patrol;
+pub mod read_channel;
 pub mod socket;
 pub mod spawn;
 
@@ -153,6 +154,34 @@ pub fn run(camp: &CampDir) -> Result<()> {
         .context("creating the transcript watcher")?;
     patrol.set_watcher(patrol_watcher);
 
+    // cp-0 (control-plane spec §2.3): the read channel — campd tails each
+    // worker's stdout file by byte offset. The notify watcher on sessions/
+    // signals the loop through a self-pipe (the config-watch /
+    // patrol-watch mold); drain-all-on-every-wake is the correctness rule.
+    // The cap is test-injectable via CAMP_MAX_STREAM_BYTES (note 1);
+    // production uses MAX_STREAM_BYTES_DEFAULT until config.rs gains a
+    // [control] field.
+    let sessions_dir = camp.root.join("sessions");
+    let max_stream_bytes =
+        read_channel::max_stream_bytes_from_env(read_channel::MAX_STREAM_BYTES_DEFAULT)?;
+    let mut read_channel =
+        read_channel::ReadChannelRuntime::new(sessions_dir.clone(), max_stream_bytes)?;
+    let (read_sender, mut read_receiver) =
+        mio::unix::pipe::new().context("creating the read-channel watch pipe")?;
+    let read_filter = read_channel.filter_slot();
+    let mut read_watcher =
+        notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+            read_channel::on_watch_event(result, Some(&read_sender), &read_filter);
+        })
+        .context("creating the stream watcher")?;
+    notify::Watcher::watch(
+        &mut read_watcher,
+        &sessions_dir,
+        notify::RecursiveMode::NonRecursive,
+    )
+    .context("watching the sessions directory")?;
+    read_channel.set_watcher(read_watcher);
+
     // Startup settle is fatal on error: a daemon that cannot process its
     // backlog must not pretend to be up (fail fast). Settle drains events
     // past the cursor, cooks any order.fired they declare, AND dispatches
@@ -173,6 +202,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &mut dispatcher,
         &mut graph,
         &mut patrol,
+        &mut read_channel,
     )?;
     // Adoption (spec §8.5, automatic at start): reconcile the registry
     // against the process table — dead rows crash (beads release), living
@@ -212,7 +242,20 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &mut dispatcher,
         &mut graph,
         &mut patrol,
+        &mut read_channel,
     )?;
+    // cp-0: seed the read channel from the ledger's live CAMPD-SPAWNED
+    // workers (the adoption mold) — a restart re-tails the workers that
+    // outlived the old campd. Hook-registered attended sessions
+    // (woke_actor != "campd") have no stdout file and are NOT tailed. The
+    // persisted offset is loaded per session by `register`. Sessions
+    // crashed by adoption are observed+unregistered through the read
+    // channel's normal event path on the next settle.
+    for row in ledger.live_sessions()? {
+        if row.woke_actor == "campd" {
+            read_channel.register(&mut ledger, &row.name)?;
+        }
+    }
 
     let mut stdout = std::io::stdout();
     writeln!(stdout, "{READY_PREFIX}{}", socket_path.display()).context("announcing readiness")?;
@@ -234,8 +277,12 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &mut graph,
         &mut patrol,
         &mut patrol_receiver,
+        &mut read_channel,
+        &mut read_receiver,
     );
     drop(watcher);
+    // The stream watcher lives inside `read_channel` (set_watcher) and is
+    // dropped with it at function end (the patrol-watcher mold).
     result
 }
 

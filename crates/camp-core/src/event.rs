@@ -47,6 +47,12 @@ pub enum EventType {
     RunFinalized,
     AgentStalled,
     PatrolDegraded,
+    /// cp-0 (control-plane spec §2.3): a worker's stdout stream file crossed
+    /// `max_stream_bytes`. Declarative — the cause event; the reap appends
+    /// `session.crashed` with `cause_seq` pointing here, and the bead
+    /// re-hooks via the patrol restart path. The event NAMES the cap
+    /// (greppable, invariant 3: the ledger tells the whole story).
+    SessionStreamCapped,
 }
 
 impl EventType {
@@ -79,6 +85,7 @@ impl EventType {
         EventType::RunFinalized,
         EventType::AgentStalled,
         EventType::PatrolDegraded,
+        EventType::SessionStreamCapped,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -111,6 +118,7 @@ impl EventType {
             EventType::RunFinalized => "run.finalized",
             EventType::AgentStalled => "agent.stalled",
             EventType::PatrolDegraded => "patrol.degraded",
+            EventType::SessionStreamCapped => "session.stream_capped",
         }
     }
 

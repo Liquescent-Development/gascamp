@@ -40,6 +40,9 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::RunFinalized => run_finalized(conn, event),
         EventType::AgentStalled => agent_stalled(conn, event),
         EventType::PatrolDegraded => patrol_degraded(event),
+        // cp-0: declarative — the cause event; the reap's session.crashed
+        // carries the session-end state. No fold state changes here.
+        EventType::SessionStreamCapped => Ok(()),
         // Log-only events: no state effect.
         EventType::CampdStarted | EventType::CampdStopped => Ok(()),
     }

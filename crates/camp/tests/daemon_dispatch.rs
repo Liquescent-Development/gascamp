@@ -236,8 +236,42 @@ fn tier0_sling_runs_the_whole_contract_with_a_causal_trail() {
         .unwrap();
     assert_eq!(st["data"]["exit_code"], 0);
 
-    // Envelope capture exists (decision G)
-    assert!(root.join("sessions").join("t-dev-1.json").exists());
+    // The stdout capture existed during the run (phase-8 decision G) and is
+    // DISPOSED AT REAP, so it is gone once the session stops.
+    //
+    // This assertion was inverted deliberately, under an operator ruling
+    // (2026-07-13, cp-0 review finding 4): decision G promised the capture
+    // was "kept for forensics", but the control-plane spec §2.3/§9 makes that
+    // same file campd's live read channel and mandates reap-time disposal,
+    // and its phase-0 roadmap assigns that disposal to cp-0 by name. The
+    // control-plane spec GOVERNS. The supersession is recorded in the v1
+    // design spec §7.1 (`docs/design/2026-07-05-gas-camp-design.md`,
+    // amendment 2026-07-13) — spec and code do not diverge silently.
+    //
+    // Decision G's forensics intent is preserved by a different mechanism:
+    // campd drains a reaped session's stream to EOF BEFORE disposing it, so
+    // the worker's final bytes survive as durable ledger events. The raw file
+    // is what goes, not the record. The capture-during-run is proven by the
+    // milestone + transcript checks above; the drain-before-disposal ordering
+    // is proven by `read_channel.rs`'s worker-lifecycle test.
+    //
+    // POLLED, not asserted instantaneously: `session.stopped` is appended by
+    // the reap, which runs EARLIER IN THE SAME WAKE than the drain block that
+    // disposes the file. So a test that observes the event in the ledger can
+    // legitimately look at the filesystem before campd has reached disposal.
+    // The bare `exists()` check was racy by construction and passed only on
+    // timing luck. The assertion is unchanged in meaning — the file MUST be
+    // gone — it just gives campd the moment it is entitled to.
+    let stream_file = root.join("sessions").join("t-dev-1.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while stream_file.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stream file was never disposed at reap — control-plane §2.3, and \
+             design spec §7.1 as amended 2026-07-13"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 
     // The state fold agrees with the whole story.
     let out = camp(&root, &["doctor", "--refold"]);

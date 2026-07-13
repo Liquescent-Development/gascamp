@@ -31,7 +31,8 @@ const LISTENER: Token = Token(0);
 /// layout (lead ruling, PR #13 review MEDIUM 4; Phase 11 plan Decision I,
 /// approved): 0 = listener, 1 = config watch, 2 = Phase 8's SIGCHLD
 /// self-pipe, 3 = Phase 11's patrol transcript-watch self-pipe, 4 = Phase
-/// 1's SIGTERM/SIGINT self-pipe (campd service management), 5+ =
+/// 1's SIGTERM/SIGINT self-pipe (campd service management), 5 = cp-0's
+/// read-channel stream-watch self-pipe (control-plane spec §2.3), 6+ =
 /// connections. Coordinate with the lead before renumbering.
 const CONFIG_WATCH: Token = Token(1);
 /// Phase 8's SIGCHLD self-pipe (worker death detection, spec §10.1), per
@@ -44,6 +45,10 @@ const PATROL_WATCH: Token = Token(3);
 /// supervisor stops campd with SIGTERM; SIGINT is Ctrl-C on a foreground
 /// `camp daemon`. Both run the same graceful stop as Request::Stop.
 const SIGTERM_SIG: Token = Token(4);
+/// cp-0's read-channel stream-watch self-pipe (control-plane spec §2.3):
+/// the notify watcher on the sessions/ directory signals through this
+/// pipe; the drain-all-on-every-wake rule makes it a latency-only wake.
+const READ_WATCH: Token = Token(5);
 
 /// Upper bound on a single request line (PR #8 review finding 3). Real
 /// requests are tens of bytes; the cap keeps a broken or hostile client
@@ -101,6 +106,8 @@ pub fn run(
     graph: &mut GraphRuntime,
     patrol: &mut PatrolRuntime,
     patrol_rx: &mut mio::unix::pipe::Receiver,
+    read_channel: &mut super::read_channel::ReadChannelRuntime,
+    read_rx: &mut mio::unix::pipe::Receiver,
 ) -> Result<()> {
     let mut poll = Poll::new().context("creating the poller")?;
     let mut events = Events::with_capacity(64);
@@ -117,6 +124,9 @@ pub fn run(
     poll.registry()
         .register(patrol_rx, PATROL_WATCH, Interest::READABLE)
         .context("registering the patrol watch pipe")?;
+    poll.registry()
+        .register(read_rx, READ_WATCH, Interest::READABLE)
+        .context("registering the read-channel watch pipe")?;
     let mut sigterm = UnixStream::from_std(sigterm);
     poll.registry()
         .register(&mut sigterm, SIGTERM_SIG, Interest::READABLE)
@@ -127,9 +137,9 @@ pub fn run(
     // bursts, and per-connection memory is already bounded by
     // MAX_REQUEST_BYTES.
     let mut conns: HashMap<Token, Conn> = HashMap::new();
-    // Tokens 2–4 are RESERVED (SIGCHLD, patrol watch, SIGTERM/SIGINT — the
-    // layout above); connections start at 5.
-    let mut next_token = 5usize;
+    // Tokens 2–5 are RESERVED (SIGCHLD, patrol watch, SIGTERM/SIGINT, cp-0
+    // read-channel watch — the layout above); connections start at 6.
+    let mut next_token = 6usize;
     let mut self_raise_budget = SELF_RAISE_BUDGET;
 
     let mut last_seen = Timestamp::now();
@@ -222,7 +232,14 @@ pub fn run(
                     // are retried next wake (try_wait re-returns the
                     // status).
                     match reap_and_refill(
-                        ledger, processor, runtime, clock, dispatcher, graph, patrol,
+                        ledger,
+                        processor,
+                        runtime,
+                        clock,
+                        dispatcher,
+                        graph,
+                        patrol,
+                        read_channel,
                     ) {
                         Ok(()) => self_raise_budget = SELF_RAISE_BUDGET,
                         Err(failure) => {
@@ -265,6 +282,11 @@ pub fn run(
                         ledger.append(input)?;
                         wake_ledger_work = true;
                     }
+                }
+                READ_WATCH => {
+                    drain_pipe(read_rx)?;
+                    // The watch is a latency-only wake (§2.3); drain_all
+                    // runs in the common path below regardless of token.
                 }
                 CONFIG_WATCH => {
                     drain_pipe(config_rx)?;
@@ -336,6 +358,7 @@ pub fn run(
                         dispatcher,
                         graph,
                         patrol,
+                        read_channel,
                         MAX_REQUEST_BYTES,
                     ) {
                         Ok(ConnState::Open) => {
@@ -367,9 +390,183 @@ pub fn run(
             // error re-surfaces on the next poke. The joint settle also
             // dispatches whatever the cooks made ready (Phase 8), in this
             // same wake.
-            if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol) {
+            if let Err(e) = settle(
+                ledger,
+                processor,
+                runtime,
+                clock,
+                dispatcher,
+                graph,
+                patrol,
+                read_channel,
+            ) {
                 eprintln!("campd: settle failed: {e:#}");
             }
+        }
+        // cp-0 (§2.3): on EVERY wake — any poll token — drain every tailed
+        // stream file to EOF before going back to sleep. The watch only
+        // makes the common case fast; correctness never depends on a
+        // delivered event. This runs AFTER settle, so sessions registered
+        // by this wake's settle are drained on this same wake (no lag).
+        // The `apply_tracking` here is the safety net for the no-settle-
+        // ran case (settle already applied this wake's ops when it ran);
+        // idempotent via `mem::take`-drained `track_ops`.
+        // review fix 7: `apply_tracking` does LEDGER work (register loads the
+        // persisted cursor; the deferred unregister clears it). Fix 8's
+        // non-fatal carve-out was for per-session FILE I/O (open/seek/read/
+        // stat) ONLY — never for ledger writes. Dropping a failed cursor
+        // write to stderr leaves campd re-reading from a stale offset on
+        // every restart while looking healthy (invariant 5: stderr is
+        // neither the caller nor the ledger). Fail fast — this matches the
+        // `apply_tracking(ledger)?` in `settle`.
+        read_channel.apply_tracking(ledger)?;
+        // cp-0 fix 8: drain_all is non-fatal — drain_one captures per-
+        // session errors into the drain_errors collector (campd keeps
+        // draining the other tailed sessions and stays up; a `?` here would
+        // let one bad stream crash the whole wake — invariant 1). The
+        // collector is surfaced as durable patrol.degraded events below.
+        if let Err(e) = read_channel.drain_all(ledger) {
+            eprintln!("campd: read-channel drain_all failed: {e:#}");
+        }
+        // cp-0 (§2.3): a max_stream_bytes breach is a loud session failure —
+        // append the named cause event FIRST (the agent.stalled → kill →
+        // session.crashed mold), then kill the worker. The reap appends
+        // session.crashed with cause_seq pointing at stream_capped, and the
+        // bead re-hooks via the patrol restart path (fix 6: the kill reason
+        // starts with "patrol restart" so patrol::observe queues a Respawn).
+        // The kill triggers SIGCHLD → the next wake reaps.
+        let mut appended_read_channel_events = false;
+        for breach in read_channel.take_cap_breaches() {
+            let (rig, bead) = dispatcher
+                .child_info(&breach.session)
+                .map(|(r, b)| (Some(r), Some(b)))
+                .unwrap_or((None, breach.bead.clone()));
+            let cause_seq = ledger.append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::SessionStreamCapped,
+                rig,
+                actor: "campd".into(),
+                bead: bead.clone(),
+                data: serde_json::json!({
+                    "session": breach.session,
+                    "file": breach.file.to_string_lossy(),
+                    "file_size": breach.file_size,
+                    "cap_bytes": breach.cap_bytes,
+                    "bead": bead,
+                }),
+            })?;
+            // review fix 3: the return value is CHECKED. `false` means no
+            // live child holds that session (an adopted worker from a
+            // previous campd life, or one already reaped): the SIGKILL never
+            // lands, so there is no SIGCHLD, no reap, no `session.crashed`,
+            // no `cause_seq`, and no bead re-hook. Discarding it left the
+            // bead stranded behind a `session.stream_capped` that had no
+            // effect — and because the session is now `capped` (a hard stop)
+            // the breach would never re-surface. A campd action must always
+            // have a ledger consequence (invariant 3) and a failure must be
+            // durable, never silent (invariant 5).
+            let killed = dispatcher.kill_worker_with_reason(
+                &breach.session,
+                cause_seq,
+                "patrol restart: stream cap exceeded max_stream_bytes".to_owned(),
+            )?;
+            if !killed {
+                ledger.append(camp_core::event::EventInput {
+                    kind: camp_core::event::EventType::PatrolDegraded,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: bead.clone(),
+                    data: serde_json::json!({
+                        "session": breach.session,
+                        "error": format!(
+                            "read_channel: stream cap exceeded max_stream_bytes \
+                             ({} bytes > cap {}) but the kill could not be delivered: \
+                             no live worker holds this session (adopted from a previous \
+                             campd life, or already reaped). The session is no longer \
+                             tailed.",
+                            breach.file_size, breach.cap_bytes
+                        ),
+                    }),
+                })?;
+                // Stop tailing it: a capped session is a hard stop, so
+                // leaving it registered would tail a file campd refuses to
+                // read, forever.
+                read_channel.queue_unregister(&breach.session);
+            }
+            appended_read_channel_events = true;
+        }
+        // Fail fast (§2.3): watcher errors, non-JSON lines, and drain
+        // (open/seek/read) errors are durable patrol.degraded events, never
+        // stderr-only. Appending them is ledger work, so settle this same
+        // wake to advance the campd cursor past them (the `wake_ledger_work`
+        // local is reassigned at the top of each iteration, so we settle
+        // directly here instead).
+        for input in read_channel.take_watch_error_events() {
+            ledger.append(input)?;
+            appended_read_channel_events = true;
+        }
+        for input in read_channel.take_drain_error_events() {
+            ledger.append(input)?;
+            appended_read_channel_events = true;
+        }
+        for input in read_channel.take_parse_error_events() {
+            ledger.append(input)?;
+            appended_read_channel_events = true;
+        }
+        if appended_read_channel_events
+            && let Err(e) = settle(
+                ledger,
+                processor,
+                runtime,
+                clock,
+                dispatcher,
+                graph,
+                patrol,
+                read_channel,
+            )
+        {
+            eprintln!("campd: read-channel event settle failed: {e:#}");
+        }
+        // cp-0 fix 7: persist the in-memory offsets LAST — after the
+        // cap-breach kills and the fault-event appends + settle, so the
+        // offset commits after the line's ledger effect (phase 0: the
+        // drain; phase 1+: the permission.pending event's txn). A cap-
+        // killed session is `crashed`, so live_sessions() won't re-tail it
+        // on restart and the cap (file-size-based) re-detects if needed.
+        // review fix 7: `persist_offsets` is a LEDGER write (set_stream_cursor)
+        // — fatal, not eprintln-only. A persistently failing cursor write
+        // (disk full, corrupt DB) would otherwise leave campd re-reading from
+        // a stale offset on every restart while reporting itself healthy.
+        read_channel.persist_offsets(ledger)?;
+        // review fix 1 (CRITICAL): ONLY NOW dispose the reaped sessions. By
+        // this point their stream files have been drained to EOF by the
+        // `drain_all` above (they were still in `tailed` for it), their
+        // final lines have become durable parse/drain fault events, and
+        // their cursors are persisted. Unregistering earlier — which is what
+        // `apply_tracking` used to do inside `settle`, before this whole
+        // block — unlinked the file first and deleted the worker's last
+        // output unread.
+        //
+        // Lead ruling (a): this call also ENFORCES the ordering it depends on.
+        // A session queued for unregister after `drain_all` (which today
+        // cannot happen — the reap appends session.stopped/crashed BEFORE
+        // settle — but which a future phase could introduce) is drained before
+        // disposal and the violated ordering is recorded as a durable fault
+        // event. It returns `true` when it appended anything, so the campd
+        // cursor is advanced past those events in this same wake rather than
+        // waiting for a wake that an idle campd may never take.
+        if read_channel.apply_pending_unregisters(ledger)?
+            && let Err(e) = settle(
+                ledger,
+                processor,
+                runtime,
+                clock,
+                dispatcher,
+                graph,
+                patrol,
+                read_channel,
+            )
+        {
+            eprintln!("campd: read-channel disposal settle failed: {e:#}");
         }
     }
 }
@@ -419,6 +616,7 @@ fn serve_connection(
     dispatcher: &mut Dispatcher,
     graph: &mut GraphRuntime,
     patrol: &mut PatrolRuntime,
+    read_channel: &mut super::read_channel::ReadChannelRuntime,
     max_request_bytes: usize,
 ) -> Result<ConnState> {
     let mut chunk = [0u8; 4096];
@@ -440,7 +638,15 @@ fn serve_connection(
             }
         };
         let drained = drain_lines(
-            conn, ledger, processor, runtime, clock, dispatcher, graph, patrol,
+            conn,
+            ledger,
+            processor,
+            runtime,
+            clock,
+            dispatcher,
+            graph,
+            patrol,
+            read_channel,
         )?;
         if let Some(terminal) = drained {
             return Ok(terminal);
@@ -484,6 +690,7 @@ fn drain_lines(
     dispatcher: &mut Dispatcher,
     graph: &mut GraphRuntime,
     patrol: &mut PatrolRuntime,
+    read_channel: &mut super::read_channel::ReadChannelRuntime,
 ) -> Result<Option<ConnState>> {
     while let Some(newline) = conn.buf.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = conn.buf.drain(..=newline).collect();
@@ -508,8 +715,16 @@ fn drain_lines(
                 // leaves the cursor before the failing event — surfaced,
                 // never skipped; the next wake retries.
                 let ack = respond(&mut conn.stream, &Response::Ok { ok: true });
-                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol)
-                {
+                if let Err(e) = settle(
+                    ledger,
+                    processor,
+                    runtime,
+                    clock,
+                    dispatcher,
+                    graph,
+                    patrol,
+                    read_channel,
+                ) {
                     eprintln!("campd: poke processing failed: {e:#}");
                 }
                 if let Err(e) = ack {
@@ -565,8 +780,16 @@ fn drain_lines(
                     }
                 };
                 respond(&mut conn.stream, &response)?;
-                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol)
-                {
+                if let Err(e) = settle(
+                    ledger,
+                    processor,
+                    runtime,
+                    clock,
+                    dispatcher,
+                    graph,
+                    patrol,
+                    read_channel,
+                ) {
                     eprintln!("campd: adopt settle failed: {e:#}");
                 }
             }
@@ -663,6 +886,7 @@ fn drain_signal_pipe(stream: &mut UnixStream, which: &str) -> Result<usize> {
 /// The SIGCHLD service path (Phase 8 plan decision I): reap exited
 /// workers, record their session ends, then settle — the
 /// 11th-ready-bead-dispatches-on-first-close path.
+#[allow(clippy::too_many_arguments)]
 fn reap_and_refill(
     ledger: &mut Ledger,
     processor: &mut ReadinessProcessor,
@@ -671,17 +895,26 @@ fn reap_and_refill(
     dispatcher: &mut Dispatcher,
     graph: &mut GraphRuntime,
     patrol: &mut PatrolRuntime,
+    read_channel: &mut super::read_channel::ReadChannelRuntime,
 ) -> Result<(), ReapFailure> {
     dispatcher.reap(ledger)?;
     // Decision 11e: check-script children ride the same SIGCHLD pipe;
     // their verdict batches land before the settle that acts on them.
     graph.reap_checks(ledger)?;
     // settle failures are ledger-side: retry-worthy, like the appends
-    settle(ledger, processor, runtime, clock, dispatcher, graph, patrol).map_err(|error| {
-        ReapFailure {
-            retryable: true,
-            error,
-        }
+    settle(
+        ledger,
+        processor,
+        runtime,
+        clock,
+        dispatcher,
+        graph,
+        patrol,
+        read_channel,
+    )
+    .map_err(|error| ReapFailure {
+        retryable: true,
+        error,
     })
 }
 
@@ -696,6 +929,7 @@ fn reap_and_refill(
 /// event processed, and a patrol-released bead's respawn dispatches in
 /// the same wake. Bounded by the shrinking queues: convergence, not
 /// polling.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn settle(
     ledger: &mut Ledger,
     processor: &mut ReadinessProcessor,
@@ -704,13 +938,22 @@ pub(super) fn settle(
     dispatcher: &mut Dispatcher,
     graph: &mut GraphRuntime,
     patrol: &mut PatrolRuntime,
+    read_channel: &mut super::read_channel::ReadChannelRuntime,
 ) -> Result<()> {
     // Decision 11f / issue #17: the fire budget spans this WHOLE
     // invocation (every orders::settle / converge round below) — resetting
     // any deeper lets through-converge regeneration escape the budget.
     runtime.reset_fire_budget();
     loop {
-        orders::settle(ledger, processor, runtime, clock, graph, patrol)?;
+        orders::settle(
+            ledger,
+            processor,
+            runtime,
+            clock,
+            graph,
+            patrol,
+            read_channel,
+        )?;
         // Phase 9: drain the graph work the processor queued — spawn due
         // check scripts, cook due bond children. Cooks append events, so
         // the fixpoint below re-settles them in this same invocation.
@@ -720,6 +963,13 @@ pub(super) fn settle(
         // in this same wake, before converge respawns released beads.
         let now = Timestamp::now();
         patrol.apply_tracking(ledger, now)?;
+        // cp-0: apply read-channel tracking (register/unregister + offset
+        // load) outside the cursor txn — the patrol apply_tracking mold.
+        // Covers the settle path: ops queued by this invocation's
+        // CampdProcessor::process (observe) are applied here, so the
+        // drain-on-every-wake block after `settle` sees freshly-registered
+        // sessions tailed on this same wake.
+        read_channel.apply_tracking(ledger)?;
         patrol.execute_pending(ledger, dispatcher, now)?;
         dispatcher.converge(ledger)?;
         let cursor = ledger.cursor(cursor::CAMPD_CURSOR)?;
@@ -781,6 +1031,16 @@ mod tests {
         let config = camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap();
         let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
         crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config)
+    }
+
+    /// A read-channel runtime for settle/serve_connection threading (cp-0):
+    /// empty tailed set, sessions dir under the camp root.
+    fn test_read_channel(dir: &std::path::Path) -> crate::daemon::read_channel::ReadChannelRuntime {
+        crate::daemon::read_channel::ReadChannelRuntime::new(
+            dir.join("sessions"),
+            256 * 1024 * 1024,
+        )
+        .unwrap()
     }
 
     /// Phase 11: the poll timeout composes THREE deadline sources through
@@ -853,6 +1113,7 @@ mod tests {
         let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
         let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config);
         let mut graph = GraphRuntime::new(dir.path().to_path_buf(), &config);
+        let mut read_channel = test_read_channel(dir.path());
 
         // first settle: observe the woke row, arm the timer
         settle(
@@ -863,6 +1124,7 @@ mod tests {
             &mut dispatcher,
             &mut graph,
             &mut patrol,
+            &mut read_channel,
         )
         .unwrap();
         assert!(
@@ -889,6 +1151,7 @@ mod tests {
             &mut dispatcher,
             &mut graph,
             &mut patrol,
+            &mut read_channel,
         )
         .unwrap();
 
@@ -975,6 +1238,7 @@ mod tests {
             dir.path().to_path_buf(),
             &camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
         );
+        let mut read_channel = test_read_channel(dir.path());
         let state = serve_connection(
             &mut conn,
             &mut ledger,
@@ -984,6 +1248,7 @@ mod tests {
             &mut dispatcher,
             &mut graph,
             &mut test_patrol(),
+            &mut read_channel,
             1024,
         )
         .expect("a dead poker must not error the connection loop");
@@ -1051,6 +1316,7 @@ mod tests {
             },
             config,
         );
+        let mut read_channel = test_read_channel(dir.path());
 
         settle(
             &mut ledger,
@@ -1060,6 +1326,7 @@ mod tests {
             &mut dispatcher,
             &mut graph,
             &mut patrol,
+            &mut read_channel,
         )
         .expect("settle must return despite the regenerative order");
 
@@ -1096,6 +1363,7 @@ mod tests {
             &mut dispatcher,
             &mut graph,
             &mut patrol,
+            &mut read_channel,
         )
         .unwrap();
         assert_eq!(
@@ -1180,6 +1448,7 @@ mod tests {
             dir.path().to_path_buf(),
             &camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
         );
+        let mut read_channel = test_read_channel(dir.path());
         let state = serve_connection(
             &mut conn,
             &mut ledger,
@@ -1189,6 +1458,7 @@ mod tests {
             &mut dispatcher,
             &mut graph,
             &mut test_patrol(),
+            &mut read_channel,
             TEST_CAP,
         )
         .unwrap();

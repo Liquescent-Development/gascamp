@@ -250,6 +250,54 @@ fn idle_campd_cpu_delta_zero_and_rss_under_20mb() {
     assert!(rss1 < 20 * 1024, "idle RSS {rss1} KB exceeds 20 MB");
 }
 
+/// cp-0 / control-plane spec §4.3: the EXTENDED idle gate — M quiescent
+/// workers with tailed stdout files and the read channel active, zero
+/// activity => 0.0% CPU delta / <20 MB RSS (invariant 1). The notify
+/// watcher on sessions/ is a live watcher for the whole idle window, AND
+/// now M tailed files are open — this is the fleet-scale claim §4.3 makes.
+/// N connected subscribers are deferred to phase 2 (the `session.subscribe`
+/// verb does not exist in phase 0). The workers hold via FAKE_AGENT_HOLD_DIR
+/// (poll the filesystem, not stdin — they outlive campd and stay alive,
+/// keeping their stdout files open and their sessions registered for the
+/// read channel to tail).
+#[test]
+#[ignore = "idle harness: run via `make perf` (release, local-only)"]
+fn idle_campd_with_tailed_workers_zero_cpu_under_20mb() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 8, "");
+    let hold = dir.path().join("hold");
+    std::fs::create_dir_all(&hold).unwrap();
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_HOLD_DIR", hold.to_str().unwrap())]);
+    let pid = campd.pid();
+
+    // Dispatch M=4 quiescent workers (each claims then holds; its stdout
+    // file stays open and its session stays registered for the read channel).
+    for i in 0..4 {
+        let _bead = camp_ok(&root, &["sling", &format!("quiescent task {i}")])
+            .trim()
+            .to_owned();
+    }
+    wait_until(&root, "4 sessions dispatched", |e| {
+        e.iter().filter(|ev| ev["type"] == "session.woke").count() == 4
+    });
+
+    // The measurement window: 30 s idle with 4 tailed files open.
+    let (cpu0, _rss0) = ps_cputime_rss(pid);
+    std::thread::sleep(Duration::from_secs(30));
+    let (cpu1, rss1) = ps_cputime_rss(pid);
+
+    let delta = cpu1.saturating_sub(cpu0);
+    eprintln!("[daemon] idle 30s with 4 tailed workers: cpu delta {delta:?}, rss {rss1} KB");
+    assert!(
+        delta <= Duration::from_millis(10),
+        "idle CPU delta {delta:?} exceeds 10 ms (invariant 1: idle is free with tailed workers)"
+    );
+    assert!(
+        rss1 < 20 * 1024,
+        "idle RSS {rss1} KB exceeds 20 MB with 4 tailed workers"
+    );
+}
+
 /// Spec §14: sling → worker spawn ≤ 2 s. Measured wall-clock from issuing the
 /// sling to observing the worker's dispatch (session.woke for the bead).
 #[test]

@@ -462,6 +462,54 @@ impl Ledger {
         Ok(seq.unwrap_or(0))
     }
 
+    /// cp-0 (control-plane spec §2.3): the byte offset campd has consumed
+    /// for `session`'s stdout stream file. 0 when campd has never tailed
+    /// it. Consumer bookkeeping (the `cursors` mold) — deliberately
+    /// outside refold; durable so a campd restart resumes from the exact
+    /// byte the last life consumed (§8 append-only-cursors test).
+    pub fn stream_cursor(&self, session: &str) -> Result<u64, CoreError> {
+        use rusqlite::OptionalExtension;
+        let offset: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT byte_offset FROM stream_cursors WHERE session_name = ?1",
+                [session],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(offset.unwrap_or(0) as u64)
+    }
+
+    /// cp-0: persist the byte offset for `session` (UPSERT). Called only
+    /// after the consumed line's ledger effect commits (§2.3), so a crash
+    /// between read and persist re-reads — never loses, never silently
+    /// duplicates (the ledger dedupes by request_id in phase 1+).
+    ///
+    /// Phase-1+ obligation: once consumed lines become `permission.pending`
+    /// events with their own ledger effect, this persist must move to
+    /// AFTER that effect's transaction commits (persist-after-event-
+    /// commit), not after each read chunk. Phase 0 has no per-line ledger
+    /// effect, so persisting after the drain is correct today.
+    pub fn set_stream_cursor(&self, session: &str, offset: u64) -> Result<(), CoreError> {
+        self.conn.execute(
+            "INSERT INTO stream_cursors (session_name, byte_offset) VALUES (?1, ?2)
+             ON CONFLICT(session_name) DO UPDATE SET byte_offset = excluded.byte_offset",
+            params![session, offset as i64],
+        )?;
+        Ok(())
+    }
+
+    /// cp-0: drop the offset row when the session ends (the stream file is
+    /// disposed at reap, §2.3). Idempotent. Keeps the table from
+    /// accumulating rows for long-dead sessions.
+    pub fn clear_stream_cursor(&self, session: &str) -> Result<(), CoreError> {
+        self.conn.execute(
+            "DELETE FROM stream_cursors WHERE session_name = ?1",
+            [session],
+        )?;
+        Ok(())
+    }
+
     /// Process every event past the named cursor, exactly once (spec §7.3).
     ///
     /// Each event runs in its own `BEGIN IMMEDIATE` transaction that executes
@@ -1195,6 +1243,60 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    /// cp-0 amendment fix 1: the read-channel fault events reuse
+    /// `patrol.degraded`, so their payloads MUST satisfy the
+    /// `PatrolDegraded` fold contract (deny_unknown_fields: `error` +
+    /// optional `session` only). The read-channel source id, offset, and
+    /// offending line ride the `error` STRING (not separate keys). This
+    /// test pins the fold contract: each shape appends without
+    /// `InvalidEventData` and the ledger refolds clean.
+    #[test]
+    fn read_channel_patrol_degraded_shapes_round_trip_through_the_fold() {
+        let (_dir, mut l) = temp_ledger();
+        // watcher error (no session context).
+        l.append(EventInput {
+            kind: EventType::PatrolDegraded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "error": "read_channel: stream watcher error: inotify watch limit reached",
+            }),
+        })
+        .unwrap();
+        // drain (open/seek/read) error (with session context).
+        l.append(EventInput {
+            kind: EventType::PatrolDegraded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "session": "t/dev/1",
+                "error": "read_channel: stream drain: opening sessions/t-dev-1.json: Permission denied",
+            }),
+        })
+        .unwrap();
+        // non-JSON line (with session + offset + line in the error string).
+        l.append(EventInput {
+            kind: EventType::PatrolDegraded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "session": "t/dev/1",
+                "error": "read_channel: non-JSON line in stream at offset 4096: expected value at line 1 column 1: claimed gc-1",
+            }),
+        })
+        .unwrap();
+        // patrol.degraded is log-only — no state drift.
+        assert_eq!(count(&l, "SELECT count(*) FROM events"), 3);
+        assert_eq!(count(&l, "SELECT count(*) FROM beads"), 0);
+        assert!(
+            l.refold_check().unwrap().drift.is_empty(),
+            "refold is clean"
+        );
     }
 
     #[test]
@@ -2406,6 +2508,38 @@ mod tests {
             })
             .unwrap();
         assert!(again.is_empty());
+    }
+
+    /// cp-0: the per-session stream byte offset is consumer bookkeeping
+    /// (the `cursors` mold) — defaults to 0, UPSERTs, and clears.
+    #[test]
+    fn stream_cursor_defaults_to_zero_upserts_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        assert_eq!(l.stream_cursor("t/dev/1").unwrap(), 0, "absent => 0");
+        l.set_stream_cursor("t/dev/1", 4096).unwrap();
+        assert_eq!(l.stream_cursor("t/dev/1").unwrap(), 4096);
+        // UPSERT, not insert-or-fail:
+        l.set_stream_cursor("t/dev/1", 8192).unwrap();
+        assert_eq!(l.stream_cursor("t/dev/1").unwrap(), 8192);
+        l.clear_stream_cursor("t/dev/1").unwrap();
+        assert_eq!(l.stream_cursor("t/dev/1").unwrap(), 0, "cleared => 0");
+        // clearing an absent row is a no-op (idempotent)
+        l.clear_stream_cursor("t/dev/1").unwrap();
+    }
+
+    /// cp-0: stream cursors are isolated per session.
+    #[test]
+    fn stream_cursors_are_isolated_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        l.set_stream_cursor("t/dev/1", 100).unwrap();
+        l.set_stream_cursor("t/dev/2", 200).unwrap();
+        assert_eq!(l.stream_cursor("t/dev/1").unwrap(), 100);
+        assert_eq!(l.stream_cursor("t/dev/2").unwrap(), 200);
+        l.clear_stream_cursor("t/dev/1").unwrap();
+        assert_eq!(l.stream_cursor("t/dev/1").unwrap(), 0);
+        assert_eq!(l.stream_cursor("t/dev/2").unwrap(), 200, "unaffected");
     }
 
     #[test]

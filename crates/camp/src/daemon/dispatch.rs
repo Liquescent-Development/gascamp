@@ -65,6 +65,11 @@ struct Worker {
     /// Set when patrol killed this worker: its exit reaps as
     /// session.crashed carrying this cause_seq (the agent.stalled event).
     patrol_kill: Option<Seq>,
+    /// cp-0 (§2.3): a custom kill reason set by `kill_worker_with_reason`
+    /// (e.g. "stream cap exceeded max_stream_bytes"). Overrides the default
+    /// "patrol restart" reason in the reap classification so the ledger
+    /// names the cap (invariant 3: the ledger tells the whole story).
+    kill_reason: Option<String>,
 }
 
 struct AuxChild {
@@ -236,6 +241,38 @@ impl Dispatcher {
         true
     }
 
+    /// cp-0 (§2.3): kill a worker with a custom reason (the max_stream_bytes
+    /// ceiling). The reap appends `session.crashed` carrying this reason
+    /// and `cause_seq` (the `session.stream_capped` event's seq), so the
+    /// ledger names the cap. Otherwise identical to `kill_worker`.
+    ///
+    /// Returns `Ok(false)` when NO live child holds that session (an adopted
+    /// worker from a previous campd life, or one already reaped) — the
+    /// caller MUST handle that: a `session.stream_capped` with no kill
+    /// behind it is a campd action with no ledger consequence (invariant 3).
+    ///
+    /// review fix 3: a failing `child.kill()` is now PROPAGATED, not
+    /// swallowed into an `eprintln!` that then returned `true` — stderr is
+    /// neither the caller nor the ledger (invariant 5).
+    pub fn kill_worker_with_reason(
+        &mut self,
+        session: &str,
+        cause_seq: Seq,
+        reason: String,
+    ) -> Result<bool> {
+        let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
+            return Ok(false);
+        };
+        worker.patrol_kill = Some(cause_seq);
+        worker.kill_reason = Some(reason);
+        worker.stdin = None; // no more turns for a condemned worker
+        worker
+            .child
+            .kill()
+            .with_context(|| format!("cap-breach kill of {session}"))?;
+        Ok(true)
+    }
+
     /// The release rule (Decision C2): the bead closed, so drop the held
     /// stdin (EOF) and mark the worker released — its exit reaps as
     /// session.stopped with the reason. Returns the session name when a
@@ -342,6 +379,7 @@ impl Dispatcher {
                 stdin,
                 released: None,
                 patrol_kill: None,
+                kill_reason: None,
             },
         );
         pid
@@ -381,6 +419,7 @@ impl Dispatcher {
                 stdin,
                 released: None,
                 patrol_kill: None,
+                kill_reason: None,
             },
         );
         pid
@@ -727,6 +766,7 @@ impl Dispatcher {
                         stdin,
                         released: None,
                         patrol_kill: None,
+                        kill_reason: None,
                     },
                 );
                 Ok(())
@@ -862,7 +902,11 @@ impl Dispatcher {
                     data["reason"] = serde_json::json!(reason);
                     EventType::SessionStopped
                 } else if let Some(cause_seq) = worker.patrol_kill {
-                    data["reason"] = serde_json::json!("patrol restart");
+                    let reason = worker
+                        .kill_reason
+                        .clone()
+                        .unwrap_or_else(|| "patrol restart".to_owned());
+                    data["reason"] = serde_json::json!(reason);
                     data["cause_seq"] = serde_json::json!(cause_seq);
                     EventType::SessionCrashed
                 } else {
@@ -2469,6 +2513,7 @@ mod tests {
                 stdin: None,
                 released: None,
                 patrol_kill: None,
+                kill_reason: None,
             },
         );
 
@@ -2554,6 +2599,7 @@ mod tests {
                 stdin: None,
                 released: None,
                 patrol_kill: None,
+                kill_reason: None,
             },
         );
         {
@@ -2665,8 +2711,25 @@ mod tests {
         let cfg = CampConfig::parse("[camp]\nname = \"t\"\n").unwrap();
         let patrol_config = camp_core::patrol::PatrolConfig::from_section(&cfg.patrol).unwrap();
         let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &cfg);
-        super::super::orders::settle(ledger, &mut readiness, rt, &clock, graph, &mut patrol)
-            .unwrap();
+        // cp-0: settle threads a read-channel runtime too (empty here). Its
+        // sessions dir is a throwaway temp dir — no sessions are registered
+        // in the graph tests, and OrdersRuntime.camp_root is private.
+        let read_dir = tempfile::tempdir().unwrap();
+        let mut read_channel = crate::daemon::read_channel::ReadChannelRuntime::new(
+            read_dir.path().to_path_buf(),
+            256 * 1024 * 1024,
+        )
+        .unwrap();
+        super::super::orders::settle(
+            ledger,
+            &mut readiness,
+            rt,
+            &clock,
+            graph,
+            &mut patrol,
+            &mut read_channel,
+        )
+        .unwrap();
     }
 
     fn append_close(l: &mut Ledger, bead: &str, data: serde_json::Value) -> i64 {
@@ -3536,6 +3599,7 @@ mod tests {
             stdin,
             released: None,
             patrol_kill: None,
+            kill_reason: None,
         }
     }
 
@@ -3773,6 +3837,69 @@ mod tests {
         assert_eq!(crashed.data["signal"], 9);
         assert_eq!(crashed.data["reason"], "patrol restart");
         assert_eq!(crashed.data["cause_seq"], 41);
+        assert!(dispatcher.children.is_empty());
+    }
+
+    /// cp-0 §2.3 / amendment fix 2: `kill_worker_with_reason` (the
+    /// max_stream_bytes ceiling kill) marks the worker with a custom reason
+    /// and cause_seq; the reap classifies the exit as `session.crashed`
+    /// carrying BOTH (so the ledger names the cap — invariant 3, and the
+    /// `patrol restart` prefix lets patrol::observe queue a Respawn — fix 6).
+    #[test]
+    fn cap_breach_kill_worker_with_reason_reaps_as_crashed_with_the_named_reason() {
+        let (dir, mut ledger) = temp_ledger();
+        wake_session(&mut ledger, "t/dev/1");
+        let mut dispatcher = test_dispatcher(dir.path());
+        let worker = held_cat_worker(dir.path(), "t/dev/1", "gc-1");
+        let pid = worker.child.id();
+        dispatcher.children.insert(pid, worker);
+
+        let reason = "patrol restart: stream cap exceeded max_stream_bytes".to_owned();
+        assert!(
+            dispatcher
+                .kill_worker_with_reason("t/dev/1", 57, reason.clone())
+                .unwrap(),
+            "a live worker is killed"
+        );
+        // review fix 3: an unknown session returns Ok(false) — the kill was
+        // NOT delivered. The event loop must act on this (durable fault
+        // event + unregister), never discard it.
+        assert!(
+            !dispatcher
+                .kill_worker_with_reason("ghost", 57, reason)
+                .unwrap(),
+            "no live worker for the session => Ok(false), the kill was not delivered"
+        );
+        // SIGKILL lands; wait for the exit so try_wait sees it.
+        loop {
+            if dispatcher
+                .children
+                .get_mut(&pid)
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        dispatcher.reap(&mut ledger).unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        let crashed = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.crashed")
+            .expect("cap-breach kill must reap as crashed");
+        assert_eq!(crashed.data["signal"], 9);
+        assert_eq!(
+            crashed.data["reason"], "patrol restart: stream cap exceeded max_stream_bytes",
+            "the reap carries the custom kill reason (names the cap)"
+        );
+        assert_eq!(
+            crashed.data["cause_seq"], 57,
+            "cause_seq points at stream_capped"
+        );
         assert!(dispatcher.children.is_empty());
     }
 

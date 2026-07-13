@@ -38,6 +38,7 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "run.finalized",
     "agent.stalled",
     "patrol.degraded",
+    "session.stream_capped",
     "session.nudged",
 ];
 

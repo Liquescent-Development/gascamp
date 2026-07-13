@@ -236,12 +236,52 @@ camp/                      # ~/camps/<name>/ (multi-rig) or <repo>/.camp/ (singl
                            #   canonical JSONL for any range (7.2)
   runs/<run-id>/           # one dir per formula run: pinned formula copy,
                            #   cook manifest, step status snapshot
-  sessions/                # per-worker stdout capture (the claude result
-                           #   envelope JSON) + stderr log, one pair per session
+  sessions/                # per-worker stdout capture (stream-json) + stderr
+                           #   log, one pair per session. The stdout file is
+                           #   campd's READ CHANNEL and is DISPOSED AT REAP —
+                           #   see the amendment below (2026-07-13)
   formulas/                # camp-local formula definitions, resolved by
                            #   name (§9; packs layer beneath, §11)
   worktrees/               # camp-managed worktrees (per agent isolation flag)
 ```
+
+> **AMENDMENT (2026-07-13) — `sessions/<session>.json` is disposed at reap.
+> The control-plane spec supersedes decision G's "kept for forensics."**
+>
+> **What changed.** Phase 8's decision G introduced the `sessions/` capture
+> and promised the stdout file was *"kept for forensics/Phase 9+"* — a
+> passive artifact nothing parsed. The control-plane design
+> (`docs/superpowers/specs/2026-07-12-camp-control-plane-design.md`) makes
+> that same file **campd's live read channel**: §2.3 tails it by byte offset
+> and states *"at session end (reap): the stream file is disposed or
+> compressed per retention policy"*; §9 restates it (*"append-only until
+> reap … disposed/compressed at session end"*); and its phase-0 roadmap
+> assigns *"append-only stream files; reap-time disposal"* to cp-0 by name.
+>
+> **Which wins, and why.** The control-plane spec (2026-07-12) is the newer
+> document and speaks to this file's purpose directly, so **it governs**:
+> the stream file is append-only for the life of its writer and **unlinked
+> at reap**. Decision G's forensics guarantee is **superseded** for the
+> stdout capture. It is recorded here rather than deleted because the two
+> texts genuinely conflicted, and a future reader who finds decision G must
+> land on this ruling instead of on a mystery. (Operator ruling, 2026-07-13,
+> on cp-0 review finding 4.)
+>
+> **The forensics intent survives — by a different mechanism.** What decision
+> G actually wanted was that a crashed worker's story be recoverable. That is
+> now the **ledger's** job, not the file's: campd drains a reaped session's
+> stream to EOF *before* disposing it, so the worker's final bytes become
+> durable events (a non-JSON or unparsable final line lands as
+> `patrol.degraded` naming it; a cap breach lands as `session.stream_capped`
+> → `session.crashed` with `cause_seq`). **The raw stdout file is what goes;
+> the record is not.** Keeping the file instead would have been the weaker
+> guarantee — an unbounded artifact nothing reads, versus an evented,
+> greppable, refoldable one.
+>
+> **Scope.** The stderr log (`sessions/<session>.log`) is unaffected by this
+> amendment. A retention policy (compress-instead-of-unlink, keep-N) is the
+> `per retention policy` clause §2.3 leaves open; phase 0 implements the
+> plain disposal it names.
 
 The ledger schema is versioned (`schema_version` in `meta`; v2 as of the
 dispatch-lifecycle delivery phase — the WorkOutcome/delivery columns);
