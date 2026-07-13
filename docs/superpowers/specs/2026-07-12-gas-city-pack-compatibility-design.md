@@ -140,7 +140,7 @@ Camp renders a defined Go-template subset: `{{.Var}}`, `{{template "name"}}` wit
 
 ### 5.2 Where model, permission mode, and tools come from — and the hole this closes
 
-**Zero of 80 gc agents declare a model, permission mode, or tool allowlist.** In Gas City these come from the **provider profile** — a layer camp does not have — and gc's claude profile defaults to **`permission_mode = "unrestricted"`**, which maps to `--dangerously-skip-permissions` (`profiles.go:102-176`). Worse: **there is no `tools` option key in any of gc's 17 providers.** A gc pack *cannot express a tool allowlist at all*.
+**Zero of 80 gc agents declare a model, permission mode, or tool allowlist.** In Gas City these come from the **provider profile** — a layer camp does not have — and gc's claude profile defaults to **`permission_mode = "unrestricted"`**, which maps to `--dangerously-skip-permissions` (`internal/worker/builtin/profiles.go:103-129`). Worse: **there is no `tools` option key in any of gc's 17 providers.** A gc pack *cannot express a tool allowlist at all*.
 
 Camp's `spawn.rs:198-208` pushes `--model` / `--permission-mode` / `--allowedTools` only `if let Some(...)`. So naïvely importing a pack would spawn **downloaded agents as bare `claude -p` with no tool restriction** — a hole larger than the one `trust_exec` closes, and camp would be inheriting gc's unrestricted default by accident.
 
