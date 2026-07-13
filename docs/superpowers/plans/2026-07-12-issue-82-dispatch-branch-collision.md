@@ -3,6 +3,8 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task in a fresh session on branch `fix-82-dispatch-branch-collision`. Steps use checkbox (`- [ ]`) syntax for tracking. This is a PLANNING-ONLY document; execution is a separate session per the fix-82 kickoff amendment.
 
 > **APPROVAL NOTE:** Plan review: APPROVE, 2026-07-13 (Opus 4.8 plan gate). Remedy choice (loud named-recovery error, branch never deleted) explicitly judged sound; alternatives' rejections verified substantive. Non-blocking notes: N1 the reason-reaches-dispatch.failed property rests on verified code inspection of dispatch.rs:615 (fix-83's file — do not add a dispatch.rs test here); N2 reproduction at the spawn/mechanical layer is the appropriate fidelity for this stream; N3 bail! String semantics and line-join behavior to be confirmed by the Step 2/5 test runs as planned; N4 the foreign-live-worktree edge stays YAGNI-deferred. No deviations accepted.
+>
+> Deviation accepted 2026-07-13 by the plan reviewer: check order swapped — directory residue precedes branch probe; create_dir_all moved after both checks. Reason: pre-existing round_trip regression + wrong -D advice in the both-exist state.
 
 **Goal:** A camp whose rig carries a predecessor ledger's leftover `camp/<bead>` branch no longer dies on a raw `git worktree add` error; instead `create_worktree` refuses with a loud, self-explaining, named-recovery error that identifies the branch, states whether it holds commits beyond the rig's base, and gives the exact command to clear it — never deleting the branch itself.
 
@@ -427,7 +429,7 @@ Expected: all three PASS.
 
 - [ ] **Step 6: Run the full spawn test module to confirm no regression**
 
-The happy-path tests (`worktree_create_and_remove_round_trip`, `ensure_worktree_reuses_the_beads_worktree_and_rejects_impostors`, `create_worktree_refuses_a_rig_without_a_base_commit`, `ensure_worktree_reuse_refuses_a_rig_gutted_since_creation`) create `camp/<bead>` branches fresh with no pre-existing branch, so `branch_collision_error` returns `Ok(None)` and they are unaffected.
+_(Amended during execution, deviation accepted 2026-07-13 — see the approval note.)_ The original rationale here claimed the pre-existing tests were unaffected because they "create `camp/<bead>` branches fresh with no pre-existing branch"; that was wrong for `worktree_create_and_remove_round_trip`, whose SECOND `create_worktree` call runs with both the branch (from the first call) and the live worktree directory present, expecting the directory-residue error. With Step 4's original ordering (branch probe before the directory check) the collision error fired first — and its `branch -D` advice would be wrong there, since git refuses `-D` on a branch checked out in a live worktree. Final ordering therefore: the directory-residue check runs FIRST, then the branch-collision probe, and `create_dir_all` runs after both so every refusal is side-effect-free. On the real dispatch path this is behavior-identical (`ensure_worktree` only reaches `create_worktree` when the directory is absent), and the three new tests are order-insensitive.
 
 Run:
 ```bash
