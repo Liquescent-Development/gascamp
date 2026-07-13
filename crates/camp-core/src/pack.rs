@@ -10,8 +10,7 @@
 //! sibling-owned consumers (`dispatch.rs`, `patrol.rs`, `sling.rs`,
 //! `spawn.rs`) never need editing — only the resolution *source* changes.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::config::{AgentDefaults, CampConfig};
 use crate::error::CoreError;
@@ -194,77 +193,58 @@ pub fn resolve_agent_def(
     })
 }
 
-/// The agents/ layers to search, lowest to highest (plan decision R).
-/// Phase 1 interim: the `packs` field is gone (compat §7 — packs now import
-/// under `<root>/imports/<binding>/`); the binding-qualified rewrite lands
-/// in Task 12. Until then the camp-local `<root>/agents/` layer is the only one.
-fn layers(cfg: &CampConfig) -> Result<Vec<PathBuf>, CoreError> {
-    let need_root = || {
+/// Resolve an agent by its qualified name (umbrella §7.1; master plan
+/// Phase 8 pinned signature — unchanged so `dispatch.rs`/`patrol.rs`/
+/// `sling.rs`/`spawn.rs` never need editing).
+///
+/// Split at the FIRST dot: the prefix is a binding in `cfg.imports` (else
+/// fail-fast naming the binding + the `camp import add <source> --name
+/// <binding>` remedy); the suffix is `<root>/imports/<binding>/agents/
+/// <suffix>/` (missing → `UnknownAgent`). A no-dot name resolves a camp-local
+/// agent at `<root>/agents/<name>/` (bare, disjoint from every binding).
+/// `gstack.review-synthesizer` + `gc.review-synthesizer` coexist by
+/// construction. `pack_ships_skills` is true when the import materialized a
+/// `skills/` dir AND the import's `skills != Some(false)`.
+pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError> {
+    let root = cfg.root.as_deref().ok_or_else(|| {
         CoreError::Config(
             "config has no root directory (loaded via parse, not load) — cannot resolve agent paths"
                 .to_owned(),
         )
-    };
-    let mut layers = Vec::new();
-    if let Some(root) = cfg.root.as_deref() {
-        layers.push(root.join("agents"));
-    } else {
-        return Err(need_root());
-    }
-    Ok(layers)
-}
-
-/// One layer's agent definitions by name; duplicate names in a layer are a
-/// hard error (fail fast — silent shadowing within one directory hides a
-/// pack bug). Reads agent DIRECTORIES (compat §5.1).
-fn load_layer(
-    dir: &Path,
-    defaults: &AgentDefaults,
-) -> Result<BTreeMap<String, AgentDef>, CoreError> {
-    let mut defs = BTreeMap::new();
-    if !dir.is_dir() {
-        return Ok(defs); // a pack without agents/ contributes nothing
-    }
-    let entries = std::fs::read_dir(dir).map_err(|e| pack_err(dir, format!("cannot read: {e}")))?;
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| pack_err(dir, format!("cannot read entry: {e}")))?;
-        let path = entry.path();
-        if path.is_dir() {
-            dirs.push(path);
+    })?;
+    match name.split_once('.') {
+        Some((binding, suffix)) => {
+            let decl = cfg.imports.get(binding).ok_or_else(|| {
+                CoreError::Pack(format!(
+                    "agent {name:?}: no binding {binding:?} in camp.toml — run \
+                     `camp import add <source> --name {binding}`"
+                ))
+            })?;
+            let dir = root.join("imports").join(binding).join("agents").join(suffix);
+            if !dir.is_dir() {
+                return Err(CoreError::UnknownAgent {
+                    name: name.to_owned(),
+                    searched: vec![dir.display().to_string()],
+                });
+            }
+            let (raw, _refusals) = parse_agent_dir(&dir)?;
+            let pack_ships_skills =
+                root.join("imports").join(binding).join("skills").is_dir()
+                    && decl.skills != Some(false);
+            resolve_agent_def(&cfg.agent_defaults, &raw, name, pack_ships_skills)
+        }
+        None => {
+            let dir = root.join("agents").join(name);
+            if !dir.is_dir() {
+                return Err(CoreError::UnknownAgent {
+                    name: name.to_owned(),
+                    searched: vec![dir.display().to_string()],
+                });
+            }
+            let (raw, _refusals) = parse_agent_dir(&dir)?;
+            resolve_agent_def(&cfg.agent_defaults, &raw, name, false)
         }
     }
-    dirs.sort();
-    for d in dirs {
-        let (raw, _refusals) = parse_agent_dir(&d)?;
-        // Camp-local agents have no skills/ dir, so the Skill-allowlist gate
-        // does not apply here (pack_ships_skills = false). Binding-qualified
-        // resolution (Task 12) sets it from the import's skills/ presence.
-        let def = resolve_agent_def(defaults, &raw, &raw.name, false)?;
-        if let Some(previous) = defs.insert(def.name.clone(), def) {
-            return Err(pack_err(
-                dir,
-                format!("two dirs define agent {:?} in one layer", previous.name),
-            ));
-        }
-    }
-    Ok(defs)
-}
-
-/// Resolve an agent by name across the configured layers, last wins
-/// (spec §11; master plan Phase 8 pinned signature).
-pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError> {
-    let layers = layers(cfg)?;
-    let mut found: Option<AgentDef> = None;
-    for dir in &layers {
-        if let Some(def) = load_layer(dir, &cfg.agent_defaults)?.remove(name) {
-            found = Some(def);
-        }
-    }
-    found.ok_or_else(|| CoreError::UnknownAgent {
-        name: name.to_owned(),
-        searched: layers.iter().map(|p| p.display().to_string()).collect(),
-    })
 }
 
 #[cfg(test)]
@@ -379,6 +359,51 @@ mod tests {
     #[test]
     fn skill_present_allows_a_skills_pack() {
         assert!(resolve_agent_def(&defaults(Some(vec!["Read", "Skill"])), &raw("architect"), "bmad.architect", true).is_ok());
+    }
+
+    fn camp_with_imports(kv: &[(&str, &str)]) -> (tempfile::TempDir, CampConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut toml = String::from("[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n");
+        for (binding, _agent) in kv {
+            toml.push_str(&format!("[imports.{binding}]\nsource=\"file:///unused\"\n"));
+        }
+        for (binding, agent) in kv {
+            let a = root.join("imports").join(binding).join("agents").join(agent);
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::write(a.join("prompt.md"), format!("I am {binding}.{agent}")).unwrap();
+        }
+        std::fs::write(root.join("camp.toml"), &toml).unwrap();
+        let cfg = CampConfig::load(&root.join("camp.toml")).unwrap();
+        (dir, cfg)
+    }
+    #[test]
+    fn qualified_route_resolves_through_binding() {
+        let (_d, cfg) = camp_with_imports(&[("gc", "run-operator")]);
+        let def = resolve_agent(&cfg, "gc.run-operator").unwrap();
+        assert_eq!(def.name, "gc.run-operator");
+        assert!(def.prompt.contains("gc.run-operator"));
+    }
+    #[test]
+    fn route_to_unbound_binding_fails_naming_remedy() {
+        let (_d, cfg) = camp_with_imports(&[("gc", "run-operator")]);
+        let m = resolve_agent(&cfg, "bmad.architect").unwrap_err().to_string();
+        assert!(m.contains("bmad") && m.contains("camp import add") && m.contains("--name bmad"), "{m}");
+    }
+    #[test]
+    fn same_name_across_bindings_coexists() {
+        let (_d, cfg) =
+            camp_with_imports(&[("gstack", "review-synthesizer"), ("gc", "review-synthesizer")]);
+        assert!(resolve_agent(&cfg, "gstack.review-synthesizer").unwrap().prompt.contains("gstack"));
+        assert!(resolve_agent(&cfg, "gc.review-synthesizer").unwrap().prompt.contains("gc"));
+    }
+    #[test]
+    fn bare_name_resolves_a_camp_local_agent() {
+        let (_d, cfg) = camp_with_imports(&[]);
+        let a = cfg.root.clone().unwrap().join("agents/dev");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("prompt.md"), "local dev").unwrap();
+        assert_eq!(resolve_agent(&cfg, "dev").unwrap().name, "dev");
     }
 
     #[test]
