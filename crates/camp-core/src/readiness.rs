@@ -25,12 +25,13 @@ pub struct BeadRow {
     /// what became of the work itself (gc vocabulary, fold-validated).
     pub work_outcome: Option<String>,
     /// Phase 3 (#48 finding 2): a fail-fast dispatch's reason, folded from
-    /// dispatch.failed and cleared by a later session.woke/claim. The
-    /// marker informs the list surface; it never gates dispatchability.
-    /// Retry semantics (assessment finding A): campd's in-memory failed
-    /// set suppresses re-dispatch for its lifetime — fixing the cause is
-    /// not enough; a campd restart retries (once per restart). `camp show`
-    /// states this next to the reason.
+    /// dispatch.failed and cleared by a later session.woke/claim.
+    /// Retry semantics (issue #83): while this is set the bead is excluded
+    /// from `dispatchable_beads` and from the `ready` count, and it persists
+    /// across a campd restart (no silent re-attempt). `camp retry <bead>`
+    /// appends `dispatch.rearmed`, which clears this — the explicit,
+    /// operator-visible re-arm path. `camp show` states this next to the
+    /// reason.
     pub dispatch_failure: Option<String>,
     pub labels: Vec<String>,
     pub created_ts: String,
@@ -125,7 +126,9 @@ pub fn ready_beads(conn: &Connection, rig: Option<&str>) -> Result<Vec<BeadRow>,
 
 /// Beads campd may dispatch a worker for (Phase 8, plan decision C): open,
 /// ready (decision-6 rule), plain work (`type='task'`), not a run root
-/// (roots are finalized by campd, Phase 9), and never dispatched before
+/// (roots are finalized by campd, Phase 9), and never dispatched before,
+/// and not currently dispatch-failed (`dispatch_failure` clear — a failed
+/// dispatch is suppressed until `camp retry` re-arms it, invariant 3/1)
 /// (no sessions row bound — organic crash respawns arrive with retry
 /// budgets, Phase 9). Phase 11's patrol restarts respawn through the
 /// TARGETED `Dispatcher::dispatch_bead`, bounded by the ladder budget —
@@ -134,6 +137,7 @@ pub fn dispatchable_beads(conn: &Connection) -> Result<Vec<BeadRow>, CoreError> 
     let sql = format!(
         "SELECT {BEAD_COLS} FROM beads b
          WHERE b.status = 'open' AND {TASK}
+           AND b.dispatch_failure IS NULL
            AND NOT (b.run_id IS NOT NULL AND b.step_id IS NULL)
            AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.bead = b.id)
            AND NOT EXISTS (
@@ -149,16 +153,54 @@ pub fn dispatchable_beads(conn: &Connection) -> Result<Vec<BeadRow>, CoreError> 
 /// The number of ready TASK beads — the status surface's `ready` count
 /// (`camp top`, spec §7). Same open-and-unblocked rule as `ready_beads`,
 /// narrowed to plain work (`TASK`) so it matches what campd will actually
-/// dispatch: memory and mail beads are never counted (issue #36).
+/// dispatch: memory and mail beads are never counted (issue #36) and
+/// excluding beads whose dispatch failed (`dispatch_failure` set), which are
+/// counted as `stuck` instead (issue #83) — so `ready` means campd will
+/// actually pick it up.
 pub fn ready_task_count(conn: &Connection) -> Result<u64, CoreError> {
     let sql = format!(
         "SELECT count(*) FROM beads b
          WHERE b.status = 'open' AND {TASK}
+           AND b.dispatch_failure IS NULL
            AND NOT EXISTS (
              SELECT 1 FROM deps d LEFT JOIN beads t ON t.id = d.needs_id
              WHERE d.bead_id = b.id AND {UNMET_DEP})"
     );
     count_nonneg(conn, &sql, "ready-task")
+}
+
+/// The reason prefix campd stamps on a `dispatch.failed` that is a worker-cap
+/// DEFERRAL of a patrol respawn (round-2 LOW 2), not a dead dispatch: campd
+/// itself retries it when a slot frees (its pending-respawns queue), so it is
+/// NOT `stuck` (issue #83 review F1) and `camp retry` has nothing to re-arm.
+/// One constant shared by the writer (`Dispatcher::dispatch_bead`), the
+/// `stuck` count, `camp show`'s recovery hint, and `camp retry`'s gate — the
+/// discriminator cannot drift.
+pub const DEFERRED_DISPATCH_PREFIX: &str = "patrol respawn deferred:";
+
+/// True when a `dispatch_failure` reason is the worker-cap deferral above —
+/// campd owns that retry; the operator re-arm path does not apply.
+pub fn is_deferred_dispatch_failure(reason: &str) -> bool {
+    reason.starts_with(DEFERRED_DISPATCH_PREFIX)
+}
+
+/// The number of stuck TASK beads — open plain work whose dispatch failed
+/// and has not been re-armed (`beads.dispatch_failure` set). The status
+/// surface's `stuck` count (issue #83): a bead that is open in the ledger
+/// but unreachable in the runtime until `camp retry` re-arms it. Task-scoped
+/// like the other status counts. Worker-cap deferrals are excluded (review
+/// F1): campd retries those itself, so counting them stuck would promise a
+/// `camp retry` that has nothing to do.
+pub fn stuck_task_count(conn: &Connection) -> Result<u64, CoreError> {
+    let sql = format!(
+        "SELECT count(*) FROM beads b
+         WHERE b.status = 'open' AND {TASK} AND b.dispatch_failure IS NOT NULL
+           AND b.dispatch_failure NOT LIKE ?1"
+    );
+    let n: i64 = conn.query_row(&sql, params![format!("{DEFERRED_DISPATCH_PREFIX}%")], |r| {
+        r.get(0)
+    })?;
+    u64::try_from(n).map_err(|_| CoreError::Corrupt(format!("negative stuck-task count {n}")))
 }
 
 /// The number of open TASK beads — the status surface's `open` count (blocked
@@ -480,6 +522,137 @@ mod tests {
         })
         .unwrap();
         assert!(l.dispatchable_beads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dispatch_rearmed_clears_the_failure_marker() {
+        use crate::event::{EventInput, EventType};
+        let (_d, mut l) = ledger();
+        create(&mut l, "gc-1", &[]);
+        l.append(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "reason": "rig path is not a directory" }),
+        })
+        .unwrap();
+        assert_eq!(
+            l.get_bead("gc-1")
+                .unwrap()
+                .unwrap()
+                .dispatch_failure
+                .as_deref(),
+            Some("rig path is not a directory")
+        );
+
+        l.append(EventInput {
+            kind: EventType::DispatchRearmed,
+            rig: Some("gc".into()),
+            actor: "cli".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "previous_reason": "rig path is not a directory" }),
+        })
+        .unwrap();
+        assert_eq!(
+            l.get_bead("gc-1").unwrap().unwrap().dispatch_failure,
+            None,
+            "re-arm clears the marker"
+        );
+
+        // idempotent: re-arming an already-clear bead is a harmless no-op
+        l.append(EventInput {
+            kind: EventType::DispatchRearmed,
+            rig: Some("gc".into()),
+            actor: "cli".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "previous_reason": "rig path is not a directory" }),
+        })
+        .unwrap();
+        assert_eq!(l.get_bead("gc-1").unwrap().unwrap().dispatch_failure, None);
+    }
+
+    #[test]
+    fn dispatchable_excludes_a_dispatch_failed_bead_until_rearmed() {
+        use crate::event::{EventInput, EventType};
+        let (_d, mut l) = ledger();
+        create(&mut l, "gc-1", &[]);
+        // a failed dispatch marks the bead — it drops out of the set
+        l.append(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "reason": "no agent to dispatch to" }),
+        })
+        .unwrap();
+        assert!(
+            l.dispatchable_beads().unwrap().is_empty(),
+            "a dispatch-failed bead is not dispatchable"
+        );
+        // re-arming clears the marker and the bead is dispatchable again
+        l.append(EventInput {
+            kind: EventType::DispatchRearmed,
+            rig: Some("gc".into()),
+            actor: "cli".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "previous_reason": "no agent to dispatch to" }),
+        })
+        .unwrap();
+        let ids: Vec<String> = l
+            .dispatchable_beads()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(ids, vec!["gc-1"], "a re-armed bead is dispatchable again");
+    }
+
+    /// Issue #83 review F1: a worker-cap DEFERRAL of a patrol respawn also
+    /// lands as dispatch.failed, but campd itself retries it when a slot
+    /// frees (the pending_respawns queue) — it is not dead, so it must NOT
+    /// be counted `stuck` (that count promises `camp retry` can fix it).
+    #[test]
+    fn a_cap_deferred_dispatch_failure_is_not_counted_stuck() {
+        use super::{DEFERRED_DISPATCH_PREFIX, is_deferred_dispatch_failure};
+        use crate::event::{EventInput, EventType};
+        let (_d, mut l) = ledger();
+        create(&mut l, "gc-1", &[]);
+        create(&mut l, "gc-2", &[]);
+        // gc-1: the cap deferral — campd owns this retry
+        l.append(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "reason": format!(
+                "{DEFERRED_DISPATCH_PREFIX} worker cap reached; will retry when a slot frees"
+            ) }),
+        })
+        .unwrap();
+        assert_eq!(
+            l.status_summary().unwrap().stuck,
+            0,
+            "a cap-deferred bead is campd's own retry, never stuck"
+        );
+        assert!(is_deferred_dispatch_failure(
+            "patrol respawn deferred: worker cap reached; will retry when a slot frees"
+        ));
+        assert!(!is_deferred_dispatch_failure("rig path is not a directory"));
+        // gc-2: a genuinely dead dispatch IS stuck
+        l.append(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-2".into()),
+            data: serde_json::json!({ "reason": "no agent to dispatch to" }),
+        })
+        .unwrap();
+        assert_eq!(
+            l.status_summary().unwrap().stuck,
+            1,
+            "only the dead dispatch counts stuck"
+        );
     }
 
     /// Test obligation (iv), dispatch-lifecycle Phase 1 (#29): a freshly

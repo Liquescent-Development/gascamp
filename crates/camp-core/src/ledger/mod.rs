@@ -33,6 +33,7 @@ pub struct StatusSummary {
     pub live_sessions: Vec<String>,
     pub ready: u64,
     pub open: u64,
+    pub stuck: u64,
 }
 
 /// One live `sessions` registry row with its `session.woke` provenance
@@ -322,10 +323,12 @@ impl Ledger {
             .collect::<rusqlite::Result<_>>()?;
         let ready = crate::readiness::ready_task_count(&self.conn)?;
         let open = crate::readiness::open_task_count(&self.conn)?;
+        let stuck = crate::readiness::stuck_task_count(&self.conn)?;
         Ok(StatusSummary {
             live_sessions,
             ready,
             open,
+            stuck,
         })
     }
 
@@ -2220,7 +2223,8 @@ mod tests {
             StatusSummary {
                 live_sessions: vec![],
                 ready: 0,
-                open: 0
+                open: 0,
+                stuck: 0,
             }
         );
 
@@ -2258,7 +2262,8 @@ mod tests {
             StatusSummary {
                 live_sessions: vec!["camp/dev/1".to_owned()],
                 ready: 1,
-                open: 2
+                open: 2,
+                stuck: 0,
             }
         );
     }
@@ -2291,7 +2296,8 @@ mod tests {
             StatusSummary {
                 live_sessions: vec![],
                 ready: 0,
-                open: 0
+                open: 0,
+                stuck: 0,
             }
         );
 
@@ -2307,7 +2313,8 @@ mod tests {
             StatusSummary {
                 live_sessions: vec![],
                 ready: 1,
-                open: 1
+                open: 1,
+                stuck: 0,
             }
         );
 
@@ -2324,7 +2331,46 @@ mod tests {
             StatusSummary {
                 live_sessions: vec![],
                 ready: 1,
-                open: 2
+                open: 2,
+                stuck: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn status_summary_moves_a_dispatch_failed_bead_from_ready_to_stuck() {
+        use crate::event::{EventInput, EventType};
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({ "title": "one" })))
+            .unwrap();
+        // ready before the failure
+        assert_eq!(
+            ledger.status_summary().unwrap(),
+            StatusSummary {
+                live_sessions: vec![],
+                ready: 1,
+                open: 1,
+                stuck: 0,
+            }
+        );
+        // a dispatch failure: no longer ready, now stuck (still open)
+        ledger
+            .append(EventInput {
+                kind: EventType::DispatchFailed,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({ "reason": "no agent" }),
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.status_summary().unwrap(),
+            StatusSummary {
+                live_sessions: vec![],
+                ready: 0,
+                open: 1,
+                stuck: 1,
             }
         );
     }

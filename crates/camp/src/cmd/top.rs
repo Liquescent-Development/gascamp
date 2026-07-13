@@ -60,8 +60,8 @@ fn render(summary: &StatusSummary, red: u64, campd_pid: u32) -> String {
         )
     };
     format!(
-        "campd pid: {campd_pid}\nlive sessions: {sessions}\nready: {}\nopen: {}\nred: {red}\n",
-        summary.ready, summary.open
+        "campd pid: {campd_pid}\nlive sessions: {sessions}\nready: {}\nopen: {}\nstuck: {}\nred: {red}\n",
+        summary.ready, summary.open, summary.stuck
     )
 }
 
@@ -77,19 +77,21 @@ mod tests {
             live_sessions: vec![],
             ready: 0,
             open: 0,
+            stuck: 0,
         };
         assert_eq!(
             render(&empty, 0, 4242),
-            "campd pid: 4242\nlive sessions: 0\nready: 0\nopen: 0\nred: 0\n"
+            "campd pid: 4242\nlive sessions: 0\nready: 0\nopen: 0\nstuck: 0\nred: 0\n"
         );
         let busy = StatusSummary {
             live_sessions: vec!["camp/dev/1".to_owned(), "camp/dev/2".to_owned()],
             ready: 1,
             open: 3,
+            stuck: 0,
         };
         assert_eq!(
             render(&busy, 1, 7),
-            "campd pid: 7\nlive sessions: 2 (camp/dev/1, camp/dev/2)\nready: 1\nopen: 3\nred: 1\n"
+            "campd pid: 7\nlive sessions: 2 (camp/dev/1, camp/dev/2)\nready: 1\nopen: 3\nstuck: 0\nred: 1\n"
         );
     }
 }

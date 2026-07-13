@@ -204,7 +204,9 @@ fn assert_no_campd_came_up(root: &Path, out: &std::process::Output, starts_befor
 fn start_socket_accepts_and_status_is_sane() {
     let dir = tempfile::tempdir().unwrap();
     let root = init_camp(dir.path());
-    // seed: gc-1 ready; gc-2 open but blocked on gc-1
+    // seed: gc-1 unblocked but unroutable (no assignee, rig has no
+    // default_agent), so campd dispatch-fails it at startup and it becomes
+    // `stuck` — no longer `ready` (issue #83); gc-2 open but blocked on gc-1
     run_ok(&root, &["create", "first"]);
     run_ok(&root, &["create", "second", "--needs", "gc-1"]);
 
@@ -212,8 +214,12 @@ fn start_socket_accepts_and_status_is_sane() {
     let status = daemon.request(r#"{"op":"status"}"#);
     assert_eq!(status["ok"], true);
     assert_eq!(status["campd_pid"], daemon.child.id());
-    assert_eq!(status["ready"], 1);
+    assert_eq!(status["ready"], 0);
     assert_eq!(status["open"], 2);
+    assert_eq!(
+        status["stuck"], 1,
+        "gc-1 dispatch-failed as unroutable — stuck, not ready (issue #83)"
+    );
     assert_eq!(status["live_sessions"], serde_json::json!([]));
 
     assert!(event_types(&root).contains(&"campd.started".to_owned()));
@@ -291,11 +297,16 @@ fn kill_dash_nine_stale_socket_restart_and_exactly_once_catch_up() {
     assert_eq!(campd_cursor(&root), max_seq(&root));
     let status = daemon2.request(r#"{"op":"status"}"#);
     assert_eq!(status["ok"], true);
-    assert_eq!(
-        status["ready"], 1,
-        "gc-2 was unblocked by gc-1's pass close"
-    );
+    // gc-1's pass close unblocked gc-2; but gc-2 is unroutable (no assignee,
+    // rig has no default_agent), so campd dispatch-fails it at startup — it
+    // is `stuck`, not `ready` (issue #83). stuck==1 is itself the proof gc-2
+    // was unblocked (a still-blocked bead would never be dispatch-attempted).
+    assert_eq!(status["ready"], 0);
     assert_eq!(status["open"], 1);
+    assert_eq!(
+        status["stuck"], 1,
+        "gc-2 was unblocked by gc-1's pass close (then dispatch-failed as unroutable → stuck)"
+    );
 }
 
 #[test]

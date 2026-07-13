@@ -41,6 +41,7 @@ pub enum EventType {
     BeadWorktreeReaped,
     DispatchFailed,
     DispatchLiveTree,
+    DispatchRearmed,
     CheckPassed,
     CheckFailed,
     RunFinalized,
@@ -72,6 +73,7 @@ impl EventType {
         EventType::BeadWorktreeReaped,
         EventType::DispatchFailed,
         EventType::DispatchLiveTree,
+        EventType::DispatchRearmed,
         EventType::CheckPassed,
         EventType::CheckFailed,
         EventType::RunFinalized,
@@ -103,6 +105,7 @@ impl EventType {
             EventType::BeadWorktreeReaped => "bead.worktree.reaped",
             EventType::DispatchFailed => "dispatch.failed",
             EventType::DispatchLiveTree => "dispatch.live_tree",
+            EventType::DispatchRearmed => "dispatch.rearmed",
             EventType::CheckPassed => "check.passed",
             EventType::CheckFailed => "check.failed",
             EventType::RunFinalized => "run.finalized",
@@ -226,5 +229,15 @@ mod tests {
     fn rig_added_round_trips_through_its_name() {
         assert_eq!(EventType::parse("rig.added").unwrap(), EventType::RigAdded);
         assert_eq!(EventType::RigAdded.as_str(), "rig.added");
+    }
+
+    #[test]
+    fn dispatch_rearmed_round_trips_through_its_name() {
+        assert_eq!(EventType::DispatchRearmed.as_str(), "dispatch.rearmed");
+        assert_eq!(
+            EventType::parse("dispatch.rearmed").unwrap(),
+            EventType::DispatchRearmed
+        );
+        assert!(EventType::ALL.contains(&EventType::DispatchRearmed));
     }
 }

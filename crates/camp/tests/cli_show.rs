@@ -277,11 +277,11 @@ fn show_json_emits_state_and_history() {
     assert!(v["commit"].is_null());
 }
 
-/// PR #54 assessment finding A (operator UX): the dispatch-failed marker
-/// must tell the operator HOW to retry — campd's in-memory failed set
-/// suppresses re-dispatch for its lifetime (plan decision F, by design),
-/// so fixing the rig alone does nothing until campd restarts. The show
-/// rendering states that, right where the reason is read.
+/// PR #54 assessment finding A + issue #83 (operator UX): the dispatch-failed
+/// marker must tell the operator HOW to recover — the marker persists across
+/// restart and suppresses re-dispatch until re-armed, so fixing the rig alone
+/// does nothing until `camp retry <bead>` re-arms it. The show rendering
+/// states that, right where the reason is read.
 #[test]
 fn show_prints_the_dispatch_failure_with_the_retry_hint() {
     let dir = camp_with_bead();
@@ -309,8 +309,45 @@ fn show_prints_the_dispatch_failure_with_the_retry_hint() {
             "dispatch-failed  rig repo cannot host a worktree (no base commit)",
         ))
         .stdout(predicates::str::contains(
-            "campd retries once per restart — after fixing the cause, restart campd",
+            "won't dispatch until re-armed — after fixing the cause, run `camp retry gc-1`",
         ));
+}
+
+/// Issue #83 review F1: a worker-cap DEFERRAL of a patrol respawn also lands
+/// as dispatch.failed, but campd retries it itself when a slot frees — the
+/// reason stays visible, and `camp show` must NOT advise `camp retry` (which
+/// would be a silent no-op for an ever-sessioned bead).
+#[test]
+fn show_does_not_advise_retry_for_a_cap_deferred_dispatch() {
+    let dir = camp_with_bead();
+    {
+        let mut ledger =
+            camp_core::ledger::Ledger::open(&dir.path().join(".camp/camp.db")).unwrap();
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::DispatchFailed,
+                rig: Some("gascity".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "reason": format!(
+                        "{} worker cap reached; will retry when a slot frees",
+                        camp_core::readiness::DEFERRED_DISPATCH_PREFIX
+                    )
+                }),
+            })
+            .unwrap();
+    }
+    use predicates::boolean::PredicateBooleanExt;
+    camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "dispatch-failed  patrol respawn deferred: worker cap reached; will retry when a slot frees",
+        ))
+        .stdout(predicates::str::contains("camp retry").not());
 }
 
 /// An already-closed bead returns immediately (no watch armed).

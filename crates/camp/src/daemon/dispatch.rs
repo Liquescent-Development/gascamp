@@ -5,7 +5,7 @@
 //! lands in the ledger (`dispatch.failed`, `session.crashed`), never in a
 //! void: campd has no caller (invariant 5).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
@@ -31,9 +31,6 @@ pub struct Dispatcher {
     /// in the same try_wait sweep; failures land as patrol.degraded, never
     /// as session events.
     aux: HashMap<u32, AuxChild>,
-    /// Beads that failed to dispatch this campd lifetime (plan decision
-    /// F): one dispatch.failed each, retried once per restart (crash-only).
-    failed: HashSet<String>,
     /// Patrol respawns deferred because the worker cap was full (Phase 11,
     /// round-2 LOW 2): retried on every `converge`, so a reap-freed slot
     /// re-hooks the bead — never stranded, never silently dropped
@@ -166,7 +163,6 @@ impl Dispatcher {
             config,
             children: HashMap::new(),
             aux: HashMap::new(),
-            failed: HashSet::new(),
             pending_respawns: Vec::new(),
         }
     }
@@ -419,18 +415,20 @@ impl Dispatcher {
     /// spawn: the just-committed session.woke removes the bead from the
     /// dispatchable set, so the ledger is the only bookkeeping. Deferred
     /// patrol respawns (round-2 LOW 2) get first crack at freed slots —
-    /// they represent in-flight work patrol is recovering.
+    /// they represent in-flight work patrol is recovering. Dispatch failures
+    /// suppress re-dispatch through the ledger's `dispatch_failure` marker
+    /// (invariant 3), not an in-memory set — a marked bead leaves
+    /// `dispatchable_beads`, so the loop advances and never hot-loops the
+    /// same failure.
     pub fn converge(&mut self, ledger: &mut Ledger) -> Result<()> {
         self.retry_pending_respawns(ledger)?;
         loop {
             if self.children.len() >= self.config.dispatch.max_workers {
                 return Ok(());
             }
-            let next = ledger
-                .dispatchable_beads()?
-                .into_iter()
-                .find(|b| !self.failed.contains(&b.id));
-            let Some(bead) = next else { return Ok(()) };
+            let Some(bead) = ledger.dispatchable_beads()?.into_iter().next() else {
+                return Ok(());
+            };
             self.dispatch_one(ledger, &bead)?;
         }
     }
@@ -464,7 +462,10 @@ impl Dispatcher {
         if self.children.len() >= self.config.dispatch.max_workers {
             // Queue for retry on the next freed slot. Event ONCE per
             // deferral episode — a retry that is still capped re-queues
-            // silently (no dispatch.failed spam).
+            // silently (no dispatch.failed spam). The reason carries the
+            // shared DEFERRED_DISPATCH_PREFIX (issue #83 review F1): this
+            // is campd's OWN pending retry, so the `stuck` count, `camp
+            // show`'s hint, and `camp retry` all recognize and exclude it.
             if !self.pending_respawns.iter().any(|b| b == bead_id) {
                 self.pending_respawns.push(bead_id.to_owned());
                 ledger.append(EventInput {
@@ -473,15 +474,15 @@ impl Dispatcher {
                     actor: "campd".into(),
                     bead: Some(bead.id.clone()),
                     data: serde_json::json!({
-                        "reason": "patrol respawn deferred: worker cap reached; \
-                                   will retry when a slot frees",
+                        "reason": format!(
+                            "{} worker cap reached; will retry when a slot frees",
+                            camp_core::readiness::DEFERRED_DISPATCH_PREFIX
+                        ),
                     }),
                 })?;
             }
             return Ok(());
         }
-        // a patrol respawn supersedes an earlier same-life dispatch failure
-        self.failed.remove(bead_id);
         self.dispatch_one(ledger, &bead)
     }
 
@@ -492,7 +493,6 @@ impl Dispatcher {
         let prep = match self.prepare(ledger, bead) {
             Ok(prep) => prep,
             Err(reason) => {
-                self.failed.insert(bead.id.clone());
                 ledger.append(EventInput {
                     kind: EventType::DispatchFailed,
                     rig: Some(bead.rig.clone()),
@@ -606,7 +606,6 @@ impl Dispatcher {
             ) {
                 Ok(dir) => Some(dir),
                 Err(e) => {
-                    self.failed.insert(bead.id.clone());
                     ledger.append(EventInput {
                         kind: EventType::DispatchFailed,
                         rig: Some(bead.rig.clone()),
@@ -3642,6 +3641,21 @@ mod tests {
             failed[0].data["reason"].as_str().unwrap().contains("retry"),
             "the deferral must be truthful: {}",
             failed[0].data["reason"]
+        );
+        // issue #83 review F1: the deferral is campd's OWN pending retry —
+        // it must carry the shared prefix and must NOT count as `stuck`
+        // (stuck promises `camp retry` can fix it; here it cannot).
+        assert!(
+            camp_core::readiness::is_deferred_dispatch_failure(
+                failed[0].data["reason"].as_str().unwrap()
+            ),
+            "the deferral reason must carry DEFERRED_DISPATCH_PREFIX: {}",
+            failed[0].data["reason"]
+        );
+        assert_eq!(
+            ledger.status_summary().unwrap().stuck,
+            0,
+            "a cap-deferred bead is never counted stuck"
         );
         // a second attempt while still capped must NOT re-event
         dispatcher.dispatch_bead(&mut ledger, "gc-9").unwrap();
