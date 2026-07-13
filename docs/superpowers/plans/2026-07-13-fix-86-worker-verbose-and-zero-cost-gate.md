@@ -1,5 +1,7 @@
 # Fix #86 (`--verbose` in HeldStream argv) + the $0 real-claude gate — Implementation Plan
 
+> **Plan review: APPROVE, 2026-07-13 (Opus 4.8 plan gate).** Non-blocking notes: N1 spawn.rs co-tenancy with fix-82 (stay in the HeldStream arm; expect a trivial rebase after sibling merges); N2 Makefile compat target may need a one-line rebase; N3 TDD-red is carried by Task 1 plus the gate's permanent negative-control assertion (the gate test itself is green-on-write, honestly labeled); N4 the gate's held_stream_flags is a minimal validation argv, not argv-for-argv parity with build_spec — do not 'fix' it toward parity. No deviations accepted.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task (this stream is planning-only; a fresh implementer session executes). Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Pass `--verbose` unconditionally in campd's `HeldStream` worker argv so dispatch works on any machine (not just one whose `~/.claude/settings.json` sets `"verbose": true`), and stand up the **$0 tier** of the real-`claude` compatibility gate as an opt-in, local-only, no-API-spend target that catches this bug class before a release.
