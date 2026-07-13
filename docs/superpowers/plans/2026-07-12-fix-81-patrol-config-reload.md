@@ -1,5 +1,7 @@
 # Fix #81 — Patrol Config Hot-Reload Implementation Plan
 
+> **Plan review: APPROVE, 2026-07-13 (Opus 4.8 plan gate).** Config-derived field inventory verified exhaustive (config, camp_config, ladder budget — Decision A's live-timer preservation deliberate); the pack-scoped reproduction verified deterministic-RED against the un-wired arm; Decision L confirmed a plan-time deferral (phase-11 plan :86), not a settled spec decision — issue #81 un-defers it, no escalation. Non-blocking notes: N1 the camp-core module header at `crates/camp-core/src/patrol/mod.rs:3-5` carries the same obsolete Decision-L line as the camp-side header — update it in this PR (Task 1 already edits that file; Decision F commits to code/docs non-divergence); N2 the exhausted-branch reload boundary (unit-level only) accepted as flagged. No deviations accepted.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task (a fresh implementer session, per the fix-81 kickoff amendment). Steps use checkbox (`- [ ]`) syntax for tracking. Record the plan-review approval note (date, verdict, non-blocking notes, accepted deviations) at the top of this doc in the first execution commit.
 
 **Goal:** An applied `camp.toml` hot reload must reach the patrol runtime, so a worker dispatched to a freshly added pack/agent is resolved by patrol without a campd restart — killing the spurious `patrol.degraded` "unknown agent" the birth config produces.
