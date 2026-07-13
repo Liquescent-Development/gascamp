@@ -8,4 +8,5 @@
 //! install, and the `trust_exec` inventory. The camp binary half (`camp
 //! import` verbs + the hardened git subprocess) lives in `crates/camp/src/cmd/import.rs`.
 
+pub mod lock;
 pub mod source;
