@@ -60,10 +60,15 @@ if [[ -n "${FAKE_AGENT_RECORD_BRANCH:-}" ]]; then
   git branch --show-current > "$FAKE_AGENT_RECORD_BRANCH"
 fi
 
-"$CAMP_BIN" claim "$CAMP_BEAD" --session "$CAMP_SESSION"
+# cp-0: the camp CLI's human output (e.g. "claimed gc-1") must NOT pollute the
+# worker's stdout file — that file is campd's stream-json tail target (spec
+# §2.3), and real claude --verbose writes ONLY stream-json to it. Redirect
+# the camp CLI's stdout to stderr (campd's stderr, visible in test logs) so
+# the stdout file stays stream-json-clean.
+"$CAMP_BIN" claim "$CAMP_BEAD" --session "$CAMP_SESSION" 1>&2
 
 if [[ -n "${FAKE_AGENT_MILESTONE:-}" ]]; then
-  "$CAMP_BIN" event emit "$FAKE_AGENT_MILESTONE" --bead "$CAMP_BEAD" --session "$CAMP_SESSION"
+  "$CAMP_BIN" event emit "$FAKE_AGENT_MILESTONE" --bead "$CAMP_BEAD" --session "$CAMP_SESSION" 1>&2
 fi
 
 if [[ -n "${FAKE_AGENT_CRASH:-}" ]]; then
@@ -121,7 +126,7 @@ if [[ "${FAKE_AGENT_DELIVERY:-}" = "ship" ]]; then
   ship_commit="$(git rev-parse HEAD)"
   ship_branch="$(git rev-parse --abbrev-ref HEAD)"
   "$CAMP_BIN" close "$CAMP_BEAD" --outcome pass --reason "shipped by fake agent" \
-    --work-outcome shipped --work-commit "$ship_commit" --work-branch "$ship_branch"
+    --work-outcome shipped --work-commit "$ship_commit" --work-branch "$ship_branch" 1>&2
   exit 0
 fi
 if [[ "${FAKE_AGENT_DELIVERY:-}" = "deadend" ]]; then
@@ -135,12 +140,12 @@ if [[ "${FAKE_AGENT_DELIVERY:-}" = "deadend" ]]; then
   git "${GITC[@]}" commit -m "dead-end readme"
   dead_commit="$(git rev-parse HEAD)"
   if "$CAMP_BIN" close "$CAMP_BEAD" --outcome pass --reason "should be rejected" \
-       --work-outcome shipped --work-commit "$dead_commit" --work-branch add-readme; then
+       --work-outcome shipped --work-commit "$dead_commit" --work-branch add-readme 1>&2; then
     echo "fake-agent: THE SHIPPED GATE ACCEPTED A DEAD-END COMMIT" >&2
     exit 96
   fi
   "$CAMP_BIN" close "$CAMP_BEAD" --outcome fail \
-    --reason "no base: the branch cannot land" --work-outcome blocked
+    --reason "no base: the branch cannot land" --work-outcome blocked 1>&2
   exit 0
 fi
 if [[ "${FAKE_AGENT_DELIVERY:-}" = "blocked" ]]; then
@@ -148,7 +153,7 @@ if [[ "${FAKE_AGENT_DELIVERY:-}" = "blocked" ]]; then
   # worktree and bead branch must survive for forensics.
   git "${GITC[@]}" commit --allow-empty -m "half-done work for $CAMP_BEAD"
   "$CAMP_BIN" close "$CAMP_BEAD" --outcome fail \
-    --reason "cannot land: blocked by fake scenario" --work-outcome blocked
+    --reason "cannot land: blocked by fake scenario" --work-outcome blocked 1>&2
   exit 0
 fi
 
@@ -183,4 +188,4 @@ fi
 if [[ -n "$output_json" ]]; then
   close_args+=(--output-json "$output_json")
 fi
-"$CAMP_BIN" "${close_args[@]}"
+"$CAMP_BIN" "${close_args[@]}" 1>&2

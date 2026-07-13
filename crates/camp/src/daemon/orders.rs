@@ -333,14 +333,16 @@ pub fn catch_up_anchor(ledger: &Ledger, now: Timestamp) -> Result<Timestamp, Cor
 }
 
 /// The campd processor: readiness (Phase 7) plus orders (Phase 10) plus
-/// graph execution (Phase 9) plus patrol observation (Phase 11), one pass
-/// per committed event, inside the cursor transaction.
+/// graph execution (Phase 9) plus patrol observation (Phase 11) plus
+/// read-channel session tracking (cp-0), one pass per committed event,
+/// inside the cursor transaction.
 pub struct CampdProcessor<'a> {
     pub readiness: &'a mut ReadinessProcessor,
     pub runtime: &'a mut OrdersRuntime,
     pub clock: &'a dyn Clock,
     pub graph: &'a mut GraphRuntime,
     pub patrol: &'a mut super::patrol::PatrolRuntime,
+    pub read_channel: &'a mut super::read_channel::ReadChannelRuntime,
 }
 
 impl EventProcessor for CampdProcessor<'_> {
@@ -349,6 +351,11 @@ impl EventProcessor for CampdProcessor<'_> {
         //     rows, queues releases, resets stall timers on worker
         //     activity (Decision J). Watches/timers apply after the txn.
         self.patrol.observe(event);
+        // (0b) cp-0 read-channel observation: memory-only — queues
+        //     register (session.woke) / unregister (session.stopped /
+        //     crashed) ops, applied outside the cursor txn by
+        //     `apply_tracking` (the patrol mold).
+        self.read_channel.observe(event);
         // (1) readiness bookkeeping — untouched Phase 7 behavior
         self.readiness.process(conn, event)?;
         // (2) a fire declaration → queue its cook for the settle loop
@@ -439,6 +446,7 @@ pub fn settle(
     clock: &dyn Clock,
     graph: &mut GraphRuntime,
     patrol: &mut super::patrol::PatrolRuntime,
+    read_channel: &mut super::read_channel::ReadChannelRuntime,
 ) -> Result<(), CoreError> {
     loop {
         {
@@ -448,6 +456,7 @@ pub fn settle(
                 clock,
                 graph,
                 patrol,
+                read_channel,
             };
             cursor::catch_up(ledger, &mut processor)?;
         }
@@ -564,9 +573,20 @@ mod tests {
         super::super::patrol::PatrolRuntime::new(patrol_config, &config)
     }
 
+    /// A read-channel runtime for settle threading (cp-0): empty tailed
+    /// set, sessions dir under the camp root.
+    fn test_read_channel(camp_root: &std::path::Path) -> super::super::read_channel::ReadChannelRuntime {
+        super::super::read_channel::ReadChannelRuntime::new(
+            camp_root.join("sessions"),
+            256 * 1024 * 1024,
+        )
+        .unwrap()
+    }
+
     fn settle_all(ledger: &mut Ledger, runtime: &mut OrdersRuntime) {
         let mut readiness = ReadinessProcessor::default();
         let mut graph = graph_for(runtime);
+        let mut read_channel = test_read_channel(&runtime.camp_root);
         settle(
             ledger,
             &mut readiness,
@@ -574,6 +594,7 @@ mod tests {
             &clock(),
             &mut graph,
             &mut test_patrol(),
+            &mut read_channel,
         )
         .unwrap();
     }
@@ -966,6 +987,7 @@ mod tests {
 
         let mut readiness = ReadinessProcessor::default();
         let mut graph = graph_for(&rt);
+        let mut read_channel = test_read_channel(&rt.camp_root);
         let err = settle(
             &mut ledger,
             &mut readiness,
@@ -973,6 +995,7 @@ mod tests {
             &clock(),
             &mut graph,
             &mut test_patrol(),
+            &mut read_channel,
         );
         assert!(err.is_err(), "the infra error must surface");
         // BOTH cooks survive for the next settle (the failing one included)
@@ -983,6 +1006,7 @@ mod tests {
             .unwrap();
         {
             let mut graph = graph_for(&rt);
+            let mut read_channel = test_read_channel(&rt.camp_root);
             settle(
                 &mut ledger,
                 &mut readiness,
@@ -990,6 +1014,7 @@ mod tests {
                 &clock(),
                 &mut graph,
                 &mut test_patrol(),
+                &mut read_channel,
             )
             .unwrap();
         }
@@ -1071,6 +1096,7 @@ mod tests {
         let mut readiness = ReadinessProcessor::default();
         {
             let mut graph = graph_for(&rt);
+            let mut read_channel = test_read_channel(&rt.camp_root);
             settle(
                 &mut ledger,
                 &mut readiness,
@@ -1078,6 +1104,7 @@ mod tests {
                 &clock(),
                 &mut graph,
                 &mut test_patrol(),
+                &mut read_channel,
             )
             .unwrap();
         }
@@ -1092,6 +1119,7 @@ mod tests {
         declare_cron_fires(&mut ledger, &fires).unwrap();
         {
             let mut graph = graph_for(&rt);
+            let mut read_channel = test_read_channel(&rt.camp_root);
             settle(
                 &mut ledger,
                 &mut readiness,
@@ -1099,6 +1127,7 @@ mod tests {
                 &clock(),
                 &mut graph,
                 &mut test_patrol(),
+                &mut read_channel,
             )
             .unwrap();
         }

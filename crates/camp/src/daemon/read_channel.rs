@@ -16,14 +16,45 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::io::{Read as _, Seek as _, SeekFrom};
-use std::path::PathBuf;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context as _, Result};
 use camp_core::event::{Event, EventType};
 use camp_core::ledger::Ledger;
 
 use super::spawn::munge;
+
+/// The per-session byte ceiling on the stream file (§2.3). Generous
+/// default — a stream-json session file grows ~KB/min. Configurability is
+/// deferred to a phase that owns `config.rs` (compat-1 owns it in W1);
+/// phase 0 exposes the cap test-injectably via `max_stream_bytes_from_env`
+/// so a real §8 ceiling integration test with a small cap exercises the
+/// full path.
+pub const MAX_STREAM_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+
+/// cp-0 (note 1): the cap is test-injectable via the `CAMP_MAX_STREAM_BYTES`
+/// env var (a test-only override; production uses `MAX_STREAM_BYTES_DEFAULT`
+/// until `config.rs` gains a `[control]` field in a phase that owns it).
+/// Fail fast: a malformed override is an error, never silently ignored.
+pub fn max_stream_bytes_from_env(default: u64) -> Result<u64> {
+    match std::env::var("CAMP_MAX_STREAM_BYTES") {
+        Ok(raw) => {
+            let n: u64 = raw
+                .parse()
+                .with_context(|| format!("CAMP_MAX_STREAM_BYTES={raw:?} is not a u64"))?;
+            if n == 0 {
+                anyhow::bail!("CAMP_MAX_STREAM_BYTES must be > 0");
+            }
+            Ok(n)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(v)) => {
+            anyhow::bail!("CAMP_MAX_STREAM_BYTES={v:?} is not valid UTF-8");
+        }
+    }
+}
 
 /// The per-session tail state: the in-memory byte offset (persisted to
 /// `stream_cursors` by `drain_all` after each line's ledger effect commits),
@@ -60,8 +91,11 @@ pub struct ReadChannelRuntime {
     parsed_counts: HashMap<String, usize>,
     /// Surfaced parse failures (fail fast — §2.3: an unparsable line is
     /// never silently dropped). Drained into durable events by
-    /// `take_parse_error_events` (wired in Task 5).
+    /// `take_parse_error_events`.
     parse_errors: Vec<ParseError>,
+    /// The notify watcher on `sessions/` (held for liveness; the drain-
+    /// all-on-every-wake rule makes it latency-only — §2.3).
+    watcher: Option<notify::RecommendedWatcher>,
 }
 
 /// A non-JSON line surfaced from a drain (fail fast). The caller turns it
@@ -95,6 +129,7 @@ impl ReadChannelRuntime {
             filter: std::sync::Arc::new(std::sync::Mutex::new(ReadFilter::default())),
             parsed_counts: HashMap::new(),
             parse_errors: Vec::new(),
+            watcher: None,
         })
     }
 
@@ -110,7 +145,12 @@ impl ReadChannelRuntime {
     pub fn observe(&mut self, event: &Event) {
         match event.kind {
             EventType::SessionWoke => {
-                if let Some(name) = event.data["name"].as_str() {
+                // cp-0: tail only campd-spawned workers (actor "campd").
+                // Hook-registered attended sessions (actor "hook:...") have
+                // no stdout file — tailing them would error every wake.
+                if event.actor == "campd"
+                    && let Some(name) = event.data["name"].as_str()
+                {
                     self.track_ops.push(TrackOp::Register(name.to_owned()));
                 }
             }
@@ -203,16 +243,21 @@ impl ReadChannelRuntime {
         let Some(t) = self.tailed.get_mut(session) else {
             return Ok(());
         };
-        // Open-or-reuse the fd at the offset.
+        // Open-or-reuse the fd at the offset. A missing file is NOT a
+        // hard fault: a just-crashed worker's stream file is reaped at the
+        // SIGCHLD reap, and the unregister lands only on the next settle —
+        // so a drain in that window sees the file gone. Skip it; the
+        // unregister will remove the session from the tailed set.
         let file = match t.file.as_mut() {
             Some(f) => f,
-            None => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .open(&t.stdout_path)
-                    .with_context(|| format!("opening {}", t.stdout_path.display()))?;
-                t.file.insert(f)
-            }
+            None => match std::fs::OpenOptions::new().read(true).open(&t.stdout_path) {
+                Ok(f) => t.file.insert(f),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("opening {}", t.stdout_path.display()))
+                }
+            },
         };
         file.seek(SeekFrom::Start(t.offset))
             .with_context(|| format!("seeking {}", t.stdout_path.display()))?;
@@ -289,15 +334,106 @@ impl ReadChannelRuntime {
     pub fn take_parse_errors(&mut self) -> Vec<ParseError> {
         std::mem::take(&mut self.parse_errors)
     }
+
+    /// Hold the notify watcher for liveness (the patrol mold).
+    pub fn set_watcher(&mut self, watcher: notify::RecommendedWatcher) {
+        self.watcher = Some(watcher);
+    }
+
+    /// Drain a stored watcher error into its durable event (the
+    /// patrol::take_watch_error_events mold — a dead watcher is a durable,
+    /// evented fault, never just a stderr line). Reuses `patrol.degraded`;
+    /// the read-channel source is named IN the `error` string
+    /// (`read_channel: ...`) because the `patrol.degraded` schema is
+    /// `deny_unknown_fields` (only `error` + `session`) — a phase that
+    /// wants a dedicated `read_channel.degraded` event can split it later.
+    pub fn take_watch_error_events(&mut self) -> Vec<camp_core::event::EventInput> {
+        let mut out = Vec::new();
+        if let Some(msg) = lock_unpoisoned(&self.filter).error.take() {
+            out.push(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::PatrolDegraded,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "error": format!("read_channel: stream watcher error: {msg}"),
+                }),
+            });
+        }
+        out
+    }
+
+    /// Drain surfaced parse errors into durable events (fail fast — §2.3:
+    /// an unparsable line is never silently dropped). The caller appends
+    /// them to the ledger. Reuses `patrol.degraded` with the session in its
+    /// `session` audit field and the read-channel source named in `error`.
+    pub fn take_parse_error_events(&mut self) -> Vec<camp_core::event::EventInput> {
+        self.take_parse_errors()
+            .into_iter()
+            .map(|pe| camp_core::event::EventInput {
+                kind: camp_core::event::EventType::PatrolDegraded,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": pe.session,
+                    "error": format!(
+                        "read_channel: non-JSON line in stream at offset {}: {}: {}",
+                        pe.offset, pe.error, pe.line
+                    ),
+                }),
+            })
+            .collect()
+    }
+
+    /// The sessions directory the watcher watches (for the mod.rs wiring).
+    pub fn sessions_dir(&self) -> &Path {
+        &self.sessions_dir
+    }
 }
 
 /// A poisoned mutex still yields its data (the patrol mold): the callback
 /// holds the lock only for inserts, and campd must not die over a poisoned
 /// filter.
-fn lock_unpoisoned<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The notify callback body (runs on the watcher's thread — the
+/// patrol::on_watch_event mold): a Rescan, an empty-path event, or any
+/// unrecognized event kind ⇒ set the `rescan` flag (§2.3: rev 2's
+/// `event.paths` iteration discarded the Rescan). Per-path dispatch is
+/// an optimization applied only to well-formed events; phase 0 drains all
+/// on every wake, so the flag is forward-compatible. Always signal — the
+/// drain-all-on-every-wake rule makes the watch a latency-only wake.
+pub fn on_watch_event(
+    result: notify::Result<notify::Event>,
+    sender: Option<&mio::unix::pipe::Sender>,
+    filter: &Mutex<ReadFilter>,
+) {
+    let signal = match result {
+        Ok(event) => {
+            let mut f = lock_unpoisoned(filter);
+            // §2.3: a Rescan (empty paths) or any non-modify kind ⇒ drain all.
+            let well_formed_modify = matches!(
+                event.kind,
+                notify::EventKind::Modify(_) | notify::EventKind::Access(_)
+            );
+            if event.paths.is_empty() || !well_formed_modify {
+                f.rescan = true;
+            }
+            true
+        }
+        Err(e) => {
+            lock_unpoisoned(filter).error = Some(format!("{e}"));
+            true
+        }
+    };
+    if signal && let Some(sender) = sender {
+        let _ = (&*sender).write(&[1]);
     }
 }
 
@@ -506,5 +642,66 @@ mod tests {
         assert!(!rc.take_parse_errors().is_empty(), "the parse error is surfaced");
         // the good line after it is still consumed
         assert_eq!(rc.parsed_lines("t/dev/1"), 1, "the valid line after the bad one is parsed");
+    }
+
+    use mio::unix::pipe;
+
+    /// A well-formed event on a registered path signals the self-pipe.
+    #[test]
+    fn on_watch_event_signals_on_a_registered_path() {
+        let (sender, mut receiver) = pipe::new().unwrap();
+        let rc = ReadChannelRuntime::new(std::env::temp_dir(), 256 * 1024 * 1024).unwrap();
+        let filter = rc.filter_slot();
+        let path = std::env::temp_dir().join("t-dev-1.json");
+        lock_unpoisoned(&filter).registered.insert(path.clone());
+        let mut event = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Any),
+        ));
+        event.paths.push(path);
+        on_watch_event(Ok(event), Some(&sender), &filter);
+        let mut buf = [0u8; 1];
+        assert_eq!(receiver.read(&mut buf).unwrap(), 1, "signaled");
+    }
+
+    /// §2.3 / §8: a Rescan (empty paths) event MUST signal — rev 2's
+    /// `event.paths` iteration discarded it. The drain-all-on-every-wake
+    /// rule covers correctness; this test pins that the callback does not
+    /// drop the event.
+    #[test]
+    fn on_watch_event_signals_on_a_rescan_empty_paths_event() {
+        let (sender, mut receiver) = pipe::new().unwrap();
+        let rc = ReadChannelRuntime::new(std::env::temp_dir(), 256 * 1024 * 1024).unwrap();
+        let filter = rc.filter_slot();
+        // notify's documented inotify-overflow shape: EventKind::Other with
+        // an EMPTY paths vec.
+        let event = notify::Event::new(notify::EventKind::Other);
+        assert!(event.paths.is_empty(), "the Rescan has empty paths");
+        on_watch_event(Ok(event), Some(&sender), &filter);
+        let mut buf = [0u8; 1];
+        assert_eq!(receiver.read(&mut buf).unwrap(), 1, "the Rescan signaled");
+        assert!(lock_unpoisoned(&filter).rescan, "the rescan flag is set");
+    }
+
+    /// A watcher error is stored for its durable event and signals.
+    #[test]
+    fn on_watch_event_stores_a_watcher_error_and_signals() {
+        let (sender, mut receiver) = pipe::new().unwrap();
+        let rc = ReadChannelRuntime::new(std::env::temp_dir(), 256 * 1024 * 1024).unwrap();
+        let filter = rc.filter_slot();
+        on_watch_event(
+            Err(notify::Error::generic("inotify watch limit reached")),
+            Some(&sender),
+            &filter,
+        );
+        let mut buf = [0u8; 1];
+        assert_eq!(receiver.read(&mut buf).unwrap(), 1, "signaled");
+        assert!(
+            lock_unpoisoned(&filter)
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("inotify watch limit reached"),
+            "error stored"
+        );
     }
 }

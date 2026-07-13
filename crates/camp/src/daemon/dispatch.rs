@@ -2665,8 +2665,23 @@ mod tests {
         let cfg = CampConfig::parse("[camp]\nname = \"t\"\n").unwrap();
         let patrol_config = camp_core::patrol::PatrolConfig::from_section(&cfg.patrol).unwrap();
         let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &cfg);
-        super::super::orders::settle(ledger, &mut readiness, rt, &clock, graph, &mut patrol)
-            .unwrap();
+        // cp-0: settle threads a read-channel runtime too (empty here). Its
+        // sessions dir is a throwaway temp dir — no sessions are registered
+        // in the graph tests, and OrdersRuntime.camp_root is private.
+        let read_dir = tempfile::tempdir().unwrap();
+        let mut read_channel =
+            crate::daemon::read_channel::ReadChannelRuntime::new(read_dir.path().to_path_buf(), 256 * 1024 * 1024)
+                .unwrap();
+        super::super::orders::settle(
+            ledger,
+            &mut readiness,
+            rt,
+            &clock,
+            graph,
+            &mut patrol,
+            &mut read_channel,
+        )
+        .unwrap();
     }
 
     fn append_close(l: &mut Ledger, bead: &str, data: serde_json::Value) -> i64 {
