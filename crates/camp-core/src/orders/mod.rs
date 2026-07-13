@@ -805,6 +805,17 @@ mod tests {
         assert!(err.contains("a") && err.contains("b"), "{err}");
     }
 
+    #[test]
+    fn disabled_imported_order_does_not_execute_fire() {
+        // The fire loop only iterates the ACTIVE set. A disabled imported
+        // order is never in it, so execute_fire is unreachable for it —
+        // assert active is empty.
+        let (dir, cfg) = crate::orders::parse::tests::camp_with_imported_order(&[]);
+        let inv = crate::orders::parse::compile_all_orders(&cfg).unwrap();
+        assert!(inv.active.is_empty(), "no active order ⇒ execute_fire never reachable");
+        let _ = dir;
+    }
+
     // ---- execute_fire + reconciliation (Task 10.8; needs Phase 5's cook)
 
     fn camp_fixture() -> (tempfile::TempDir, Ledger, crate::config::CampConfig) {
