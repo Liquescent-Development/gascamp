@@ -400,6 +400,76 @@ fn run_add_materialize(
         }
     }
 
+    // §7.1 import-time visibility: scan the materialized packs' formula routes
+    // for bindings they reference that are NOT yet bound, naming the `--name`
+    // remedy (so the operator learns of a routing hole at import, not dispatch).
+    let bound: std::collections::BTreeSet<&str> = all.iter().map(|i| i.binding.as_str()).collect();
+    let mut unbound_bindings: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for imp in &all {
+        let dir = imports_root.join(&imp.binding);
+        let formulas = dir.join("formulas");
+        if !formulas.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(&formulas)?.flatten() {
+            let path = f.path();
+            if !path.extension().is_some_and(|x| x == "toml") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
+                continue;
+            };
+            let Some(steps) = doc.get("steps").and_then(|s| s.as_array()) else {
+                continue;
+            };
+            for step in steps {
+                let routes = [
+                    step.get("route").and_then(|v| v.as_str()),
+                    step.get("metadata")
+                        .and_then(|m| m.get("gc"))
+                        .and_then(|g| g.get("run_target"))
+                        .and_then(|v| v.as_str()),
+                ];
+                for route in routes {
+                    if let Some((b, _)) = route.unwrap_or("").split_once('.') {
+                        if !bound.contains(b) && b != binding {
+                            unbound_bindings.insert(b.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // §7.3 nested-pack report: a materialized transitive subtree may contain a
+    // nested `pack.toml` camp did not compose (e.g. gascity/roles/). Report each
+    // so the operator imports it explicitly rather than wondering why its agents
+    // do not resolve.
+    let mut nested_packs: Vec<serde_json::Value> = Vec::new();
+    for imp in &all {
+        if imp.via.is_none() {
+            continue;
+        }
+        let dir = imports_root.join(&imp.binding);
+        for nested in find_nested_pack_tomls(&dir)? {
+            let rel = nested
+                .strip_prefix(&dir)
+                .unwrap_or(&nested)
+                .parent()
+                .unwrap_or(std::path::Path::new(""))
+                .display()
+                .to_string();
+            let name = read_manifest(nested.parent().unwrap_or(&dir))
+                .map(|m| m.pack.name)
+                .unwrap_or_default();
+            nested_packs.push(serde_json::json!({ "path": rel, "name": name }));
+        }
+    }
+
     // Ledger events: import.added (aggregated) + one import.refused per key.
     let mut ledger = Ledger::open(&camp_root.join("camp.db")).context("open ledger")?;
     let exec_json: Vec<serde_json::Value> = exec_inventory
@@ -416,7 +486,10 @@ fn run_add_materialize(
             "source": src.repository,
             "commit": commit,
             "ignored_keys": ignored_keys.iter().cloned().collect::<Vec<_>>(),
-            "reported": serde_json::Value::Array(Vec::new()),
+            "reported": serde_json::json!({
+                "unbound_bindings": unbound_bindings.iter().cloned().collect::<Vec<_>>(),
+                "nested_packs": nested_packs,
+            }),
             "exec_inventory": exec_json,
         }),
     })?;
@@ -454,7 +527,50 @@ fn run_add_materialize(
             exec_inventory.len()
         );
     }
+    for b in &unbound_bindings {
+        eprintln!(
+            "warning: formula routes reference binding {b:?}, which is not imported — run \
+             `camp import add <source> --name {b}` to bind it, or routes like {b}.<agent> will \
+             fail at dispatch"
+        );
+    }
+    for np in &nested_packs {
+        eprintln!(
+            "note: nested pack at {} ({}) — camp did not compose it; import it explicitly with \
+             `camp import add <source>//{}/{} --name <binding>`",
+            np["path"], np["name"], binding, np["path"]
+        );
+    }
     Ok(())
+}
+
+/// Recursively find `pack.toml` files under `dir`, EXCLUDING `dir/pack.toml`
+/// itself and any nested `imports/` (a materialized sub-import, not a pack).
+/// Used to report nested packs in a transitive subtree (§7.3).
+fn find_nested_pack_tomls(dir: &Path) -> Result<Vec<PathBuf>, anyhow::Error> {
+    let mut found = Vec::new();
+    fn walk(dir: &Path, root: &Path, found: &mut Vec<PathBuf>) -> Result<(), anyhow::Error> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == "imports" {
+                continue; // a materialized sub-import, not a nested pack
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                if path.join("pack.toml").is_file() {
+                    // a nested pack dir
+                    found.push(path.join("pack.toml"));
+                    // do not descend into the nested pack (its content is its own)
+                    continue;
+                }
+                walk(&path, root, found)?;
+            }
+        }
+        Ok(())
+    }
+    walk(dir, dir, &mut found)?;
+    Ok(found)
 }
 
 /// Append an `[imports.<binding>]` section to camp.toml once (idempotent on
@@ -978,6 +1094,116 @@ mod verb_tests {
         assert!(
             err.to_lowercase().contains("escape") || err.contains("repo"),
             "{err}"
+        );
+    }
+
+    // ---- amendment defects 1, 3, 4 ------------------------------------------
+
+    #[test]
+    fn transitive_pack_shipping_agents_is_refused() {
+        // §7.2: a transitive pack that ships an `agents/` dir is refused —
+        // transitive packs contribute content layers only, not agents.
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                (
+                    "bmad/pack.toml",
+                    "[pack]\nname=\"bmad\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n",
+                ),
+                ("bmad/agents/a/prompt.md", "a"),
+                ("gascity/agents/x/prompt.md", "x"),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            camp.path().join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n",
+        )
+        .unwrap();
+        camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let url = format!("file://{}//bmad", repo.path().display());
+        let err = run_add(camp.path(), &url, Some("bmad"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("agents") && (err.contains("transitive") || err.contains("refused")),
+            "transitive agents/ must be refused loudly: {err}"
+        );
+    }
+
+    #[test]
+    fn add_reports_unbound_route_bindings() {
+        // §7.1: `camp import add` scans the pack's formula routes and reports
+        // any binding they reference that is not yet bound (naming --name).
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                ("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n"),
+                ("bmad/agents/a/prompt.md", "a"),
+                (
+                    "bmad/formulas/run-op.toml",
+                    "formula=\"run-op\"\n[[steps]]\nid=\"s\"\ntitle=\"t\"\nroute=\"gc.run-operator\"\n",
+                ),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            camp.path().join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n",
+        )
+        .unwrap();
+        camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let url = format!("file://{}//bmad", repo.path().display());
+        run_add(camp.path(), &url, Some("bmad"), None).unwrap();
+        let led = camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let added = led
+            .events_of_type(camp_core::event::EventType::ImportAdded)
+            .unwrap();
+        let reported = added[0].data["reported"].to_string();
+        assert!(
+            reported.contains("gc") && reported.contains("unbound"),
+            "import.added must report the unbound gc binding: {reported}"
+        );
+    }
+
+    #[test]
+    fn add_reports_nested_pack_in_transitive_subtree() {
+        // §7.3: a nested pack.toml inside the transitive subtree (e.g.
+        // gascity/roles/) is reported — import it explicitly.
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                (
+                    "bmad/pack.toml",
+                    "[pack]\nname=\"bmad\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n",
+                ),
+                ("bmad/agents/a/prompt.md", "a"),
+                (
+                    "gascity/roles/pack.toml",
+                    "[pack]\nname=\"gc-roles\"\nschema=2\n",
+                ),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            camp.path().join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n",
+        )
+        .unwrap();
+        camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let url = format!("file://{}//bmad", repo.path().display());
+        run_add(camp.path(), &url, Some("bmad"), None).unwrap();
+        let led = camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let added = led
+            .events_of_type(camp_core::event::EventType::ImportAdded)
+            .unwrap();
+        let reported = added[0].data["reported"].to_string();
+        assert!(
+            reported.contains("roles") && reported.contains("gc-roles"),
+            "nested pack roles/ (gc-roles) must be reported: {reported}"
         );
     }
 }
