@@ -2979,4 +2979,83 @@ mod tests {
             "patrol armed at the reloaded agent's stall_after, not the camp default"
         );
     }
+
+    /// #81 structural guard: apply_config must swap EVERY config-derived
+    /// cached field. The reload below differs from the birth config in every
+    /// derived surface — `[patrol]` (→ `self.config`: stall_after,
+    /// release_grace, restart_budget), the pack list (→ `self.camp_config`:
+    /// agent resolution), and the ladder's restart-budget ceiling — and each
+    /// is asserted changed. Whole-struct equality on `config` / `camp_config`
+    /// means a future field added to PatrolConfig or CampConfig but forgotten
+    /// in apply_config turns this test red instead of quietly reviving the
+    /// #81 defect class one field over; the ladder ceiling (private to
+    /// camp-core) is pinned by on_fire behavior.
+    #[test]
+    fn apply_config_swaps_every_config_derived_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("sentrypack");
+        std::fs::create_dir_all(pack.join("agents")).unwrap();
+        std::fs::write(
+            pack.join("agents/sentry.md"),
+            "---\nname: sentry\nisolation: none\n---\nWork.\n",
+        )
+        .unwrap();
+
+        // Birth: no packs; every [patrol] key explicit; restart_budget 0.
+        let birth_toml = "[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"5s\"\n\
+                          release_grace = \"30s\"\nrestart_budget = 0\n";
+        std::fs::write(dir.path().join("camp.toml"), birth_toml).unwrap();
+        let birth = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let birth_patrol = camp_core::patrol::PatrolConfig::from_section(&birth.patrol).unwrap();
+        let mut patrol = PatrolRuntime::new(birth_patrol.clone(), &birth);
+
+        // With the birth budget of 0, "gc-g" would exhaust on its second fire.
+        assert_eq!(patrol.ladder.on_fire("gc-g"), LadderAction::Nudge);
+
+        // Reload: EVERY derived field differs — packs added, all three
+        // [patrol] keys changed.
+        let reloaded_toml = format!(
+            "packs = [\"{}\"]\n\n[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"9s\"\n\
+             release_grace = \"77s\"\nrestart_budget = 3\n",
+            pack.display()
+        );
+        std::fs::write(dir.path().join("camp.toml"), &reloaded_toml).unwrap();
+        let reloaded = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let reloaded_patrol =
+            camp_core::patrol::PatrolConfig::from_section(&reloaded.patrol).unwrap();
+        // Vacuity guard: the fixtures must actually differ everywhere, or the
+        // equality assertions below prove nothing.
+        assert_ne!(birth_patrol, reloaded_patrol);
+        assert_ne!(birth_patrol.stall_after, reloaded_patrol.stall_after);
+        assert_ne!(birth_patrol.release_grace, reloaded_patrol.release_grace);
+        assert_ne!(birth_patrol.restart_budget, reloaded_patrol.restart_budget);
+        assert_ne!(birth, reloaded);
+        assert!(pack::resolve_agent(&birth, "sentry").is_err());
+
+        patrol.apply_config(reloaded.clone()).unwrap();
+
+        // self.config: the whole derived PatrolConfig followed the reload.
+        assert_eq!(
+            patrol.config, reloaded_patrol,
+            "apply_config must swap the entire derived PatrolConfig"
+        );
+        // self.camp_config: the whole CampConfig followed the reload, and the
+        // change is agent-resolution-visible.
+        assert_eq!(
+            patrol.camp_config, reloaded,
+            "apply_config must swap the entire cached CampConfig"
+        );
+        assert!(
+            pack::resolve_agent(&patrol.camp_config, "sentry").is_ok(),
+            "the reloaded pack agent must resolve against patrol's config"
+        );
+        // The ladder ceiling: under the birth budget (0) this second fire
+        // would be Exhausted; the reloaded budget (3) makes it Restart —
+        // and the bead's history was preserved, not reset.
+        assert_eq!(
+            patrol.ladder.on_fire("gc-g"),
+            LadderAction::Restart,
+            "the ladder ceiling must follow the reloaded restart_budget"
+        );
+    }
 }
