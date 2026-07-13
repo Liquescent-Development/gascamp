@@ -9,4 +9,5 @@
 //! import` verbs + the hardened git subprocess) lives in `crates/camp/src/cmd/import.rs`.
 
 pub mod lock;
+pub mod manifest;
 pub mod source;
