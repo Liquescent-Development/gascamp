@@ -402,24 +402,55 @@ pub fn run(
         if let Err(e) = read_channel.drain_all(ledger) {
             eprintln!("campd: read-channel drain failed: {e:#}");
         }
+        // cp-0 (§2.3): a max_stream_bytes breach is a loud session failure —
+        // append the named cause event FIRST (the agent.stalled → kill →
+        // session.crashed mold), then kill the worker. The reap appends
+        // session.crashed with cause_seq pointing at stream_capped, and the
+        // bead re-hooks via the patrol restart path. The kill triggers
+        // SIGCHLD → the next wake reaps.
+        let mut appended_read_channel_events = false;
+        for breach in read_channel.take_cap_breaches() {
+            let (rig, bead) = dispatcher
+                .child_info(&breach.session)
+                .map(|(r, b)| (Some(r), Some(b)))
+                .unwrap_or((None, breach.bead.clone()));
+            let cause_seq = ledger.append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::SessionStreamCapped,
+                rig,
+                actor: "campd".into(),
+                bead: bead.clone(),
+                data: serde_json::json!({
+                    "session": breach.session,
+                    "file": breach.file.to_string_lossy(),
+                    "file_size": breach.file_size,
+                    "cap_bytes": breach.cap_bytes,
+                    "bead": bead,
+                }),
+            })?;
+            dispatcher.kill_worker_with_reason(
+                &breach.session,
+                cause_seq,
+                "stream cap exceeded max_stream_bytes".to_owned(),
+            );
+            appended_read_channel_events = true;
+        }
         // Fail fast (§2.3): watcher errors and non-JSON lines are durable
         // patrol.degraded events, never stderr-only. Appending them is
         // ledger work, so settle this same wake to advance the campd
         // cursor past them (the `wake_ledger_work` local is reassigned at
         // the top of each iteration, so we settle directly here instead).
-        let mut appended_read_channel_errors = false;
         for input in read_channel.take_watch_error_events() {
             ledger.append(input)?;
-            appended_read_channel_errors = true;
+            appended_read_channel_events = true;
         }
         for input in read_channel.take_parse_error_events() {
             ledger.append(input)?;
-            appended_read_channel_errors = true;
+            appended_read_channel_events = true;
         }
-        if appended_read_channel_errors
+        if appended_read_channel_events
             && let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol, read_channel)
         {
-            eprintln!("campd: read-channel error settle failed: {e:#}");
+            eprintln!("campd: read-channel event settle failed: {e:#}");
         }
     }
 }

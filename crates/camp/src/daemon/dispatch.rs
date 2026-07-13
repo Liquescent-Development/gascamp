@@ -65,6 +65,11 @@ struct Worker {
     /// Set when patrol killed this worker: its exit reaps as
     /// session.crashed carrying this cause_seq (the agent.stalled event).
     patrol_kill: Option<Seq>,
+    /// cp-0 (§2.3): a custom kill reason set by `kill_worker_with_reason`
+    /// (e.g. "stream cap exceeded max_stream_bytes"). Overrides the default
+    /// "patrol restart" reason in the reap classification so the ledger
+    /// names the cap (invariant 3: the ledger tells the whole story).
+    kill_reason: Option<String>,
 }
 
 struct AuxChild {
@@ -236,6 +241,28 @@ impl Dispatcher {
         true
     }
 
+    /// cp-0 (§2.3): kill a worker with a custom reason (the max_stream_bytes
+    /// ceiling). The reap appends `session.crashed` carrying this reason
+    /// and `cause_seq` (the `session.stream_capped` event's seq), so the
+    /// ledger names the cap. Otherwise identical to `kill_worker`.
+    pub fn kill_worker_with_reason(
+        &mut self,
+        session: &str,
+        cause_seq: Seq,
+        reason: String,
+    ) -> bool {
+        let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
+            return false;
+        };
+        worker.patrol_kill = Some(cause_seq);
+        worker.kill_reason = Some(reason);
+        worker.stdin = None; // no more turns for a condemned worker
+        if let Err(e) = worker.child.kill() {
+            eprintln!("campd: cap-breach kill of {session}: {e}");
+        }
+        true
+    }
+
     /// The release rule (Decision C2): the bead closed, so drop the held
     /// stdin (EOF) and mark the worker released — its exit reaps as
     /// session.stopped with the reason. Returns the session name when a
@@ -342,6 +369,7 @@ impl Dispatcher {
                 stdin,
                 released: None,
                 patrol_kill: None,
+                kill_reason: None,
             },
         );
         pid
@@ -381,6 +409,7 @@ impl Dispatcher {
                 stdin,
                 released: None,
                 patrol_kill: None,
+                kill_reason: None,
             },
         );
         pid
@@ -727,6 +756,7 @@ impl Dispatcher {
                         stdin,
                         released: None,
                         patrol_kill: None,
+                kill_reason: None,
                     },
                 );
                 Ok(())
@@ -862,7 +892,11 @@ impl Dispatcher {
                     data["reason"] = serde_json::json!(reason);
                     EventType::SessionStopped
                 } else if let Some(cause_seq) = worker.patrol_kill {
-                    data["reason"] = serde_json::json!("patrol restart");
+                    let reason = worker
+                        .kill_reason
+                        .clone()
+                        .unwrap_or_else(|| "patrol restart".to_owned());
+                    data["reason"] = serde_json::json!(reason);
                     data["cause_seq"] = serde_json::json!(cause_seq);
                     EventType::SessionCrashed
                 } else {
@@ -2469,6 +2503,7 @@ mod tests {
                 stdin: None,
                 released: None,
                 patrol_kill: None,
+                kill_reason: None,
             },
         );
 
@@ -2554,6 +2589,7 @@ mod tests {
                 stdin: None,
                 released: None,
                 patrol_kill: None,
+                kill_reason: None,
             },
         );
         {
@@ -3551,6 +3587,7 @@ mod tests {
             stdin,
             released: None,
             patrol_kill: None,
+            kill_reason: None,
         }
     }
 

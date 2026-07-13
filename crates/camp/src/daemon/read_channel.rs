@@ -7,17 +7,10 @@
 //! only after the line's ledger effect commits, so a campd restart resumes
 //! from the exact byte the last life consumed. A `max_stream_bytes` breach
 //! is a loud, evented session failure (§2.3).
-//!
-//! WIP allow: this runtime is built up over Tasks 3-6 and only wired into
-//! the daemon in Task 5 (event_loop/orders/mod.rs) with the cap closed in
-//! Task 6. Until then several items are test-only or forward-declared;
-//! the module-level `dead_code` allow is removed in Task 6 once every
-//! item is reached by the wiring + the cap block.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::{Context as _, Result};
@@ -66,6 +59,11 @@ struct Tailed {
     partial: Vec<u8>,
     /// None until the first drain opens the file; reused thereafter.
     file: Option<std::fs::File>,
+    /// cp-0 §2.3: set after a `max_stream_bytes` breach is surfaced for this
+    /// session, so the kill-in-flight window (breach → SIGCHLD → reap →
+    /// unregister) does not re-surface the breach on every intervening
+    /// wake and append duplicate `session.stream_capped` events.
+    capped: bool,
 }
 
 /// The watch filter (the patrol mold): shared with the notify callback
@@ -93,9 +91,25 @@ pub struct ReadChannelRuntime {
     /// never silently dropped). Drained into durable events by
     /// `take_parse_error_events`.
     parse_errors: Vec<ParseError>,
+    /// cp-0 §2.3: sessions whose stdout file crossed `max_stream_bytes`
+    /// this drain — surfaced by `take_cap_breaches` for the event loop to
+    /// append `session.stream_capped` + kill the worker.
+    cap_breaches: Vec<CapBreach>,
     /// The notify watcher on `sessions/` (held for liveness; the drain-
     /// all-on-every-wake rule makes it latency-only — §2.3).
     watcher: Option<notify::RecommendedWatcher>,
+}
+
+/// cp-0 §2.3: a stream file that crossed `max_stream_bytes` this drain —
+/// the loud session-failure cause. The event loop appends
+/// `session.stream_capped` from a breach, then kills the worker.
+#[derive(Debug, Clone)]
+pub struct CapBreach {
+    pub session: String,
+    pub bead: Option<String>,
+    pub file: PathBuf,
+    pub file_size: u64,
+    pub cap_bytes: u64,
 }
 
 /// A non-JSON line surfaced from a drain (fail fast). The caller turns it
@@ -129,6 +143,7 @@ impl ReadChannelRuntime {
             filter: std::sync::Arc::new(std::sync::Mutex::new(ReadFilter::default())),
             parsed_counts: HashMap::new(),
             parse_errors: Vec::new(),
+            cap_breaches: Vec::new(),
             watcher: None,
         })
     }
@@ -197,6 +212,7 @@ impl ReadChannelRuntime {
                 offset,
                 partial: Vec::new(),
                 file: None,
+                capped: false,
             },
         );
         Ok(())
@@ -213,11 +229,13 @@ impl ReadChannelRuntime {
     }
 
     /// Test observable: the set of tailed session names.
+    #[allow(dead_code)] // test observable (the unit tests in this file)
     pub fn tailed_sessions(&self) -> Vec<String> {
         self.tailed.keys().cloned().collect()
     }
 
     /// Test observable: the in-memory offset for a session.
+    #[allow(dead_code)] // test observable (the unit tests in this file)
     pub fn offset_of(&self, session: &str) -> Option<u64> {
         self.tailed.get(session).map(|t| t.offset)
     }
@@ -320,11 +338,32 @@ impl ReadChannelRuntime {
             // chunk is correct today.
             ledger.set_stream_cursor(session, t.offset)?;
         }
+        // §2.3: max_stream_bytes ceiling — a loud session failure. The
+        // offset has already advanced to EOF (the breach is loud, not a
+        // silent truncation; invariant 5); the event loop appends
+        // session.stream_capped from the breach and kills the worker.
+        let file_size = t
+            .file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if file_size > self.max_stream_bytes && !t.capped {
+            t.capped = true;
+            self.cap_breaches.push(CapBreach {
+                session: session.to_owned(),
+                bead: None, // the event loop fills the bead from the session registry
+                file: t.stdout_path.clone(),
+                file_size,
+                cap_bytes: self.max_stream_bytes,
+            });
+        }
         Ok(())
     }
 
     /// Test observable: complete JSON lines parsed (consumed) for a session
     /// this runtime life.
+    #[allow(dead_code)] // test observable (the unit tests in this file)
     pub fn parsed_lines(&self, session: &str) -> usize {
         self.parsed_counts.get(session).copied().unwrap_or(0)
     }
@@ -333,6 +372,12 @@ impl ReadChannelRuntime {
     /// as durable events in Task 5; phase 0 surfaces them for the test).
     pub fn take_parse_errors(&mut self) -> Vec<ParseError> {
         std::mem::take(&mut self.parse_errors)
+    }
+
+    /// cp-0 §2.3: drain the cap breaches surfaced this drain — the event
+    /// loop appends `session.stream_capped` from each and kills the worker.
+    pub fn take_cap_breaches(&mut self) -> Vec<CapBreach> {
+        std::mem::take(&mut self.cap_breaches)
     }
 
     /// Hold the notify watcher for liveness (the patrol mold).
@@ -384,11 +429,6 @@ impl ReadChannelRuntime {
                 }),
             })
             .collect()
-    }
-
-    /// The sessions directory the watcher watches (for the mod.rs wiring).
-    pub fn sessions_dir(&self) -> &Path {
-        &self.sessions_dir
     }
 }
 
@@ -703,5 +743,32 @@ mod tests {
                 .contains("inotify watch limit reached"),
             "error stored"
         );
+    }
+
+    /// A stream file crossing max_stream_bytes surfaces a cap breach (the
+    /// offset still advances to EOF — the breach is loud, not a silent
+    /// truncation; invariant 5).
+    #[test]
+    fn drain_all_surfaces_a_cap_breach_when_the_file_exceeds_max_stream_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        // A small cap so the test is fast.
+        let cap: u64 = 64;
+        std::fs::write(&stdout, "{\"type\":\"assistant\"}\n").unwrap();
+        // Grow the file past the cap.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&stdout).unwrap();
+        use std::io::Write;
+        file.write_all(&[b' '; 128]).unwrap();
+        drop(file);
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, cap).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        let breaches = rc.take_cap_breaches();
+        assert_eq!(breaches.len(), 1, "one breach surfaced");
+        assert_eq!(breaches[0].session, "t/dev/1");
+        assert!(breaches[0].file_size > cap, "the file exceeded the cap");
     }
 }
