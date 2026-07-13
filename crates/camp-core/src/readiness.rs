@@ -169,17 +169,38 @@ pub fn ready_task_count(conn: &Connection) -> Result<u64, CoreError> {
     count_nonneg(conn, &sql, "ready-task")
 }
 
+/// The reason prefix campd stamps on a `dispatch.failed` that is a worker-cap
+/// DEFERRAL of a patrol respawn (round-2 LOW 2), not a dead dispatch: campd
+/// itself retries it when a slot frees (its pending-respawns queue), so it is
+/// NOT `stuck` (issue #83 review F1) and `camp retry` has nothing to re-arm.
+/// One constant shared by the writer (`Dispatcher::dispatch_bead`), the
+/// `stuck` count, `camp show`'s recovery hint, and `camp retry`'s gate — the
+/// discriminator cannot drift.
+pub const DEFERRED_DISPATCH_PREFIX: &str = "patrol respawn deferred:";
+
+/// True when a `dispatch_failure` reason is the worker-cap deferral above —
+/// campd owns that retry; the operator re-arm path does not apply.
+pub fn is_deferred_dispatch_failure(reason: &str) -> bool {
+    reason.starts_with(DEFERRED_DISPATCH_PREFIX)
+}
+
 /// The number of stuck TASK beads — open plain work whose dispatch failed
 /// and has not been re-armed (`beads.dispatch_failure` set). The status
 /// surface's `stuck` count (issue #83): a bead that is open in the ledger
 /// but unreachable in the runtime until `camp retry` re-arms it. Task-scoped
-/// like the other status counts.
+/// like the other status counts. Worker-cap deferrals are excluded (review
+/// F1): campd retries those itself, so counting them stuck would promise a
+/// `camp retry` that has nothing to do.
 pub fn stuck_task_count(conn: &Connection) -> Result<u64, CoreError> {
     let sql = format!(
         "SELECT count(*) FROM beads b
-         WHERE b.status = 'open' AND {TASK} AND b.dispatch_failure IS NOT NULL"
+         WHERE b.status = 'open' AND {TASK} AND b.dispatch_failure IS NOT NULL
+           AND b.dispatch_failure NOT LIKE ?1"
     );
-    count_nonneg(conn, &sql, "stuck-task")
+    let n: i64 = conn.query_row(&sql, params![format!("{DEFERRED_DISPATCH_PREFIX}%")], |r| {
+        r.get(0)
+    })?;
+    u64::try_from(n).map_err(|_| CoreError::Corrupt(format!("negative stuck-task count {n}")))
 }
 
 /// The number of open TASK beads — the status surface's `open` count (blocked
@@ -585,6 +606,53 @@ mod tests {
             .map(|b| b.id)
             .collect();
         assert_eq!(ids, vec!["gc-1"], "a re-armed bead is dispatchable again");
+    }
+
+    /// Issue #83 review F1: a worker-cap DEFERRAL of a patrol respawn also
+    /// lands as dispatch.failed, but campd itself retries it when a slot
+    /// frees (the pending_respawns queue) — it is not dead, so it must NOT
+    /// be counted `stuck` (that count promises `camp retry` can fix it).
+    #[test]
+    fn a_cap_deferred_dispatch_failure_is_not_counted_stuck() {
+        use super::{DEFERRED_DISPATCH_PREFIX, is_deferred_dispatch_failure};
+        use crate::event::{EventInput, EventType};
+        let (_d, mut l) = ledger();
+        create(&mut l, "gc-1", &[]);
+        create(&mut l, "gc-2", &[]);
+        // gc-1: the cap deferral — campd owns this retry
+        l.append(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "reason": format!(
+                "{DEFERRED_DISPATCH_PREFIX} worker cap reached; will retry when a slot frees"
+            ) }),
+        })
+        .unwrap();
+        assert_eq!(
+            l.status_summary().unwrap().stuck,
+            0,
+            "a cap-deferred bead is campd's own retry, never stuck"
+        );
+        assert!(is_deferred_dispatch_failure(
+            "patrol respawn deferred: worker cap reached; will retry when a slot frees"
+        ));
+        assert!(!is_deferred_dispatch_failure("rig path is not a directory"));
+        // gc-2: a genuinely dead dispatch IS stuck
+        l.append(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-2".into()),
+            data: serde_json::json!({ "reason": "no agent to dispatch to" }),
+        })
+        .unwrap();
+        assert_eq!(
+            l.status_summary().unwrap().stuck,
+            1,
+            "only the dead dispatch counts stuck"
+        );
     }
 
     /// Test obligation (iv), dispatch-lifecycle Phase 1 (#29): a freshly

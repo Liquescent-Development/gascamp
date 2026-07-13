@@ -462,7 +462,10 @@ impl Dispatcher {
         if self.children.len() >= self.config.dispatch.max_workers {
             // Queue for retry on the next freed slot. Event ONCE per
             // deferral episode — a retry that is still capped re-queues
-            // silently (no dispatch.failed spam).
+            // silently (no dispatch.failed spam). The reason carries the
+            // shared DEFERRED_DISPATCH_PREFIX (issue #83 review F1): this
+            // is campd's OWN pending retry, so the `stuck` count, `camp
+            // show`'s hint, and `camp retry` all recognize and exclude it.
             if !self.pending_respawns.iter().any(|b| b == bead_id) {
                 self.pending_respawns.push(bead_id.to_owned());
                 ledger.append(EventInput {
@@ -471,8 +474,10 @@ impl Dispatcher {
                     actor: "campd".into(),
                     bead: Some(bead.id.clone()),
                     data: serde_json::json!({
-                        "reason": "patrol respawn deferred: worker cap reached; \
-                                   will retry when a slot frees",
+                        "reason": format!(
+                            "{} worker cap reached; will retry when a slot frees",
+                            camp_core::readiness::DEFERRED_DISPATCH_PREFIX
+                        ),
                     }),
                 })?;
             }
@@ -3636,6 +3641,21 @@ mod tests {
             failed[0].data["reason"].as_str().unwrap().contains("retry"),
             "the deferral must be truthful: {}",
             failed[0].data["reason"]
+        );
+        // issue #83 review F1: the deferral is campd's OWN pending retry —
+        // it must carry the shared prefix and must NOT count as `stuck`
+        // (stuck promises `camp retry` can fix it; here it cannot).
+        assert!(
+            camp_core::readiness::is_deferred_dispatch_failure(
+                failed[0].data["reason"].as_str().unwrap()
+            ),
+            "the deferral reason must carry DEFERRED_DISPATCH_PREFIX: {}",
+            failed[0].data["reason"]
+        );
+        assert_eq!(
+            ledger.status_summary().unwrap().stuck,
+            0,
+            "a cap-deferred bead is never counted stuck"
         );
         // a second attempt while still capped must NOT re-event
         dispatcher.dispatch_bead(&mut ledger, "gc-9").unwrap();

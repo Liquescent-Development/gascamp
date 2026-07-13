@@ -313,6 +313,43 @@ fn show_prints_the_dispatch_failure_with_the_retry_hint() {
         ));
 }
 
+/// Issue #83 review F1: a worker-cap DEFERRAL of a patrol respawn also lands
+/// as dispatch.failed, but campd retries it itself when a slot frees — the
+/// reason stays visible, and `camp show` must NOT advise `camp retry` (which
+/// would be a silent no-op for an ever-sessioned bead).
+#[test]
+fn show_does_not_advise_retry_for_a_cap_deferred_dispatch() {
+    let dir = camp_with_bead();
+    {
+        let mut ledger =
+            camp_core::ledger::Ledger::open(&dir.path().join(".camp/camp.db")).unwrap();
+        ledger
+            .append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::DispatchFailed,
+                rig: Some("gascity".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "reason": format!(
+                        "{} worker cap reached; will retry when a slot frees",
+                        camp_core::readiness::DEFERRED_DISPATCH_PREFIX
+                    )
+                }),
+            })
+            .unwrap();
+    }
+    use predicates::boolean::PredicateBooleanExt;
+    camp()
+        .current_dir(dir.path())
+        .args(["show", "gc-1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "dispatch-failed  patrol respawn deferred: worker cap reached; will retry when a slot frees",
+        ))
+        .stdout(predicates::str::contains("camp retry").not());
+}
+
 /// An already-closed bead returns immediately (no watch armed).
 #[test]
 fn show_wait_returns_immediately_when_already_closed() {

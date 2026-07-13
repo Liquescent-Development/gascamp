@@ -203,11 +203,16 @@ fn render_human(view: &BeadView) {
     if let Some(df) = &row.dispatch_failure {
         // issue #83: the marker persists across restart and suppresses
         // re-dispatch; `camp retry` is the explicit, evented re-arm path.
+        // A worker-cap DEFERRAL is the exception (review F1): campd retries
+        // that itself when a slot frees — the reason says so, and advising
+        // `camp retry` there would be a lie (it has nothing to re-arm).
         println!("dispatch-failed  {df}");
-        println!(
-            "                 (won't dispatch until re-armed — after fixing the cause, run `camp retry {}`)",
-            row.id
-        );
+        if !camp_core::readiness::is_deferred_dispatch_failure(df) {
+            println!(
+                "                 (won't dispatch until re-armed — after fixing the cause, run `camp retry {}`)",
+                row.id
+            );
+        }
     }
     if !row.labels.is_empty() {
         println!("labels   {}", row.labels.join(", "));

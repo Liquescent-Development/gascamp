@@ -1514,3 +1514,62 @@ fn a_dispatch_failure_survives_a_campd_restart_without_a_silent_retry() {
         "the restart must not silently re-attempt A: {events:#?}"
     );
 }
+
+/// issue #83 review F3 — the loop-termination proof: `camp retry` while the
+/// cause is STILL broken buys exactly one more attempt. The re-arm clears the
+/// marker, converge re-dispatches once, the attempt fails and re-marks the
+/// bead in the same transaction, so the very next dispatchable scan excludes
+/// it again — back to stuck, no runaway dispatch/failure loop, no timer.
+#[test]
+fn a_retry_while_the_cause_persists_fails_once_more_and_returns_to_stuck() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 10, "");
+    std::fs::remove_dir_all(&rig).unwrap();
+
+    let _campd = Daemon::spawn(&root, &[]);
+    let bead = camp_ok(&root, &["sling", "still broken"]).trim().to_owned();
+    wait_until(&root, "the first dispatch failure", |e| {
+        count(e, "dispatch.failed") == 1
+    });
+
+    // retry WITHOUT fixing the cause: the verb succeeds (the re-arm is a
+    // durable fact) and campd attempts exactly ONE more dispatch
+    let retry_out = camp_ok(&root, &["retry", &bead]);
+    assert!(retry_out.contains(&bead), "retry out: {retry_out}");
+    wait_until(&root, "the second dispatch failure", |e| {
+        e.iter()
+            .filter(|ev| ev["type"] == "dispatch.failed" && ev["bead"] == bead.as_str())
+            .count()
+            == 2
+    });
+
+    // back to stuck, not ready — the truth surface recovers too
+    let top = camp_ok(&root, &["top"]);
+    assert!(top.contains("ready: 0"), "top: {top}");
+    assert!(top.contains("stuck: 1"), "top: {top}");
+
+    // positive sync proving no runaway: a second bead's failure is a later
+    // converge scan; the first bead's count is still exactly 2 afterwards.
+    let bead_b = camp_ok(&root, &["sling", "sync"]).trim().to_owned();
+    wait_until(&root, "the sync bead's failure", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "dispatch.failed" && ev["bead"] == bead_b.as_str())
+    });
+    let events = events_json(&root);
+    let a_failures = events
+        .iter()
+        .filter(|e| e["type"] == "dispatch.failed" && e["bead"] == bead.as_str())
+        .count();
+    assert_eq!(
+        a_failures, 2,
+        "one re-arm buys exactly one attempt — no loop: {events:#?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "dispatch.rearmed")
+            .count(),
+        1,
+        "exactly the operator's one re-arm, nothing automatic: {events:#?}"
+    );
+}
