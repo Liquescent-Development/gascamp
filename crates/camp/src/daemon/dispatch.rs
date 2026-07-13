@@ -5,7 +5,7 @@
 //! lands in the ledger (`dispatch.failed`, `session.crashed`), never in a
 //! void: campd has no caller (invariant 5).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
@@ -31,9 +31,6 @@ pub struct Dispatcher {
     /// in the same try_wait sweep; failures land as patrol.degraded, never
     /// as session events.
     aux: HashMap<u32, AuxChild>,
-    /// Beads that failed to dispatch this campd lifetime (plan decision
-    /// F): one dispatch.failed each, retried once per restart (crash-only).
-    failed: HashSet<String>,
     /// Patrol respawns deferred because the worker cap was full (Phase 11,
     /// round-2 LOW 2): retried on every `converge`, so a reap-freed slot
     /// re-hooks the bead — never stranded, never silently dropped
@@ -166,7 +163,6 @@ impl Dispatcher {
             config,
             children: HashMap::new(),
             aux: HashMap::new(),
-            failed: HashSet::new(),
             pending_respawns: Vec::new(),
         }
     }
@@ -419,18 +415,20 @@ impl Dispatcher {
     /// spawn: the just-committed session.woke removes the bead from the
     /// dispatchable set, so the ledger is the only bookkeeping. Deferred
     /// patrol respawns (round-2 LOW 2) get first crack at freed slots —
-    /// they represent in-flight work patrol is recovering.
+    /// they represent in-flight work patrol is recovering. Dispatch failures
+    /// suppress re-dispatch through the ledger's `dispatch_failure` marker
+    /// (invariant 3), not an in-memory set — a marked bead leaves
+    /// `dispatchable_beads`, so the loop advances and never hot-loops the
+    /// same failure.
     pub fn converge(&mut self, ledger: &mut Ledger) -> Result<()> {
         self.retry_pending_respawns(ledger)?;
         loop {
             if self.children.len() >= self.config.dispatch.max_workers {
                 return Ok(());
             }
-            let next = ledger
-                .dispatchable_beads()?
-                .into_iter()
-                .find(|b| !self.failed.contains(&b.id));
-            let Some(bead) = next else { return Ok(()) };
+            let Some(bead) = ledger.dispatchable_beads()?.into_iter().next() else {
+                return Ok(());
+            };
             self.dispatch_one(ledger, &bead)?;
         }
     }
@@ -480,8 +478,6 @@ impl Dispatcher {
             }
             return Ok(());
         }
-        // a patrol respawn supersedes an earlier same-life dispatch failure
-        self.failed.remove(bead_id);
         self.dispatch_one(ledger, &bead)
     }
 
@@ -492,7 +488,6 @@ impl Dispatcher {
         let prep = match self.prepare(ledger, bead) {
             Ok(prep) => prep,
             Err(reason) => {
-                self.failed.insert(bead.id.clone());
                 ledger.append(EventInput {
                     kind: EventType::DispatchFailed,
                     rig: Some(bead.rig.clone()),
@@ -606,7 +601,6 @@ impl Dispatcher {
             ) {
                 Ok(dir) => Some(dir),
                 Err(e) => {
-                    self.failed.insert(bead.id.clone());
                     ledger.append(EventInput {
                         kind: EventType::DispatchFailed,
                         rig: Some(bead.rig.clone()),

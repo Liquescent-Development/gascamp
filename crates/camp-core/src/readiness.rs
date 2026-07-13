@@ -25,12 +25,13 @@ pub struct BeadRow {
     /// what became of the work itself (gc vocabulary, fold-validated).
     pub work_outcome: Option<String>,
     /// Phase 3 (#48 finding 2): a fail-fast dispatch's reason, folded from
-    /// dispatch.failed and cleared by a later session.woke/claim. The
-    /// marker informs the list surface; it never gates dispatchability.
-    /// Retry semantics (assessment finding A): campd's in-memory failed
-    /// set suppresses re-dispatch for its lifetime — fixing the cause is
-    /// not enough; a campd restart retries (once per restart). `camp show`
-    /// states this next to the reason.
+    /// dispatch.failed and cleared by a later session.woke/claim.
+    /// Retry semantics (issue #83): while this is set the bead is excluded
+    /// from `dispatchable_beads` and from the `ready` count, and it persists
+    /// across a campd restart (no silent re-attempt). `camp retry <bead>`
+    /// appends `dispatch.rearmed`, which clears this — the explicit,
+    /// operator-visible re-arm path. `camp show` states this next to the
+    /// reason.
     pub dispatch_failure: Option<String>,
     pub labels: Vec<String>,
     pub created_ts: String,
@@ -125,7 +126,9 @@ pub fn ready_beads(conn: &Connection, rig: Option<&str>) -> Result<Vec<BeadRow>,
 
 /// Beads campd may dispatch a worker for (Phase 8, plan decision C): open,
 /// ready (decision-6 rule), plain work (`type='task'`), not a run root
-/// (roots are finalized by campd, Phase 9), and never dispatched before
+/// (roots are finalized by campd, Phase 9), and never dispatched before,
+/// and not currently dispatch-failed (`dispatch_failure` clear — a failed
+/// dispatch is suppressed until `camp retry` re-arms it, invariant 3/1)
 /// (no sessions row bound — organic crash respawns arrive with retry
 /// budgets, Phase 9). Phase 11's patrol restarts respawn through the
 /// TARGETED `Dispatcher::dispatch_bead`, bounded by the ladder budget —
@@ -134,6 +137,7 @@ pub fn dispatchable_beads(conn: &Connection) -> Result<Vec<BeadRow>, CoreError> 
     let sql = format!(
         "SELECT {BEAD_COLS} FROM beads b
          WHERE b.status = 'open' AND {TASK}
+           AND b.dispatch_failure IS NULL
            AND NOT (b.run_id IS NOT NULL AND b.step_id IS NULL)
            AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.bead = b.id)
            AND NOT EXISTS (
@@ -496,7 +500,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            l.get_bead("gc-1").unwrap().unwrap().dispatch_failure.as_deref(),
+            l.get_bead("gc-1")
+                .unwrap()
+                .unwrap()
+                .dispatch_failure
+                .as_deref(),
             Some("rig path is not a directory")
         );
 
@@ -524,6 +532,42 @@ mod tests {
         })
         .unwrap();
         assert_eq!(l.get_bead("gc-1").unwrap().unwrap().dispatch_failure, None);
+    }
+
+    #[test]
+    fn dispatchable_excludes_a_dispatch_failed_bead_until_rearmed() {
+        use crate::event::{EventInput, EventType};
+        let (_d, mut l) = ledger();
+        create(&mut l, "gc-1", &[]);
+        // a failed dispatch marks the bead — it drops out of the set
+        l.append(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "reason": "no agent to dispatch to" }),
+        })
+        .unwrap();
+        assert!(
+            l.dispatchable_beads().unwrap().is_empty(),
+            "a dispatch-failed bead is not dispatchable"
+        );
+        // re-arming clears the marker and the bead is dispatchable again
+        l.append(EventInput {
+            kind: EventType::DispatchRearmed,
+            rig: Some("gc".into()),
+            actor: "cli".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "previous_reason": "no agent to dispatch to" }),
+        })
+        .unwrap();
+        let ids: Vec<String> = l
+            .dispatchable_beads()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(ids, vec!["gc-1"], "a re-armed bead is dispatchable again");
     }
 
     /// Test obligation (iv), dispatch-lifecycle Phase 1 (#29): a freshly
