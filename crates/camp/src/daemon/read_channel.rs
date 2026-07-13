@@ -16,6 +16,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
@@ -54,6 +55,23 @@ pub struct ReadChannelRuntime {
     /// the patrol `track_ops` mold).
     track_ops: Vec<TrackOp>,
     filter: std::sync::Arc<std::sync::Mutex<ReadFilter>>,
+    /// Complete JSON lines parsed (consumed) per session this runtime life
+    /// — test observable.
+    parsed_counts: HashMap<String, usize>,
+    /// Surfaced parse failures (fail fast — §2.3: an unparsable line is
+    /// never silently dropped). Drained into durable events by
+    /// `take_parse_error_events` (wired in Task 5).
+    parse_errors: Vec<ParseError>,
+}
+
+/// A non-JSON line surfaced from a drain (fail fast). The caller turns it
+/// into a durable `patrol.degraded` event (the read-channel component).
+#[derive(Debug, Clone)]
+pub struct ParseError {
+    pub session: String,
+    pub line: String,
+    pub offset: u64,
+    pub error: String,
 }
 
 #[derive(Debug)]
@@ -75,6 +93,8 @@ impl ReadChannelRuntime {
             tailed: HashMap::new(),
             track_ops: Vec::new(),
             filter: std::sync::Arc::new(std::sync::Mutex::new(ReadFilter::default())),
+            parsed_counts: HashMap::new(),
+            parse_errors: Vec::new(),
         })
     }
 
@@ -160,6 +180,114 @@ impl ReadChannelRuntime {
     /// Test observable: the in-memory offset for a session.
     pub fn offset_of(&self, session: &str) -> Option<u64> {
         self.tailed.get(session).map(|t| t.offset)
+    }
+
+    /// Drain EVERY tailed session's stdout file to EOF (§2.3: "on EVERY
+    /// campd wake — any poll token — campd drains every tailed stream file
+    /// to EOF before going back to sleep"). For each session: open-or-reuse
+    /// the fd, seek to the offset, read to EOF, split complete lines on
+    /// `\n`, buffer the trailing partial line, parse each complete line
+    /// as JSON (validating — phase 1+ acts on control messages; phase 0
+    /// validates only), advance the offset past each complete line, and
+    /// persist the offset. A parse failure is surfaced via
+    /// `take_parse_errors` (fail fast) but does NOT stop the drain.
+    pub fn drain_all(&mut self, ledger: &mut Ledger) -> Result<()> {
+        let sessions: Vec<String> = self.tailed.keys().cloned().collect();
+        for session in sessions {
+            self.drain_one(ledger, &session)?;
+        }
+        Ok(())
+    }
+
+    fn drain_one(&mut self, ledger: &mut Ledger, session: &str) -> Result<()> {
+        let Some(t) = self.tailed.get_mut(session) else {
+            return Ok(());
+        };
+        // Open-or-reuse the fd at the offset.
+        let file = match t.file.as_mut() {
+            Some(f) => f,
+            None => {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&t.stdout_path)
+                    .with_context(|| format!("opening {}", t.stdout_path.display()))?;
+                t.file.insert(f)
+            }
+        };
+        file.seek(SeekFrom::Start(t.offset))
+            .with_context(|| format!("seeking {}", t.stdout_path.display()))?;
+        // The trailing partial from a previous drain is still in the file
+        // at [t.offset..] (the stream file is append-only, never
+        // truncated — §2.3), so re-reading from `t.offset` re-reads it.
+        // Clear the in-memory partial so it is not double-counted; the
+        // bytes are re-read fresh from the file below.
+        t.partial.clear();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("reading {}", t.stdout_path.display()))
+                }
+            };
+            t.partial.extend_from_slice(&buf[..n]);
+            // Split complete lines on `\n`; keep the trailing partial.
+            while let Some(pos) = t.partial.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = t.partial.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
+                let line = line.trim_end_matches('\r');
+                let new_offset = t.offset + line_bytes.len() as u64;
+                if line.trim().is_empty() {
+                    t.offset = new_offset;
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(_v) => {
+                        self.parsed_counts
+                            .entry(session.to_owned())
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
+                    }
+                    Err(e) => {
+                        self.parse_errors.push(ParseError {
+                            session: session.to_owned(),
+                            line: line.to_owned(),
+                            offset: t.offset,
+                            error: format!("{e}"),
+                        });
+                    }
+                }
+                t.offset = new_offset;
+            }
+            // Persist the offset after each read chunk. The offset is at
+            // the last complete line's end; the partial buffer is held in
+            // memory and re-read from `t.offset` on the next drain.
+            //
+            // cp-0 phase-1+ obligation: once consumed lines become
+            // `permission.pending` events with their own ledger effect,
+            // this persist must move to AFTER that effect's transaction
+            // commits (persist-after-event-commit), not after each read
+            // chunk — so a crash between parse and persist re-reads
+            // (dedup by request_id) rather than silently skipping. Phase 0
+            // has no per-line ledger effect, so persisting after the drain
+            // chunk is correct today.
+            ledger.set_stream_cursor(session, t.offset)?;
+        }
+        Ok(())
+    }
+
+    /// Test observable: complete JSON lines parsed (consumed) for a session
+    /// this runtime life.
+    pub fn parsed_lines(&self, session: &str) -> usize {
+        self.parsed_counts.get(session).copied().unwrap_or(0)
+    }
+
+    /// Drain the surfaced parse errors (fail fast — the caller appends them
+    /// as durable events in Task 5; phase 0 surfaces them for the test).
+    pub fn take_parse_errors(&mut self) -> Vec<ParseError> {
+        std::mem::take(&mut self.parse_errors)
     }
 }
 
@@ -250,5 +378,133 @@ mod tests {
         let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
         rc.register(&mut ledger, "t/dev/1").unwrap();
         assert_eq!(rc.offset_of("t/dev/1"), Some(8192), "resumed from the persisted offset");
+    }
+
+    /// drain_all reads to EOF from offset 0 and persists the offset at the
+    /// file size. Two complete lines => offset advances past both.
+    #[test]
+    fn drain_all_reads_complete_lines_and_persists_the_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        std::fs::write(
+            &stdout,
+            "{\"type\":\"assistant\",\"text\":\"hi\"}\n{\"type\":\"result\",\"text\":\"ok\"}\n",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir.clone(), 256 * 1024 * 1024).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        let file_len = std::fs::metadata(&stdout).unwrap().len();
+        assert_eq!(rc.offset_of("t/dev/1"), Some(file_len), "offset at EOF");
+        assert_eq!(ledger.stream_cursor("t/dev/1").unwrap(), file_len, "persisted");
+        assert_eq!(rc.parsed_lines("t/dev/1"), 2, "two complete lines consumed");
+    }
+
+    /// A trailing partial line is buffered, NOT parsed, and the offset
+    /// stays at the last complete line's end (§2.3: a notify event can land
+    /// mid-line; a partial JSON line is never parsed). The next drain
+    /// completes it.
+    #[test]
+    fn drain_all_buffers_a_trailing_partial_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        let complete = b"{\"type\":\"assistant\"}\n";
+        let partial = b"{\"type\":\"result\",\"text\":\"op";
+        std::fs::write(&stdout, [complete.as_ref(), partial.as_ref()].concat()).unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir.clone(), 256 * 1024 * 1024).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        let offset = rc.offset_of("t/dev/1").unwrap();
+        assert_eq!(offset, complete.len() as u64, "offset at the last complete line end");
+        assert_eq!(rc.parsed_lines("t/dev/1"), 1, "the partial line was NOT parsed");
+        // Append the rest of the line + a newline.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&stdout).unwrap();
+        use std::io::Write;
+        file.write_all(b"en\"}\n").unwrap();
+        drop(file);
+        rc.drain_all(&mut ledger).unwrap();
+        assert_eq!(rc.parsed_lines("t/dev/1"), 2, "the completed line is now parsed");
+        let file_len = std::fs::metadata(&stdout).unwrap().len();
+        assert_eq!(rc.offset_of("t/dev/1"), Some(file_len), "offset at EOF after completion");
+    }
+
+    /// A second drain with no new data is a no-op (idempotent): the offset
+    /// does not move, no line is re-parsed.
+    #[test]
+    fn drain_all_with_no_new_data_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        std::fs::write(&stdout, "{\"type\":\"assistant\"}\n").unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        let offset = rc.offset_of("t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        assert_eq!(rc.offset_of("t/dev/1"), Some(offset), "no movement");
+        assert_eq!(rc.parsed_lines("t/dev/1"), 1, "no re-parse");
+    }
+
+    /// drain_all resumes from the persisted offset after a restart: a fresh
+    /// runtime, register loads the prior offset, drain reads ONLY the new
+    /// bytes (no loss, no duplication) (§8 append-only-cursors).
+    #[test]
+    fn drain_all_resumes_from_the_persisted_offset_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        std::fs::write(&stdout, "{\"type\":\"a\"}\n{\"type\":\"b\"}\n").unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        // First life: drain both lines, persist the offset.
+        let mut rc1 = ReadChannelRuntime::new(sessions_dir.clone(), 256 * 1024 * 1024).unwrap();
+        rc1.register(&mut ledger, "t/dev/1").unwrap();
+        rc1.drain_all(&mut ledger).unwrap();
+        let persisted = ledger.stream_cursor("t/dev/1").unwrap();
+        assert_eq!(rc1.parsed_lines("t/dev/1"), 2);
+        // Append a third line after the "crash".
+        let mut file = std::fs::OpenOptions::new().append(true).open(&stdout).unwrap();
+        use std::io::Write;
+        file.write_all(b"{\"type\":\"c\"}\n").unwrap();
+        drop(file);
+        // Second life: fresh runtime, register loads the persisted offset.
+        let mut rc2 = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        rc2.register(&mut ledger, "t/dev/1").unwrap();
+        assert_eq!(rc2.offset_of("t/dev/1"), Some(persisted), "resumed from persisted");
+        rc2.drain_all(&mut ledger).unwrap();
+        assert_eq!(rc2.parsed_lines("t/dev/1"), 1, "only the NEW line — no duplication");
+        let file_len = std::fs::metadata(&stdout).unwrap().len();
+        assert_eq!(rc2.offset_of("t/dev/1"), Some(file_len), "no loss — offset at EOF");
+    }
+
+    /// A non-JSON line surfaces as a durable error event (fail fast, §2.3:
+    /// an unparsable line is never silently dropped). The drain CONTINUES
+    /// past it (the offset advances); the error is collected for the
+    /// caller to append. This test asserts the offset advances AND the
+    /// error is captured (the ledger append is wired in Task 5).
+    #[test]
+    fn drain_all_surfaces_a_non_json_line_as_an_error_and_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        std::fs::write(&stdout, "not json at all\n{\"type\":\"ok\"}\n").unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        let file_len = std::fs::metadata(&stdout).unwrap().len();
+        assert_eq!(rc.offset_of("t/dev/1"), Some(file_len), "the bad line's offset advances");
+        assert!(!rc.take_parse_errors().is_empty(), "the parse error is surfaced");
+        // the good line after it is still consumed
+        assert_eq!(rc.parsed_lines("t/dev/1"), 1, "the valid line after the bad one is parsed");
     }
 }
