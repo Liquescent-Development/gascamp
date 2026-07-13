@@ -387,6 +387,16 @@ enum OrderCommand {
         /// Order name from camp.toml
         name: String,
     },
+    /// Arm an imported order (add it to [orders] enabled)
+    Enable {
+        /// The imported order name (<binding>.<stem>)
+        name: String,
+    },
+    /// Disarm an imported order (remove it from [orders] enabled)
+    Disable {
+        /// The imported order name (<binding>.<stem>)
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -672,6 +682,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             match command {
                 OrderCommand::Ls { json } => cmd::order::ls(&camp, json),
                 OrderCommand::Run { name } => cmd::order::run_order(&camp, &name),
+                OrderCommand::Enable { name } => cmd::order::enable_order(&camp.root, &name),
+                OrderCommand::Disable { name } => cmd::order::disable_order(&camp.root, &name),
             }
         }
         Command::Import { command } => {
