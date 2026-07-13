@@ -73,6 +73,32 @@ claude 2.1.205 (pinned at 2.1.201; Phase 11 re-probed at 2.1.204). Verdicts:
 fix landed in this PR; F6 out of scope). No pinned fact drifted beyond the F3
 computation refinement above.
 
+### #86 config-contamination and the $0 gate (2026-07-13)
+
+The Phase 15 e2e re-verification above ran on a machine whose
+`~/.claude/settings.json` set `"verbose": true`. That silently satisfied the
+CLI's hard requirement that `--print` + `--output-format stream-json` be
+accompanied by `--verbose` (`verbose` resolves flag → settings → false). So
+**F5's "HOLDS" for the HeldStream argv was not portable**: on any machine
+without that setting, the pre-fix argv is rejected at argv validation (exit 1,
+`Error: When using --print, --output-format=stream-json requires --verbose`)
+before any worker contract runs. Filed and fixed as #86 — camp now passes
+`--verbose` unconditionally in the HeldStream argv, so the operator's setting
+no longer participates.
+
+**Re-validation:** the argv-acceptance portion of F5 is now re-validated
+portably by the **$0 real-`claude` compatibility gate** (`make compat`,
+control-plane design §8), which spawns the real CLI under a **fresh
+`CLAUDE_CONFIG_DIR`** (so `verbose` defaults to false) and asserts the fixed
+argv is accepted, the pre-fix argv is rejected (#86 reproduced), the
+`initialize` handshake round-trips, and a pre-turn `interrupt` is acknowledged
+— all at $0, no auth. The task-delivery portion of F5 and F7's capability
+pinning (`--model`/`--permission-mode`/`--allowedTools` behavior over a real
+turn) still ride the paid `make e2e` tier; those runs are no longer
+argv-contaminated now that camp passes `--verbose` explicitly, but re-running
+`make e2e` with `verbose` unset to confirm the turn-level facts remains a
+follow-up, deferred out of this stream's scope.
+
 ### Key probe evidence (dispatch)
 
 D1 — envelope shape and success exit (cwd = scratch rig-a):

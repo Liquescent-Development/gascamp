@@ -10,7 +10,7 @@
 PREFIX ?= $(HOME)/.local
 BINDIR := $(PREFIX)/bin
 
-.PHONY: install uninstall perf e2e service-e2e container-smoke
+.PHONY: install uninstall perf e2e compat service-e2e container-smoke
 
 # Build the release binary and install `camp` into $(BINDIR), plus the
 # `campd` symlink that argv0 dispatch uses to run the daemon (main.rs keys
@@ -40,6 +40,17 @@ perf:
 # comparable to `make perf`; single-threaded isolates the measurements.
 e2e:
 	CAMP_E2E=1 cargo test --release -p camp --test e2e -- --ignored --nocapture --test-threads=1
+
+# Opt-in $0 real-`claude` compatibility gate (control-plane design §8 "the $0
+# tier"). LOCAL-ONLY: CI never runs it (the test is #[ignore]d AND gated on
+# CAMP_COMPAT=1). Unlike `make e2e`, it spends NO API money and needs NO auth —
+# every assertion is pre-turn (argv acceptance, the `initialize` handshake, a
+# pre-turn `interrupt`), run under a fresh throwaway CLAUDE_CONFIG_DIR. It PINS
+# the tested claude version (ci/claude-compat/CLAUDE_VERSION) and fails loudly
+# on a mismatch. Requires a `claude` binary on PATH at the pinned version.
+# Single-threaded: it spawns a real worker and speaks the control protocol.
+compat:
+	CAMP_COMPAT=1 cargo test -p camp --test claude_compat -- --ignored --nocapture --test-threads=1
 
 # Opt-in `camp service` lifecycle against the HOST's REAL service manager
 # (design §9). LOCAL-ONLY: it installs, starts, restarts, stops and removes a
