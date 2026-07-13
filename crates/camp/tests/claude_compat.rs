@@ -73,7 +73,8 @@ fn pinned_version_file_is_present_and_shaped() {
     );
     // Shape: dotted numeric, e.g. 2.1.207.
     assert!(
-        pin.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+        pin.split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
         "pin must be a dotted numeric version: {pin:?}"
     );
 }
@@ -280,13 +281,18 @@ fn claude_compat_zero_cost() {
             stderr.contains("requires --verbose"),
             "PRE-FIX argv must fail with the #86 error; stderr was: {stderr:?}"
         );
-        eprintln!("[compat] negative control OK: pre-fix argv rejected ({})", stderr.trim());
+        eprintln!(
+            "[compat] negative control OK: pre-fix argv rejected ({})",
+            stderr.trim()
+        );
     }
 
     // (2)+(3) FIXED argv: accepted, initialize round-trips, interrupt acked.
     {
         let (mut cmd, _cfg) = claude_command(&claude, &held_stream_flags(SESSION_ID, true));
-        let mut worker = Worker { child: cmd.spawn().unwrap() };
+        let mut worker = Worker {
+            child: cmd.spawn().unwrap(),
+        };
         let rx = stdout_lines(&mut worker.child);
 
         // initialize handshake (the SDK sends this first).
