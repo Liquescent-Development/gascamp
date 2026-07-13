@@ -1387,3 +1387,130 @@ fn a_single_sling_dispatches_exactly_once_across_subsequent_wakes() {
         "no third spawn of any kind"
     );
 }
+
+/// issue #83: a failed dispatch is recoverable. The rig directory is missing
+/// at dispatch time, so dispatch fails; `camp top` stops calling the bead
+/// `ready` and names it `stuck`; `camp show` points at `camp retry`; after
+/// the cause is fixed, `camp retry` re-dispatches the SAME bead (id and
+/// history intact) — never a close + re-sling. Fully evented.
+#[test]
+fn a_failed_dispatch_is_recoverable_with_camp_retry_keeping_the_bead_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 10, "");
+    // break the cause: remove the rig directory so prepare() fails is_dir
+    std::fs::remove_dir_all(&rig).unwrap();
+
+    let _campd = Daemon::spawn(&root, &[]);
+    let bead = camp_ok(&root, &["sling", "recover me"]).trim().to_owned();
+    wait_until(&root, "the dispatch failure", |e| {
+        count(e, "dispatch.failed") == 1
+    });
+
+    // camp top: not counted ready; counted stuck
+    let top = camp_ok(&root, &["top"]);
+    assert!(top.contains("ready: 0"), "top: {top}");
+    assert!(top.contains("stuck: 1"), "top: {top}");
+
+    // camp show: the reason and the recovery verb
+    let show = camp_ok(&root, &["show", &bead]);
+    assert!(show.contains("dispatch-failed"), "show: {show}");
+    assert!(
+        show.contains(&format!("camp retry {bead}")),
+        "show must name the recovery verb: {show}"
+    );
+
+    // fix the cause, then re-arm the EXISTING bead
+    std::fs::create_dir_all(&rig).unwrap();
+    let retry_out = camp_ok(&root, &["retry", &bead]);
+    assert!(retry_out.contains(&bead), "retry out: {retry_out}");
+
+    // it re-dispatches: a session.woke names the same bead
+    wait_until(&root, "the re-dispatch", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "session.woke" && ev["data"]["bead"] == bead.as_str())
+    });
+
+    // ...and the recovered work runs to completion: the SAME bead closes.
+    // The close-fields assertion below sits BEHIND this wait_until on
+    // purpose — asserting them without waiting would race the worker.
+    wait_until(&root, "the recovered close", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "bead.closed" && ev["bead"] == bead.as_str())
+    });
+
+    let events = events_json(&root);
+    // exactly one re-arm, keyed to the bead
+    let rearms: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "dispatch.rearmed" && e["bead"] == bead.as_str())
+        .collect();
+    assert_eq!(rearms.len(), 1, "one dispatch.rearmed: {events:#?}");
+    assert!(
+        rearms[0]["data"]["previous_reason"]
+            .as_str()
+            .unwrap()
+            .contains("directory"),
+        "the re-arm records the prior reason: {}",
+        rearms[0]["data"]["previous_reason"]
+    );
+    // recovery kept the SAME bead — exactly one bead.created (the original
+    // sling), re-dispatched by id above; the bead.closed here is the
+    // recovered work completing (pass), the end-to-end proof.
+    assert_eq!(
+        count(&events, "bead.created"),
+        1,
+        "recovery must not re-sling under a new id: {events:#?}"
+    );
+    let closed = events
+        .iter()
+        .find(|e| e["type"] == "bead.closed" && e["bead"] == bead.as_str())
+        .expect("the recovered close was waited for above");
+    assert_eq!(
+        closed["data"]["outcome"], "pass",
+        "the recovered work completes pass: {closed:#?}"
+    );
+}
+
+/// issue #83: the failed state is ledger-durable — a campd RESTART no longer
+/// silently re-attempts the bead (the old in-memory failed set was rebuilt
+/// empty on restart). Proven deterministically: bead A fails; after a restart
+/// a second bead B is created and also fails (a positive sync that campd has
+/// converged at least once) — and A's dispatch.failed count is still exactly
+/// one, so the restart did not re-attempt A.
+#[test]
+fn a_dispatch_failure_survives_a_campd_restart_without_a_silent_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 10, "");
+    std::fs::remove_dir_all(&rig).unwrap();
+
+    let bead_a = {
+        let _campd = Daemon::spawn(&root, &[]);
+        let a = camp_ok(&root, &["sling", "bead A"]).trim().to_owned();
+        wait_until(&root, "A's dispatch failure", |e| {
+            e.iter()
+                .any(|ev| ev["type"] == "dispatch.failed" && ev["bead"] == a.as_str())
+        });
+        a
+        // _campd dropped here: campd is killed and reaped (restart)
+    };
+
+    let _campd2 = Daemon::spawn(&root, &[]);
+    // positive sync: create B (rig still missing), wait for ITS failure —
+    // guarantees campd2 has run a converge that scanned the dispatchable set.
+    let bead_b = camp_ok(&root, &["sling", "bead B"]).trim().to_owned();
+    wait_until(&root, "B's dispatch failure", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "dispatch.failed" && ev["bead"] == bead_b.as_str())
+    });
+
+    // A was NOT silently re-attempted across the restart.
+    let events = events_json(&root);
+    let a_failures = events
+        .iter()
+        .filter(|e| e["type"] == "dispatch.failed" && e["bead"] == bead_a.as_str())
+        .count();
+    assert_eq!(
+        a_failures, 1,
+        "the restart must not silently re-attempt A: {events:#?}"
+    );
+}

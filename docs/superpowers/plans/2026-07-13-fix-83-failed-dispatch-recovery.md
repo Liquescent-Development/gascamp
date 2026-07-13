@@ -1,6 +1,10 @@
 # Failed-Dispatch Recovery (issue #83) Implementation Plan
 
 > **Plan review: APPROVE, 2026-07-13 (Opus 4.8 plan gate).** One-transaction loop-termination argument, restart inversion, camp-specific vocab partition, and the fix-82 boundary (dispatch.rs:615 reason wrap untouched) all verified against code. Non-blocking notes: N1 Task 5 Step 7's git-add lists crates/camp/src/cmd/mod.rs which does not exist — drop that path from the add line (submodules are declared in main.rs, as the plan's own prose says); N2 refold_prop's generator never emits dispatch.rearmed, so the new fold arm has no property-level coverage — determinism is by construction and the focused idempotency test covers it, acceptable as planned; N3 the top-level HashSet import likely goes unused after deleting the failed set (known_pids uses the fully-qualified form) — the clippy gate catches it as the plan defers. No deviations accepted.
+>
+> **Deviation accepted 2026-07-13 by the plan reviewer:** two pre-existing daemon_lifecycle.rs `ready==1` assertions encoded the pre-#83 behavior and are updated+strengthened to ready/open/stuck triples; Task 4 Step 7's "unaffected" claim was wrong. No production-code change.
+>
+> **Second deviation accepted 2026-07-13 by the plan reviewer:** Task 6 Step 1's bead.closed==0 assertion contradicted the fake-agent contract and rewarded a failed retry; replaced with bead.created==1 plus a wait-for-close assertion of outcome==pass on the same bead. No production-code change.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task (this work stream runs planning and execution as separate sessions — a fresh implementer session executes this doc on branch `fix-83-failed-dispatch-recovery` after the plan gate's APPROVE). Steps use checkbox (`- [ ]`) syntax for tracking. Strict TDD: write the failing test, run it, watch it fail, implement, watch it pass, commit.
 
