@@ -78,3 +78,18 @@ jobs:
           fi
       - name: vocabulary cross-check
         run: ci/gc-compat/check_vocab.sh gascity-src "$GITHUB_WORKSPACE"
+
+  gcpacks-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: read pinned gascity-packs ref
+        id: gcpacks-ref
+        run: echo "ref=$(cat ci/gc-compat/GCPACKS_REF)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: gastownhall/gascity-packs
+          ref: ${{ steps.gcpacks-ref.outputs.ref }}
+          path: gcpacks-src
+      - name: phase-1 corpus-load gate (pack/agent/transitive)
+        run: python3 ci/gc-compat/load_corpus_packs.py gcpacks-src
