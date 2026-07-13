@@ -245,22 +245,32 @@ impl Dispatcher {
     /// ceiling). The reap appends `session.crashed` carrying this reason
     /// and `cause_seq` (the `session.stream_capped` event's seq), so the
     /// ledger names the cap. Otherwise identical to `kill_worker`.
+    ///
+    /// Returns `Ok(false)` when NO live child holds that session (an adopted
+    /// worker from a previous campd life, or one already reaped) — the
+    /// caller MUST handle that: a `session.stream_capped` with no kill
+    /// behind it is a campd action with no ledger consequence (invariant 3).
+    ///
+    /// review fix 3: a failing `child.kill()` is now PROPAGATED, not
+    /// swallowed into an `eprintln!` that then returned `true` — stderr is
+    /// neither the caller nor the ledger (invariant 5).
     pub fn kill_worker_with_reason(
         &mut self,
         session: &str,
         cause_seq: Seq,
         reason: String,
-    ) -> bool {
+    ) -> Result<bool> {
         let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
-            return false;
+            return Ok(false);
         };
         worker.patrol_kill = Some(cause_seq);
         worker.kill_reason = Some(reason);
         worker.stdin = None; // no more turns for a condemned worker
-        if let Err(e) = worker.child.kill() {
-            eprintln!("campd: cap-breach kill of {session}: {e}");
-        }
-        true
+        worker
+            .child
+            .kill()
+            .with_context(|| format!("cap-breach kill of {session}"))?;
+        Ok(true)
     }
 
     /// The release rule (Decision C2): the bead closed, so drop the held
@@ -3845,10 +3855,20 @@ mod tests {
         dispatcher.children.insert(pid, worker);
 
         let reason = "patrol restart: stream cap exceeded max_stream_bytes".to_owned();
-        assert!(dispatcher.kill_worker_with_reason("t/dev/1", 57, reason.clone()));
         assert!(
-            !dispatcher.kill_worker_with_reason("ghost", 57, reason),
-            "unknown session"
+            dispatcher
+                .kill_worker_with_reason("t/dev/1", 57, reason.clone())
+                .unwrap(),
+            "a live worker is killed"
+        );
+        // review fix 3: an unknown session returns Ok(false) — the kill was
+        // NOT delivered. The event loop must act on this (durable fault
+        // event + unregister), never discard it.
+        assert!(
+            !dispatcher
+                .kill_worker_with_reason("ghost", 57, reason)
+                .unwrap(),
+            "no live worker for the session => Ok(false), the kill was not delivered"
         );
         // SIGKILL lands; wait for the exit so try_wait sees it.
         loop {

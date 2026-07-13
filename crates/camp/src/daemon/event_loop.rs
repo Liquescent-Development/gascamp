@@ -411,9 +411,15 @@ pub fn run(
         // The `apply_tracking` here is the safety net for the no-settle-
         // ran case (settle already applied this wake's ops when it ran);
         // idempotent via `mem::take`-drained `track_ops`.
-        if let Err(e) = read_channel.apply_tracking(ledger) {
-            eprintln!("campd: read-channel apply_tracking failed: {e:#}");
-        }
+        // review fix 7: `apply_tracking` does LEDGER work (register loads the
+        // persisted cursor; the deferred unregister clears it). Fix 8's
+        // non-fatal carve-out was for per-session FILE I/O (open/seek/read/
+        // stat) ONLY — never for ledger writes. Dropping a failed cursor
+        // write to stderr leaves campd re-reading from a stale offset on
+        // every restart while looking healthy (invariant 5: stderr is
+        // neither the caller nor the ledger). Fail fast — this matches the
+        // `apply_tracking(ledger)?` in `settle`.
+        read_channel.apply_tracking(ledger)?;
         // cp-0 fix 8: drain_all is non-fatal — drain_one captures per-
         // session errors into the drain_errors collector (campd keeps
         // draining the other tailed sessions and stays up; a `?` here would
@@ -448,11 +454,44 @@ pub fn run(
                     "bead": bead,
                 }),
             })?;
-            dispatcher.kill_worker_with_reason(
+            // review fix 3: the return value is CHECKED. `false` means no
+            // live child holds that session (an adopted worker from a
+            // previous campd life, or one already reaped): the SIGKILL never
+            // lands, so there is no SIGCHLD, no reap, no `session.crashed`,
+            // no `cause_seq`, and no bead re-hook. Discarding it left the
+            // bead stranded behind a `session.stream_capped` that had no
+            // effect — and because the session is now `capped` (a hard stop)
+            // the breach would never re-surface. A campd action must always
+            // have a ledger consequence (invariant 3) and a failure must be
+            // durable, never silent (invariant 5).
+            let killed = dispatcher.kill_worker_with_reason(
                 &breach.session,
                 cause_seq,
                 "patrol restart: stream cap exceeded max_stream_bytes".to_owned(),
-            );
+            )?;
+            if !killed {
+                ledger.append(camp_core::event::EventInput {
+                    kind: camp_core::event::EventType::PatrolDegraded,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: bead.clone(),
+                    data: serde_json::json!({
+                        "session": breach.session,
+                        "error": format!(
+                            "read_channel: stream cap exceeded max_stream_bytes \
+                             ({} bytes > cap {}) but the kill could not be delivered: \
+                             no live worker holds this session (adopted from a previous \
+                             campd life, or already reaped). The session is no longer \
+                             tailed.",
+                            breach.file_size, breach.cap_bytes
+                        ),
+                    }),
+                })?;
+                // Stop tailing it: a capped session is a hard stop, so
+                // leaving it registered would tail a file campd refuses to
+                // read, forever.
+                read_channel.queue_unregister(&breach.session);
+            }
             appended_read_channel_events = true;
         }
         // Fail fast (§2.3): watcher errors, non-JSON lines, and drain
@@ -493,9 +532,20 @@ pub fn run(
         // drain; phase 1+: the permission.pending event's txn). A cap-
         // killed session is `crashed`, so live_sessions() won't re-tail it
         // on restart and the cap (file-size-based) re-detects if needed.
-        if let Err(e) = read_channel.persist_offsets(ledger) {
-            eprintln!("campd: read-channel persist_offsets failed: {e:#}");
-        }
+        // review fix 7: `persist_offsets` is a LEDGER write (set_stream_cursor)
+        // — fatal, not eprintln-only. A persistently failing cursor write
+        // (disk full, corrupt DB) would otherwise leave campd re-reading from
+        // a stale offset on every restart while reporting itself healthy.
+        read_channel.persist_offsets(ledger)?;
+        // review fix 1 (CRITICAL): ONLY NOW dispose the reaped sessions. By
+        // this point their stream files have been drained to EOF by the
+        // `drain_all` above (they were still in `tailed` for it), their
+        // final lines have become durable parse/drain fault events, and
+        // their cursors are persisted. Unregistering earlier — which is what
+        // `apply_tracking` used to do inside `settle`, before this whole
+        // block — unlinked the file first and deleted the worker's last
+        // output unread.
+        read_channel.apply_pending_unregisters(ledger)?;
     }
 }
 

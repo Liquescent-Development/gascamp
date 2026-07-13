@@ -56,13 +56,24 @@ pub fn max_stream_bytes_from_env(default: u64) -> Result<u64> {
 struct Tailed {
     stdout_path: PathBuf,
     offset: u64,
+    /// review fix 9: the offset last written to `stream_cursors`. The
+    /// UPSERT is skipped when `offset == persisted_offset` (a quiescent
+    /// tailed session costs ZERO ledger writes per wake — the drain block
+    /// runs on every wake, so an unconditional UPSERT was N SQLite writes
+    /// per wake with N workers).
+    persisted_offset: u64,
     partial: Vec<u8>,
     /// None until the first drain opens the file; reused thereafter.
     file: Option<std::fs::File>,
-    /// cp-0 §2.3: set after a `max_stream_bytes` breach is surfaced for this
-    /// session, so the kill-in-flight window (breach → SIGCHLD → reap →
-    /// unregister) does not re-surface the breach on every intervening
-    /// wake and append duplicate `session.stream_capped` events.
+    /// cp-0 §2.3: a `max_stream_bytes` breach was surfaced for this session.
+    /// review fix 2: this is a HARD STOP, not an event-dedupe flag — a
+    /// capped session is not read AT ALL until it is unregistered. The
+    /// original code gated the two OOM guards on `!capped`, which DISABLED
+    /// them on the exact path they exist for: once capped, the pre-read
+    /// guard fell through to the read loop and the in-loop guard let
+    /// `partial` extend without bound, so a re-drained capped session read
+    /// its whole over-cap file into memory. Refusing to read is both the
+    /// RSS bound and the breach-dedupe.
     capped: bool,
 }
 
@@ -83,6 +94,20 @@ pub struct ReadChannelRuntime {
     /// Queued register/unregister ops (applied outside the cursor txn —
     /// the patrol `track_ops` mold).
     track_ops: Vec<TrackOp>,
+    /// review fix 1 (CRITICAL): sessions whose unregister is DEFERRED until
+    /// after this wake's final drain. `apply_tracking` used to execute the
+    /// Unregister immediately — and it runs inside `settle`, which runs
+    /// BEFORE the event loop's drain block. So a reaped session was dropped
+    /// from `tailed` and its stream file unlinked while the drain block
+    /// still had to run: every byte the worker wrote between the last drain
+    /// and its exit was deleted UNREAD. That voids §2.3's "drained to EOF on
+    /// EVERY wake … never lost" at the exact moment it matters most — the
+    /// session's LAST output (in phase 1 those final bytes carry the
+    /// terminal `result`, the `control_response` to an interrupt, and any
+    /// late `can_use_tool`). The session now stays in `tailed` through the
+    /// drain and is disposed only by `apply_pending_unregisters`, which the
+    /// event loop calls as the LAST step of the drain block.
+    pending_unregisters: Vec<String>,
     filter: std::sync::Arc<std::sync::Mutex<ReadFilter>>,
     /// Complete JSON lines parsed (consumed) per session this runtime life
     /// — test observable.
@@ -156,6 +181,7 @@ impl ReadChannelRuntime {
             max_stream_bytes,
             tailed: HashMap::new(),
             track_ops: Vec::new(),
+            pending_unregisters: Vec::new(),
             filter: std::sync::Arc::new(std::sync::Mutex::new(ReadFilter::default())),
             parsed_counts: HashMap::new(),
             parse_errors: Vec::new(),
@@ -200,15 +226,50 @@ impl ReadChannelRuntime {
     /// by `mem::take`, so a second call after a settle that already applied
     /// the same ops is a no-op (the deliberate safety net for the
     /// no-settle-ran case — see the event_loop wiring).
+    ///
+    /// review fix 1 (CRITICAL): a Register is applied NOW (so a session
+    /// woken by this settle is drained on this same wake — no lag), but an
+    /// Unregister is only QUEUED. Executing it here would drop the session
+    /// from `tailed` and unlink its stream file BEFORE the event loop's
+    /// drain block runs, destroying the worker's final output unread. The
+    /// event loop calls `apply_pending_unregisters` as the LAST step of the
+    /// drain block, so a reaped session is drained to EOF one final time
+    /// (its last bytes become durable ledger events) and only then disposed.
     pub fn apply_tracking(&mut self, ledger: &mut Ledger) -> Result<()> {
         let ops = std::mem::take(&mut self.track_ops);
         for op in ops {
             match op {
                 TrackOp::Register(name) => self.register(ledger, &name)?,
-                TrackOp::Unregister(name) => self.unregister(ledger, &name)?,
+                TrackOp::Unregister(name) => self.pending_unregisters.push(name),
             }
         }
         Ok(())
+    }
+
+    /// review fix 1: execute the deferred unregisters — called by the event
+    /// loop as the LAST step of the drain block, AFTER `drain_all` has read
+    /// each reaped session's stream file to EOF, after its parse/drain fault
+    /// events are appended, and after `persist_offsets`. Only here is the
+    /// session dropped from `tailed` and its stream file disposed.
+    ///
+    /// Idempotent: the queue is drained by `mem::take`, and `unregister` is
+    /// a no-op for a session that is no longer tailed.
+    pub fn apply_pending_unregisters(&mut self, ledger: &mut Ledger) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending_unregisters);
+        for session in pending {
+            self.unregister(ledger, &session)?;
+        }
+        Ok(())
+    }
+
+    /// review fix 3: queue a session for disposal from outside the observe
+    /// path — used when a cap-breach kill could NOT be delivered (no live
+    /// child for that session, e.g. an adopted worker from a previous campd
+    /// life, or one already reaped). Such a session must stop being tailed;
+    /// otherwise it sits capped forever with a `session.stream_capped`
+    /// event that had no effect.
+    pub fn queue_unregister(&mut self, session: &str) {
+        self.pending_unregisters.push(session.to_owned());
     }
 
     /// Register a session for tailing: derive its stdout path, load the
@@ -229,6 +290,9 @@ impl ReadChannelRuntime {
             Tailed {
                 stdout_path,
                 offset,
+                // review fix 9: the loaded offset IS the persisted one, so a
+                // session that never advances costs zero cursor writes.
+                persisted_offset: offset,
                 partial: Vec::new(),
                 file: None,
                 capped: false,
@@ -298,6 +362,18 @@ impl ReadChannelRuntime {
         let Some(t) = self.tailed.get_mut(session) else {
             return Ok(());
         };
+        // review fix 2: a capped session is a HARD STOP — do not read it at
+        // all (not even open it) until it is unregistered. The `capped` flag
+        // used to gate the two OOM guards below (`&& !t.capped`), which
+        // inverted their meaning: once a breach set the flag, the pre-read
+        // guard stopped firing and the in-loop guard stopped bounding
+        // `partial`, so the very next drain of a capped session read its
+        // entire over-cap file into memory — the unbounded read the guards
+        // exist to prevent. Refusing to read IS the RSS bound, and it also
+        // dedupes the breach (no duplicate `session.stream_capped`).
+        if t.capped {
+            return Ok(());
+        }
         // Open-or-reuse the fd. A missing file is NOT a hard fault (the
         // reap-race window: a just-crashed worker's stream file is unlinked
         // before the unregister lands) — skip it. Any other open error is
@@ -339,7 +415,9 @@ impl ReadChannelRuntime {
                 return Ok(());
             }
         };
-        if file_size > self.max_stream_bytes && !t.capped {
+        // review fix 2: NO `&& !t.capped` here — a capped session already
+        // returned above. The guard is unconditional.
+        if file_size > self.max_stream_bytes {
             t.capped = true;
             self.cap_breaches.push(CapBreach {
                 session: session.to_owned(),
@@ -376,7 +454,11 @@ impl ReadChannelRuntime {
             // (A partial buffer only holds an incomplete line; if adding
             // the new chunk crosses the cap, the line is over-cap → a loud
             // breach is correct.)
-            if (t.partial.len() + n) as u64 > self.max_stream_bytes && !t.capped {
+            // review fix 2: NO `&& !t.capped` here either — this is the
+            // guard that keeps `partial` bounded, and gating it on the flag
+            // is what let a capped session accumulate a whole over-cap
+            // newline-less blob into memory.
+            if (t.partial.len() + n) as u64 > self.max_stream_bytes {
                 t.capped = true;
                 self.cap_breaches.push(CapBreach {
                     session: session.to_owned(),
@@ -428,9 +510,17 @@ impl ReadChannelRuntime {
     /// transaction; phase 0: the drain). A crash between read and persist
     /// re-reads from the last persisted offset (no loss, no silent dup —
     /// the ledger dedupes by request_id in phase 1+).
+    /// review fix 9: only sessions whose offset actually MOVED are written.
+    /// The drain block runs on EVERY wake, so an unconditional UPSERT cost
+    /// one SQLite write per tailed session per wake (N writes/wake with N
+    /// workers) even when nothing was read.
     pub fn persist_offsets(&mut self, ledger: &mut Ledger) -> Result<()> {
-        for (session, t) in &self.tailed {
+        for (session, t) in &mut self.tailed {
+            if t.offset == t.persisted_offset {
+                continue; // nothing was consumed — no cursor write
+            }
             ledger.set_stream_cursor(session, t.offset)?;
+            t.persisted_offset = t.offset;
         }
         Ok(())
     }
@@ -628,9 +718,12 @@ mod tests {
         assert_eq!(rc.offset_of("t/dev/1"), Some(0), "new session => offset 0");
     }
 
-    /// A stopped/crashed session unregisters and clears the offset row.
+    /// A stopped/crashed session unregisters and clears the offset row —
+    /// but only once the DEFERRED unregister is applied (review fix 1).
+    /// `apply_tracking` merely queues it, so the event loop's drain block
+    /// still sees the session tailed and reads its final bytes.
     #[test]
-    fn observe_stopped_then_apply_unregisters_and_clears_the_offset() {
+    fn observe_stopped_then_apply_defers_the_unregister_until_after_the_drain() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join("sessions");
         let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
@@ -645,11 +738,131 @@ mod tests {
         let stopped = ledger.events_range(2, None).unwrap().pop().unwrap();
         rc.observe(&stopped);
         rc.apply_tracking(&mut ledger).unwrap();
+        // review fix 1: STILL TAILED — the drain block has not run yet, and
+        // dropping it here would delete the worker's final output unread.
+        assert_eq!(
+            rc.tailed_sessions(),
+            vec!["t/dev/1".to_string()],
+            "the unregister is DEFERRED — the session is still tailed for the final drain"
+        );
+        // The event loop applies it as the LAST step of the drain block.
+        rc.apply_pending_unregisters(&mut ledger).unwrap();
         assert!(rc.tailed_sessions().is_empty(), "unregistered");
         assert_eq!(
             ledger.stream_cursor("t/dev/1").unwrap(),
             0,
             "offset row cleared"
+        );
+    }
+
+    /// review fix 1 (CRITICAL), the unit-level proof: a worker's FINAL bytes
+    /// — written after the reap event was observed but before disposal —
+    /// are drained. The reap-ordering the event loop implements is:
+    ///   observe(stopped) → apply_tracking (defers) → drain_all (reads the
+    ///   final bytes) → persist_offsets → apply_pending_unregisters (disposes)
+    /// Executing the unregister inside `apply_tracking` (the original code)
+    /// unlinked the file before `drain_all` ever saw it.
+    #[test]
+    fn a_reaped_sessions_final_bytes_are_drained_before_the_file_is_disposed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        std::fs::write(&stdout, "{\"type\":\"assistant\"}\n").unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        ledger.append(woke_input("t/dev/1", "gc-1")).unwrap();
+        let woke = ledger.events_range(1, None).unwrap().pop().unwrap();
+        rc.observe(&woke);
+        rc.apply_tracking(&mut ledger).unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        assert_eq!(rc.parsed_lines("t/dev/1"), 1, "the first line is consumed");
+        // The worker writes its LAST line and exits. campd reaps it: the
+        // session.stopped is observed and tracking applied — all before the
+        // event loop's drain block runs.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stdout)
+            .unwrap()
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n")
+            .unwrap();
+        ledger.append(stopped_input("t/dev/1")).unwrap();
+        let stopped = ledger.events_range(2, None).unwrap().pop().unwrap();
+        rc.observe(&stopped);
+        rc.apply_tracking(&mut ledger).unwrap();
+        // The drain block: the final line MUST still be readable here.
+        rc.drain_all(&mut ledger).unwrap();
+        assert_eq!(
+            rc.parsed_lines("t/dev/1"),
+            2,
+            "the worker's FINAL line was drained before disposal — not deleted unread"
+        );
+        rc.persist_offsets(&mut ledger).unwrap();
+        rc.apply_pending_unregisters(&mut ledger).unwrap();
+        assert!(
+            !stdout.exists(),
+            "and only THEN is the stream file disposed"
+        );
+        assert!(rc.tailed_sessions().is_empty());
+    }
+
+    /// review fix 2: a capped session is a HARD STOP — a second drain does
+    /// NOT read the over-cap file (the guards used to be gated on
+    /// `!capped`, so once capped they stopped firing and the next drain
+    /// read the whole over-cap file into `partial` — unbounded RSS).
+    #[test]
+    fn a_capped_session_is_not_read_again_and_partial_stays_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        let cap: u64 = 128;
+        // A newline-less blob far over the cap.
+        std::fs::write(&stdout, vec![b'x'; 64 * 1024]).unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, cap).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        assert_eq!(rc.take_cap_breaches().len(), 1, "the breach is surfaced");
+        // The kill-in-flight window: campd wakes again before the reap lands.
+        rc.drain_all(&mut ledger).unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        assert!(
+            rc.take_cap_breaches().is_empty(),
+            "no duplicate breach events"
+        );
+        let partial_len = rc.tailed.get("t/dev/1").map(|t| t.partial.len()).unwrap();
+        assert_eq!(
+            partial_len, 0,
+            "a capped session is never read again — partial stays empty (RSS-bounded)"
+        );
+    }
+
+    /// review fix 9: a quiescent tailed session costs ZERO cursor writes.
+    /// `persist_offsets` used to UPSERT every tailed session on every wake.
+    #[test]
+    fn persist_offsets_skips_sessions_whose_offset_did_not_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        std::fs::write(&stdout, "{\"type\":\"a\"}\n").unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        rc.persist_offsets(&mut ledger).unwrap();
+        let persisted = ledger.stream_cursor("t/dev/1").unwrap();
+        assert!(persisted > 0, "the consumed line was persisted");
+        // Corrupt the row behind the runtime's back: a second persist with an
+        // unmoved offset must NOT rewrite it (proving no write happened).
+        ledger.set_stream_cursor("t/dev/1", 999_999).unwrap();
+        rc.drain_all(&mut ledger).unwrap(); // no new bytes — offset unmoved
+        rc.persist_offsets(&mut ledger).unwrap();
+        assert_eq!(
+            ledger.stream_cursor("t/dev/1").unwrap(),
+            999_999,
+            "no cursor write for a session whose offset did not move"
         );
     }
 
@@ -982,14 +1195,20 @@ mod tests {
         );
     }
 
-    /// cp-0 fix 9 (OOM-before-cap): a single newline-less line larger than
-    /// the cap surfaces a CapBreach WITHOUT reading the whole line into
-    /// `partial` — `partial` never exceeds the cap (RSS-bounded). The
-    /// pre-read check (file_size > cap) breaches before any read; the
-    /// in-loop check (before-extend) covers a file that grows past the cap
-    /// during a drain (concurrent worker writes).
+    /// cp-0 fix 9 (OOM-before-cap), PRE-READ half: a file already over the
+    /// cap breaches WITHOUT reading a byte — `partial` stays 0.
+    ///
+    /// review fix 6: this test is NAMED for the in-loop guard but only ever
+    /// exercised the pre-read one — it writes a static 500-byte file against
+    /// a 200-byte cap, so the pre-read check fires and `drain_one` returns
+    /// before the read loop runs. `partial` is 0, making `partial <= cap`
+    /// trivially true; deleting the in-loop guard left it green. The in-loop
+    /// guard is now driven by its own test below (it is UNREACHABLE for a
+    /// static file: the pre-read check compares the absolute file size, so
+    /// any file with more than `cap` bytes past the offset breaches before
+    /// the read loop — only a file that GROWS mid-drain reaches it).
     #[test]
-    fn drain_all_surfaces_a_cap_breach_for_a_huge_newlineless_line_without_unbounded_partial() {
+    fn drain_all_pre_read_cap_breach_does_not_read_the_over_cap_file_at_all() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
@@ -1003,13 +1222,79 @@ mod tests {
         rc.drain_all(&mut ledger).unwrap();
         let breaches = rc.take_cap_breaches();
         assert_eq!(breaches.len(), 1, "the huge line breached the cap");
-        // partial never exceeds the cap — the pre-read check breached
-        // before reading a single byte (partial stays 0).
+        // The pre-read check breached before reading a single byte.
         let partial_len = rc.tailed.get("t/dev/1").map(|t| t.partial.len()).unwrap();
-        assert!(
-            partial_len as u64 <= cap,
-            "partial ({partial_len}) never exceeds the cap ({cap}) — RSS-bounded"
+        assert_eq!(
+            partial_len, 0,
+            "the pre-read guard breached WITHOUT reading — partial is untouched"
         );
+    }
+
+    /// cp-0 fix 9 (OOM-before-cap), IN-LOOP half — review fix 6.
+    ///
+    /// The in-loop guard bounds `partial` when the file GROWS DURING the
+    /// drain: the pre-read stat saw a size under the cap, so the read loop
+    /// runs, and a concurrent worker keeps appending newline-less bytes past
+    /// the cap while we read. Without the before-extend check, `partial`
+    /// absorbs the whole over-cap blob (unbounded RSS — the exact OOM fix 9
+    /// exists to prevent).
+    ///
+    /// Reaching this guard REQUIRES concurrency (see the pre-read test's
+    /// note), so the scenario is retried until the race lands the drain in
+    /// the read loop — proven by `partial > 0`, which a pre-read breach can
+    /// never produce. Delete the in-loop guard and this test fails: `partial`
+    /// grows to the whole multi-MiB file, blowing the `<= cap` bound.
+    #[test]
+    fn drain_all_in_loop_guard_bounds_partial_when_the_file_grows_during_the_drain() {
+        const CAP: u64 = 1 << 20; // 1 MiB
+        for attempt in 0..25 {
+            let dir = tempfile::tempdir().unwrap();
+            let sessions_dir = dir.path().join("sessions");
+            std::fs::create_dir_all(&sessions_dir).unwrap();
+            let stdout = sessions_dir.join("t-dev-1.json");
+            // Start UNDER the cap so the pre-read stat lets the read loop run.
+            std::fs::write(&stdout, vec![b'x'; (CAP as usize) - 4096]).unwrap();
+            let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+            let mut rc = ReadChannelRuntime::new(sessions_dir, CAP).unwrap();
+            rc.register(&mut ledger, "t/dev/1").unwrap();
+            // A "worker" appending newline-less bytes far past the cap while
+            // the drain reads.
+            let path = stdout.clone();
+            let writer = std::thread::spawn(move || {
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                for _ in 0..512 {
+                    if f.write_all(&[b'y'; 8192]).is_err() {
+                        return;
+                    }
+                }
+            });
+            rc.drain_all(&mut ledger).unwrap();
+            writer.join().unwrap();
+            let partial_len = rc.tailed.get("t/dev/1").map(|t| t.partial.len()).unwrap();
+            if partial_len == 0 {
+                // The writer won the race and pushed the file over the cap
+                // before the stat: the PRE-read guard breached instead. Not
+                // the path under test — retry.
+                continue;
+            }
+            // The read loop ran (partial > 0) — so the in-loop guard is the
+            // only thing standing between `partial` and the whole file.
+            assert!(
+                partial_len as u64 <= CAP,
+                "attempt {attempt}: the in-loop guard did not bound partial: \
+                 partial={partial_len} exceeds cap={CAP} (unbounded read — OOM)"
+            );
+            assert_eq!(
+                rc.take_cap_breaches().len(),
+                1,
+                "attempt {attempt}: the in-loop guard breached loudly"
+            );
+            return; // the in-loop path was exercised and held
+        }
+        panic!("the in-loop cap guard was never exercised in 25 attempts");
     }
 
     /// cp-0 fix 10 (reap-time stream-file disposal): unregister best-effort
