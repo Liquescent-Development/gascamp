@@ -307,7 +307,7 @@ impl ReadChannelRuntime {
             // The final drain FOUND unread bytes: this wake's `drain_all` did
             // not cover this session. The bytes are saved (just read above);
             // the ordering bug that hid them is now on the record.
-            let mut note = format!(
+            let note = format!(
                 "read_channel: ORDERING VIOLATION: session {session} still had unread \
                  stdout bytes when it was disposed — this wake's drain_all did not cover \
                  it (offset {} -> {}). The bytes were drained at disposal, so nothing was \
@@ -316,22 +316,49 @@ impl ReadChannelRuntime {
                 before.unwrap_or(0),
                 after.unwrap_or(0),
             );
-            // That late drain can itself breach the cap. The worker is already
-            // terminal, so there is nothing left to kill — but the breach is
-            // never silently dropped.
-            for b in std::mem::take(&mut self.cap_breaches) {
-                note.push_str(&format!(
-                    "; the late drain also found the stream over max_stream_bytes \
-                     ({} bytes > cap {})",
-                    b.file_size, b.cap_bytes
-                ));
-            }
             ledger.append(camp_core::event::EventInput {
                 kind: camp_core::event::EventType::PatrolDegraded,
                 rig: None,
                 actor: "campd".into(),
                 bead: None,
                 data: serde_json::json!({ "session": session, "error": note }),
+            })?;
+            appended = true;
+        }
+        // Review finding 1: the disposal-time drains above can surface faults —
+        // and every one of them must be consumed BEFORE the sessions are
+        // disposed below. These flushes therefore sit OUTSIDE the per-session
+        // loop, so they cover every exit path through it, not just the
+        // offset-advanced one.
+        //
+        // The cap-breach flush in particular used to live inside the
+        // `before != after` branch, which stranded a breach raised by the
+        // PRE-READ guard: that guard returns without reading, so the offset
+        // does NOT advance, the loop `continue`s, and the CapBreach it pushed
+        // was left sitting in the collector while `unregister` disposed the
+        // session — contradicting the very comment promising it is never
+        // dropped. Hoisting it here closes that hole for good.
+        //
+        // A breach found at disposal cannot be acted on the usual way: the
+        // session is already terminal, so there is no worker left to kill and
+        // no bead to re-hook. It is recorded and nothing more — but it IS
+        // recorded (invariant 5).
+        for b in std::mem::take(&mut self.cap_breaches) {
+            ledger.append(camp_core::event::EventInput {
+                kind: camp_core::event::EventType::PatrolDegraded,
+                rig: None,
+                actor: "campd".into(),
+                bead: b.bead.clone(),
+                data: serde_json::json!({
+                    "session": b.session,
+                    "error": format!(
+                        "read_channel: the disposal-time drain found the stream over \
+                         max_stream_bytes ({} bytes > cap {}) — the session is already \
+                         terminal, so there is no worker left to kill; the breach is \
+                         recorded, never silently dropped",
+                        b.file_size, b.cap_bytes
+                    ),
+                }),
             })?;
             appended = true;
         }
@@ -519,6 +546,29 @@ impl ReadChannelRuntime {
         };
         // review fix 2: NO `&& !t.capped` here — a capped session already
         // returned above. The guard is unconditional.
+        //
+        // DELIBERATE: the cap is on CUMULATIVE ON-DISK FILE SIZE, not on the
+        // unread backlog (`file_size - t.offset`). This is not an oversight —
+        // it is what the spec asks for. §2.3 bounds "the stream file", which is
+        // append-only until reap and never rotated or truncated (rotating it
+        // would silently lose every later line — that is the whole reason rev 2
+        // was thrown out), and §9 calls `max_stream_bytes` the "event history
+        // bound". So a worker's LIFETIME output is capped independently of how
+        // much campd has consumed: a healthy, fully-drained, long-lived worker
+        // is still cap-killed once its cumulative stdout crosses the ceiling.
+        //
+        // The visible consequence, stated plainly: after a campd restart,
+        // `register` reloads the persisted offset and the next drain re-stats
+        // the file — so an over-cap file re-detects and the REATTACHED worker
+        // is killed, even though campd has read every byte of it.
+        //
+        // A backlog bound (`file_size.saturating_sub(t.offset)`) would track
+        // campd's actual RSS risk more closely, but it is NOT what the spec
+        // says, and it would let an append-only file grow without limit on
+        // disk as long as campd kept up — which is the disk-exhaustion class
+        // (#64) the ceiling exists to close. Changing this is a SPEC question,
+        // not a local judgement call. At the 256 MiB default it is ~months of
+        // stream-json for one session, so the operational reach is remote.
         if file_size > self.max_stream_bytes {
             t.capped = true;
             self.cap_breaches.push(CapBreach {
@@ -963,6 +1013,56 @@ mod tests {
         // Disposed, as intended.
         assert!(!stdout.exists(), "the stream file is disposed");
         assert!(rc.tailed_sessions().is_empty());
+    }
+
+    /// Review finding 1: a cap breach raised by the PRE-READ guard during the
+    /// disposal-time drain must not be stranded.
+    ///
+    /// The pre-read guard returns WITHOUT reading, so the offset does not
+    /// advance — the ordering-violation branch is skipped (`before == after`).
+    /// When the cap-breach flush lived inside that branch, the `CapBreach` it
+    /// pushed was left sitting in the collector while `unregister` disposed the
+    /// session: silently dropped on an idle campd, exactly what the comment
+    /// promised could not happen. The flush now sits outside the loop.
+    ///
+    /// Put the flush back inside the `before != after` branch and this test
+    /// fails: no event is appended and the breach is still in the collector.
+    #[test]
+    fn a_cap_breach_found_at_disposal_is_recorded_not_stranded() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        let cap: u64 = 128;
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, cap).unwrap();
+        // Registered but never drained, so `capped` is still false — the
+        // disposal-time drain is the FIRST read, and it hits the pre-read
+        // guard. (No complete lines, so the offset cannot advance either.)
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        std::fs::write(&stdout, vec![b'x'; 64 * 1024]).unwrap();
+        rc.queue_unregister("t/dev/1");
+        let appended = rc.apply_pending_unregisters(&mut ledger).unwrap();
+        assert!(
+            appended,
+            "the disposal-time cap breach was recorded, not silently dropped"
+        );
+        assert!(
+            rc.take_cap_breaches().is_empty(),
+            "the breach was consumed before disposal — nothing stranded in the collector"
+        );
+        let events = ledger.events_range(1, None).unwrap();
+        let degraded = events
+            .iter()
+            .find(|e| e.kind == EventType::PatrolDegraded)
+            .expect("a durable patrol.degraded records the disposal-time breach");
+        let msg = degraded.data["error"].as_str().unwrap();
+        assert!(
+            msg.contains("max_stream_bytes") && msg.contains("disposal-time"),
+            "the event names the breach: {msg}"
+        );
+        assert_eq!(degraded.data["session"], "t/dev/1");
+        assert!(rc.tailed_sessions().is_empty(), "disposed");
     }
 
     /// Lead ruling (a) + (b): the fix-3 undeliverable-kill path legitimately
