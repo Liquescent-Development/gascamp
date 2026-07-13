@@ -33,6 +33,7 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::WorktreeKept => worktree_kept(conn, event),
         EventType::BeadWorktreeReaped => bead_worktree_reaped(conn, event),
         EventType::DispatchFailed => dispatch_failed(conn, event),
+        EventType::DispatchRearmed => dispatch_rearmed(conn, event),
         EventType::DispatchLiveTree => dispatch_live_tree(conn, event),
         EventType::CheckPassed => check_passed(conn, event),
         EventType::CheckFailed => check_failed(conn, event),
@@ -608,7 +609,8 @@ struct DispatchFailed {
 /// error lands here (invariant 5); Phase 8 plan decision F. Phase 3 (#48
 /// finding 2): no longer log-only — the fail-fast reason folds onto the
 /// bead (`beads.dispatch_failure`) so `camp ls` can mark work that looks
-/// ready but will not dispatch. Cleared by a later session.woke/claim.
+/// ready but will not dispatch. Cleared by a later session.woke/claim, or by
+/// `dispatch.rearmed` (`camp retry`).
 fn dispatch_failed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     let bead = required_bead(event)?;
     known_bead(conn, bead)?;
@@ -617,6 +619,33 @@ fn dispatch_failed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     conn.execute(
         "UPDATE beads SET dispatch_failure = ?1, updated_ts = ?2 WHERE id = ?3",
         params![p.reason, event.ts, bead],
+    )?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchRearmed {
+    /// The dispatch.failed reason being cleared — carried so the ledger
+    /// history is self-describing ("re-armed after: <reason>").
+    previous_reason: String,
+}
+
+/// `dispatch.rearmed`: an operator re-armed a bead whose dispatch failed
+/// (`camp retry`, issue #83). Clears `beads.dispatch_failure` so the bead
+/// re-enters the dispatchable set on the next converge — the explicit
+/// re-arm path (invariant 1: no automatic retry). Idempotent (like the
+/// session.woke/claim clears): a bead whose marker is already clear is a
+/// harmless no-op, which keeps refold deterministic.
+fn dispatch_rearmed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let bead = required_bead(event)?;
+    known_bead(conn, bead)?;
+    let p: DispatchRearmed = payload(event)?;
+    non_empty(event, "previous_reason", &p.previous_reason)?;
+    conn.execute(
+        "UPDATE beads SET dispatch_failure = NULL, updated_ts = ?2
+         WHERE id = ?1 AND dispatch_failure IS NOT NULL",
+        params![bead, event.ts],
     )?;
     Ok(())
 }

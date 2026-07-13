@@ -482,6 +482,50 @@ mod tests {
         assert!(l.dispatchable_beads().unwrap().is_empty());
     }
 
+    #[test]
+    fn dispatch_rearmed_clears_the_failure_marker() {
+        use crate::event::{EventInput, EventType};
+        let (_d, mut l) = ledger();
+        create(&mut l, "gc-1", &[]);
+        l.append(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "reason": "rig path is not a directory" }),
+        })
+        .unwrap();
+        assert_eq!(
+            l.get_bead("gc-1").unwrap().unwrap().dispatch_failure.as_deref(),
+            Some("rig path is not a directory")
+        );
+
+        l.append(EventInput {
+            kind: EventType::DispatchRearmed,
+            rig: Some("gc".into()),
+            actor: "cli".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "previous_reason": "rig path is not a directory" }),
+        })
+        .unwrap();
+        assert_eq!(
+            l.get_bead("gc-1").unwrap().unwrap().dispatch_failure,
+            None,
+            "re-arm clears the marker"
+        );
+
+        // idempotent: re-arming an already-clear bead is a harmless no-op
+        l.append(EventInput {
+            kind: EventType::DispatchRearmed,
+            rig: Some("gc".into()),
+            actor: "cli".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "previous_reason": "rig path is not a directory" }),
+        })
+        .unwrap();
+        assert_eq!(l.get_bead("gc-1").unwrap().unwrap().dispatch_failure, None);
+    }
+
     /// Test obligation (iv), dispatch-lifecycle Phase 1 (#29): a freshly
     /// slung bead (title+assignee, open, unclaimed) is IMMEDIATELY visible
     /// to campd's dispatchable query — nothing reserves or hides it. One
