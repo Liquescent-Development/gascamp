@@ -260,11 +260,75 @@ pub fn completion_input(conn: &Connection, event: &Event) -> Result<Option<Event
     }))
 }
 
-/// Where an order's formula name resolves (spec §7.1/§9, plan Decision E):
-/// `<camp>/formulas/<name>.toml`. Phase 12's pack layering replaces this
-/// body; local definitions stay the highest layer (spec §11).
-pub fn formula_path(camp_root: &Path, formula: &str) -> PathBuf {
-    camp_root.join("formulas").join(format!("{formula}.toml"))
+/// Resolve a formula file by BARE name through layers, lowest→highest
+/// (compat §7.1, finishing Phase 12's layering): each materialized import's
+/// `formulas/`, then `<camp>/formulas/` (highest). Cross-import duplication
+/// is a hard error naming both providers. Returns the resolved path
+/// (callers read a path). A formula file is `<name>.toml` or
+/// `<name>.formula.toml` (gc's corpus naming).
+///
+/// Phase-1 scope: resolves the path for layering; does NOT compile
+/// `extends`/`drain` (phase 2).
+pub fn resolve_formula(cfg: &crate::config::CampConfig, name: &str) -> Result<PathBuf, CoreError> {
+    let root = cfg.root.as_deref().ok_or_else(|| {
+        CoreError::Config(
+            "config has no root directory (loaded via parse, not load) — cannot resolve formula paths"
+                .to_owned(),
+        )
+    })?;
+    let file = |dir: &Path| -> Option<PathBuf> {
+        let primary = dir.join(format!("{name}.toml"));
+        if primary.is_file() {
+            return Some(primary);
+        }
+        let gc = dir.join(format!("{name}.formula.toml"));
+        gc.is_file().then(|| gc)
+    };
+
+    // Import tier (lowest): every materialized <root>/imports/<binding>/formulas/.
+    let imports_dir = root.join("imports");
+    let mut hits: Vec<(String, PathBuf)> = Vec::new();
+    if imports_dir.is_dir() {
+        let entries = std::fs::read_dir(&imports_dir).map_err(|e| {
+            CoreError::Config(format!("cannot read {}: {e}", imports_dir.display()))
+        })?;
+        let mut bindings: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        bindings.sort();
+        for b in bindings {
+            if let Some(p) = file(&b.join("formulas")) {
+                let binding = b
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                hits.push((binding, p));
+            }
+        }
+    }
+    if hits.len() > 1 {
+        let providers: Vec<&str> = hits.iter().map(|(n, _)| n.as_str()).collect();
+        return Err(CoreError::Order {
+            order: name.to_owned(),
+            reason: format!(
+                "formula {name:?} exists in multiple imports: {providers:?} — disambiguate or remove one"
+            ),
+        });
+    }
+    // Local tier (highest): <root>/formulas/.
+    if let Some(local) = file(&root.join("formulas")) {
+        return Ok(local);
+    }
+    if let Some((_, p)) = hits.into_iter().next() {
+        return Ok(p);
+    }
+    Err(CoreError::Order {
+        order: name.to_owned(),
+        reason: format!("formula {name:?} not found in any import or <camp>/formulas/"),
+    })
 }
 
 /// Every `fired_seq` that already has a response: a `run.cooked` whose
@@ -367,18 +431,13 @@ pub fn execute_fire(
         })?;
         Ok(())
     };
-    let path = formula_path(camp_root, &order.formula);
-    if !path.exists() {
-        fail(
-            ledger,
-            format!(
-                "formula {:?} not found at {}",
-                order.formula,
-                path.display()
-            ),
-        )?;
-        return Ok(None);
-    }
+    let path = match resolve_formula(config, &order.formula) {
+        Ok(p) => p,
+        Err(e) => {
+            fail(ledger, format!("formula {:?}: {e}", order.formula))?;
+            return Ok(None);
+        }
+    };
     let formula = match crate::formula::parse_and_validate(&path) {
         Ok(formula) => formula,
         Err(e) => {
@@ -705,12 +764,45 @@ mod tests {
         assert!(completions.is_empty());
     }
 
+    fn camp_with_formula_layers() -> (tempfile::TempDir, crate::config::CampConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname=\"t\"\n[imports.bmad]\nsource=\"file:///x\"\n").unwrap();
+        let f = root.join("imports/bmad/formulas");
+        std::fs::create_dir_all(&f).unwrap();
+        std::fs::write(f.join("build.toml"), "formula = \"imported-build\"\n").unwrap();
+        std::fs::create_dir_all(root.join("formulas")).unwrap();
+        std::fs::write(root.join("formulas/build.toml"), "formula = \"local-build\"\n").unwrap();
+        let cfg = crate::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+        (dir, cfg)
+    }
     #[test]
-    fn formula_path_is_the_camp_local_formulas_dir() {
-        assert_eq!(
-            formula_path(std::path::Path::new("/camp/.camp"), "triage-inbox"),
-            std::path::PathBuf::from("/camp/.camp/formulas/triage-inbox.toml")
-        );
+    fn local_formula_shadows_an_imported_one() {
+        let (_d, cfg) = camp_with_formula_layers();
+        let p = resolve_formula(&cfg, "build").unwrap();
+        assert!(!p.to_string_lossy().contains("imports"), "{}", p.display());
+        assert_eq!(std::fs::read_to_string(&p).unwrap().trim(), "formula = \"local-build\"");
+    }
+    #[test]
+    fn an_imported_formula_is_reachable_without_a_local_override() {
+        let (_d, cfg) = camp_with_formula_layers();
+        std::fs::remove_file(cfg.root.as_ref().unwrap().join("formulas/build.toml")).unwrap();
+        assert!(resolve_formula(&cfg, "build").unwrap().to_string_lossy().contains("imports/bmad/formulas"));
+    }
+    #[test]
+    fn cross_import_formula_collision_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("camp.toml"),
+            "[camp]\nname=\"t\"\n[imports.a]\nsource=\"file:///x\"\n[imports.b]\nsource=\"file:///y\"\n").unwrap();
+        for b in ["a", "b"] {
+            let f = root.join("imports").join(b).join("formulas");
+            std::fs::create_dir_all(&f).unwrap();
+            std::fs::write(f.join("dup.toml"), "formula = \"x\"\n").unwrap();
+        }
+        let cfg = crate::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+        let err = resolve_formula(&cfg, "dup").unwrap_err().to_string();
+        assert!(err.contains("a") && err.contains("b"), "{err}");
     }
 
     // ---- execute_fire + reconciliation (Task 10.8; needs Phase 5's cook)
@@ -718,10 +810,12 @@ mod tests {
     fn camp_fixture() -> (tempfile::TempDir, Ledger, crate::config::CampConfig) {
         let dir = tempfile::tempdir().unwrap();
         let ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
-        let config = crate::config::CampConfig::parse(
+        std::fs::write(
+            dir.path().join("camp.toml"),
             "[camp]\nname=\"d\"\n\n[[rigs]]\nname=\"gc\"\npath=\"/p\"\nprefix=\"gc\"\n",
         )
         .unwrap();
+        let config = crate::config::CampConfig::load(&dir.path().join("camp.toml")).unwrap();
         (dir, ledger, config)
     }
 
@@ -803,7 +897,10 @@ mod tests {
     fn execute_fire_with_no_resolvable_rig_is_evented() {
         let (dir, mut ledger, _config) = camp_fixture();
         write_formula(dir.path(), "one-step");
-        let riglss = crate::config::CampConfig::parse("[camp]\nname=\"d\"\n").unwrap();
+        let riglss = {
+            std::fs::write(dir.path().join("camp.toml"), "[camp]\nname=\"d\"\n").unwrap();
+            crate::config::CampConfig::load(&dir.path().join("camp.toml")).unwrap()
+        };
         let order = cron_order_named("t", "one-step");
         let fired = ledger.append(fired_input("t", &FireCause::Manual)).unwrap();
         assert!(

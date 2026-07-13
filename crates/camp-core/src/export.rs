@@ -630,7 +630,15 @@ fn write_pack(
         if !copied.insert(formula.clone()) {
             continue;
         }
-        let src = crate::orders::formula_path(camp_root, &formula);
+        let src = crate::orders::resolve_formula(config, &formula);
+        let src = match src {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(CoreError::Export(format!(
+                    "exported order {order_name:?} references formula {formula:?}: {e}"
+                )));
+            }
+        };
         let content = std::fs::read(&src).map_err(|e| {
             CoreError::Export(format!(
                 "exported order {order_name:?} references formula {formula:?} but {} cannot \
