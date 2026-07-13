@@ -499,3 +499,87 @@ fn transcript_activity_keeps_a_working_agent_unmolested() {
     );
     assert_eq!(count(&events, "session.crashed"), 0);
 }
+
+/// #81: a hot reload that adds a PACK shipping a new agent must reach
+/// PATROL, not just the dispatcher. A worker dispatched to the reloaded
+/// pack agent (with NO campd restart) is resolved by patrol: the stall it
+/// declares carries the AGENT's own stall_after — not the camp default the
+/// stale birth config would fall back to — and no patrol.degraded is
+/// emitted. Against main (the CONFIG_WATCH arm never calls
+/// patrol.apply_config) patrol keeps its birth config, so it cannot see the
+/// pack agent: it falls back to the 5s camp default and logs a
+/// patrol.degraded "unknown agent" — both assertions fail.
+#[test]
+fn a_hot_reloaded_pack_agent_is_resolved_by_patrol_without_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    // Birth camp: a distinct 5s camp-default stall_after, one local "dev"
+    // agent so the base config is runnable; no packs yet.
+    let (root, rig) = scaffold(
+        dir.path(),
+        "stall_after = \"5s\"",
+        &[("dev", "isolation: none\n")],
+    );
+
+    // A throwaway pack shipping agent "sentry" with a DISTINCT 700ms
+    // stall_after override. camp's pack loader needs only <pack>/agents/*.md.
+    let pack = dir.path().join("sentrypack");
+    std::fs::create_dir_all(pack.join("agents")).unwrap();
+    std::fs::write(
+        pack.join("agents/sentry.md"),
+        "---\nname: sentry\nisolation: none\nstall_after: 700ms\n---\nWork.\n",
+    )
+    .unwrap();
+
+    // FAKE_AGENT_NUDGE_CLOSE=1: the worker goes silent (stalls), then closes
+    // on the nudge so no fake-agent process outlives the daemon.
+    let _campd = Daemon::spawn(
+        &root,
+        &dir.path().join("claude-home"),
+        &[("FAKE_AGENT_NUDGE_CLOSE", "1")],
+    );
+
+    // Hot-add the pack and route new beads to its agent — NO restart. `packs`
+    // is a top-level key, so it precedes every [table] header (TOML).
+    let reloaded = format!(
+        "packs = [\"{}\"]\n\n[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\n\
+         path = \"{}\"\nprefix = \"gc\"\n\n[dispatch]\nmax_workers = 4\n\
+         command = \"{}\"\ndefault_agent = \"sentry\"\n\n[patrol]\nstall_after = \"5s\"\n",
+        pack.display(),
+        rig.display(),
+        fake_agent(),
+    );
+    std::fs::write(root.join("camp.toml"), &reloaded).unwrap();
+    wait_until(&root, "the applied reload", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "config.changed" && ev["data"]["applied"] == true)
+    });
+
+    // Dispatch a bead to the freshly added agent.
+    camp_ok(&root, &["sling", "watch me"]);
+
+    // Patrol must resolve "sentry" from the reloaded pack: the first stall it
+    // declares for this worker carries the agent's 700ms threshold.
+    wait_until(&root, "the sentry stall", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "agent.stalled" && ev["data"]["agent"] == "sentry")
+    });
+    let events = events_json(&root);
+    let first_stall = events
+        .iter()
+        .find(|e| e["type"] == "agent.stalled" && e["data"]["agent"] == "sentry")
+        .unwrap();
+    assert_eq!(
+        first_stall["data"]["threshold"], "700ms",
+        "patrol must arm at the reloaded pack agent's stall_after, not the camp default; events: {events:#?}"
+    );
+    assert_eq!(
+        count(&events, "patrol.degraded"),
+        0,
+        "no unknown-agent degradation once the reload reaches patrol; events: {events:#?}"
+    );
+
+    // The nudge revives and closes it: clean shutdown, no lingering worker.
+    wait_until(&root, "the revived close", |e| {
+        e.iter().any(|ev| ev["type"] == "session.stopped")
+    });
+}

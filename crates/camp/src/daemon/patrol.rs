@@ -12,8 +12,12 @@
 //! annotate-only: agent.stalled + re-arm, never nudge/kill (spec §10:
 //! never kill a session in the user's TUI).
 //!
-//! Patrol config is read at campd start; hot reload does not re-arm
-//! patrol (plan Decision L).
+//! Patrol config is swapped on an applied hot reload (issue #81,
+//! `apply_config`): future agent/rig/threshold resolutions and future
+//! timer arms follow the reloaded config with no campd restart. In-flight
+//! stall timers are NOT re-armed — each tracked worker keeps the threshold
+//! it was armed with (the surviving half of Phase-11 plan Decision L; the
+//! config-visibility half is un-deferred by #81).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -231,6 +235,32 @@ impl PatrolRuntime {
             .iter()
             .filter(|s| self.tracked.contains_key(*s))
             .count() as u64
+    }
+
+    /// Swap patrol's config on an applied hot reload (issue #81). Patrol
+    /// resolves agents, rig lookups, the dispatch command, and stall/
+    /// release thresholds against the config it holds; an applied reload
+    /// that adds a pack/agent/rig or edits `[patrol]` must reach patrol too,
+    /// or a worker dispatched to a freshly added pack agent draws a spurious
+    /// `patrol.degraded` "unknown agent" (the birth config cannot see it).
+    ///
+    /// FUTURE resolutions and future timer arms see the new config; in-flight
+    /// timers and tracked workers are NOT re-armed — each armed worker keeps
+    /// the threshold it was armed with, exactly as the dispatcher leaves
+    /// in-flight children on their already-resolved spec. The ladder's
+    /// per-bead restart history is preserved; only its `restart_budget`
+    /// ceiling follows the reload.
+    ///
+    /// An applied config is pre-validated (`CampConfig::parse` runs
+    /// `PatrolConfig::from_section`), so the re-derivation cannot fail for an
+    /// applied reload; the `?` is fail-fast on an impossible torn state,
+    /// never a silent fallback.
+    pub fn apply_config(&mut self, config: CampConfig) -> Result<()> {
+        let patrol_config = PatrolConfig::from_section(&config.patrol)?;
+        self.ladder.set_restart_budget(patrol_config.restart_budget);
+        self.config = patrol_config;
+        self.camp_config = config;
+        Ok(())
     }
 
     /// The slot the notify callback closure captures.
@@ -2854,6 +2884,178 @@ mod tests {
                 .filter(|e| e.kind.as_str() == "session.crashed")
                 .count(),
             0
+        );
+    }
+
+    /// #81: after apply_config swaps in a config whose pack ships an agent the
+    /// BIRTH config could not see, patrol resolves that agent — no
+    /// patrol.degraded, and the agent's own stall_after governs the armed
+    /// timer (proving resolution ran against the reloaded config, not the
+    /// birth one).
+    #[test]
+    fn apply_config_lets_patrol_resolve_a_reloaded_pack_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pack shipping agent "sentry" with a DISTINCT stall_after override.
+        let pack = dir.path().join("sentrypack");
+        std::fs::create_dir_all(pack.join("agents")).unwrap();
+        std::fs::write(
+            pack.join("agents/sentry.md"),
+            "---\nname: sentry\nisolation: none\nstall_after: 700ms\n---\nWork.\n",
+        )
+        .unwrap();
+
+        // Birth config: NO packs, a distinct camp-default stall_after of 5s.
+        let birth_toml = "[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"5s\"\n";
+        std::fs::write(dir.path().join("camp.toml"), birth_toml).unwrap();
+        let birth = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&birth.patrol).unwrap();
+        let mut patrol = PatrolRuntime::new(patrol_config, &birth);
+
+        // Reloaded config: adds the pack (so "sentry" becomes resolvable).
+        let reloaded_toml = format!(
+            "packs = [\"{}\"]\n\n[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"5s\"\n",
+            pack.display()
+        );
+        std::fs::write(dir.path().join("camp.toml"), &reloaded_toml).unwrap();
+        let reloaded = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        patrol.apply_config(reloaded).unwrap();
+
+        // Drive a campd-spawned (Owned::Child) worker for the pack agent through
+        // observe -> apply_tracking, exactly as the settle path does. Append the
+        // session.woke through the ledger and read it back so the Event has the
+        // exact shape the fold produces (mirrors event_loop.rs's test
+        // a_due_stall_declares_and_the_settle_executes_the_action).
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "t"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "name": "t/sentry/1",
+                    "agent": "sentry",
+                    "transcript_path": dir.path().join("projects/-p/sid.jsonl"),
+                    "bead": "gc-1",
+                }),
+            })
+            .unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        let woke = events
+            .iter()
+            .find(|e| e.kind == EventType::SessionWoke)
+            .unwrap();
+        patrol.observe(woke);
+        let now = jiff::Timestamp::now();
+        patrol.apply_tracking(&mut ledger, now).unwrap();
+
+        // No unknown-agent degradation: resolution ran against the reloaded config.
+        let degraded = ledger.events_of_type(EventType::PatrolDegraded).unwrap();
+        assert!(
+            degraded.is_empty(),
+            "patrol must resolve the reloaded pack agent, got: {degraded:?}"
+        );
+
+        // And the arm used the AGENT's 700ms override, not the 5s camp default:
+        // fire it just past 700ms and read the declared threshold.
+        let later = now
+            .checked_add(jiff::SignedDuration::from_millis(750))
+            .unwrap();
+        let fires = patrol.fire_due(later);
+        assert_eq!(fires.len(), 1, "the 700ms agent threshold fired by 750ms");
+        patrol.declare_stalls(&mut ledger, &fires, later).unwrap();
+        let stalled = ledger.events_of_type(EventType::AgentStalled).unwrap();
+        assert_eq!(
+            stalled[0].data["threshold"], "700ms",
+            "patrol armed at the reloaded agent's stall_after, not the camp default"
+        );
+    }
+
+    /// #81 structural guard: apply_config must swap EVERY config-derived
+    /// cached field. The reload below differs from the birth config in every
+    /// derived surface — `[patrol]` (→ `self.config`: stall_after,
+    /// release_grace, restart_budget), the pack list (→ `self.camp_config`:
+    /// agent resolution), and the ladder's restart-budget ceiling — and each
+    /// is asserted changed. Whole-struct equality on `config` / `camp_config`
+    /// means a future field added to PatrolConfig or CampConfig but forgotten
+    /// in apply_config turns this test red instead of quietly reviving the
+    /// #81 defect class one field over; the ladder ceiling (private to
+    /// camp-core) is pinned by on_fire behavior.
+    #[test]
+    fn apply_config_swaps_every_config_derived_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("sentrypack");
+        std::fs::create_dir_all(pack.join("agents")).unwrap();
+        std::fs::write(
+            pack.join("agents/sentry.md"),
+            "---\nname: sentry\nisolation: none\n---\nWork.\n",
+        )
+        .unwrap();
+
+        // Birth: no packs; every [patrol] key explicit; restart_budget 0.
+        let birth_toml = "[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"5s\"\n\
+                          release_grace = \"30s\"\nrestart_budget = 0\n";
+        std::fs::write(dir.path().join("camp.toml"), birth_toml).unwrap();
+        let birth = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let birth_patrol = camp_core::patrol::PatrolConfig::from_section(&birth.patrol).unwrap();
+        let mut patrol = PatrolRuntime::new(birth_patrol.clone(), &birth);
+
+        // With the birth budget of 0, "gc-g" would exhaust on its second fire.
+        assert_eq!(patrol.ladder.on_fire("gc-g"), LadderAction::Nudge);
+
+        // Reload: EVERY derived field differs — packs added, all three
+        // [patrol] keys changed.
+        let reloaded_toml = format!(
+            "packs = [\"{}\"]\n\n[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"9s\"\n\
+             release_grace = \"77s\"\nrestart_budget = 3\n",
+            pack.display()
+        );
+        std::fs::write(dir.path().join("camp.toml"), &reloaded_toml).unwrap();
+        let reloaded = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let reloaded_patrol =
+            camp_core::patrol::PatrolConfig::from_section(&reloaded.patrol).unwrap();
+        // Vacuity guard: the fixtures must actually differ everywhere, or the
+        // equality assertions below prove nothing.
+        assert_ne!(birth_patrol, reloaded_patrol);
+        assert_ne!(birth_patrol.stall_after, reloaded_patrol.stall_after);
+        assert_ne!(birth_patrol.release_grace, reloaded_patrol.release_grace);
+        assert_ne!(birth_patrol.restart_budget, reloaded_patrol.restart_budget);
+        assert_ne!(birth, reloaded);
+        assert!(pack::resolve_agent(&birth, "sentry").is_err());
+
+        patrol.apply_config(reloaded.clone()).unwrap();
+
+        // self.config: the whole derived PatrolConfig followed the reload.
+        assert_eq!(
+            patrol.config, reloaded_patrol,
+            "apply_config must swap the entire derived PatrolConfig"
+        );
+        // self.camp_config: the whole CampConfig followed the reload, and the
+        // change is agent-resolution-visible.
+        assert_eq!(
+            patrol.camp_config, reloaded,
+            "apply_config must swap the entire cached CampConfig"
+        );
+        assert!(
+            pack::resolve_agent(&patrol.camp_config, "sentry").is_ok(),
+            "the reloaded pack agent must resolve against patrol's config"
+        );
+        // The ladder ceiling: under the birth budget (0) this second fire
+        // would be Exhausted; the reloaded budget (3) makes it Restart —
+        // and the bead's history was preserved, not reset.
+        assert_eq!(
+            patrol.ladder.on_fire("gc-g"),
+            LadderAction::Restart,
+            "the ladder ceiling must follow the reloaded restart_budget"
         );
     }
 }
