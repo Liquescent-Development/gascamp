@@ -185,10 +185,18 @@ pub fn build_spec(
                 arg("json"); // F2
             }
             StdinMode::HeldStream => {
-                // P2: stream in requires stream out; both accepted with
-                // the pinned flags at 2.1.204.
+                // P2: stream in requires stream out. The shipped CLI
+                // (2.1.205–2.1.207) hard-rejects `--print` + stream-json
+                // output UNLESS `--verbose` is passed (#86): `verbose`
+                // resolves flag -> settings -> false, so without the flag
+                // dispatch dies at argv validation on every machine whose
+                // ~/.claude/settings.json does not set it. The Agent SDK
+                // hardcodes `--verbose` here for exactly this reason;
+                // camp does too. Order mirrors the SDK:
+                // --output-format stream-json --verbose --input-format stream-json.
                 arg("--output-format");
                 arg("stream-json");
+                arg("--verbose");
                 arg("--input-format");
                 arg("stream-json");
             }
@@ -815,6 +823,7 @@ mod tests {
                 "claude",
                 "--output-format",
                 "stream-json",
+                "--verbose",
                 "--input-format",
                 "stream-json",
                 "--session-id",
