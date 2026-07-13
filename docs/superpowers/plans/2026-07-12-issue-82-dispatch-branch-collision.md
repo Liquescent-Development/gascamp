@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task in a fresh session on branch `fix-82-dispatch-branch-collision`. Steps use checkbox (`- [ ]`) syntax for tracking. This is a PLANNING-ONLY document; execution is a separate session per the fix-82 kickoff amendment.
 
-> **APPROVAL NOTE:** _(to be filled in by the IMPLEMENTER session in its first execution commit, once the lead relays the plan reviewer's verdict — date, verdict, non-blocking notes, and any accepted deviations. Do not execute until APPROVE is relayed.)_
+> **APPROVAL NOTE:** Plan review: APPROVE, 2026-07-13 (Opus 4.8 plan gate). Remedy choice (loud named-recovery error, branch never deleted) explicitly judged sound; alternatives' rejections verified substantive. Non-blocking notes: N1 the reason-reaches-dispatch.failed property rests on verified code inspection of dispatch.rs:615 (fix-83's file — do not add a dispatch.rs test here); N2 reproduction at the spawn/mechanical layer is the appropriate fidelity for this stream; N3 bail! String semantics and line-join behavior to be confirmed by the Step 2/5 test runs as planned; N4 the foreign-live-worktree edge stays YAGNI-deferred. No deviations accepted.
 
 **Goal:** A camp whose rig carries a predecessor ledger's leftover `camp/<bead>` branch no longer dies on a raw `git worktree add` error; instead `create_worktree` refuses with a loud, self-explaining, named-recovery error that identifies the branch, states whether it holds commits beyond the rig's base, and gives the exact command to clear it — never deleting the branch itself.
 
