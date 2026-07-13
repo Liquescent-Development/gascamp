@@ -235,6 +235,19 @@ pub fn resolve_agent_def(
 /// `gstack.review-synthesizer` + `gc.review-synthesizer` coexist by
 /// construction. `pack_ships_skills` is true when the import materialized a
 /// `skills/` dir AND the import's `skills != Some(false)`.
+/// An agent's directory name: the binding charset (`[A-Za-z0-9_-]+`). Agent
+/// names arrive from PACK CONTENT — a formula's `route`/`assignee` — which is
+/// untrusted input, and the name is joined straight onto a filesystem path. A
+/// route of `gc.../../../../etc/some-agent` would otherwise walk out of the
+/// materialization root and read a prompt from anywhere on disk. The charset
+/// excludes `.`, `..`, and `/` by construction.
+fn valid_agent_dirname(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError> {
     let root = cfg.root.as_deref().ok_or_else(|| {
         CoreError::Config(
@@ -242,6 +255,17 @@ pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError
                 .to_owned(),
         )
     })?;
+    // Validate BEFORE any path join: the suffix (or a bare name) becomes a
+    // directory component, so a traversal must never reach the filesystem.
+    let dirname = name.split_once('.').map_or(name, |(_, suffix)| suffix);
+    if !valid_agent_dirname(dirname) {
+        return Err(CoreError::UnknownAgent {
+            name: name.to_owned(),
+            searched: vec![format!(
+                "{dirname:?} is not a legal agent name ([A-Za-z0-9_-]+)"
+            )],
+        });
+    }
     match name.split_once('.') {
         Some((binding, suffix)) => {
             let decl = cfg.imports.get(binding).ok_or_else(|| {
@@ -472,6 +496,34 @@ mod tests {
         let def = resolve_agent(&cfg, "gc.run-operator").unwrap();
         assert_eq!(def.name, "gc.run-operator");
         assert!(def.prompt.contains("gc.run-operator"));
+    }
+
+    /// An agent name is joined onto a filesystem path, and it arrives from PACK
+    /// CONTENT (a formula's `route`/`assignee`) — untrusted input. A traversal
+    /// in the suffix must never reach the filesystem, or a crafted route reads a
+    /// prompt from outside the materialization root and feeds it to a worker.
+    #[test]
+    fn a_qualified_agent_name_cannot_traverse_out_of_the_import_root() {
+        let (dir, cfg) = camp_with_imports(&[("gc", "run-operator")]);
+        // Plant a real agent dir OUTSIDE any import, reachable only by escaping.
+        let outside = dir.path().join("outside/evil");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("prompt.md"), "PWNED").unwrap();
+
+        for name in [
+            "gc../../outside/evil",
+            "gc./../outside/evil",
+            "gc.../..",
+            "gc./",
+        ] {
+            let err = resolve_agent(&cfg, name).unwrap_err();
+            assert!(
+                matches!(err, CoreError::UnknownAgent { .. }),
+                "{name:?} must be refused as an agent name, got {err:?}"
+            );
+        }
+        // The bare-name layer is guarded by the same charset.
+        assert!(resolve_agent(&cfg, "../outside/evil").is_err());
     }
     #[test]
     fn route_to_unbound_binding_fails_naming_remedy() {

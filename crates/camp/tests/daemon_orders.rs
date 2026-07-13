@@ -430,24 +430,12 @@ fn a_hot_reload_updates_dispatch_routing_without_a_restart() {
         "expected a routing hole before the reload; got {failed:?}"
     );
 
-    // Pre-materialize the starter import's agent directory: the daemon's hot
-    // reload only RE-PARSES camp.toml (it does not call `camp import add`), so
-    // `imports/starter/agents/dev/` must already exist for `resolve_agent` to
-    // find `starter.dev` after the reload. (compat: a pack is now an import
-    // bound under `<root>/imports/<binding>/`, not a `packs = [...]` entry.)
-    let dev_dir = root.join("imports/starter/agents/dev");
-    std::fs::create_dir_all(&dev_dir).unwrap();
-    std::fs::copy(
-        starter_pack().join("agents/dev/agent.toml"),
-        dev_dir.join("agent.toml"),
-    )
-    .unwrap();
-    std::fs::copy(
-        starter_pack().join("agents/dev/prompt.md"),
-        dev_dir.join("prompt.md"),
-    )
-    .unwrap();
-
+    // No pre-materialization is needed: the reloaded `[imports.starter]` names
+    // the starter by ABSOLUTE PATH, which is a LOCAL source — layered in place
+    // (D7), so `resolve_agent` reads `starter.dev` straight out of the pack
+    // itself. The daemon's hot reload only re-parses camp.toml (it never runs
+    // `camp import add`), and with an in-place layer it does not have to.
+    //
     // Hot-add the starter import + a qualified default agent. The reloaded
     // camp.toml carries `[imports.starter]` (the binding) and
     // `default_agent = "starter.dev"` (binding-qualified); `[agent_defaults].tools`

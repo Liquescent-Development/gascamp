@@ -91,5 +91,9 @@ jobs:
           repository: gastownhall/gascity-packs
           ref: ${{ steps.gcpacks-ref.outputs.ref }}
           path: gcpacks-src
-      - name: phase-1 corpus-load gate (pack/agent/transitive)
-        run: python3 ci/gc-compat/load_corpus_packs.py gcpacks-src
+      # The gate now drives camp's OWN loader over the corpus, not just its
+      # shape — so it needs the binary.
+      - name: build camp
+        run: cargo build --bin camp
+      - name: phase-1 corpus-load gate (pack/agent/transitive + camp loader)
+        run: python3 ci/gc-compat/load_corpus_packs.py gcpacks-src target/debug/camp

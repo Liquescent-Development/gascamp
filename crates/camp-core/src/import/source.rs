@@ -29,9 +29,6 @@ pub struct Source {
     pub is_local_path: bool,
 }
 
-/// Normalize a raw source string plus an optional `version` (from
-/// `ImportDecl.version`) into a `Source`. Errors are `CoreError::Import`
-/// naming the source as the binding for actionable messages.
 /// Is this source a LOCAL filesystem path (as opposed to a git-backed
 /// remote)? Starts with `.` or `/`, or has no scheme / `git@` / `//` / `::`
 /// (the `::` exclusion sends git's `ext::` transport to the remote path,
@@ -48,6 +45,9 @@ pub fn is_local_source(s: &str) -> bool {
         || (!s.contains("://") && !s.starts_with("git@") && !s.contains("//") && !s.contains("::"))
 }
 
+/// Normalize a raw source string plus an optional `version` (from
+/// `ImportDecl.version`) into a `Source`. Errors are `CoreError::Import`
+/// naming the source as the binding for actionable messages.
 pub fn normalize(source: &str, version: Option<&str>) -> Result<Source, CoreError> {
     let s = source.trim();
     if s.is_empty() {
@@ -106,6 +106,26 @@ pub fn normalize(source: &str, version: Option<&str>) -> Result<Source, CoreErro
 
     // Validate the transport allowlist.
     validate_transport(&repo, source)?;
+
+    // Neither the repository nor the ref may LOOK like an option. Both reach
+    // git as bare positionals (`git ls-remote <repo> <ref>`), and the contract
+    // camp's hardening rests on is a PINNED argv — a value that git could parse
+    // as a flag breaks that contract by construction. Refuse it at the boundary
+    // rather than depend on git's transport rules to save us downstream.
+    for (what, value) in [
+        ("repository", repo.as_str()),
+        ("ref", reference.as_deref().unwrap_or("")),
+    ] {
+        if value.starts_with('-') {
+            return Err(CoreError::Import {
+                binding: source.to_owned(),
+                reason: format!(
+                    "{what} {value:?} begins with '-' — it would reach git as an option, \
+                     not a value"
+                ),
+            });
+        }
+    }
 
     Ok(Source {
         repository: repo,
@@ -181,6 +201,30 @@ fn validate_transport(repo: &str, source: &str) -> Result<(), CoreError> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The ref and the repository reach git as bare positionals. camp's
+    /// hardening contract is a PINNED argv, so a value that git could parse as
+    /// an option is refused at the boundary — not left to git's transport rules
+    /// to catch downstream.
+    #[test]
+    fn a_ref_or_repo_that_looks_like_an_option_is_refused() {
+        let err = normalize(
+            "https://example.com/repo",
+            Some("--upload-pack=touch /tmp/pwn"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("begins with '-'"), "got {err}");
+
+        let err = normalize("https://example.com/repo#--upload-pack=x", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("begins with '-'"), "got {err}");
+
+        // A legitimate ref that merely CONTAINS a dash is untouched.
+        let s = normalize("https://example.com/repo", Some("release-1.2")).unwrap();
+        assert_eq!(s.reference.as_deref(), Some("release-1.2"));
+    }
 
     #[test]
     fn generic_form_splits_repo_subpath_ref() {

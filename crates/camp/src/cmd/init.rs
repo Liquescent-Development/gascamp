@@ -6,13 +6,21 @@ use camp_core::ledger::Ledger;
 use crate::service::{self, Decision, ServiceChoice, SystemProbe, SystemRunner};
 
 /// The default starter-pack source (component decision 12): the gascamp
-/// `packs/starter` on `main`. Pinned by `DEFAULT_STARTER_VERSION` to a sha
-/// that carries the rewritten directory-shaped starter (Task 20). The sha
-/// is finalized to the starter-rewrite commit when this stream merges; tests
-/// never fetch it (they import a LOCAL `packs/starter` path).
+/// `packs/starter` on `main`. The tree URL CARRIES its ref (`main`), so it is
+/// the single ref this source supplies and `run_add` takes no separate version.
+///
+/// It previously also passed a `version` of `sha:0000…0000` — a placeholder
+/// (invariant 5 forbids them) that ALSO disagreed with the tree URL's `main`,
+/// so `reconcile_refs` hard-errored before any network call and the default
+/// interactive offer could never succeed. Two refs is one too many.
+///
+/// A commit pin is still the goal: `main` is a moving target, and §13's
+/// supply-chain story wants a sha. The sha cannot be written down here yet —
+/// it is the commit that lands the directory-shaped starter, i.e. this very
+/// stream's own merge — so it is a follow-up, not something to invent now.
+/// Tests never fetch this (they import a LOCAL `packs/starter` path).
 const DEFAULT_STARTER_SOURCE: &str =
     "https://github.com/Liquescent-Development/gascamp/tree/main/packs/starter";
-const DEFAULT_STARTER_VERSION: &str = "sha:0000000000000000000000000000000000000000";
 
 /// What `camp init` decided to do about the starter pack (component §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,16 +222,13 @@ fn camp_name(root: &Path) -> String {
     dir_for_name.unwrap_or("camp").to_owned()
 }
 
-/// Install the default starter pack (a prompted yes). Uses the pinned
-/// `DEFAULT_STARTER_VERSION` so the materialization is reproducible. A fetch
-/// failure exits non-zero ("camp WAS created, pack was NOT installed").
+/// Install the default starter pack (a prompted yes). The source carries its
+/// own ref, so no separate version is supplied — passing one too made the two
+/// disagree and the offer could never succeed. A fetch failure exits non-zero
+/// ("camp WAS created, pack was NOT installed").
 fn install_default_starter(root: &Path) -> Result<()> {
-    if let Err(e) = crate::cmd::import::run_add(
-        root,
-        DEFAULT_STARTER_SOURCE,
-        Some("starter"),
-        Some(DEFAULT_STARTER_VERSION),
-    ) {
+    if let Err(e) = crate::cmd::import::run_add(root, DEFAULT_STARTER_SOURCE, Some("starter"), None)
+    {
         bail!(
             "The camp at {} WAS created, but the starter pack was NOT installed ({e:#}); \
              the camp is usable — run `camp import add {DEFAULT_STARTER_SOURCE} --name starter` yourself",
@@ -237,6 +242,29 @@ fn install_default_starter(root: &Path) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The DEFAULT interactive starter offer must be able to succeed. On a TTY,
+    /// plain Enter at `Install the starter pack? [Y/n]` takes this exact path —
+    /// it is the headline fix of #80 ("a fresh camp knows zero agents until the
+    /// starter import"). It used to supply TWO refs (the tree URL's `main` AND
+    /// a `sha:0000…` placeholder), which `reconcile_refs` rejects before any
+    /// network call, so the offer failed 100% of the time. No network needed to
+    /// prove it: normalization fails first.
+    #[test]
+    fn the_default_starter_offer_supplies_exactly_one_ref() {
+        let src = camp_core::import::source::normalize(DEFAULT_STARTER_SOURCE, None)
+            .expect("the default starter source must normalize — the offer depends on it");
+        assert_eq!(
+            src.reference.as_deref(),
+            Some("main"),
+            "the tree URL carries the ref; nothing may supply a second one"
+        );
+        assert_eq!(src.subpath.as_deref(), Some("packs/starter"));
+        assert!(
+            !DEFAULT_STARTER_SOURCE.contains("0000000000"),
+            "no placeholder sha may ship (invariant 5)"
+        );
+    }
 
     #[test]
     fn decide_import_covers_the_matrix() {

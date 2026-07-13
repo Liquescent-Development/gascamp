@@ -203,14 +203,28 @@ pub fn compile_all_orders(cfg: &CampConfig) -> Result<OrderInventory, CoreError>
     layers.sort();
     for (binding, layer) in layers {
         let orders_dir = layer.join("orders");
-        let Ok(order_entries) = std::fs::read_dir(&orders_dir) else {
+        // A pack without orders/ is normal; an UNREADABLE orders/ is not.
+        // Skipping it silently would leave an armed order quietly unarmed —
+        // the money invariant reads the wrong way round.
+        if !orders_dir.is_dir() {
             continue;
-        };
-        let mut order_files: Vec<PathBuf> = order_entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "toml"))
-            .collect();
+        }
+        let order_entries = std::fs::read_dir(&orders_dir).map_err(|e| CoreError::Order {
+            order: binding.clone(),
+            reason: format!("cannot read {}: {e}", orders_dir.display()),
+        })?;
+        let mut order_files: Vec<PathBuf> = Vec::new();
+        for entry in order_entries {
+            let path = entry
+                .map_err(|e| CoreError::Order {
+                    order: binding.clone(),
+                    reason: format!("cannot read {}: {e}", orders_dir.display()),
+                })?
+                .path();
+            if path.is_file() && path.extension().is_some_and(|x| x == "toml") {
+                order_files.push(path);
+            }
+        }
         order_files.sort();
         for order_file in order_files {
             let stem = order_file

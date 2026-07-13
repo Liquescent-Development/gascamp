@@ -316,7 +316,7 @@ pub fn resolve_formula(cfg: &crate::config::CampConfig, name: &str) -> Result<Pa
         }
         Ok(tier.into_iter().next().map(|(_, p)| p))
     };
-    let transitive = one_of(collect(cfg.transitive_layers()), "transitive layers")?;
+    let transitive = one_of(collect(cfg.transitive_layers()?), "transitive layers")?;
     let direct = one_of(collect(cfg.import_layers()), "imports")?;
 
     // Local tier (highest): <root>/formulas/.

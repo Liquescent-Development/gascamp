@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use camp_core::config::ImportDecl;
+use camp_core::config::{ImportDecl, TRANSITIVE_DIR};
 use camp_core::event::{EventInput, EventType};
 use camp_core::import::ResolvedImport;
 use camp_core::import::inventory::ExecItem;
@@ -24,7 +24,7 @@ use camp_core::import::manifest::read_manifest;
 use camp_core::import::manifest::{PackManifest, PackMeta};
 use camp_core::import::materialize::materialize_tree;
 use camp_core::import::resolve_transitive;
-use camp_core::import::source::normalize;
+use camp_core::import::source::{Source, normalize};
 use camp_core::ledger::Ledger;
 use camp_core::pack::parse_agent_dir;
 
@@ -127,6 +127,62 @@ pub fn git_clone(repository: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Check `commit` out (detached) in an already-cloned `dest`, with the same
+/// hardened argv + `GIT_*` env strip.
+///
+/// This is what makes the pin REAL. `git clone` alone always lands on the
+/// remote's default-branch HEAD, so without this the materialized tree was
+/// whatever the branch tip said at fetch time while `packs.lock` and the
+/// `import.added` event recorded the sha of the ref the operator asked for —
+/// a lock that actively LIED about the bytes it pinned. Those bytes become an
+/// agent prompt and a formula, so the pin is the supply-chain boundary §13's
+/// hardening rests on. A failure here is fatal: materializing content we
+/// cannot prove is the pinned content is exactly the outcome being prevented.
+pub fn git_checkout(dest: &Path, commit: &str) -> Result<()> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(dest)
+        .args(hardened_git_args())
+        .args(["checkout", "--detach"])
+        .arg(commit);
+    strip_git_env(&mut cmd);
+    let output = cmd.output().with_context(|| {
+        format!(
+            "failed to spawn git checkout {commit} in {}",
+            dest.display()
+        )
+    })?;
+    if !output.status.success() {
+        bail!(
+            "git checkout {commit} in {} failed: {}",
+            dest.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Clone `repository` into `dest` and check out exactly `commit` — the only
+/// sanctioned way to obtain a remote tree, so no caller can forget the pin.
+fn clone_at_commit(repository: &str, dest: &Path, commit: &str) -> Result<()> {
+    git_clone(repository, dest)?;
+    git_checkout(dest, commit)
+}
+
+/// The `Source` a lock entry describes. Reconstructed FIELD-BY-FIELD, never by
+/// re-parsing `entry.source`: the `//subpath` was split off into `entry.subpath`
+/// at add time, so re-normalizing the bare repository silently dropped it and
+/// sent `install`/`upgrade` looking for a pack.toml at the repo ROOT — which
+/// broke every subpath import, i.e. all four corpus packs.
+fn source_of(entry: &LockEntry) -> Source {
+    Source {
+        repository: entry.source.clone(),
+        subpath: entry.subpath.clone(),
+        reference: (!entry.version.is_empty()).then(|| entry.version.clone()),
+        is_local_path: camp_core::import::source::is_local_source(&entry.source),
+    }
+}
+
 /// A binding name: `[A-Za-z0-9_-]+`, non-empty, not `.`/`..`.
 fn valid_binding(name: &str) -> bool {
     !name.is_empty()
@@ -204,30 +260,21 @@ pub fn run_add(
         );
     }
 
-    // Clone (remote) or read (local path). Resolve commit for remotes. The
-    // clone tempdir is held in `_checkout` for the duration of materialization
-    // (it drops at the end of run_add, after run_add_materialize has copied
-    // out of it).
-    let (repo_dir, commit, _checkout) = if src.is_local_path {
-        (PathBuf::from(&src.repository), String::new(), None)
+    // Clone (remote) or read (local path). Resolve the commit for remotes and
+    // check it out, so the tree we materialize IS the tree we lock. The clone
+    // tempdir is held in `_checkout` for the duration of materialization (it
+    // drops at the end of run_add, after run_add_materialize has copied out).
+    let (repo_dir, anchor_sub, commit, _checkout) = if src.is_local_path {
+        let (root, sub) = local_anchor(camp_root, &src.repository)?;
+        (root, sub, String::new(), None)
     } else {
         let checkout = tempfile::tempdir().context("clone scratch dir")?;
         let dest = checkout.path().join("repo");
-        git_clone(&src.repository, &dest).with_context(|| format!("clone {source:?}"))?;
         let commit = resolve_commit(&src.repository, src.reference.as_deref())
             .with_context(|| format!("resolve {source:?}"))?;
-        (dest, commit, Some(checkout))
-    };
-
-    // The materialize escape boundary: for a remote clone, the clone dir
-    // (untrusted — a pack may not reach outside its checkout). For a LOCAL
-    // path, the git repo root containing the pack (the operator's trusted
-    // repo) — so a pack may symlink to sibling content in its own repo
-    // (e.g. the starter's corpus symlink) but not outside it.
-    let materialize_root = if src.is_local_path {
-        find_git_root(&repo_dir).unwrap_or_else(|| repo_dir.clone())
-    } else {
-        repo_dir.clone()
+        clone_at_commit(&src.repository, &dest, &commit)
+            .with_context(|| format!("clone {source:?}"))?;
+        (dest, src.subpath.clone(), commit, Some(checkout))
     };
 
     run_add_materialize(
@@ -235,13 +282,51 @@ pub fn run_add(
         &src,
         &binding,
         &repo_dir,
-        &materialize_root,
+        &anchor_sub,
         &commit,
         &mut lock,
         source,
     )?;
     lock.write(&lock_path).context("write packs.lock")?;
     Ok(())
+}
+
+/// Anchor a LOCAL pack for transitive resolution: the repo (or containing
+/// directory) it sits in, plus the pack's own subpath relative to that root.
+///
+/// A pack-level relative source anchors at the DECLARING pack (§7.2), which
+/// only resolves if the declaring pack has a subpath to pop `..` off. A local
+/// source normalizes to `subpath: None`, so `../gascity` was popping past a
+/// lexically EMPTY root and every real pack — all four in the corpus declare
+/// exactly that import — was refused. Anchoring at the pack's repo root (its
+/// parent, when it is not in a repo) makes `../gascity` resolve to the sibling
+/// it is, while the existing escape check still guards the real root.
+///
+/// The returned root is ALSO the materialize escape boundary: a pack may
+/// symlink to sibling content inside its own repo (the starter's corpus
+/// symlink) but never outside it.
+fn local_anchor(camp_root: &Path, source: &str) -> Result<(PathBuf, Option<String>)> {
+    // A relative source in camp.toml is relative to camp.toml (§5); an
+    // absolute one is itself. `join` gives both.
+    let pack_dir = camp_root.join(source);
+    if !pack_dir.is_dir() {
+        bail!(
+            "local import source {source:?} is not a directory (looked in {})",
+            pack_dir.display()
+        );
+    }
+    let pack_dir = pack_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize local import source {source:?}"))?;
+    let root = find_git_root(&pack_dir)
+        .or_else(|| pack_dir.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| pack_dir.clone());
+    let sub = pack_dir
+        .strip_prefix(&root)
+        .ok()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    Ok((root, sub))
 }
 
 /// Walk up from `start` for the first ancestor containing a `.git` entry
@@ -261,12 +346,18 @@ fn run_add_materialize(
     src: &camp_core::import::source::Source,
     binding: &str,
     repo_dir: &Path,
-    materialize_root: &Path,
+    anchor_sub: &Option<String>,
     commit: &str,
     lock: &mut PacksLock,
     source_str: &str,
 ) -> Result<()> {
-    let subpath_dir = match &src.subpath {
+    // `anchor_sub` is where the pack sits INSIDE `repo_dir` — the anchor for
+    // transitive `..` resolution. For a remote it is the source's `//subpath`;
+    // for a local pack it is its path within its own repo (see `local_anchor`),
+    // which is what lets `../gascity` resolve to the sibling it is. `repo_dir`
+    // is also the materialize escape boundary: a pack may reach sideways inside
+    // its own repo, never outside it.
+    let subpath_dir = match anchor_sub {
         Some(s) => repo_dir.join(s),
         None => repo_dir.to_path_buf(),
     };
@@ -280,7 +371,7 @@ fn run_add_materialize(
     let direct = vec![ResolvedImport {
         binding: binding.to_owned(),
         source: src.repository.clone(),
-        subpath: src.subpath.clone(),
+        subpath: anchor_sub.clone(),
         reference: src.reference.clone(),
         via: None,
         is_local: src.is_local_path,
@@ -361,7 +452,7 @@ fn run_add_materialize(
             continue; // D7: layered in place — never copied
         }
         let dest = layer_of(imp);
-        materialize_tree(materialize_root, &src_subtree, &dest)
+        materialize_tree(repo_dir, &src_subtree, &dest)
             .with_context(|| format!("materialize {source_str:?} into {}", dest.display()))?;
     }
 
@@ -446,14 +537,16 @@ fn run_add_materialize(
             if path.extension().is_none_or(|x| x != "toml") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
-                continue;
-            };
+            // Invariant 5: an unreadable or malformed formula is surfaced, not
+            // skipped. Swallowing it silently drops the very routes this scan
+            // exists to report, so the operator would be told a pack has no
+            // unbound bindings when camp simply could not read it.
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("read formula {}", path.display()))?;
+            let doc: toml::Value = toml::from_str(&text)
+                .with_context(|| format!("formula {}: invalid TOML", path.display()))?;
             let Some(steps) = doc.get("steps").and_then(|s| s.as_array()) else {
-                continue;
+                continue; // a formula with no steps declares no routes
             };
             for step in steps {
                 let routes = [
@@ -626,73 +719,93 @@ fn append_import_decl(camp_toml: &Path, binding: &str, decl: &ImportDecl) -> Res
     Ok(())
 }
 
-/// `camp import install` — re-materialize every locked import (never
-/// re-resolves a ref; `upgrade` is the only ref-mover).
+/// `camp import install` — re-materialize every locked import AT ITS LOCKED
+/// COMMIT (never re-resolves a ref; `upgrade` is the only ref-mover). This is
+/// what the docker entrypoint runs on every container start, so it must
+/// reproduce the locked tree byte-for-byte.
 pub fn run_install(camp_root: &Path) -> Result<()> {
-    let lock = PacksLock::read(&camp_root.join("packs.lock"))?;
-    for entry in &lock.imports {
-        if entry.via.is_some() {
-            continue; // transitive — materialized with its declaring import
-        }
-        let src = normalize(&entry.source, Some(&entry.version))
-            .with_context(|| format!("locked import {:?}", entry.name))?;
-        let (repo_dir, commit, materialize_root, _checkout) = if src.is_local_path {
-            let rd = PathBuf::from(&src.repository);
-            let mr = find_git_root(&rd).unwrap_or_else(|| rd.clone());
-            (rd, entry.commit.clone(), mr, None)
+    let lock_path = camp_root.join("packs.lock");
+    let mut lock = PacksLock::read(&lock_path)?;
+    // The direct entries decide the work; `run_add_materialize` re-derives each
+    // one's transitive layers, so iterate a snapshot while `lock` is rewritten.
+    let direct: Vec<LockEntry> = lock
+        .imports
+        .iter()
+        .filter(|e| e.via.is_none())
+        .cloned()
+        .collect();
+    for entry in &direct {
+        let src = source_of(entry);
+        let (repo_dir, anchor_sub, _checkout) = if src.is_local_path {
+            let (root, sub) = local_anchor(camp_root, &src.repository)?;
+            (root, sub, None)
         } else {
             let checkout = tempfile::tempdir().context("clone scratch dir")?;
             let dest = checkout.path().join("repo");
-            git_clone(&src.repository, &dest)?;
-            (dest.clone(), entry.commit.clone(), dest, Some(checkout))
+            // The LOCKED commit — install reproduces, it never re-resolves.
+            clone_at_commit(&src.repository, &dest, &entry.commit)
+                .with_context(|| format!("locked import {:?}", entry.name))?;
+            (dest, src.subpath.clone(), Some(checkout))
         };
-        let mut new_lock = PacksLock::read(&camp_root.join("packs.lock"))?;
         run_add_materialize(
             camp_root,
             &src,
             &entry.name,
             &repo_dir,
-            &materialize_root,
-            &commit,
-            &mut new_lock,
+            &anchor_sub,
+            &entry.commit,
+            &mut lock,
             &entry.source,
         )?;
     }
-    PacksLock::read(&camp_root.join("packs.lock"))?.write(&camp_root.join("packs.lock"))?;
+    lock.write(&lock_path).context("write packs.lock")?;
     Ok(())
 }
 
-/// `camp import upgrade [<name>]` — re-resolve the ref and move the commit.
+/// `camp import upgrade [<name>]` — re-resolve the ref, move the commit, and
+/// PERSIST it. It is the only ref-mover, so a lock it fails to write leaves the
+/// tree ahead of its own pin and every later `install` reproducing the past.
 pub fn run_upgrade(camp_root: &Path, name: Option<&str>) -> Result<()> {
-    let lock = PacksLock::read(&camp_root.join("packs.lock"))?;
-    for entry in lock.imports.iter().filter(|e| e.via.is_none()) {
-        if let Some(n) = name
-            && entry.name != n
-        {
-            continue;
-        }
-        let src = normalize(&entry.source, Some(&entry.version))?;
+    let lock_path = camp_root.join("packs.lock");
+    let mut lock = PacksLock::read(&lock_path)?;
+    let direct: Vec<LockEntry> = lock
+        .imports
+        .iter()
+        .filter(|e| e.via.is_none())
+        .filter(|e| name.is_none_or(|n| e.name == n))
+        .cloned()
+        .collect();
+    if let Some(n) = name
+        && direct.is_empty()
+    {
+        bail!("no import named {n:?} to upgrade");
+    }
+    for entry in &direct {
+        let src = source_of(entry);
         if src.is_local_path {
             bail!(
-                "upgrade is a no-op for a local-path import {:?}",
+                "upgrade is a no-op for a local-path import {:?} — it is layered in place, \
+                 so editing the source IS the upgrade",
                 entry.name
             );
         }
         let commit = resolve_commit(&src.repository, src.reference.as_deref())?;
         let checkout = tempfile::tempdir().context("clone scratch dir")?;
         let dest = checkout.path().join("repo");
-        git_clone(&src.repository, &dest)?;
+        clone_at_commit(&src.repository, &dest, &commit)
+            .with_context(|| format!("upgrade {:?}", entry.name))?;
         run_add_materialize(
             camp_root,
             &src,
             &entry.name,
             &dest,
-            &dest,
+            &src.subpath.clone(),
             &commit,
-            &mut PacksLock::read(&camp_root.join("packs.lock"))?,
+            &mut lock,
             &entry.source,
         )?;
     }
+    lock.write(&lock_path).context("write packs.lock")?;
     Ok(())
 }
 
@@ -755,46 +868,33 @@ pub fn run_list(camp_root: &Path) -> Result<()> {
 /// unbinds it, it does not delete their pack.
 pub fn run_remove(camp_root: &Path, name: &str) -> Result<()> {
     let camp_toml = camp_root.join("camp.toml");
-    let declared = camp_core::config::CampConfig::load(&camp_toml)
-        .map(|cfg| cfg.imports.contains_key(name))
-        .unwrap_or(false);
+    // A parse/IO failure here is NOT "not declared" — swallowing it would let
+    // `remove` delete a tree on the strength of a config it could not read.
+    let declared = if camp_toml.is_file() {
+        camp_core::config::CampConfig::load(&camp_toml)
+            .with_context(|| format!("read {}", camp_toml.display()))?
+            .imports
+            .contains_key(name)
+    } else {
+        false
+    };
 
     let lock_path = camp_root.join("packs.lock");
     let mut lock = PacksLock::read(&lock_path)?;
     let before = lock.imports.len();
-    // The transitive layers THIS binding pulled in — captured before the drop,
-    // so their materialized dirs can be reclaimed with it.
-    let transitive: Vec<String> = lock
-        .imports
-        .iter()
-        .filter(|e| e.via.as_deref() == Some(name))
-        .map(|e| e.name.clone())
-        .collect();
     lock.imports
         .retain(|e| e.name != name && e.via.as_deref() != Some(name));
     let locked = lock.imports.len() != before;
     if !locked && !declared {
         bail!("no import named {name:?}");
     }
-    lock.write(&lock_path)?;
 
-    // Camp-owned dirs only — never the operator's in-place local source.
-    let mut owned = vec![camp_root.join("imports").join(name)];
-    owned.extend(
-        transitive
-            .iter()
-            .map(|b| camp_core::config::transitive_layer_dir(camp_root, b)),
-    );
-    for dir in owned {
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
-        }
-    }
-    // Best-effort: drop the [imports.<name>] block from camp.toml.
-    let camp_toml = camp_root.join("camp.toml");
-    if camp_toml.is_file()
-        && let Ok(text) = std::fs::read_to_string(&camp_toml)
-    {
+    // camp.toml FIRST: it is the source of truth. If the rewrite fails we have
+    // deleted nothing, so the camp stays coherent — the reverse order could
+    // delete the tree and then leave camp.toml declaring a gone import.
+    if camp_toml.is_file() {
+        let text = std::fs::read_to_string(&camp_toml)
+            .with_context(|| format!("read {}", camp_toml.display()))?;
         let header = format!("[imports.{name}]");
         let mut out = String::new();
         let mut skipping = false;
@@ -811,9 +911,67 @@ pub fn run_remove(camp_root: &Path, name: &str) -> Result<()> {
                 out.push('\n');
             }
         }
-        let _ = std::fs::write(&camp_toml, out);
+        std::fs::write(&camp_toml, out)
+            .with_context(|| format!("rewrite {}", camp_toml.display()))?;
     }
+    lock.write(&lock_path).context("write packs.lock")?;
+
+    // The binding's own materialized dir — camp-owned only. A local import's
+    // source is the OPERATOR'S directory: `remove` unbinds it, never deletes it.
+    let own = camp_root.join("imports").join(name);
+    if own.exists() {
+        std::fs::remove_dir_all(&own).with_context(|| format!("remove {}", own.display()))?;
+    }
+    gc_transitive_layers(camp_root)?;
     println!("removed import {name}");
+    Ok(())
+}
+
+/// Reclaim every transitive layer NO surviving import still declares.
+///
+/// Transitive layers are shared and deduped by content: bmad and gstack both
+/// declare `[imports.gc] source = "../gascity"`, so they resolve to ONE
+/// `.transitive/gc/` layer. Deleting it because the import that happened to
+/// materialize it was removed pulls the layer out from under its co-dependent —
+/// `check` then fails and every formula that `extends` gascity stops resolving.
+/// So ownership is not "who fetched it" but "who still needs it": recompute the
+/// needed set from the surviving imports' own manifests and drop only the rest.
+fn gc_transitive_layers(camp_root: &Path) -> Result<()> {
+    let dir = camp_root.join("imports").join(TRANSITIVE_DIR);
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let camp_toml = camp_root.join("camp.toml");
+    let cfg = camp_core::config::CampConfig::load(&camp_toml)
+        .with_context(|| format!("read {}", camp_toml.display()))?;
+
+    // What the survivors declare, read from each one's own pack.toml (which
+    // lives at its layer dir — in place for a local import, materialized for a
+    // remote one). A direct import always has a manifest; a missing one means
+    // the camp is inconsistent and we must not guess.
+    let mut needed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (binding, layer) in cfg.import_layers() {
+        let manifest = read_manifest(&layer).with_context(|| {
+            format!("import {binding:?}: read pack.toml at {}", layer.display())
+        })?;
+        needed.extend(manifest.imports.into_keys());
+    }
+
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = entry
+            .with_context(|| format!("read {}", dir.display()))?
+            .path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(binding) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !needed.contains(binding) {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("reclaim transitive layer {}", path.display()))?;
+        }
+    }
     Ok(())
 }
 /// (creating parent dirs), then add + commit. Reused by the verb tests and
@@ -861,6 +1019,51 @@ pub(crate) mod testsupport {
             .status()
             .map(|s| s.success());
         assert!(ok.unwrap_or(false), "git commit {dir:?}");
+    }
+
+    /// Run a git subcommand in `dir`, asserting success. Hermetic against the
+    /// operator's gitconfig (identity + no signing), like `init_repo`.
+    pub fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .status()
+            .map(|s| s.success());
+        assert!(ok.unwrap_or(false), "git {args:?} in {dir:?}");
+    }
+
+    /// Write `files` into `dir` and commit them as a new revision.
+    pub fn commit_files(dir: &Path, msg: &str, files: &[(&str, &str)]) {
+        for (rel, content) in files {
+            let path = dir.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, content).unwrap();
+        }
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", msg]);
+    }
+
+    /// The sha `rev` resolves to in `dir`.
+    pub fn rev_parse(dir: &Path, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse {rev} in {dir:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 }
 
@@ -917,6 +1120,249 @@ mod tests {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod verb_tests {
     use super::*;
+
+    /// A camp root with a camp.toml + ledger, ready for `run_add`.
+    fn camp_at(dir: &Path) -> &Path {
+        std::fs::write(
+            dir.join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n",
+        )
+        .unwrap();
+        camp_core::ledger::Ledger::open(&dir.join("camp.db")).unwrap();
+        dir
+    }
+
+    /// A repo whose pack content DIFFERS between tag `v1` and branch HEAD.
+    /// Returns (repo, v1_sha, head_sha).
+    fn pinned_repo(repo: &Path) -> (String, String) {
+        testsupport::init_repo(
+            repo,
+            &[
+                ("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n"),
+                ("bmad/agents/architect/prompt.md", "V1-PINNED-CONTENT"),
+            ],
+        );
+        testsupport::git(repo, &["tag", "v1"]);
+        let v1 = testsupport::rev_parse(repo, "v1");
+        testsupport::commit_files(
+            repo,
+            "move head",
+            &[("bmad/agents/architect/prompt.md", "V2-HEAD-CONTENT")],
+        );
+        let head = testsupport::rev_parse(repo, "HEAD");
+        assert_ne!(v1, head, "the fixture must actually move HEAD off the tag");
+        (v1, head)
+    }
+
+    /// FINDING 1 — the `--version`/`#ref` pin must be REAL. `git clone` alone
+    /// always lands on the remote's default-branch HEAD; nothing checked out
+    /// the sha `resolve_commit` returned, so the materialized tree was HEAD's
+    /// while packs.lock recorded the pinned sha. The lock LIED, and the lie is
+    /// load-bearing: it is the supply-chain pin an operator reviews a pack at,
+    /// and the bytes it mis-describes are fed to a worker as an agent prompt.
+    #[test]
+    fn a_pinned_version_materializes_the_pinned_commit_not_head() {
+        let repo = tempfile::tempdir().unwrap();
+        let (v1, head) = pinned_repo(repo.path());
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp_at(camp.path());
+        let base = format!("file://{}", repo.path().display());
+
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), Some("v1")).unwrap();
+
+        let prompt =
+            std::fs::read_to_string(root.join("imports/bmad/agents/architect/prompt.md")).unwrap();
+        assert_eq!(
+            prompt, "V1-PINNED-CONTENT",
+            "the MATERIALIZED bytes must be the pinned commit's, not the branch tip's"
+        );
+        let lock = PacksLock::read(&root.join("packs.lock")).unwrap();
+        let entry = lock.imports.iter().find(|e| e.name == "bmad").unwrap();
+        assert_eq!(entry.commit, v1, "the lock records the pinned sha");
+        assert_ne!(entry.commit, head, "...which is NOT the branch tip");
+    }
+
+    /// FINDING 2 — `install` must re-materialize a SUBPATH import. It rebuilt
+    /// the Source with `normalize(entry.source, ..)`, but `entry.source` is the
+    /// bare repository (the `//subpath` was split off at add time), so the
+    /// subpath was silently dropped and the manifest was read at the repo ROOT.
+    /// Every corpus pack lives in a subpath, and the docker entrypoint runs
+    /// `install` on every container start — so this failed a restart outright.
+    #[test]
+    fn install_re_materializes_a_subpath_import() {
+        let repo = tempfile::tempdir().unwrap();
+        pinned_repo(repo.path());
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp_at(camp.path());
+        let base = format!("file://{}", repo.path().display());
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), None).unwrap();
+
+        // Simulate the container's empty (gitignored) imports/ dir.
+        std::fs::remove_dir_all(root.join("imports")).unwrap();
+        run_install(root).expect("install must re-materialize a subpath import");
+        assert!(
+            root.join("imports/bmad/agents/architect/prompt.md")
+                .is_file(),
+            "install must restore the pack from its LOCKED subpath"
+        );
+        run_check(root).expect("check must pass after install");
+    }
+
+    /// FINDING 2+3 — `upgrade` is defined as "the only ref-mover", so it must
+    /// both re-materialize the new content AND persist the moved commit. It
+    /// passed a TEMPORARY `PacksLock` into `run_add_materialize` and never
+    /// wrote it, so the lock kept the OLD pin while the tree moved — leaving
+    /// the next `install` reasoning from a stale lock.
+    #[test]
+    fn upgrade_moves_the_locked_commit_and_the_content() {
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                ("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n"),
+                ("bmad/agents/architect/prompt.md", "OLD"),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp_at(camp.path());
+        let base = format!("file://{}", repo.path().display());
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), None).unwrap();
+        let before = PacksLock::read(&root.join("packs.lock")).unwrap();
+        let old_commit = before
+            .imports
+            .iter()
+            .find(|e| e.name == "bmad")
+            .unwrap()
+            .commit
+            .clone();
+
+        testsupport::commit_files(
+            repo.path(),
+            "move",
+            &[("bmad/agents/architect/prompt.md", "NEW")],
+        );
+        let new_sha = testsupport::rev_parse(repo.path(), "HEAD");
+        assert_ne!(old_commit, new_sha);
+
+        run_upgrade(root, Some("bmad")).unwrap();
+
+        let after = PacksLock::read(&root.join("packs.lock")).unwrap();
+        let entry = after.imports.iter().find(|e| e.name == "bmad").unwrap();
+        assert_eq!(
+            entry.commit, new_sha,
+            "upgrade must PERSIST the moved commit — it is the only ref-mover"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("imports/bmad/agents/architect/prompt.md")).unwrap(),
+            "NEW",
+            "upgrade must re-materialize the new content"
+        );
+    }
+
+    /// FINDING 4 — `remove` must not delete a transitive layer that a SURVIVING
+    /// import still depends on. bmad and gstack both declare `[imports.gc]
+    /// source = "../gascity"`, so they SHARE one materialized `.transitive/gc`
+    /// layer. Removing bmad deleted it out from under gstack: `check` then
+    /// failed, and gstack's formulas that `extends` gascity stopped resolving.
+    #[test]
+    fn removing_one_import_keeps_a_transitive_layer_its_sibling_still_needs() {
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                (
+                    "bmad/pack.toml",
+                    "[pack]\nname=\"bmad\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n",
+                ),
+                ("bmad/agents/architect/prompt.md", "architect"),
+                (
+                    "gstack/pack.toml",
+                    "[pack]\nname=\"gstack\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n",
+                ),
+                ("gstack/agents/synth/prompt.md", "synth"),
+                (
+                    "gascity/formulas/build-base.formula.toml",
+                    "formula=\"build-base\"\n",
+                ),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp_at(camp.path());
+        let base = format!("file://{}", repo.path().display());
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), None).unwrap();
+        run_add(root, &format!("{base}//gstack"), Some("gstack"), None).unwrap();
+
+        let shared = camp_core::config::transitive_layer_dir(root, "gc");
+        assert!(shared.is_dir(), "both imports share one gc layer");
+
+        run_remove(root, "bmad").unwrap();
+
+        assert!(
+            shared.is_dir(),
+            "the shared transitive layer must SURVIVE — gstack still declares it"
+        );
+        run_check(root).expect("check must pass: nothing gstack depends on is missing");
+        let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+        assert!(
+            camp_core::orders::resolve_formula(&cfg, "build-base").is_ok(),
+            "gstack's transitive formula layer must still resolve"
+        );
+
+        // ...and removing the LAST dependent finally reclaims it.
+        run_remove(root, "gstack").unwrap();
+        assert!(
+            !shared.exists(),
+            "with no importer left, the transitive layer is reclaimed"
+        );
+    }
+
+    /// FINDING 6 — a LOCAL-path import of a real pack must work. Every corpus
+    /// pack declares `[imports.gc] source = "../gascity"`, and transitive
+    /// resolution anchored the declaring pack at a lexical EMPTY root, so
+    /// `../gascity` "escaped" and every such import was refused — gutting the
+    /// operator's D7 read-in-place ruling in the one scenario it exists for
+    /// (`camp init --import <local path>`, docker `CAMP_PACK=/packs/bmad`).
+    #[test]
+    fn a_local_import_of_a_pack_with_transitive_imports_resolves_the_sibling_layer() {
+        let packs = tempfile::tempdir().unwrap();
+        // Laid out like the corpus: siblings under one root.
+        for (rel, content) in [
+            (
+                "bmad/pack.toml",
+                "[pack]\nname=\"bmad\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n",
+            ),
+            ("bmad/agents/architect/prompt.md", "architect"),
+            (
+                "gascity/formulas/build-base.formula.toml",
+                "formula=\"build-base\"\n",
+            ),
+        ] {
+            let p = packs.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp_at(camp.path());
+
+        let bmad = packs.path().join("bmad");
+        run_add(root, &bmad.display().to_string(), Some("bmad"), None)
+            .expect("a local import of a pack declaring [imports.*] must resolve");
+
+        let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+        // D7: the pack itself is read IN PLACE (never copied)...
+        assert!(!root.join("imports/bmad").exists());
+        assert_eq!(
+            camp_core::pack::resolve_agent(&cfg, "bmad.architect")
+                .unwrap()
+                .name,
+            "bmad.architect"
+        );
+        // ...and its transitive sibling layer resolves by bare name.
+        assert!(
+            camp_core::orders::resolve_formula(&cfg, "build-base").is_ok(),
+            "the transitive ../gascity layer must resolve for a LOCAL import too"
+        );
+    }
 
     #[test]
     fn add_from_file_repo_clones_locks_materializes() {

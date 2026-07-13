@@ -112,12 +112,43 @@ pub fn ls(camp: &CampDir, json: bool) -> Result<()> {
 pub fn enable_order(camp_root: &std::path::Path, name: &str) -> Result<()> {
     let camp_toml = camp_root.join("camp.toml");
     let cfg = CampConfig::load(&camp_toml)?;
+
+    // The name must actually NAME an order. Writing an unknown one into
+    // `[orders] enabled` printed success and exited 0 while arming nothing —
+    // so a typo in the one list that arms money-spending work looked like it
+    // had taken effect. Validate against the real inventory and say what exists.
+    let inv = camp_core::orders::parse::compile_all_orders(&cfg)?;
+    let known: Vec<String> = inv
+        .disabled
+        .iter()
+        .map(|d| d.name.clone())
+        .chain(inv.active.iter().map(|o| o.name.clone()))
+        .collect();
+    if !known.iter().any(|n| n == name) {
+        if known.is_empty() {
+            bail!(
+                "no order named {name:?} — this camp has no orders (import a pack that ships \
+                 orders/, or add an [[order]] table)"
+            );
+        }
+        bail!("no order named {name:?} — available orders: {known:?}");
+    }
+
     let mut enabled = cfg.orders_section.enabled.clone();
     if !enabled.iter().any(|n| n == name) {
         enabled.push(name.to_owned());
     }
     rewrite_orders_block(&camp_toml, &enabled)?;
     println!("enabled order {name}");
+    // Phase-1 honesty: the daemon's fire loop still compiles LOCAL `[[order]]`
+    // tables only, so arming an IMPORTED order records the operator's intent
+    // without yet scheduling it. Say so rather than imply work is now firing.
+    if name.contains('.') {
+        println!(
+            "note: imported orders are armed in camp.toml but are not yet fired by campd — \
+             the imported-order fire path ships in phase 2"
+        );
+    }
     Ok(())
 }
 
@@ -217,14 +248,59 @@ pub fn run_order(camp: &CampDir, name: &str) -> Result<()> {
 mod compat_tests {
     use super::*;
 
-    #[test]
-    fn enable_adds_and_disable_removes_the_name() {
-        let dir = tempfile::tempdir().unwrap();
+    /// A camp with a `bmad` import that really ships `orders/nightly.toml` and
+    /// the formula it names — so `bmad.nightly` is a REAL order, not a name the
+    /// test merely hoped would be accepted.
+    fn camp_with_an_imported_order(root: &std::path::Path) {
         std::fs::write(
-            dir.path().join("camp.toml"),
+            root.join("camp.toml"),
             "[camp]\nname=\"t\"\n[imports.bmad]\nsource=\"file:///x\"\n",
         )
         .unwrap();
+        let pack = root.join("imports/bmad");
+        std::fs::create_dir_all(pack.join("orders")).unwrap();
+        std::fs::create_dir_all(pack.join("formulas")).unwrap();
+        std::fs::write(
+            pack.join("orders/nightly.toml"),
+            "[order]\nformula = \"nightly-formula\"\ntrigger = \"cron\"\nschedule = \"0 2 * * *\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("formulas/nightly-formula.toml"),
+            "formula = \"nightly-formula\"\n",
+        )
+        .unwrap();
+    }
+
+    /// `enable` must refuse a name that is not an order. Writing an unknown name
+    /// into `[orders] enabled` printed success and exited 0 while arming
+    /// nothing — a typo in the one list that arms money-spending work looked
+    /// like it had taken effect.
+    #[test]
+    fn enabling_an_order_that_does_not_exist_is_refused_and_names_what_does() {
+        let dir = tempfile::tempdir().unwrap();
+        camp_with_an_imported_order(dir.path());
+
+        let err = enable_order(dir.path(), "bmad.does-not-exist")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no order named"), "got {err}");
+        assert!(
+            err.contains("bmad.nightly"),
+            "the error must name the orders that DO exist, got {err}"
+        );
+
+        let cfg = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        assert!(
+            cfg.orders_section.enabled.is_empty(),
+            "a refused enable must not have written the name"
+        );
+    }
+
+    #[test]
+    fn enable_adds_and_disable_removes_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        camp_with_an_imported_order(dir.path());
         enable_order(dir.path(), "bmad.nightly").unwrap();
         let cfg = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
         assert!(

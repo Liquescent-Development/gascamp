@@ -270,25 +270,35 @@ impl CampConfig {
     /// name and sit BELOW the direct imports — so a direct import of the same
     /// binding overrides the transitive one's agents while its content layers
     /// survive (D8).
-    pub fn transitive_layers(&self) -> Vec<(String, PathBuf)> {
+    pub fn transitive_layers(&self) -> Result<Vec<(String, PathBuf)>, CoreError> {
         let Some(root) = self.root.as_deref() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let dir = root.join("imports").join(TRANSITIVE_DIR);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
-        };
-        let mut layers: Vec<(String, PathBuf)> = entries
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .filter_map(|p| {
-                let binding = p.file_name()?.to_str()?.to_owned();
-                Some((binding, p))
-            })
-            .collect();
+        // No transitive layers is the normal case, not an error. An UNREADABLE
+        // one is an error: silently treating it as empty would drop the very
+        // formula layers the corpus's `extends` compiles against, and the
+        // failure would surface later as a bogus "formula not found".
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| CoreError::Config(format!("cannot read {}: {e}", dir.display())))?;
+        let mut layers: Vec<(String, PathBuf)> = Vec::new();
+        for entry in entries {
+            let path = entry
+                .map_err(|e| CoreError::Config(format!("cannot read {}: {e}", dir.display())))?
+                .path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(binding) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            layers.push((binding.to_owned(), path));
+        }
         layers.sort();
-        layers
+        Ok(layers)
     }
 }
 
