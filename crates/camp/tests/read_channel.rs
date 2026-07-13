@@ -67,19 +67,22 @@ fn scaffold(dir: &Path, max_workers: usize) -> (PathBuf, PathBuf) {
         root.join("camp.toml"),
         format!(
             "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\
-             [dispatch]\nmax_workers = {max_workers}\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
+             [dispatch]\nmax_workers = {max_workers}\ncommand = \"{}\"\ndefault_agent = \"dev\"\n\n\
+             [agent_defaults]\ntools = [\"Read\", \"Bash\"]\n",
             rig.display(),
             fake_agent(),
         ),
     )
     .unwrap();
-    let agents = root.join("agents");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(
-        agents.join("dev.md"),
-        "---\nname: dev\nisolation: none\n---\nWork.\n",
-    )
-    .unwrap();
+    // A DIRECTORY agent (compat §5.1): identity is the directory name, and
+    // model/tools/permission are operator-owned via [agent_defaults] — camp
+    // never inherits gc's unrestricted default (§5.2). The `isolation = "none"`
+    // opt-out is unchanged in meaning: it is what lets dispatch run against the
+    // plain rig dir with no base commit.
+    let dev = root.join("agents/dev");
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::write(dev.join("agent.toml"), "isolation = \"none\"\n").unwrap();
+    std::fs::write(dev.join("prompt.md"), "Work.\n").unwrap();
     camp_ok(&root, &["events", "--json"]);
     (root, rig)
 }
