@@ -5,7 +5,7 @@
 | Date | 2026-07-13 |
 | Scope | How the compat phases (spec §12) and control-plane phases (spec §7) are dispatched, parallelized, verified, and recovered — the wave-2 companion to `2026-07-06-v1-orchestration.md` |
 | Authority | Operator > specs (`docs/design/2026-07-05-gas-camp-design.md` as amended by compat §11; `docs/superpowers/specs/2026-07-12-gas-city-pack-compatibility-design.md` rev 4; `…-camp-control-plane-design.md` rev 3; `…-camp-pack-imports-design.md` rev 3) > this guide |
-| Companion | `.claude/skills/phase-orchestration/SKILL.md` — the lead's behavioral contract, unchanged. Where this guide and the v1 guide differ, this guide wins for wave-2 streams. |
+| Companion | `.claude/skills/phase-orchestration/SKILL.md` — the lead's behavioral contract, as amended by the wave-2 process amendments below (amendment 4 overrides its never-merge rule). Where this guide and the v1 guide differ, this guide wins for wave-2 streams. |
 
 A fresh wave-2 lead reconstructs the entire state from this file plus
 `gh pr list --state all` — nothing load-bearing lives only in a session's
@@ -72,7 +72,7 @@ These bind every wave-2 stream and amend the v1 guide's flow:
 | cp-1 | `cp-1-control-protocol` | control-plane §7 phase 1: the one wire-format module, pinned fixtures, socket verbs `interrupt` + `send_turn`, subscribe connection mode §4.4 | cp-0 |
 | cp-2 | `cp-2-camp-watch` | control-plane §7 phase 2: the fleet view | cp-1 |
 | cp-3 | `cp-3-permission-flow` | control-plane §7 phase 3: `can_use_tool`, BLOCKED, stall-disarm §5.3.3, adoption rule §5.3.4, per-agent stdio flag §5.3.1 | cp-2 |
-| cp-4 | `cp-4-camp-attach` | control-plane §7 phase 4: per-agent view (`--include-partial-messages`) | cp-2 |
+| cp-4 | `cp-4-camp-attach` | control-plane §7 phase 4: per-agent view (`--include-partial-messages`) | cp-2 *(hard verb dep is cp-1's `subscribe`; the cp-2 edge is conservative sequencing)* |
 | cp-5 | `cp-5-overseer` | control-plane §7 phase 5: the operator skill as a control-plane client | cp-3 · cp-4 |
 
 gastown (compat §12.6) is v2 and NOT in this wave — it re-opens
@@ -89,7 +89,7 @@ compat-3 (which touches spawn/dispatch alongside nothing else).
 | W1 | fix-86 (+ compat-1 plan approved) | compat-1 ∥ cp-0 | Nearly disjoint: import/pack machinery vs daemon read channel. Both touch `event.rs`/`vocab.rs`/`fold.rs` additively. |
 | W2 | compat-1 | compat-2 ∥ cp-0 (if still open) or cp-1 | compat-2 is formula compiler + graph runtime (`formula/`, `dispatch.rs` drain arm); cp-1 is socket/event_loop. Both touch `dispatch.rs`/`event_loop.rs` — coordinate via the lead; expect a real rebase (v1's W4 precedent). |
 | W3 | compat-2, cp-1 | compat-3 ∥ cp-2 | compat-3 owns `spawn.rs` (env, shims) + the shim binary surface; cp-2 is a client-side view. Low overlap. |
-| W4 | compat-3, cp-2 | compat-4 ∥ cp-3 ∥ cp-4 | compat-4 is mail verbs on the bead type (mostly camp-core + CLI); cp-3/cp-4 both extend the protocol client/daemon — the highest-overlap pair in the wave (subscribe/eventing); acceptable with worktree isolation, expect a rebase between them. |
+| W4 | compat-3, cp-2 | compat-4 ∥ cp-3 ∥ cp-4 | compat-4 is mail verbs on the bead type (mostly camp-core + CLI); cp-3/cp-4 both extend the protocol client/daemon — the highest-overlap pair in the wave (subscribe/eventing), **including the same `spawn.rs` argv-construction region** (cp-3 adds `--permission-prompt-tool stdio`, cp-4 adds `--include-partial-messages`); acceptable with worktree isolation, expect a real rebase between them. |
 | W5 | cp-3, cp-4 | cp-5 | Runs alone at the tail. |
 
 The lead may run fewer streams than a window allows (operator review
@@ -102,8 +102,10 @@ Guaranteed-contention files (keep every touch additive):
 `crates/camp-core/src/vocab.rs` · `crates/camp-core/src/ledger/fold.rs` ·
 `Cargo.toml` / `Cargo.lock`. Wave-specific hot spots: `config.rs`
 (compat-1 owns the big change; later phases additive), `dispatch.rs`
-(compat-2 drain runtime ∥ cp-0/cp-1 daemon work), `spawn.rs` (compat-3),
-`.github/workflows/ci.yml` (compat-1/-2 gate).
+(compat-2 drain runtime ∥ cp-0/cp-1 daemon work), `spawn.rs` (compat-3;
+and again in W4 — cp-3's stdio flag and cp-4's `--include-partial-messages`
+land in the same argv region), `.github/workflows/ci.yml`
+(compat-1/-2 gate).
 
 Protocol, unchanged from v1 and non-negotiable: kickoffs name in-flight
 siblings and their owned files; after ANY merge to main the lead
@@ -291,9 +293,13 @@ CI green.
 Your task is control-plane phase 4: the per-agent view. {BRANCH} =
 cp-4-camp-attach. Contract: control-plane spec §5.2 (live typed event
 stream; filter, replay from the durable transcript, send-turn,
-interrupt, answer a permission request from the view), §2.2
-(--include-partial-messages gates deltas — attach needs it, autonomous
-dispatch must NOT gain it), cursors are byte offsets (§9).
+interrupt), §2.2 (--include-partial-messages gates deltas — attach
+needs it, autonomous dispatch must NOT gain it), cursors are byte
+offsets (§9). DEFERRED, mirroring cp-2's BLOCKED column: §5.2's
+"answer a permission request" needs cp-3's session.permission_decision
+verb, which does not exist while you run parallel to cp-3 — build the
+view so the answer action drops in after cp-3 merges; do NOT build the
+permission path yourself.
 Exit criteria: attach + detach against a live fake worker without the
 worker noticing; replay of a finished session; CI green.
 ```
