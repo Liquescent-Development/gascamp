@@ -148,6 +148,14 @@ fn gate_core_flags_match_build_spec_held_stream_arm() {
     let start = SPAWN_RS.find(ARM).unwrap() + ARM.len();
     let body = &SPAWN_RS[start..];
     let body = &body[..body.find('}').expect("HeldStream arm closes")];
+    // Truncating at the first '}' is only correct while the arm is brace-free:
+    // a nested block would end the scan early and silently drop trailing
+    // flags. Turn that future edit into a loud failure instead.
+    assert!(
+        !body.contains('{'),
+        "the HeldStream arm grew a nested block — teach this parser brace \
+         depth before trusting its flag extraction"
+    );
     let builder_flags: Vec<&str> = body
         .lines()
         .filter_map(|l| l.trim().strip_prefix("arg(\"")?.strip_suffix("\");"))
@@ -277,16 +285,21 @@ fn send(child: &mut Child, json: &str) {
 /// Drain the child's stderr on a reader thread (mirrors `stdout_lines`): a
 /// child writing more than the OS pipe buffer to stderr would otherwise
 /// deadlock against a parent that only reads stderr after `wait()` (child
-/// blocked on the stderr write, parent blocked in wait). Join AFTER the child
-/// exits to collect the captured text.
-fn stderr_capture(child: &mut Child) -> thread::JoinHandle<String> {
+/// blocked on the stderr write, parent blocked in wait). The captured text
+/// comes back over a channel so the caller can `recv_timeout` — a `claude`
+/// descendant inheriting the write end could hold the pipe open past the
+/// child's exit, and an unbounded join would hang the gate on it (the drain
+/// thread may then outlive the test; it dies with the process).
+fn stderr_capture(child: &mut Child) -> mpsc::Receiver<String> {
     let mut stderr = child.stderr.take().expect("child stderr piped");
+    let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         use std::io::Read;
         let mut s = String::new();
         let _ = stderr.read_to_string(&mut s);
-        s
-    })
+        let _ = tx.send(s);
+    });
+    rx
 }
 
 /// Bounded wait: the child must exit within RESPONSE_TIMEOUT or the gate
@@ -365,7 +378,7 @@ fn claude_compat_zero_cost() {
             child: cmd.spawn().unwrap(),
         };
         let rx = stdout_lines(&mut worker.child);
-        let stderr_thread = stderr_capture(&mut worker.child);
+        let stderr_rx = stderr_capture(&mut worker.child);
 
         // initialize handshake (the SDK sends this first).
         send(
@@ -391,7 +404,10 @@ fn claude_compat_zero_cost() {
             status.success(),
             "fixed argv worker must exit 0 on stdin EOF; got {status:?}"
         );
-        let stderr = stderr_thread.join().expect("stderr drain thread panicked");
+        let stderr = stderr_rx.recv_timeout(RESPONSE_TIMEOUT).expect(
+            "stderr not drained within the response timeout — a descendant \
+             is holding the worker's stderr write end open past exit",
+        );
         assert!(
             !stderr.contains("requires --verbose"),
             "fixed argv must NOT trip the #86 error; stderr was: {stderr:?}"
