@@ -243,4 +243,24 @@ mod tests {
         assert!(matches!(decide_import(false, None, false), ImportDecision::HandOff));
         assert!(matches!(decide_import(false, Some("file:///x"), false), ImportDecision::Install(_)));
     }
+
+    #[test]
+    fn fresh_camp_has_no_agents_until_starter_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".camp");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("camp.toml"), "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\",\"Skill\"]\n").unwrap();
+        camp_core::ledger::Ledger::open(&root.join("camp.db")).unwrap();
+        let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+        // #80: zero agents — the route fails (the documented dead-end).
+        assert!(camp_core::pack::resolve_agent(&cfg, "starter.dev")
+            .unwrap_err()
+            .to_string()
+            .contains("starter"));
+        // the fix: import the LOCAL starter pack (a file source; never the network).
+        let starter = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/starter");
+        crate::cmd::import::run_add(&root, &starter.to_string_lossy(), Some("starter"), None).unwrap();
+        let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+        assert_eq!(camp_core::pack::resolve_agent(&cfg, "starter.dev").unwrap().name, "starter.dev");
+    }
 }

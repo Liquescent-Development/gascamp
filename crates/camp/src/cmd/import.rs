@@ -198,9 +198,30 @@ pub fn run_add(camp_root: &Path, source: &str, name: Option<&str>, version: Opti
         (dest, commit, Some(checkout))
     };
 
-    run_add_materialize(camp_root, &src, &binding, &repo_dir, &commit, &mut lock, source)?;
+    // The materialize escape boundary: for a remote clone, the clone dir
+    // (untrusted — a pack may not reach outside its checkout). For a LOCAL
+    // path, the git repo root containing the pack (the operator's trusted
+    // repo) — so a pack may symlink to sibling content in its own repo
+    // (e.g. the starter's corpus symlink) but not outside it.
+    let materialize_root = if src.is_local_path {
+        find_git_root(&repo_dir).unwrap_or_else(|| repo_dir.clone())
+    } else {
+        repo_dir.clone()
+    };
+
+    run_add_materialize(camp_root, &src, &binding, &repo_dir, &materialize_root, &commit, &mut lock, source)?;
     lock.write(&lock_path).context("write packs.lock")?;
     Ok(())
+}
+
+/// Walk up from `start` for the first ancestor containing a `.git` entry
+/// (a directory for a normal repo, a file for a worktree/submodule gitdir
+/// pointer). Returns `None` when `start` is not inside a git repo.
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 /// Materialize + lock + camp.toml + ledger events, shared by `add`/`install`.
@@ -209,6 +230,7 @@ fn run_add_materialize(
     src: &camp_core::import::source::Source,
     binding: &str,
     repo_dir: &Path,
+    materialize_root: &Path,
     commit: &str,
     lock: &mut PacksLock,
     source_str: &str,
@@ -279,7 +301,7 @@ fn run_add_materialize(
                 imp.binding
             );
         }
-        materialize_tree(repo_dir, &src_subtree, &dest)
+        materialize_tree(materialize_root, &src_subtree, &dest)
             .with_context(|| format!("materialize {source_str:?} into {}", dest.display()))?;
     }
 
@@ -430,17 +452,18 @@ pub fn run_install(camp_root: &Path) -> Result<()> {
         }
         let src = normalize(&entry.source, Some(&entry.version))
             .with_context(|| format!("locked import {:?}", entry.name))?;
-        let (repo_dir, commit) = if src.is_local_path {
-            (PathBuf::from(&src.repository), entry.commit.clone())
+        let (repo_dir, commit, materialize_root, _checkout) = if src.is_local_path {
+            let rd = PathBuf::from(&src.repository);
+            let mr = find_git_root(&rd).unwrap_or_else(|| rd.clone());
+            (rd, entry.commit.clone(), mr, None)
         } else {
             let checkout = tempfile::tempdir().context("clone scratch dir")?;
             let dest = checkout.path().join("repo");
             git_clone(&src.repository, &dest)?;
-            (dest, entry.commit.clone())
+            (dest.clone(), entry.commit.clone(), dest, Some(checkout))
         };
         let mut new_lock = PacksLock::read(&camp_root.join("packs.lock"))?;
-        run_add_materialize(camp_root, &src, &entry.name, &repo_dir, &commit, &mut new_lock, &entry.source)?;
-        // install re-writes the lock; persist after the loop instead
+        run_add_materialize(camp_root, &src, &entry.name, &repo_dir, &materialize_root, &commit, &mut new_lock, &entry.source)?;
     }
     PacksLock::read(&camp_root.join("packs.lock"))?.write(&camp_root.join("packs.lock"))?;
     Ok(())
@@ -463,7 +486,7 @@ pub fn run_upgrade(camp_root: &Path, name: Option<&str>) -> Result<()> {
         let checkout = tempfile::tempdir().context("clone scratch dir")?;
         let dest = checkout.path().join("repo");
         git_clone(&src.repository, &dest)?;
-        run_add_materialize(camp_root, &src, &entry.name, &dest, &commit, &mut PacksLock::read(&camp_root.join("packs.lock"))?, &entry.source)?;
+        run_add_materialize(camp_root, &src, &entry.name, &dest, &dest, &commit, &mut PacksLock::read(&camp_root.join("packs.lock"))?, &entry.source)?;
     }
     Ok(())
 }
