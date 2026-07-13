@@ -105,6 +105,7 @@ pub fn git_clone(repository: &str, dest: &Path) -> Result<()> {
 /// Test-only fixture builder: init a git repo at `dir`, write each file
 /// (creating parent dirs), then add + commit. Reused by the verb tests and
 /// the end-to-end acceptance test.
+#[cfg(test)]
 pub(crate) mod testsupport {
     use std::path::Path;
 
