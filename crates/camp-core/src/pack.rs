@@ -152,31 +152,20 @@ pub fn parse_agent_file(path: &Path) -> Result<AgentDef, CoreError> {
 }
 
 /// The agents/ layers to search, lowest to highest (plan decision R).
+/// Phase 1 interim: the `packs` field is gone (compat §7 — packs now import
+/// under `<root>/imports/<binding>/`); the binding-qualified rewrite lands in
+/// Task 12. Until then the camp-local `<root>/agents/` layer is the only one.
 fn layers(cfg: &CampConfig) -> Result<Vec<PathBuf>, CoreError> {
-    let mut layers = Vec::with_capacity(cfg.packs.len() + 1);
     let need_root = || {
         CoreError::Config(
-            "config has no root directory (loaded via parse, not load) — cannot resolve pack paths"
+            "config has no root directory (loaded via parse, not load) — cannot resolve agent paths"
                 .to_owned(),
         )
     };
-    for pack in &cfg.packs {
-        let dir = if pack.is_absolute() {
-            pack.clone()
-        } else {
-            cfg.root.as_deref().ok_or_else(need_root)?.join(pack)
-        };
-        if !dir.is_dir() {
-            return Err(CoreError::Config(format!(
-                "pack directory {} (from camp.toml packs) does not exist",
-                dir.display()
-            )));
-        }
-        layers.push(dir.join("agents"));
-    }
+    let mut layers = Vec::new();
     if let Some(root) = cfg.root.as_deref() {
         layers.push(root.join("agents"));
-    } else if cfg.packs.is_empty() {
+    } else {
         return Err(need_root());
     }
     Ok(layers)
@@ -374,54 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_agent_layers_packs_last_wins_with_local_agents_highest() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write_agent(
-            &root.join("pack-a/agents"),
-            "dev.md",
-            "---\nname: dev\n---\nFrom pack-a.\n",
-        );
-        write_agent(
-            &root.join("pack-a/agents"),
-            "only-a.md",
-            "---\nname: only-a\n---\nA only.\n",
-        );
-        write_agent(
-            &root.join("pack-b/agents"),
-            "dev.md",
-            "---\nname: dev\n---\nFrom pack-b.\n",
-        );
-        std::fs::write(
-            root.join("camp.toml"),
-            "packs = [\"pack-a\", \"pack-b\"]\n[camp]\nname = \"t\"\n",
-        )
-        .unwrap();
-        let cfg = CampConfig::load(&root.join("camp.toml")).unwrap();
-
-        // later pack wins
-        assert_eq!(resolve_agent(&cfg, "dev").unwrap().prompt, "From pack-b.");
-        // earlier pack still contributes what later layers don't override
-        assert_eq!(resolve_agent(&cfg, "only-a").unwrap().prompt, "A only.");
-
-        // local <camp>/agents/ beats every pack
-        write_agent(
-            &root.join("agents"),
-            "dev.md",
-            "---\nname: dev\n---\nLocal.\n",
-        );
-        assert_eq!(resolve_agent(&cfg, "dev").unwrap().prompt, "Local.");
-
-        // unknown agent: error lists the searched layers
-        let err = resolve_agent(&cfg, "ghost").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("ghost") && msg.contains("pack-a"),
-            "msg: {msg}"
-        );
-    }
-
-    #[test]
     fn duplicate_agent_names_in_one_layer_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -431,25 +372,5 @@ mod tests {
         let cfg = CampConfig::load(&root.join("camp.toml")).unwrap();
         let err = resolve_agent(&cfg, "dev").unwrap_err();
         assert!(err.to_string().contains("dev"), "got {err}");
-    }
-
-    #[test]
-    fn missing_pack_dir_is_a_hard_error_and_parse_only_config_has_no_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("camp.toml"),
-            "packs = [\"nope\"]\n[camp]\nname = \"t\"\n",
-        )
-        .unwrap();
-        let cfg = CampConfig::load(&root.join("camp.toml")).unwrap();
-        assert!(
-            resolve_agent(&cfg, "dev").is_err(),
-            "missing pack dir must fail"
-        );
-
-        let cfg2 = CampConfig::parse("packs = [\"p\"]\n[camp]\nname = \"t\"\n").unwrap();
-        let err = resolve_agent(&cfg2, "dev").unwrap_err();
-        assert!(err.to_string().contains("root"), "got {err}");
     }
 }

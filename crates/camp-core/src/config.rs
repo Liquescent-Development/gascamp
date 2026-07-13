@@ -19,9 +19,21 @@ pub struct CampConfig {
     /// `[[order]]` tables (spec §9); compiled by `orders::parse::compile_orders`.
     #[serde(default, rename = "order", skip_serializing_if = "Vec::is_empty")]
     pub orders: Vec<crate::orders::parse::OrderConfig>,
-    /// Pack directories (spec §11). Relative paths resolve against `root`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub packs: Vec<PathBuf>,
+    /// `[imports.<binding>]` (compat §7): the binding namespace. Each
+    /// import materializes under `<root>/imports/<binding>/` and qualifies
+    /// its agents/formulas/orders as `<binding>.<name>`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub imports: std::collections::BTreeMap<String, ImportDecl>,
+    /// `[orders] enabled = [...]` (compat §14): the money invariant — an
+    /// imported order is INERT until this list names it. Distinct from the
+    /// `[[order]]` array above (`rename = "order"`).
+    #[serde(default, rename = "orders", skip_serializing_if = "OrdersSection::is_default")]
+    pub orders_section: OrdersSection,
+    /// `[agent_defaults]` (compat §5.2): model/permission_mode/tools come
+    /// ONLY from the operator, never from a pack — camp never inherits gc's
+    /// unrestricted default.
+    #[serde(default, skip_serializing_if = "AgentDefaults::is_default")]
+    pub agent_defaults: AgentDefaults,
     #[serde(default, skip_serializing_if = "DispatchConfig::is_default")]
     pub dispatch: DispatchConfig,
     /// `[patrol]` (spec §10): stall threshold, restart budget, release
@@ -169,6 +181,58 @@ pub struct RigConfig {
     pub default_agent: Option<String>,
 }
 
+/// One `[imports.<binding>]` declaration (compat §7). A binding qualifies
+/// every agent/formula/order the import materializes as `<binding>.<name>`.
+/// `trust_exec` defaults false (§13 default-deny); `skills = false` is the
+/// §5.3 opt-out (a pack that ships `skills/` but should not install them).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportDecl {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_exec: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<bool>,
+}
+
+/// `[orders]` (compat §14): the `enabled` list that arms imported orders.
+/// An imported order is INERT until named here — the money invariant.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersSection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled: Vec<String>,
+}
+
+impl OrdersSection {
+    fn is_default(&self) -> bool {
+        self.enabled.is_empty()
+    }
+}
+
+/// `[agent_defaults]` (compat §5.2): model/permission_mode/tools are
+/// operator-owned, never pack-owned. No resolvable `tools` → no spawn.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+}
+
+impl AgentDefaults {
+    fn is_default(&self) -> bool {
+        *self == AgentDefaults::default()
+    }
+}
+
 impl CampConfig {
     /// Parse a camp.toml file. Missing file, bad TOML, and unknown keys are
     /// all hard errors.
@@ -181,6 +245,19 @@ impl CampConfig {
     }
 
     pub fn parse(text: &str) -> Result<CampConfig, CoreError> {
+        // Friendly rewrite for the removed `packs = [...]` key BEFORE
+        // `deny_unknown_fields` rejects it with a generic unknown-field
+        // error (component §13): a local pack is now an import whose
+        // source is a path.
+        let doc: toml::Value = toml::from_str(text).map_err(|e| CoreError::Config(e.to_string()))?;
+        if doc.get("packs").is_some() {
+            return Err(CoreError::Config(
+                "`packs = [...]` was removed. Rewrite each pack as an import:\n  \
+                 [imports.<name>]\n  source = \"<path-or-url>\"\n\
+                 (a local pack is an import whose source is a path — component spec §13)"
+                    .to_owned(),
+            ));
+        }
         let cfg: CampConfig = toml::from_str(text).map_err(|e| CoreError::Config(e.to_string()))?;
         if cfg.dispatch.max_workers == 0 {
             // A typo'd cap must not silently disable dispatch (PR #14
@@ -307,7 +384,9 @@ prefix = "gc"
                 default_agent: None,
             }],
             orders: vec![],
-            packs: Vec::new(),
+            imports: std::collections::BTreeMap::new(),
+            orders_section: OrdersSection::default(),
+            agent_defaults: AgentDefaults::default(),
             dispatch: DispatchConfig::default(),
             patrol: PatrolSection::default(),
             root: None,
@@ -316,15 +395,12 @@ prefix = "gc"
         assert_eq!(CampConfig::parse(&text).unwrap(), cfg);
     }
 
-    // ---- Phase 8: [dispatch], packs, per-rig default_agent ---------------
+    // ---- Phase 8: [dispatch], per-rig default_agent ----------------------
 
     #[test]
-    fn dispatch_and_packs_parse_with_defaults() {
+    fn dispatch_and_imports_parse_with_defaults() {
         let cfg = CampConfig::parse(
             r#"
-# top-level keys precede any [table] header (TOML), so packs comes first
-packs = ["packs/starter", "/abs/otherpack"]
-
 [camp]
 name = "dev"
 
@@ -334,6 +410,9 @@ path = "/code/gascity"
 prefix = "gc"
 default_agent = "rigger"
 
+[imports.starter]
+source = "packs/starter"
+
 [dispatch]
 max_workers = 3
 command = "tests/fake-agent.sh"
@@ -341,13 +420,8 @@ default_agent = "dev"
 "#,
         )
         .unwrap();
-        assert_eq!(
-            cfg.packs,
-            vec![
-                PathBuf::from("packs/starter"),
-                PathBuf::from("/abs/otherpack")
-            ]
-        );
+        assert_eq!(cfg.imports["starter"].source, "packs/starter");
+        assert!(!cfg.imports["starter"].trust_exec);
         assert_eq!(cfg.dispatch.max_workers, 3);
         assert_eq!(cfg.dispatch.command, PathBuf::from("tests/fake-agent.sh"));
         assert_eq!(cfg.dispatch.default_agent.as_deref(), Some("dev"));
@@ -360,7 +434,7 @@ default_agent = "dev"
     #[test]
     fn dispatch_section_is_optional_with_spec_defaults() {
         let cfg = CampConfig::parse("[camp]\nname = \"dev\"\n").unwrap();
-        assert!(cfg.packs.is_empty());
+        assert!(cfg.imports.is_empty());
         assert_eq!(cfg.dispatch.max_workers, 10);
         assert_eq!(cfg.dispatch.command, PathBuf::from("claude"));
         assert!(cfg.dispatch.default_agent.is_none());
@@ -390,11 +464,69 @@ default_agent = "dev"
     fn defaults_do_not_pollute_serialization() {
         // rig add appends TOML text rather than re-serializing, but the
         // config type must still round-trip cleanly without inventing
-        // [dispatch]/packs blocks the user never wrote.
+        // [dispatch]/[imports]/[orders]/[agent_defaults] blocks the user
+        // never wrote.
         let cfg = CampConfig::parse("[camp]\nname = \"dev\"\n").unwrap();
         let text = toml::to_string(&cfg).unwrap();
         assert!(!text.contains("dispatch"), "text was: {text}");
-        assert!(!text.contains("packs"), "text was: {text}");
+        assert!(!text.contains("imports"), "text was: {text}");
+        assert!(!text.contains("orders"), "text was: {text}");
+        assert!(!text.contains("agent_defaults"), "text was: {text}");
+    }
+
+    // ---- compat phase 1: [imports.*], [orders] enabled, [agent_defaults] --
+
+    #[test]
+    fn imports_orders_enabled_and_agent_defaults_parse() {
+        let cfg = CampConfig::parse(
+            r#"
+[camp]
+name = "dev"
+
+[imports.bmad]
+source = "https://github.com/gastownhall/gascity-packs"
+subpath = "bmad"
+version = "sha:deadbeef"
+
+[imports.gc]
+source = "../local/roles"
+trust_exec = true
+skills = false
+
+[orders]
+enabled = ["bmad.nightly", "gc.triage"]
+
+[agent_defaults]
+model = "sonnet"
+permission_mode = "acceptEdits"
+tools = ["Read", "Edit", "Bash", "Skill"]
+"#,
+        )
+        .unwrap();
+        let bmad = &cfg.imports["bmad"];
+        assert_eq!(bmad.source, "https://github.com/gastownhall/gascity-packs");
+        assert_eq!(bmad.subpath.as_deref(), Some("bmad"));
+        assert_eq!(bmad.version.as_deref(), Some("sha:deadbeef"));
+        assert!(!bmad.trust_exec);
+        let gc = &cfg.imports["gc"];
+        assert!(gc.trust_exec);
+        assert_eq!(gc.skills, Some(false));
+        assert_eq!(cfg.orders_section.enabled, vec!["bmad.nightly", "gc.triage"]);
+        assert_eq!(cfg.agent_defaults.model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.agent_defaults.tools.as_deref().unwrap(), ["Read", "Edit", "Bash", "Skill"]);
+    }
+
+    #[test]
+    fn legacy_packs_key_is_a_specific_rewrite_error() {
+        let err = CampConfig::parse("packs = [\"packs/starter\"]\n[camp]\nname = \"d\"\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("packs"), "{msg}");
+        assert!(msg.contains("[imports."), "must show the rewrite: {msg}");
+    }
+
+    #[test]
+    fn agent_defaults_reject_unknown_keys() {
+        assert!(CampConfig::parse("[camp]\nname=\"d\"\n[agent_defaults]\nbogus = 1\n").is_err());
     }
 
     #[test]
