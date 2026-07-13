@@ -40,6 +40,8 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "patrol.degraded",
     "session.stream_capped",
     "session.nudged",
+    "import.added",
+    "import.refused",
 ];
 
 /// Values `bead.closed` accepts for `outcome` — a strict subset of gc's

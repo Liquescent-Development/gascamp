@@ -19,9 +19,25 @@ pub struct CampConfig {
     /// `[[order]]` tables (spec §9); compiled by `orders::parse::compile_orders`.
     #[serde(default, rename = "order", skip_serializing_if = "Vec::is_empty")]
     pub orders: Vec<crate::orders::parse::OrderConfig>,
-    /// Pack directories (spec §11). Relative paths resolve against `root`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub packs: Vec<PathBuf>,
+    /// `[imports.<binding>]` (compat §7): the binding namespace. Each
+    /// import materializes under `<root>/imports/<binding>/` and qualifies
+    /// its agents/formulas/orders as `<binding>.<name>`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub imports: std::collections::BTreeMap<String, ImportDecl>,
+    /// `[orders] enabled = [...]` (compat §14): the money invariant — an
+    /// imported order is INERT until this list names it. Distinct from the
+    /// `[[order]]` array above (`rename = "order"`).
+    #[serde(
+        default,
+        rename = "orders",
+        skip_serializing_if = "OrdersSection::is_default"
+    )]
+    pub orders_section: OrdersSection,
+    /// `[agent_defaults]` (compat §5.2): model/permission_mode/tools come
+    /// ONLY from the operator, never from a pack — camp never inherits gc's
+    /// unrestricted default.
+    #[serde(default, skip_serializing_if = "AgentDefaults::is_default")]
+    pub agent_defaults: AgentDefaults,
     #[serde(default, skip_serializing_if = "DispatchConfig::is_default")]
     pub dispatch: DispatchConfig,
     /// `[patrol]` (spec §10): stall threshold, restart budget, release
@@ -169,6 +185,157 @@ pub struct RigConfig {
     pub default_agent: Option<String>,
 }
 
+/// One `[imports.<binding>]` declaration (compat §7). A binding qualifies
+/// every agent/formula/order the import materializes as `<binding>.<name>`.
+/// `trust_exec` defaults false (§13 default-deny); `skills = false` is the
+/// §5.3 opt-out (a pack that ships `skills/` but should not install them).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportDecl {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_exec: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<bool>,
+}
+
+/// The subdirectory of `<root>/imports/` that holds TRANSITIVE (pack-level,
+/// §7.2) materializations. A leading `.` makes it unspellable as a binding
+/// (`[A-Za-z0-9_-]+`), so a pack can never shadow it — and it keeps the
+/// transitive content layers DISJOINT from the direct bindings' dirs, which
+/// is what lets a direct import override a transitive one of the same name
+/// (§7.1) without clobbering the transitive formula layers (D8).
+pub const TRANSITIVE_DIR: &str = ".transitive";
+
+/// Where a TRANSITIVE import's content layer is materialized (§7.2). Keyed by
+/// its binding, under the transitive sentinel dir. Transitive packs contribute
+/// content (formulas, fragments, skills, assets) by BARE name only — never
+/// agents (a transitive `agents/` dir is refused at import).
+pub fn transitive_layer_dir(root: &Path, binding: &str) -> PathBuf {
+    root.join("imports").join(TRANSITIVE_DIR).join(binding)
+}
+
+impl ImportDecl {
+    /// Is this import's source a LOCAL filesystem path? Delegates to the ONE
+    /// definition of "local" (`import::source::is_local_source`), so a
+    /// declared import and a CLI source can never be classified differently.
+    pub fn is_local(&self) -> bool {
+        crate::import::source::is_local_source(&self.source)
+    }
+
+    /// The directory this import's content is READ from (component §5).
+    ///
+    /// - **Local path → layered IN PLACE.** The source resolves relative to
+    ///   `camp.toml`'s root and is read where the operator keeps it: no fetch,
+    ///   no copy under `imports/`, no lock entry (§5's layout diagram). This
+    ///   is the single seam that makes read-in-place true for EVERY resolver
+    ///   (agents, formulas, orders, skills, exec inventory) at once.
+    /// - **Git-backed → the DERIVED materialization** `<root>/imports/<binding>/`.
+    ///   Never stored — storing it made a path read from a tracked file into a
+    ///   write-anywhere primitive (§5).
+    pub fn layer_dir(&self, root: &Path, binding: &str) -> PathBuf {
+        if self.is_local() {
+            let base = root.join(&self.source);
+            return match &self.subpath {
+                Some(s) => base.join(s),
+                None => base,
+            };
+        }
+        root.join("imports").join(binding)
+    }
+}
+
+impl CampConfig {
+    /// The DIRECT import layers as `(binding, dir)`, declaration-driven and
+    /// sorted by binding (§7.1: the binding IS the namespace). Driven by
+    /// `camp.toml`, NOT by listing `imports/` — a local import has no dir
+    /// there, and the transitive sentinel must never be mistaken for a
+    /// binding. Returns `None`-free pairs only when the config has a root.
+    pub fn import_layers(&self) -> Vec<(String, PathBuf)> {
+        let Some(root) = self.root.as_deref() else {
+            return Vec::new();
+        };
+        self.imports
+            .iter()
+            .map(|(binding, decl)| (binding.clone(), decl.layer_dir(root, binding)))
+            .collect()
+    }
+
+    /// The TRANSITIVE content layers as `(binding, dir)` (§7.2), sorted by
+    /// binding. These contribute formulas/fragments/skills/assets by BARE
+    /// name and sit BELOW the direct imports — so a direct import of the same
+    /// binding overrides the transitive one's agents while its content layers
+    /// survive (D8).
+    pub fn transitive_layers(&self) -> Result<Vec<(String, PathBuf)>, CoreError> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let dir = root.join("imports").join(TRANSITIVE_DIR);
+        // No transitive layers is the normal case, not an error. An UNREADABLE
+        // one is an error: silently treating it as empty would drop the very
+        // formula layers the corpus's `extends` compiles against, and the
+        // failure would surface later as a bogus "formula not found".
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| CoreError::Config(format!("cannot read {}: {e}", dir.display())))?;
+        let mut layers: Vec<(String, PathBuf)> = Vec::new();
+        for entry in entries {
+            let path = entry
+                .map_err(|e| CoreError::Config(format!("cannot read {}: {e}", dir.display())))?
+                .path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(binding) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            layers.push((binding.to_owned(), path));
+        }
+        layers.sort();
+        Ok(layers)
+    }
+}
+
+/// `[orders]` (compat §14): the `enabled` list that arms imported orders.
+/// An imported order is INERT until named here — the money invariant.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersSection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled: Vec<String>,
+}
+
+impl OrdersSection {
+    fn is_default(&self) -> bool {
+        self.enabled.is_empty()
+    }
+}
+
+/// `[agent_defaults]` (compat §5.2): model/permission_mode/tools are
+/// operator-owned, never pack-owned. No resolvable `tools` → no spawn.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+}
+
+impl AgentDefaults {
+    fn is_default(&self) -> bool {
+        *self == AgentDefaults::default()
+    }
+}
+
 impl CampConfig {
     /// Parse a camp.toml file. Missing file, bad TOML, and unknown keys are
     /// all hard errors.
@@ -181,6 +348,20 @@ impl CampConfig {
     }
 
     pub fn parse(text: &str) -> Result<CampConfig, CoreError> {
+        // Friendly rewrite for the removed `packs = [...]` key BEFORE
+        // `deny_unknown_fields` rejects it with a generic unknown-field
+        // error (component §13): a local pack is now an import whose
+        // source is a path.
+        let doc: toml::Value =
+            toml::from_str(text).map_err(|e| CoreError::Config(e.to_string()))?;
+        if doc.get("packs").is_some() {
+            return Err(CoreError::Config(
+                "`packs = [...]` was removed. Rewrite each pack as an import:\n  \
+                 [imports.<name>]\n  source = \"<path-or-url>\"\n\
+                 (a local pack is an import whose source is a path — component spec §13)"
+                    .to_owned(),
+            ));
+        }
         let cfg: CampConfig = toml::from_str(text).map_err(|e| CoreError::Config(e.to_string()))?;
         if cfg.dispatch.max_workers == 0 {
             // A typo'd cap must not silently disable dispatch (PR #14
@@ -212,6 +393,88 @@ impl CampConfig {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// D7 (operator ruling, issue #80): a LOCAL-path import is layered IN
+    /// PLACE — resolvers read the operator's own directory, resolved relative
+    /// to camp.toml. It is never fetched and never copied under `imports/`
+    /// (component §5's layout diagram: "local path: layered in place / no
+    /// fetch, no lock entry"). A git-backed import keeps the DERIVED
+    /// materialization path. Mutating `layer_dir` to return the materialized
+    /// path for a local source turns this red.
+    #[test]
+    fn a_local_import_layers_in_place_and_a_git_import_layers_under_imports() {
+        let root = Path::new("/camp");
+        let local = ImportDecl {
+            source: "../packs/house".to_owned(),
+            subpath: None,
+            version: None,
+            trust_exec: false,
+            skills: None,
+        };
+        assert!(local.is_local());
+        assert_eq!(
+            local.layer_dir(root, "house"),
+            PathBuf::from("/camp/../packs/house"),
+            "a local source is read in place, relative to camp.toml"
+        );
+
+        let git = ImportDecl {
+            source: "https://github.com/Liquescent-Development/gascamp".to_owned(),
+            subpath: Some("packs/starter".to_owned()),
+            version: None,
+            trust_exec: false,
+            skills: None,
+        };
+        assert!(!git.is_local());
+        assert_eq!(
+            git.layer_dir(root, "starter"),
+            PathBuf::from("/camp/imports/starter"),
+            "a git source is materialized; its location is DERIVED, never stored"
+        );
+    }
+
+    /// D8 (operator ruling, issue #80): a DIRECT import OVERRIDES a transitive
+    /// one for the same binding (§7.1 — the operator's binding always wins;
+    /// gc's own rule, pack.go:335-340). The direct import owns
+    /// `imports/<binding>/`, while the transitive layer persists under a
+    /// SEPARATE path — so a direct override never clobbers the transitive
+    /// FORMULA layers that the corpus's `extends = [...]` depend on.
+    #[test]
+    fn a_direct_import_and_a_transitive_layer_of_the_same_binding_have_disjoint_dirs() {
+        let root = Path::new("/camp");
+        let direct = ImportDecl {
+            source: "https://example.com/gc".to_owned(),
+            subpath: None,
+            version: None,
+            trust_exec: false,
+            skills: None,
+        };
+        assert_eq!(
+            direct.layer_dir(root, "gc"),
+            PathBuf::from("/camp/imports/gc")
+        );
+        assert_eq!(
+            transitive_layer_dir(root, "gc"),
+            PathBuf::from("/camp/imports/.transitive/gc"),
+            "the transitive layer is materialized OUTSIDE the direct binding's dir"
+        );
+        assert_ne!(
+            direct.layer_dir(root, "gc"),
+            transitive_layer_dir(root, "gc")
+        );
+    }
+
+    /// The transitive sentinel can never collide with a real binding: binding
+    /// names are validated `[A-Za-z0-9_-]+`, so none can equal `.transitive`.
+    #[test]
+    fn the_transitive_sentinel_is_not_a_legal_binding_name() {
+        assert!(
+            !TRANSITIVE_DIR
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "{TRANSITIVE_DIR:?} must be unspellable as a binding, or a pack could shadow it"
+        );
+    }
 
     #[test]
     fn parses_camp_and_rigs() {
@@ -307,7 +570,9 @@ prefix = "gc"
                 default_agent: None,
             }],
             orders: vec![],
-            packs: Vec::new(),
+            imports: std::collections::BTreeMap::new(),
+            orders_section: OrdersSection::default(),
+            agent_defaults: AgentDefaults::default(),
             dispatch: DispatchConfig::default(),
             patrol: PatrolSection::default(),
             root: None,
@@ -316,15 +581,12 @@ prefix = "gc"
         assert_eq!(CampConfig::parse(&text).unwrap(), cfg);
     }
 
-    // ---- Phase 8: [dispatch], packs, per-rig default_agent ---------------
+    // ---- Phase 8: [dispatch], per-rig default_agent ----------------------
 
     #[test]
-    fn dispatch_and_packs_parse_with_defaults() {
+    fn dispatch_and_imports_parse_with_defaults() {
         let cfg = CampConfig::parse(
             r#"
-# top-level keys precede any [table] header (TOML), so packs comes first
-packs = ["packs/starter", "/abs/otherpack"]
-
 [camp]
 name = "dev"
 
@@ -334,6 +596,9 @@ path = "/code/gascity"
 prefix = "gc"
 default_agent = "rigger"
 
+[imports.starter]
+source = "packs/starter"
+
 [dispatch]
 max_workers = 3
 command = "tests/fake-agent.sh"
@@ -341,13 +606,8 @@ default_agent = "dev"
 "#,
         )
         .unwrap();
-        assert_eq!(
-            cfg.packs,
-            vec![
-                PathBuf::from("packs/starter"),
-                PathBuf::from("/abs/otherpack")
-            ]
-        );
+        assert_eq!(cfg.imports["starter"].source, "packs/starter");
+        assert!(!cfg.imports["starter"].trust_exec);
         assert_eq!(cfg.dispatch.max_workers, 3);
         assert_eq!(cfg.dispatch.command, PathBuf::from("tests/fake-agent.sh"));
         assert_eq!(cfg.dispatch.default_agent.as_deref(), Some("dev"));
@@ -360,7 +620,7 @@ default_agent = "dev"
     #[test]
     fn dispatch_section_is_optional_with_spec_defaults() {
         let cfg = CampConfig::parse("[camp]\nname = \"dev\"\n").unwrap();
-        assert!(cfg.packs.is_empty());
+        assert!(cfg.imports.is_empty());
         assert_eq!(cfg.dispatch.max_workers, 10);
         assert_eq!(cfg.dispatch.command, PathBuf::from("claude"));
         assert!(cfg.dispatch.default_agent.is_none());
@@ -390,11 +650,76 @@ default_agent = "dev"
     fn defaults_do_not_pollute_serialization() {
         // rig add appends TOML text rather than re-serializing, but the
         // config type must still round-trip cleanly without inventing
-        // [dispatch]/packs blocks the user never wrote.
+        // [dispatch]/[imports]/[orders]/[agent_defaults] blocks the user
+        // never wrote.
         let cfg = CampConfig::parse("[camp]\nname = \"dev\"\n").unwrap();
         let text = toml::to_string(&cfg).unwrap();
         assert!(!text.contains("dispatch"), "text was: {text}");
-        assert!(!text.contains("packs"), "text was: {text}");
+        assert!(!text.contains("imports"), "text was: {text}");
+        assert!(!text.contains("orders"), "text was: {text}");
+        assert!(!text.contains("agent_defaults"), "text was: {text}");
+    }
+
+    // ---- compat phase 1: [imports.*], [orders] enabled, [agent_defaults] --
+
+    #[test]
+    fn imports_orders_enabled_and_agent_defaults_parse() {
+        let cfg = CampConfig::parse(
+            r#"
+[camp]
+name = "dev"
+
+[imports.bmad]
+source = "https://github.com/gastownhall/gascity-packs"
+subpath = "bmad"
+version = "sha:deadbeef"
+
+[imports.gc]
+source = "../local/roles"
+trust_exec = true
+skills = false
+
+[orders]
+enabled = ["bmad.nightly", "gc.triage"]
+
+[agent_defaults]
+model = "sonnet"
+permission_mode = "acceptEdits"
+tools = ["Read", "Edit", "Bash", "Skill"]
+"#,
+        )
+        .unwrap();
+        let bmad = &cfg.imports["bmad"];
+        assert_eq!(bmad.source, "https://github.com/gastownhall/gascity-packs");
+        assert_eq!(bmad.subpath.as_deref(), Some("bmad"));
+        assert_eq!(bmad.version.as_deref(), Some("sha:deadbeef"));
+        assert!(!bmad.trust_exec);
+        let gc = &cfg.imports["gc"];
+        assert!(gc.trust_exec);
+        assert_eq!(gc.skills, Some(false));
+        assert_eq!(
+            cfg.orders_section.enabled,
+            vec!["bmad.nightly", "gc.triage"]
+        );
+        assert_eq!(cfg.agent_defaults.model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            cfg.agent_defaults.tools.as_deref().unwrap(),
+            ["Read", "Edit", "Bash", "Skill"]
+        );
+    }
+
+    #[test]
+    fn legacy_packs_key_is_a_specific_rewrite_error() {
+        let err =
+            CampConfig::parse("packs = [\"packs/starter\"]\n[camp]\nname = \"d\"\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("packs"), "{msg}");
+        assert!(msg.contains("[imports."), "must show the rewrite: {msg}");
+    }
+
+    #[test]
+    fn agent_defaults_reject_unknown_keys() {
+        assert!(CampConfig::parse("[camp]\nname=\"d\"\n[agent_defaults]\nbogus = 1\n").is_err());
     }
 
     #[test]

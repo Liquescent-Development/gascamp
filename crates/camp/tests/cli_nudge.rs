@@ -54,6 +54,8 @@ fn scaffold(dir: &Path, command: &str) -> (PathBuf, PathBuf) {
         root.join("camp.toml"),
         format!(
             "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+             [agent_defaults]\nmodel = \"sonnet\"\npermission_mode = \"acceptEdits\"\n\
+             tools = [\"Read\", \"Edit\", \"Bash\"]\n\n\
              [dispatch]\nmax_workers = 4\ncommand = \"{command}\"\ndefault_agent = \"dev\"\n",
             rig.display(),
         ),
@@ -65,26 +67,24 @@ fn scaffold(dir: &Path, command: &str) -> (PathBuf, PathBuf) {
     // isolation contract, and the rig is a bare dir (no git base for the
     // Phase 2 worktree default). The explicit opt-out makes dispatch emit
     // dispatch.live_tree before session.woke; all assertions here are
-    // per-event-type, so that is inert.
-    std::fs::write(
-        agents.join("dev.md"),
-        "---\nname: dev\nisolation: none\n---\nDo the work.\n",
-    )
-    .unwrap();
+    // per-event-type, so that is inert. compat §5.1: an agent is a directory.
+    let dev = agents.join("dev");
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::write(dev.join("agent.toml"), "isolation = \"none\"\n").unwrap();
+    std::fs::write(dev.join("prompt.md"), "Do the work.\n").unwrap();
     // create the ledger so every verb (and campd) finds it
     camp_ok(&root, &["events", "--json"]);
     (root, rig)
 }
 
-/// Rewrite the scaffolded `dev` agent with extra frontmatter (the
-/// daemon_dispatch `write_agent` idiom). `isolation: none` stays — these
-/// rigs are bare dirs (no git base for the worktree default).
-fn write_agent(root: &Path, front_extra: &str) {
-    std::fs::write(
-        root.join("agents/dev.md"),
-        format!("---\nname: dev\nisolation: none\n{front_extra}---\nDo the work.\n"),
-    )
-    .unwrap();
+/// Rewrite the scaffolded `dev` agent directory. The F7 pins (model,
+/// permission_mode, tools) now live in `[agent_defaults]` (operator-owned,
+/// compat §5.2), so `front_extra` is ignored — kept in the signature for the
+/// existing call site. `isolation: none` stays.
+fn write_agent(root: &Path, _front_extra: &str) {
+    let dev = root.join("agents/dev");
+    std::fs::write(dev.join("agent.toml"), "isolation = \"none\"\n").unwrap();
+    std::fs::write(dev.join("prompt.md"), "Do the work.\n").unwrap();
 }
 
 fn events_json(root: &Path) -> Vec<serde_json::Value> {

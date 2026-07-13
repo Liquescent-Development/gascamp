@@ -37,7 +37,9 @@ fn scaffold(dir: &Path, dispatch_default: Option<&str>, rig_default: Option<&str
     std::fs::write(
         root.join("camp.toml"),
         format!(
-            "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n{rig_line}\n[dispatch]\ncommand = \"true\"\n{dispatch_line}",
+            "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n{rig_line}\n\
+             [agent_defaults]\ntools = [\"Read\"]\n\n\
+             [dispatch]\ncommand = \"true\"\n{dispatch_line}",
             rig.display()
         ),
     )
@@ -47,13 +49,16 @@ fn scaffold(dir: &Path, dispatch_default: Option<&str>, rig_default: Option<&str
 }
 
 fn write_agent(root: &Path, name: &str) {
-    let agents = root.join("agents");
-    std::fs::create_dir_all(&agents).unwrap();
+    // compat §5.1: an agent is a DIRECTORY (agent.toml + prompt.md). Model
+    // and tools come from [agent_defaults] in camp.toml, not the pack.
+    let dir = root.join("agents").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        agents.join(format!("{name}.md")),
-        format!("---\nname: {name}\n---\nDo the work.\n"),
+        dir.join("agent.toml"),
+        format!("description = \"{name} agent\"\n"),
     )
     .unwrap();
+    std::fs::write(dir.join("prompt.md"), "Do the work.\n").unwrap();
 }
 
 fn events_json(root: &Path) -> Vec<serde_json::Value> {

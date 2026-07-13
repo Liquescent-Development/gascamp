@@ -52,22 +52,21 @@ fn scaffold(dir: &Path, max_workers: usize) -> (PathBuf, PathBuf) {
         root.join("camp.toml"),
         format!(
             "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+             [agent_defaults]\ntools = [\"Read\", \"Bash\"]\n\n\
              [dispatch]\nmax_workers = {max_workers}\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
             rig.display(),
             fake_agent(),
         ),
     )
     .unwrap();
-    let agents = root.join("agents");
-    std::fs::create_dir_all(&agents).unwrap();
     // graph tests exercise check loops / fan-out mechanics on the rig cwd;
     // the isolation contract (spec §12 default) has its own tests in
-    // daemon_dispatch.rs — pin the opt-out explicitly.
-    std::fs::write(
-        agents.join("dev.md"),
-        "---\nname: dev\nisolation: none\n---\nDo the work.\n",
-    )
-    .unwrap();
+    // daemon_dispatch.rs — pin the opt-out explicitly. Compat §5.1: an agent
+    // is a directory.
+    let dev = root.join("agents/dev");
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::write(dev.join("agent.toml"), "isolation = \"none\"\n").unwrap();
+    std::fs::write(dev.join("prompt.md"), "Do the work.\n").unwrap();
     camp_ok(&root, &["events", "--json"]); // create the ledger
     (root, rig)
 }

@@ -1461,12 +1461,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("camp.toml"),
-            "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"/tmp\"\nprefix = \"gc\"\n",
+            "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"/tmp\"\nprefix = \"gc\"\n\n\
+             [agent_defaults]\ntools = [\"Read\"]\n",
         )
         .unwrap();
-        let agents = dir.path().join("agents");
-        std::fs::create_dir_all(&agents).unwrap();
-        std::fs::write(agents.join("dev.md"), "---\nname: dev\n---\nWork.\n").unwrap();
+        // Directory agents (umbrella §5.1): identity is the directory name;
+        // model/tools/permission are operator-owned via [agent_defaults].
+        let dev = dir.path().join("agents/dev");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("prompt.md"), "Work.\n").unwrap();
         let ledger = Ledger::open_with_clock(
             &dir.path().join("camp.db"),
             Box::new(FixedClock::new("2026-07-07T07:00:00Z")),
@@ -1615,12 +1618,12 @@ mod tests {
     #[test]
     fn frontmatter_stall_after_governs_the_armed_threshold() {
         let (dir, mut ledger, _config, mut patrol) = fixture();
-        // round-1 review note: the 5m override must actually arm at 5m
-        std::fs::write(
-            dir.path().join("agents/quick.md"),
-            "---\nname: quick\nstall_after: 5m\n---\nWork fast.\n",
-        )
-        .unwrap();
+        // round-1 review note: the 5m override must actually arm at 5m.
+        // The override now lives in the agent DIRECTORY's agent.toml.
+        let quick = dir.path().join("agents/quick");
+        std::fs::create_dir_all(&quick).unwrap();
+        std::fs::write(quick.join("agent.toml"), "stall_after = \"5m\"\n").unwrap();
+        std::fs::write(quick.join("prompt.md"), "Work fast.\n").unwrap();
         let transcript = dir.path().join("projects/-p/sid.jsonl");
         let event = woke_event(
             &mut ledger,
@@ -2610,17 +2613,15 @@ mod tests {
         std::fs::write(
             dir.path().join("camp.toml"),
             format!(
-                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n",
+                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+                 [agent_defaults]\ntools = [\"Read\"]\n",
                 rig.display()
             ),
         )
         .unwrap();
-        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
-        std::fs::write(
-            dir.path().join("agents/dev.md"),
-            "---\nname: dev\n---\nWork.\n",
-        )
-        .unwrap();
+        let dev = dir.path().join("agents/dev");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("prompt.md"), "Work.\n").unwrap();
         let mut ledger = Ledger::open_with_clock(
             &dir.path().join("camp.db"),
             Box::new(FixedClock::new("2026-07-07T07:00:00Z")),
@@ -2896,28 +2897,35 @@ mod tests {
     fn apply_config_lets_patrol_resolve_a_reloaded_pack_agent() {
         let dir = tempfile::tempdir().unwrap();
         // A pack shipping agent "sentry" with a DISTINCT stall_after override.
-        let pack = dir.path().join("sentrypack");
-        std::fs::create_dir_all(pack.join("agents")).unwrap();
+        // A local-path import is layered IN PLACE (§5) — no materialization
+        // step, so the pack is simply a directory beside camp.toml.
+        let sentry = dir.path().join("sentrypack/agents/sentry");
+        std::fs::create_dir_all(&sentry).unwrap();
         std::fs::write(
-            pack.join("agents/sentry.md"),
-            "---\nname: sentry\nisolation: none\nstall_after: 700ms\n---\nWork.\n",
+            sentry.join("agent.toml"),
+            "isolation = \"none\"\nstall_after = \"700ms\"\n",
         )
         .unwrap();
+        std::fs::write(sentry.join("prompt.md"), "Work.\n").unwrap();
 
-        // Birth config: NO packs, a distinct camp-default stall_after of 5s.
-        let birth_toml = "[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"5s\"\n";
+        // Birth config: NO imports, a distinct camp-default stall_after of 5s.
+        let birth_toml = "[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"5s\"\n\n\
+                          [agent_defaults]\ntools = [\"Read\"]\n";
         std::fs::write(dir.path().join("camp.toml"), birth_toml).unwrap();
         let birth = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
         let patrol_config = camp_core::patrol::PatrolConfig::from_section(&birth.patrol).unwrap();
         let mut patrol = PatrolRuntime::new(patrol_config, &birth);
 
-        // Reloaded config: adds the pack (so "sentry" becomes resolvable).
-        let reloaded_toml = format!(
-            "packs = [\"{}\"]\n\n[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"5s\"\n",
-            pack.display()
-        );
-        std::fs::write(dir.path().join("camp.toml"), &reloaded_toml).unwrap();
+        // Reloaded config: binds the pack (so "pack.sentry" becomes resolvable).
+        let reloaded_toml = "[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"5s\"\n\n\
+                             [agent_defaults]\ntools = [\"Read\"]\n\n\
+                             [imports.pack]\nsource = \"sentrypack\"\n";
+        std::fs::write(dir.path().join("camp.toml"), reloaded_toml).unwrap();
         let reloaded = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        assert!(
+            pack::resolve_agent(&birth, "pack.sentry").is_err(),
+            "the BIRTH config cannot see the agent — that is what makes the reload load-bearing"
+        );
         patrol.apply_config(reloaded).unwrap();
 
         // Drive a campd-spawned (Owned::Child) worker for the pack agent through
@@ -2943,7 +2951,7 @@ mod tests {
                 bead: Some("gc-1".into()),
                 data: serde_json::json!({
                     "name": "t/sentry/1",
-                    "agent": "sentry",
+                    "agent": "pack.sentry",
                     "transcript_path": dir.path().join("projects/-p/sid.jsonl"),
                     "bead": "gc-1",
                 }),
@@ -2993,17 +3001,16 @@ mod tests {
     #[test]
     fn apply_config_swaps_every_config_derived_field() {
         let dir = tempfile::tempdir().unwrap();
-        let pack = dir.path().join("sentrypack");
-        std::fs::create_dir_all(pack.join("agents")).unwrap();
-        std::fs::write(
-            pack.join("agents/sentry.md"),
-            "---\nname: sentry\nisolation: none\n---\nWork.\n",
-        )
-        .unwrap();
+        // A local-path pack, layered in place (§5) — a directory agent.
+        let sentry = dir.path().join("sentrypack/agents/sentry");
+        std::fs::create_dir_all(&sentry).unwrap();
+        std::fs::write(sentry.join("agent.toml"), "isolation = \"none\"\n").unwrap();
+        std::fs::write(sentry.join("prompt.md"), "Work.\n").unwrap();
 
-        // Birth: no packs; every [patrol] key explicit; restart_budget 0.
+        // Birth: no imports; every [patrol] key explicit; restart_budget 0.
         let birth_toml = "[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"5s\"\n\
-                          release_grace = \"30s\"\nrestart_budget = 0\n";
+                          release_grace = \"30s\"\nrestart_budget = 0\n\n\
+                          [agent_defaults]\ntools = [\"Read\"]\n";
         std::fs::write(dir.path().join("camp.toml"), birth_toml).unwrap();
         let birth = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
         let birth_patrol = camp_core::patrol::PatrolConfig::from_section(&birth.patrol).unwrap();
@@ -3012,14 +3019,13 @@ mod tests {
         // With the birth budget of 0, "gc-g" would exhaust on its second fire.
         assert_eq!(patrol.ladder.on_fire("gc-g"), LadderAction::Nudge);
 
-        // Reload: EVERY derived field differs — packs added, all three
+        // Reload: EVERY derived field differs — the import bound, all three
         // [patrol] keys changed.
-        let reloaded_toml = format!(
-            "packs = [\"{}\"]\n\n[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"9s\"\n\
-             release_grace = \"77s\"\nrestart_budget = 3\n",
-            pack.display()
-        );
-        std::fs::write(dir.path().join("camp.toml"), &reloaded_toml).unwrap();
+        let reloaded_toml = "[camp]\nname = \"t\"\n\n[patrol]\nstall_after = \"9s\"\n\
+                             release_grace = \"77s\"\nrestart_budget = 3\n\n\
+                             [agent_defaults]\ntools = [\"Read\"]\n\n\
+                             [imports.pack]\nsource = \"sentrypack\"\n";
+        std::fs::write(dir.path().join("camp.toml"), reloaded_toml).unwrap();
         let reloaded = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
         let reloaded_patrol =
             camp_core::patrol::PatrolConfig::from_section(&reloaded.patrol).unwrap();
@@ -3030,7 +3036,7 @@ mod tests {
         assert_ne!(birth_patrol.release_grace, reloaded_patrol.release_grace);
         assert_ne!(birth_patrol.restart_budget, reloaded_patrol.restart_budget);
         assert_ne!(birth, reloaded);
-        assert!(pack::resolve_agent(&birth, "sentry").is_err());
+        assert!(pack::resolve_agent(&birth, "pack.sentry").is_err());
 
         patrol.apply_config(reloaded.clone()).unwrap();
 
@@ -3046,7 +3052,7 @@ mod tests {
             "apply_config must swap the entire cached CampConfig"
         );
         assert!(
-            pack::resolve_agent(&patrol.camp_config, "sentry").is_ok(),
+            pack::resolve_agent(&patrol.camp_config, "pack.sentry").is_ok(),
             "the reloaded pack agent must resolve against patrol's config"
         );
         // The ladder ceiling: under the birth budget (0) this second fire

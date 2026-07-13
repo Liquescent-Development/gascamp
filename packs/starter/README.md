@@ -1,42 +1,62 @@
 # Starter pack — example content, copy don't depend
 
-A **pack is a directory** of Claude Code content (spec §11): agent
-definitions, formulas, orders, and optional skills/commands. This starter
-pack is an example to copy and adapt — **not** a dependency of camp. The camp
-plugin ships zero roles; roles live in packs like this one.
+A **pack is a Gas City directory pack** (compat §5.1/§7): a `pack.toml`, an
+`agents/` of agent **directories** (`agent.toml` + a prompt file), a
+`formulas/` of formula-v2 files, and an `orders/` of order files. This
+starter pack is an example to copy and adapt — **not** a dependency of camp.
+The camp plugin ships zero roles; roles live in packs like this one.
 
 ```
 packs/starter/
-  agents/dev.md            # a Claude Code agent definition (role)
-  agents/reviewer.md       # another role — review-only tool set
-  agents/committer.md      # owns git — turns verified worktree work into a commit on the bead branch
-  formulas/guarded-change.toml   # a formula (Gas City formula-v2 subset)
-  orders.toml              # example scheduled / event-triggered orders
+  pack.toml                     # [pack] name + schema (required)
+  agents/dev/                   # identity = directory name; prompt + agent.toml
+    prompt.md
+    agent.toml
+  agents/reviewer/
+    prompt.md
+    agent.toml
+  agents/committer/
+    prompt.md
+    agent.toml
+  formulas/guarded-change.toml  # a formula (Gas City formula-v2 subset)
+  orders/
+    morning-triage.toml         # cron order (gc [order] shape)
+    ci-red.toml                 # event order (camp-only — labeled)
 ```
 
 ## Use it
 
-Import the pack from your `camp.toml`:
+Import the pack as a binding — model/permission/tools come from your
+`[agent_defaults]`, never the pack (compat §5.2):
 
-```toml
-packs = ["packs/starter"]
+```sh
+camp import add packs/starter --name starter
 ```
 
-Resolution is last-wins with your local definitions highest (spec §11). Route
-work to a role with `camp sling "title" --agent dev`, or set a default:
+A local path is a first-class source (no clone, no ref). Agents resolve as
+`starter.dev`, `starter.reviewer`, `starter.committer`. Route work to one
+with `camp sling "title" --agent starter.dev`, or set a default:
 
 ```toml
 [dispatch]
-default_agent = "dev"
+default_agent = "starter.dev"
+
+[agent_defaults]
+model = "sonnet"
+tools = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]
 ```
+
+The pack's `orders/*.toml` are INERT until you arm them
+(`camp order enable starter.morning-triage`) — the money invariant
+(compat §14).
 
 ## Notes
 
 - `formulas/guarded-change.toml` is a symlink into camp's gc-validated corpus
   (`crates/camp-core/tests/fixtures/formulas/valid/`), so it is guaranteed to
   compile under the real Gas City `gc` compiler (spec §8.2 subset invariant) —
-  one source of truth, no drift.
-- `orders.toml` is an example; a powered-off or sleeping machine fires no
-  orders until wake (spec §9). A supervised campd (`camp init`, or `camp
-  service install` on an existing camp) fires them from login onward — no
-  `camp` command needed first.
+  one source of truth, no drift. The symlink is dereferenced on materialize.
+- A powered-off or sleeping machine fires no orders until wake (spec §9). A
+  supervised campd (`camp init`, or `camp service install` on an existing
+  camp) fires armed orders from login onward — no `camp` command needed
+  first.

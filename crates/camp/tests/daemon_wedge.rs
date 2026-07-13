@@ -89,19 +89,17 @@ fn scaffold(dir: &Path, exec_timeout: &str) -> PathBuf {
         root.join("camp.toml"),
         format!(
             "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+             [agent_defaults]\ntools = [\"Read\", \"Bash\"]\n\n\
              [dispatch]\ncommand = \"{}\"\ndefault_agent = \"dev\"\nexec_timeout = \"{exec_timeout}\"\n",
             rig.display(),
             fake_agent(),
         ),
     )
     .unwrap();
-    let agents = root.join("agents");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(
-        agents.join("dev.md"),
-        "---\nname: dev\nisolation: none\n---\nDo the work.\n",
-    )
-    .unwrap();
+    let dev = root.join("agents/dev");
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::write(dev.join("agent.toml"), "isolation = \"none\"\n").unwrap();
+    std::fs::write(dev.join("prompt.md"), "Do the work.\n").unwrap();
     camp_ok(&root, &["events", "--json"]); // create the ledger
     root
 }

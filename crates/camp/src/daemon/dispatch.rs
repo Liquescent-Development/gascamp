@@ -3616,19 +3616,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("rig")).unwrap();
-        std::fs::create_dir_all(root.join("agents")).unwrap();
         // The subject is the respawn queue, not isolation: pin the
         // live-tree opt-out (spec §12) so the plain-dir rig dispatches.
-        std::fs::write(
-            root.join("agents/dev.md"),
-            "---\nname: dev\nisolation: none\n---\nWork.\n",
-        )
-        .unwrap();
+        // Directory agent (umbrella §5.1) — the opt-out lives in agent.toml.
+        let dev = root.join("agents/dev");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("agent.toml"), "isolation = \"none\"\n").unwrap();
+        std::fs::write(dev.join("prompt.md"), "Work.\n").unwrap();
         std::fs::write(
             root.join("camp.toml"),
             format!(
                 "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
-                 [dispatch]\nmax_workers = 1\ncommand = \"/bin/echo\"\ndefault_agent = \"dev\"\n",
+                 [dispatch]\nmax_workers = 1\ncommand = \"/bin/echo\"\ndefault_agent = \"dev\"\n\n\
+                 [agent_defaults]\ntools = [\"Read\"]\n",
                 root.join("rig").display()
             ),
         )

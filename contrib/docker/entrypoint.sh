@@ -18,7 +18,18 @@
 set -eu
 
 : "${CAMP_DIR:?CAMP_DIR must name the camp directory (the image sets it to /camp)}"
+# Optional: a pack source to import as the starter (a local path or URL). When
+# set, the camp is initialized with it; on a restart (--exists-ok) the import
+# is re-materialized idempotently. When unset and not a TTY, init hands off and
+# the camp starts empty (the operator imports a pack themselves).
+: "${CAMP_PACK:=}"
 
-camp init --camp "$CAMP_DIR" --no-service --exists-ok
+if [ -n "$CAMP_PACK" ]; then
+  camp init --camp "$CAMP_DIR" --no-service --exists-ok --import "$CAMP_PACK"
+  # Re-materialize every locked import on each start (idempotent; never re-resolves a ref).
+  camp import install --camp "$CAMP_DIR"
+else
+  camp init --camp "$CAMP_DIR" --no-service --exists-ok
+fi
 
 exec camp daemon --camp "$CAMP_DIR"

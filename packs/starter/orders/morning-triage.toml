@@ -1,0 +1,11 @@
+# Example order — copy into your camp (or a pack's orders/) and adjust.
+# An order schedules (cron) or event-triggers a formula (spec §9 / compat §14).
+# `formula` names a formula resolvable through the import + local layers.
+# Imported orders are INERT until `camp order enable <binding>.<stem>` arms
+# them (the money invariant). This pack's `guarded-change` formula is a
+# symlink into camp's gc-validated corpus, so it is guaranteed to compile.
+
+[order]
+formula = "guarded-change"
+trigger = "cron"
+schedule = "0 7 * * 1-5"

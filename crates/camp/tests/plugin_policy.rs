@@ -49,9 +49,12 @@ fn plugin_ships_zero_agent_definitions() {
 
 #[test]
 fn roles_are_pack_content_not_machinery() {
-    // Positive control: roles DO exist — as pack content.
+    // Positive control: roles DO exist — as pack content. Compat §5.1: an
+    // agent is a directory (agent.toml + prompt.md), not a .md file.
     assert!(
-        repo_root().join("packs/starter/agents/dev.md").exists(),
+        repo_root()
+            .join("packs/starter/agents/dev/prompt.md")
+            .exists(),
         "roles must live in packs, proving the plugin's emptiness is deliberate"
     );
 }

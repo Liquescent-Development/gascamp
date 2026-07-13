@@ -53,6 +53,10 @@ pub enum EventType {
     /// re-hooks via the patrol restart path. The event NAMES the cap
     /// (greppable, invariant 3: the ledger tells the whole story).
     SessionStreamCapped,
+    /// compat §7: a pack import was added (audit-only — no state fold).
+    ImportAdded,
+    /// compat §5.4: a pack/agent key was refused (audit-only — no state fold).
+    ImportRefused,
 }
 
 impl EventType {
@@ -86,6 +90,8 @@ impl EventType {
         EventType::AgentStalled,
         EventType::PatrolDegraded,
         EventType::SessionStreamCapped,
+        EventType::ImportAdded,
+        EventType::ImportRefused,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -119,6 +125,8 @@ impl EventType {
             EventType::AgentStalled => "agent.stalled",
             EventType::PatrolDegraded => "patrol.degraded",
             EventType::SessionStreamCapped => "session.stream_capped",
+            EventType::ImportAdded => "import.added",
+            EventType::ImportRefused => "import.refused",
         }
     }
 
@@ -238,7 +246,6 @@ mod tests {
         assert_eq!(EventType::parse("rig.added").unwrap(), EventType::RigAdded);
         assert_eq!(EventType::RigAdded.as_str(), "rig.added");
     }
-
     #[test]
     fn dispatch_rearmed_round_trips_through_its_name() {
         assert_eq!(EventType::DispatchRearmed.as_str(), "dispatch.rearmed");
@@ -247,5 +254,22 @@ mod tests {
             EventType::DispatchRearmed
         );
         assert!(EventType::ALL.contains(&EventType::DispatchRearmed));
+    }
+
+    #[test]
+    fn import_events_roundtrip_and_are_camp_specific() {
+        assert_eq!(EventType::ImportAdded.as_str(), "import.added");
+        assert_eq!(EventType::ImportRefused.as_str(), "import.refused");
+        assert_eq!(
+            EventType::parse("import.added").unwrap(),
+            EventType::ImportAdded
+        );
+        assert_eq!(
+            EventType::parse("import.refused").unwrap(),
+            EventType::ImportRefused
+        );
+        assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&"import.added"));
+        assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&"import.refused"));
+        assert!(!crate::vocab::GC_MIRRORED_EVENTS.contains(&"import.added"));
     }
 }

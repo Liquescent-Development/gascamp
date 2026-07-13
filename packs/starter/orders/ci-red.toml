@@ -1,0 +1,9 @@
+# Example event-triggered order: fires when a bead labeled `ci-red` closes.
+# `on` is the event spec (`<event_type>[label=<value>]`). A labeled event
+# order is camp-only (gc order TOML has no label filter), so it is not
+# gc-exportable — `camp export --skip-untranslatable` drops it.
+
+[order]
+formula = "guarded-change"
+trigger = "event"
+on = "bead.closed[label=ci-red]"

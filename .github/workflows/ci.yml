@@ -78,3 +78,22 @@ jobs:
           fi
       - name: vocabulary cross-check
         run: ci/gc-compat/check_vocab.sh gascity-src "$GITHUB_WORKSPACE"
+
+  gcpacks-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: read pinned gascity-packs ref
+        id: gcpacks-ref
+        run: echo "ref=$(cat ci/gc-compat/GCPACKS_REF)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: gastownhall/gascity-packs
+          ref: ${{ steps.gcpacks-ref.outputs.ref }}
+          path: gcpacks-src
+      # The gate now drives camp's OWN loader over the corpus, not just its
+      # shape — so it needs the binary.
+      - name: build camp
+        run: cargo build --bin camp
+      - name: phase-1 corpus-load gate (pack/agent/transitive + camp loader)
+        run: python3 ci/gc-compat/load_corpus_packs.py gcpacks-src target/debug/camp

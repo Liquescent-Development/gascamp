@@ -46,10 +46,12 @@ pub fn run(
 fn sling_formula(camp: &CampDir, name: &str, rig: Option<String>) -> Result<()> {
     let config = CampConfig::load(&camp.config_path())?;
     let rig_cfg = resolve_rig(&config, rig.as_deref())?;
-    let path = camp.root.join("formulas").join(format!("{name}.toml"));
-    if !path.exists() {
-        bail!("formula {name:?} not found at {}", path.display());
-    }
+    // compat §6/§7.1: resolve through the import + local layers, so an
+    // imported formula is reachable via `camp sling --formula`. (Running an
+    // imported formula via sling remains phase 2 — §12; phase 1 fixes the
+    // RESOLUTION path only.)
+    let path = camp_core::orders::resolve_formula(&config, name)
+        .map_err(|e| anyhow::anyhow!("formula {name:?}: {e}"))?;
     let formula = camp_core::formula::parse_and_validate(&path)
         .map_err(|e| anyhow::anyhow!("formula {name:?} is invalid:\n{e}"))?;
     let mut ledger = Ledger::open(&camp.db_path())?;
@@ -127,4 +129,35 @@ fn sling_bead(
         ))
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use camp_core::config::CampConfig;
+    use camp_core::orders::resolve_formula;
+
+    #[test]
+    fn sling_formula_resolves_an_imported_formula_path() {
+        // compat §6: `camp sling --formula` goes through `resolve_formula`,
+        // so an imported formula is reachable. (Phase 1 fixes RESOLUTION only;
+        // running an imported formula is phase 2 — no cook here.)
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("camp.toml"),
+            "[camp]\nname=\"t\"\n[imports.bmad]\nsource=\"file:///x\"\n[agent_defaults]\ntools=[\"Read\"]\n",
+        )
+        .unwrap();
+        let f = root.join("imports/bmad/formulas");
+        std::fs::create_dir_all(&f).unwrap();
+        std::fs::write(f.join("build.toml"), "formula = \"build\"\n").unwrap();
+        let cfg = CampConfig::load(&root.join("camp.toml")).unwrap();
+        let path = resolve_formula(&cfg, "build").unwrap();
+        assert!(
+            path.to_string_lossy().contains("imports/bmad/formulas"),
+            "sling --formula must resolve through the import layer: {}",
+            path.display()
+        );
+    }
 }

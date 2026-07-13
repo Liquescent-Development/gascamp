@@ -33,7 +33,7 @@ const RUNTIME_FILES: &[&str] = &[
 /// capture, and camp-managed git worktrees (spec §7.1). All generated at
 /// runtime — never source. (`formulas/`, human-authored, is intentionally
 /// absent: it stays tracked alongside `camp.toml`.)
-const RUNTIME_DIRS: &[&str] = &["runs", "sessions", "worktrees"];
+const RUNTIME_DIRS: &[&str] = &["runs", "sessions", "worktrees", "imports"];
 
 /// Header line so a human reading `.gitignore` knows what the block is and why
 /// `camp.toml` is deliberately excluded from it.
@@ -206,5 +206,25 @@ mod tests {
             "existing entry not duplicated: {out}"
         );
         assert_eq!(out.matches("/.camp/campd.log\n").count(), 1);
+    }
+
+    #[test]
+    fn imports_dir_is_a_runtime_dir() {
+        assert!(
+            RUNTIME_DIRS.contains(&"imports"),
+            "materialized imports must be gitignored"
+        );
+    }
+
+    #[test]
+    fn imports_entry_is_written_anchored_and_packs_lock_stays_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let camp = dir.path().join(".camp");
+        std::fs::create_dir_all(&camp).unwrap();
+        ensure_camp_runtime_ignored(&camp).unwrap();
+        let gi = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(gi.contains("/.camp/imports/"), "{gi}");
+        assert!(!gi.contains("packs.lock"), "packs.lock stays tracked: {gi}");
     }
 }

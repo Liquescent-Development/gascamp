@@ -45,6 +45,10 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::SessionStreamCapped => Ok(()),
         // Log-only events: no state effect.
         EventType::CampdStarted | EventType::CampdStopped => Ok(()),
+        // compat §7/§5.4: import audit events — durable in the ledger, no
+        // state fold (the materialized tree under <root>/imports/ is the
+        // state, owned by `camp import`).
+        EventType::ImportAdded | EventType::ImportRefused => Ok(()),
     }
 }
 

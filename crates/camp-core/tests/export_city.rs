@@ -32,7 +32,9 @@ fn fixture_camp(dir: &Path, orders_toml: &str) -> (PathBuf, Ledger, CampConfig) 
         dir.join("repo").display()
     );
     std::fs::write(camp_root.join("camp.toml"), &config_text).unwrap();
-    let config = CampConfig::parse(&config_text).unwrap();
+    // `load` (not `parse`) so config.root is set — export's formula copy goes
+    // through `resolve_formula`, which needs the root (compat Task 13).
+    let config = CampConfig::load(&camp_root.join("camp.toml")).unwrap();
 
     std::fs::create_dir_all(camp_root.join("formulas")).unwrap();
     std::fs::write(
@@ -40,8 +42,14 @@ fn fixture_camp(dir: &Path, orders_toml: &str) -> (PathBuf, Ledger, CampConfig) 
         "formula = \"one-step\"\n\n[[steps]]\nid = \"s1\"\ntitle = \"one step\"\n",
     )
     .unwrap();
-    std::fs::create_dir_all(camp_root.join("agents")).unwrap();
-    std::fs::write(camp_root.join("agents/dev.md"), "# dev agent\n").unwrap();
+    // An agent is a DIRECTORY (compat §5.1): agents/dev/ with agent.toml + prompt.md.
+    std::fs::create_dir_all(camp_root.join("agents/dev")).unwrap();
+    std::fs::write(
+        camp_root.join("agents/dev/agent.toml"),
+        "description = \"dev\"\n",
+    )
+    .unwrap();
+    std::fs::write(camp_root.join("agents/dev/prompt.md"), "# dev agent\n").unwrap();
 
     let mut ledger =
         Ledger::open_with_clock(&camp_root.join("camp.db"), Box::new(FixedClock::new(TS))).unwrap();
@@ -170,7 +178,7 @@ fn exported_pack_carries_manifest_agents_orders_and_their_formulas() {
         "[pack]\nname = \"golden\"\nschema = 2\ndescription = \"Exported from gas-camp camp golden\"\n"
     );
     assert_eq!(
-        std::fs::read_to_string(out.join("pack/agents/dev.md")).unwrap(),
+        std::fs::read_to_string(out.join("pack/agents/dev/prompt.md")).unwrap(),
         "# dev agent\n"
     );
     assert_eq!(
@@ -302,7 +310,7 @@ fn a_symlinked_agent_definition_fails_with_an_actionable_error() {
     let dir = tempfile::tempdir().unwrap();
     let (camp_root, ledger, config) = fixture_camp(dir.path(), "");
     std::os::unix::fs::symlink(
-        camp_root.join("agents/dev.md"),
+        camp_root.join("agents/dev/prompt.md"),
         camp_root.join("agents/link.md"),
     )
     .unwrap();
