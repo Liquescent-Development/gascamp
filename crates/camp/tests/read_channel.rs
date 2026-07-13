@@ -315,6 +315,32 @@ fn append_only_cursors_across_a_campd_restart_no_loss_no_duplication() {
     let stdout = stdout_path(&root, &session);
     let line1 = b"{\"type\":\"assistant\",\"text\":\"one\"}\n";
     let line2 = b"{\"type\":\"assistant\",\"text\":\"two\"}\n";
+    // review fix 5: the worker writes its OWN stream-json (a real one does),
+    // so the file already holds the worker's `system/init` line before the
+    // test appends anything. Wait for it to land and take it as the baseline
+    // — the no-loss/no-duplication arithmetic below is relative to it. (The
+    // HOLD_DIR worker emits nothing further: it claims, then polls a file
+    // that never appears.)
+    let base = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let len = std::fs::metadata(&stdout).map(|m| m.len()).unwrap_or(0);
+            // The worker's init line is complete once the file ends in '\n'.
+            if len > 0
+                && std::fs::read(&stdout)
+                    .map(|b| b.ends_with(b"\n"))
+                    .unwrap_or(false)
+            {
+                break len;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the worker never wrote its own stream-json to {}",
+                stdout.display()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
     // Write line1, poke to drain + persist the offset.
     std::fs::OpenOptions::new()
         .append(true)
@@ -328,7 +354,7 @@ fn append_only_cursors_across_a_campd_restart_no_loss_no_duplication() {
             .unwrap()
             .stream_cursor(&session)
             .unwrap();
-        off >= line1.len() as u64
+        off >= base + line1.len() as u64
     });
     // Append line2 (consumed by the next drain — but we kill campd before),
     // simulating a mid-stream crash.
@@ -355,7 +381,7 @@ fn append_only_cursors_across_a_campd_restart_no_loss_no_duplication() {
             .unwrap()
             .stream_cursor(&session)
             .unwrap();
-        off >= (line1.len() + line2.len()) as u64
+        off >= base + (line1.len() + line2.len()) as u64
     });
     let ledger = camp_core::ledger::Ledger::open(&root.join("camp.db")).unwrap();
     let offset = ledger.stream_cursor(&session).unwrap();
@@ -363,8 +389,9 @@ fn append_only_cursors_across_a_campd_restart_no_loss_no_duplication() {
     assert_eq!(offset, file_len, "no loss — offset at EOF after restart");
     assert_eq!(
         offset,
-        (line1.len() + line2.len()) as u64,
-        "no duplication — both lines consumed exactly once across the two lives"
+        base + (line1.len() + line2.len()) as u64,
+        "no duplication — the worker's own output plus both test lines, each \
+         consumed exactly once across the two campd lives"
     );
     drop(stream2);
     drop(campd2);
@@ -379,12 +406,19 @@ fn append_only_cursors_across_a_campd_restart_no_loss_no_duplication() {
 fn max_stream_bytes_breach_fails_the_session_loudly() {
     let dir = tempfile::tempdir().unwrap();
     let (root, _rig) = scaffold(dir.path(), 4);
-    // A 64-byte cap so a small direct append breaches it.
+    // review fix 5: the cap must sit ABOVE the worker's own legitimate
+    // stream-json. A real worker (and now the fake one) writes NDJSON to its
+    // stdout from birth — with the old 64-byte cap the worker's own
+    // `system/init` line breached it before the worker had even claimed the
+    // bead, so the cap-kill landed on a newborn worker and the bead never
+    // re-hooked. 4 KiB is comfortably above the worker's output and still far
+    // below 256 MiB, so the test's deliberate padding below is what breaches.
+    const CAP: usize = 4096;
     let campd = Daemon::spawn(
         &root,
         &[
             ("FAKE_AGENT_NUDGE_CLOSE", "1"),
-            ("CAMP_MAX_STREAM_BYTES", "64"),
+            ("CAMP_MAX_STREAM_BYTES", &CAP.to_string()),
         ],
     );
     let mut stream = connect(&root);
@@ -402,12 +436,18 @@ fn max_stream_bytes_breach_fails_the_session_loudly() {
         .as_str()
         .unwrap()
         .to_owned();
-    // Grow the worker's stdout file past the 64-byte cap (suppressed write).
+    // Wait for the claim so the cap-kill lands on a working worker (the
+    // realistic scenario), not on one still starting up.
+    wait_until(&root, "bead.claimed", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "bead.claimed" && ev["bead"] == bead.as_str())
+    });
+    // Grow the worker's stdout file past the cap (suppressed write).
     std::fs::OpenOptions::new()
         .append(true)
         .open(stdout_path(&root, &session))
         .unwrap()
-        .write_all(&[b' '; 128])
+        .write_all(&vec![b' '; CAP * 2])
         .unwrap();
     // A poke wake drains, detects the breach, appends session.stream_capped,
     // and kills the worker. The reap (next SIGCHLD wake) appends
@@ -424,7 +464,7 @@ fn max_stream_bytes_breach_fails_the_session_loudly() {
         .find(|e| e["type"] == "session.stream_capped" && e["data"]["session"] == session.as_str())
         .unwrap();
     let cause_seq = capped["seq"].as_i64().unwrap();
-    assert_eq!(capped["data"]["cap_bytes"], 64, "the event names the cap");
+    assert_eq!(capped["data"]["cap_bytes"], CAP, "the event names the cap");
     // session.crashed with cause_seq pointing at stream_capped.
     wait_until(&root, "session.crashed with cause_seq", |e| {
         e.iter().any(|ev| {
@@ -442,5 +482,122 @@ fn max_stream_bytes_breach_fails_the_session_loudly() {
             == 2
     });
     drop(stream);
+    drop(campd);
+}
+
+/// §8 + review fix 5 / fix 1 (CRITICAL): THE WORKER LIFECYCLE TEST.
+///
+/// Every other test in this file appends to the stream file itself and then
+/// forces a socket poke — so none of them ever has a worker produce stdout
+/// and exit, which is the single most important path the read channel
+/// serves. This test closes that hole: a real fake worker writes a line to
+/// its OWN stdout and exits immediately after.
+///
+/// The line is deliberately NON-JSON, because a drained non-JSON line
+/// becomes a durable `patrol.degraded` naming it (fail fast, §2.3) — that
+/// event is the observable proof the final bytes reached campd. There is NO
+/// POKE: the SIGCHLD from the worker's exit is the wake that must drain it.
+///
+/// This is the test that catches reap-before-drain: if the reap disposes the
+/// stream file before the final drain (unregister executed inside `settle`,
+/// which runs BEFORE the event loop's drain block), the worker's last bytes
+/// are unlinked unread and this event is never appended.
+#[test]
+fn a_workers_final_stdout_line_is_drained_before_the_reap_disposes_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_FINAL_STDOUT", "FINAL-LINE-NOT-JSON")]);
+    let bead = camp_ok(&root, &["sling", "do the thing"]).trim().to_owned();
+    // The worker claims, closes the bead, writes its final stdout line, and
+    // exits => SIGCHLD => reap.
+    wait_until(&root, "the worker session ended", |e| {
+        e.iter().any(|ev| {
+            (ev["type"] == "session.stopped" || ev["type"] == "session.crashed")
+                && ev["data"]["name"].is_string()
+        })
+    });
+    // NO POKE. The final bytes must already have been drained — on the reap's
+    // own wake, BEFORE the stream file was disposed.
+    wait_until(
+        &root,
+        "the worker's final stdout line drained into a durable event",
+        |e| {
+            e.iter().any(|ev| {
+                ev["type"] == "patrol.degraded"
+                    && ev["data"]["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("FINAL-LINE-NOT-JSON")
+            })
+        },
+    );
+    assert!(!bead.is_empty());
+    drop(campd);
+}
+
+/// §2.3 + review fix 8: the `sessions/` notify watch is the LATENCY path —
+/// correctness never depends on a delivered filesystem event (every other
+/// wake drains everything). But the watch must actually FIRE, or every
+/// worker line waits for an unrelated wake.
+///
+/// Append to a tailed stream file and assert the drain happens with NO other
+/// wake: no poke, no socket request, no worker exit. The cursor is polled by
+/// opening the ledger DB directly — the `camp` CLI is never invoked, so
+/// campd receives no socket traffic that could wake it by another path.
+#[test]
+fn the_sessions_watch_alone_wakes_campd_and_drains_the_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    // NUDGE_CLOSE: the worker blocks on stdin, so it stays alive and its
+    // session stays tailed (no exit, hence no SIGCHLD wake to muddy this).
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_NUDGE_CLOSE", "1")]);
+    let bead = camp_ok(&root, &["sling", "do the thing"]).trim().to_owned();
+    wait_until(&root, "session.woke", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "session.woke" && ev["data"]["bead"] == bead.as_str())
+    });
+    let woke = events_json(&root)
+        .into_iter()
+        .find(|e| e["type"] == "session.woke")
+        .unwrap();
+    let session = woke["data"]["name"].as_str().unwrap().to_owned();
+    let stdout = stdout_path(&root, &session);
+    // Let the dispatch-path wakes settle, and record the cursor we start
+    // from, so the advance we assert is caused by OUR append and nothing
+    // else.
+    std::thread::sleep(Duration::from_millis(500));
+    let before = camp_core::ledger::Ledger::open(&root.join("camp.db"))
+        .unwrap()
+        .stream_cursor(&session)
+        .unwrap();
+    let line = "{\"type\":\"assistant\",\"text\":\"watch-me\"}\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&stdout)
+        .unwrap()
+        .write_all(line.as_bytes())
+        .unwrap();
+    // Poll the ledger DIRECTLY — no CLI, no socket, nothing that wakes campd.
+    // Only the notify watch can deliver this drain.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = camp_core::ledger::Ledger::open(&root.join("camp.db"))
+            .unwrap()
+            .stream_cursor(&session)
+            .unwrap();
+        if now >= before + line.len() as u64 {
+            break; // the watch fired and the drain consumed the line
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sessions/ notify watch never woke campd: the stream cursor \
+             stayed at {before} for 10s after a line was appended to {}. \
+             §2.3 makes the watch latency-only, so this is not a correctness \
+             violation on its own — but every worker line then waits for an \
+             unrelated wake.",
+            stdout.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     drop(campd);
 }

@@ -42,6 +42,37 @@ set -euo pipefail
 : "${CAMP_BEAD:?fake-agent: CAMP_BEAD must be set by campd}"
 : "${CAMP_SESSION:?fake-agent: CAMP_SESSION must be set by campd}"
 
+# cp-0 (review fix 5): a real `claude --verbose` worker writes stream-json
+# (NDJSON, one object per line) to its stdout for its whole life — and THAT
+# FILE IS campd's read channel (spec §2.3). The fake worker must write it
+# too. Without this the fake agent emits nothing on stdout, so no test ever
+# has a worker produce output and exit — which is precisely the lifecycle the
+# read channel exists to serve, and precisely the path a reap-before-drain
+# bug destroys. (The camp CLI's own human output is separately redirected to
+# stderr below: real claude does not print "claimed gc-1" on stdout.)
+emit_stream() { printf '%s\n' "$1"; }
+
+# The terminal line, emitted on EVERY exit path (the trap covers the delivery
+# modes' early `exit`s too). A real worker's last stdout bytes carry the
+# `result` envelope — the bytes most likely to be lost to a reap-before-drain
+# race, since they are written immediately before the process dies.
+#   FAKE_AGENT_FINAL_STDOUT  override the terminal line with a raw string.
+#                            The read-channel lifecycle test sets a
+#                            deliberately NON-JSON value and asserts campd
+#                            drained it (a patrol.degraded names it) even
+#                            though the worker exited right after writing it.
+on_exit() {
+  local code=$?
+  if [[ -n "${FAKE_AGENT_FINAL_STDOUT:-}" ]]; then
+    printf '%s\n' "$FAKE_AGENT_FINAL_STDOUT"
+  else
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}\n' \
+      "$CAMP_SESSION"
+  fi
+  exit "$code"
+}
+trap on_exit EXIT
+
 # The cwd proof precedes the claim ON PURPOSE (issue #44): tests wait for
 # bead.claimed in the ledger and then assert this file exists, so the touch
 # must happen-before the claim event — bash program order plus the claim's
@@ -66,6 +97,9 @@ fi
 # the camp CLI's stdout to stderr (campd's stderr, visible in test logs) so
 # the stdout file stays stream-json-clean.
 "$CAMP_BIN" claim "$CAMP_BEAD" --session "$CAMP_SESSION" 1>&2
+
+# The stream-json a real worker emits as it starts (F2's `system/init`).
+emit_stream "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$CAMP_SESSION\"}"
 
 if [[ -n "${FAKE_AGENT_MILESTONE:-}" ]]; then
   "$CAMP_BIN" event emit "$FAKE_AGENT_MILESTONE" --bead "$CAMP_BEAD" --session "$CAMP_SESSION" 1>&2
