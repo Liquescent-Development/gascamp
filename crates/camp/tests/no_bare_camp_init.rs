@@ -156,28 +156,40 @@ use std::path::Path;
 /// perturb bracket-depth counting — while `code` keeps string contents intact,
 /// so a quoted argument like `"init"`/`"--no-service"` can still be found.
 /// Escaped quotes (`\"`) inside a string do not end it.
-fn scan_line(line: &str) -> (String, String) {
+/// `in_string` is carried ACROSS physical lines by the caller, because a Rust
+/// string literal can span them: a trailing `\` inside a string continues it
+/// onto the next line (rustfmt writes camp.toml fixtures exactly this way).
+/// Resetting the state per line parsed those continuation lines as CODE, so
+/// the brackets in a fixture body — `[agent_defaults]`, `tools = ["Read"]` —
+/// were counted as real nesting. That left `chunks`' depth permanently
+/// unbalanced, which merges every later chunk in the file together: the guard
+/// then blamed an innocent `git init` for a neighbour's `.args(`, and — far
+/// worse — a genuine bare `camp init` could be swallowed into a chunk that
+/// says `--no-service` somewhere else and be waved through. The scanner must
+/// therefore track strings the way Rust actually lexes them.
+fn scan_line(line: &str, in_string: &mut bool) -> (String, String) {
     let mut mask = String::with_capacity(line.len());
     let mut code = String::with_capacity(line.len());
     let mut chars = line.char_indices().peekable();
-    let mut in_string = false;
     while let Some((_, c)) = chars.next() {
-        if in_string {
+        if *in_string {
             code.push(c);
             mask.push(' ');
             if c == '\\' {
+                // A backslash at end-of-line is a string continuation: nothing
+                // to consume, and the string stays open into the next line.
                 if let Some(&(_, escaped)) = chars.peek() {
                     code.push(escaped);
                     mask.push(' ');
                     chars.next();
                 }
             } else if c == '"' {
-                in_string = false;
+                *in_string = false;
             }
             continue;
         }
         if c == '"' {
-            in_string = true;
+            *in_string = true;
             code.push(c);
             mask.push(' ');
             continue;
@@ -218,9 +230,10 @@ fn ignore_scope(lines: &[&str]) -> Vec<bool> {
     let mut brace_depth: i64 = 0;
     let mut pending_ignore = false;
     let mut current_fn_ignored = false;
+    let mut in_string = false;
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        let (mask, _code) = scan_line(line);
+        let (mask, _code) = scan_line(line, &mut in_string);
         if trimmed.starts_with("#[") {
             if trimmed.contains("#[ignore") {
                 pending_ignore = true;
@@ -276,13 +289,14 @@ fn chunks(lines: &[&str]) -> Vec<Chunk> {
     let mut code = String::new();
     let mut init_line: Option<usize> = None;
     let mut start = 0usize;
+    let mut in_string = false;
     for (i, line) in lines.iter().enumerate() {
         if raw.is_empty() {
             start = i;
         }
         raw.push_str(line);
         raw.push('\n');
-        let (mask, line_code) = scan_line(line);
+        let (mask, line_code) = scan_line(line, &mut in_string);
         if init_line.is_none() && line_code.contains("\"init\"") {
             init_line = Some(i);
         }
