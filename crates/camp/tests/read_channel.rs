@@ -261,16 +261,20 @@ fn rescan_event_drains_every_tailed_file() {
             .unwrap();
     }
     // The poke IS the wake — drain-all-on-every-wake drains both regardless
-    // of the watch token (the Rescan/empty-paths robustness rule, §2.3).
+    // of the watch token (the Rescan/empty-paths robustness rule, §2.3). The
+    // poke ack is sent BEFORE the event-loop drain block runs (the drain +
+    // persist_offsets happens after the poke arm's settle, still in the same
+    // wake), so poll for the persisted offsets rather than checking
+    // immediately — a synchronous check races the drain on a slow/CI runner.
     request(&mut stream, r#"{"op":"poke","seq":1}"#);
-    let ledger = camp_core::ledger::Ledger::open(&root.join("camp.db")).unwrap();
-    for session in &sessions {
-        let offset = ledger.stream_cursor(session).unwrap();
-        assert!(
-            offset > 0,
-            "session {session} drained by the wake; offset={offset}"
-        );
-    }
+    let sessions_check = sessions.clone();
+    wait_until(&root, "both sessions drained", |e| {
+        let _ = e; // poll the ledger directly, not the events
+        let l = camp_core::ledger::Ledger::open(&root.join("camp.db")).unwrap();
+        sessions_check
+            .iter()
+            .all(|s| l.stream_cursor(s).unwrap() > 0)
+    });
     drop(campd);
 }
 
