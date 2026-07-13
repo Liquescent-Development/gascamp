@@ -14,6 +14,7 @@ mod cmd {
     pub mod event_emit;
     pub mod events;
     pub mod export;
+    pub mod import;
     pub mod init;
     pub mod ls;
     pub mod nudge;
