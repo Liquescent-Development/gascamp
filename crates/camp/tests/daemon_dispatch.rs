@@ -236,8 +236,14 @@ fn tier0_sling_runs_the_whole_contract_with_a_causal_trail() {
         .unwrap();
     assert_eq!(st["data"]["exit_code"], 0);
 
-    // Envelope capture exists (decision G)
-    assert!(root.join("sessions").join("t-dev-1.json").exists());
+    // Envelope capture existed during the run (decision G); cp-0 (§2.3,
+    // amendment fix 10) disposes the stream file at reap, so after the
+    // session stops the file is gone — the capture-during-run is already
+    // proven by the milestone + transcript checks above.
+    assert!(
+        !root.join("sessions").join("t-dev-1.json").exists(),
+        "cp-0: the stream file is disposed at reap (§2.3)"
+    );
 
     // The state fold agrees with the whole story.
     let out = camp(&root, &["doctor", "--refold"]);

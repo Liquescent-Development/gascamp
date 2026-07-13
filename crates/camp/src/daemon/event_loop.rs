@@ -232,7 +232,13 @@ pub fn run(
                     // are retried next wake (try_wait re-returns the
                     // status).
                     match reap_and_refill(
-                        ledger, processor, runtime, clock, dispatcher, graph, patrol,
+                        ledger,
+                        processor,
+                        runtime,
+                        clock,
+                        dispatcher,
+                        graph,
+                        patrol,
                         read_channel,
                     ) {
                         Ok(()) => self_raise_budget = SELF_RAISE_BUDGET,
@@ -384,7 +390,16 @@ pub fn run(
             // error re-surfaces on the next poke. The joint settle also
             // dispatches whatever the cooks made ready (Phase 8), in this
             // same wake.
-            if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol, read_channel) {
+            if let Err(e) = settle(
+                ledger,
+                processor,
+                runtime,
+                clock,
+                dispatcher,
+                graph,
+                patrol,
+                read_channel,
+            ) {
                 eprintln!("campd: settle failed: {e:#}");
             }
         }
@@ -399,15 +414,21 @@ pub fn run(
         if let Err(e) = read_channel.apply_tracking(ledger) {
             eprintln!("campd: read-channel apply_tracking failed: {e:#}");
         }
+        // cp-0 fix 8: drain_all is non-fatal — drain_one captures per-
+        // session errors into the drain_errors collector (campd keeps
+        // draining the other tailed sessions and stays up; a `?` here would
+        // let one bad stream crash the whole wake — invariant 1). The
+        // collector is surfaced as durable patrol.degraded events below.
         if let Err(e) = read_channel.drain_all(ledger) {
-            eprintln!("campd: read-channel drain failed: {e:#}");
+            eprintln!("campd: read-channel drain_all failed: {e:#}");
         }
         // cp-0 (§2.3): a max_stream_bytes breach is a loud session failure —
         // append the named cause event FIRST (the agent.stalled → kill →
         // session.crashed mold), then kill the worker. The reap appends
         // session.crashed with cause_seq pointing at stream_capped, and the
-        // bead re-hooks via the patrol restart path. The kill triggers
-        // SIGCHLD → the next wake reaps.
+        // bead re-hooks via the patrol restart path (fix 6: the kill reason
+        // starts with "patrol restart" so patrol::observe queues a Respawn).
+        // The kill triggers SIGCHLD → the next wake reaps.
         let mut appended_read_channel_events = false;
         for breach in read_channel.take_cap_breaches() {
             let (rig, bead) = dispatcher
@@ -430,16 +451,21 @@ pub fn run(
             dispatcher.kill_worker_with_reason(
                 &breach.session,
                 cause_seq,
-                "stream cap exceeded max_stream_bytes".to_owned(),
+                "patrol restart: stream cap exceeded max_stream_bytes".to_owned(),
             );
             appended_read_channel_events = true;
         }
-        // Fail fast (§2.3): watcher errors and non-JSON lines are durable
-        // patrol.degraded events, never stderr-only. Appending them is
-        // ledger work, so settle this same wake to advance the campd
-        // cursor past them (the `wake_ledger_work` local is reassigned at
-        // the top of each iteration, so we settle directly here instead).
+        // Fail fast (§2.3): watcher errors, non-JSON lines, and drain
+        // (open/seek/read) errors are durable patrol.degraded events, never
+        // stderr-only. Appending them is ledger work, so settle this same
+        // wake to advance the campd cursor past them (the `wake_ledger_work`
+        // local is reassigned at the top of each iteration, so we settle
+        // directly here instead).
         for input in read_channel.take_watch_error_events() {
+            ledger.append(input)?;
+            appended_read_channel_events = true;
+        }
+        for input in read_channel.take_drain_error_events() {
             ledger.append(input)?;
             appended_read_channel_events = true;
         }
@@ -448,9 +474,27 @@ pub fn run(
             appended_read_channel_events = true;
         }
         if appended_read_channel_events
-            && let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol, read_channel)
+            && let Err(e) = settle(
+                ledger,
+                processor,
+                runtime,
+                clock,
+                dispatcher,
+                graph,
+                patrol,
+                read_channel,
+            )
         {
             eprintln!("campd: read-channel event settle failed: {e:#}");
+        }
+        // cp-0 fix 7: persist the in-memory offsets LAST — after the
+        // cap-breach kills and the fault-event appends + settle, so the
+        // offset commits after the line's ledger effect (phase 0: the
+        // drain; phase 1+: the permission.pending event's txn). A cap-
+        // killed session is `crashed`, so live_sessions() won't re-tail it
+        // on restart and the cap (file-size-based) re-detects if needed.
+        if let Err(e) = read_channel.persist_offsets(ledger) {
+            eprintln!("campd: read-channel persist_offsets failed: {e:#}");
         }
     }
 }
@@ -522,7 +566,15 @@ fn serve_connection(
             }
         };
         let drained = drain_lines(
-            conn, ledger, processor, runtime, clock, dispatcher, graph, patrol, read_channel,
+            conn,
+            ledger,
+            processor,
+            runtime,
+            clock,
+            dispatcher,
+            graph,
+            patrol,
+            read_channel,
         )?;
         if let Some(terminal) = drained {
             return Ok(terminal);
@@ -591,8 +643,16 @@ fn drain_lines(
                 // leaves the cursor before the failing event — surfaced,
                 // never skipped; the next wake retries.
                 let ack = respond(&mut conn.stream, &Response::Ok { ok: true });
-                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol, read_channel)
-                {
+                if let Err(e) = settle(
+                    ledger,
+                    processor,
+                    runtime,
+                    clock,
+                    dispatcher,
+                    graph,
+                    patrol,
+                    read_channel,
+                ) {
                     eprintln!("campd: poke processing failed: {e:#}");
                 }
                 if let Err(e) = ack {
@@ -648,8 +708,16 @@ fn drain_lines(
                     }
                 };
                 respond(&mut conn.stream, &response)?;
-                if let Err(e) = settle(ledger, processor, runtime, clock, dispatcher, graph, patrol, read_channel)
-                {
+                if let Err(e) = settle(
+                    ledger,
+                    processor,
+                    runtime,
+                    clock,
+                    dispatcher,
+                    graph,
+                    patrol,
+                    read_channel,
+                ) {
                     eprintln!("campd: adopt settle failed: {e:#}");
                 }
             }
@@ -762,11 +830,19 @@ fn reap_and_refill(
     // their verdict batches land before the settle that acts on them.
     graph.reap_checks(ledger)?;
     // settle failures are ledger-side: retry-worthy, like the appends
-    settle(ledger, processor, runtime, clock, dispatcher, graph, patrol, read_channel).map_err(|error| {
-        ReapFailure {
-            retryable: true,
-            error,
-        }
+    settle(
+        ledger,
+        processor,
+        runtime,
+        clock,
+        dispatcher,
+        graph,
+        patrol,
+        read_channel,
+    )
+    .map_err(|error| ReapFailure {
+        retryable: true,
+        error,
     })
 }
 
@@ -797,7 +873,15 @@ pub(super) fn settle(
     // any deeper lets through-converge regeneration escape the budget.
     runtime.reset_fire_budget();
     loop {
-        orders::settle(ledger, processor, runtime, clock, graph, patrol, read_channel)?;
+        orders::settle(
+            ledger,
+            processor,
+            runtime,
+            clock,
+            graph,
+            patrol,
+            read_channel,
+        )?;
         // Phase 9: drain the graph work the processor queued — spawn due
         // check scripts, cook due bond children. Cooks append events, so
         // the fixpoint below re-settles them in this same invocation.

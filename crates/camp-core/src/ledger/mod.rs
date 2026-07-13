@@ -503,8 +503,10 @@ impl Ledger {
     /// disposed at reap, §2.3). Idempotent. Keeps the table from
     /// accumulating rows for long-dead sessions.
     pub fn clear_stream_cursor(&self, session: &str) -> Result<(), CoreError> {
-        self.conn
-            .execute("DELETE FROM stream_cursors WHERE session_name = ?1", [session])?;
+        self.conn.execute(
+            "DELETE FROM stream_cursors WHERE session_name = ?1",
+            [session],
+        )?;
         Ok(())
     }
 
@@ -1241,6 +1243,60 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    /// cp-0 amendment fix 1: the read-channel fault events reuse
+    /// `patrol.degraded`, so their payloads MUST satisfy the
+    /// `PatrolDegraded` fold contract (deny_unknown_fields: `error` +
+    /// optional `session` only). The read-channel source id, offset, and
+    /// offending line ride the `error` STRING (not separate keys). This
+    /// test pins the fold contract: each shape appends without
+    /// `InvalidEventData` and the ledger refolds clean.
+    #[test]
+    fn read_channel_patrol_degraded_shapes_round_trip_through_the_fold() {
+        let (_dir, mut l) = temp_ledger();
+        // watcher error (no session context).
+        l.append(EventInput {
+            kind: EventType::PatrolDegraded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "error": "read_channel: stream watcher error: inotify watch limit reached",
+            }),
+        })
+        .unwrap();
+        // drain (open/seek/read) error (with session context).
+        l.append(EventInput {
+            kind: EventType::PatrolDegraded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "session": "t/dev/1",
+                "error": "read_channel: stream drain: opening sessions/t-dev-1.json: Permission denied",
+            }),
+        })
+        .unwrap();
+        // non-JSON line (with session + offset + line in the error string).
+        l.append(EventInput {
+            kind: EventType::PatrolDegraded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "session": "t/dev/1",
+                "error": "read_channel: non-JSON line in stream at offset 4096: expected value at line 1 column 1: claimed gc-1",
+            }),
+        })
+        .unwrap();
+        // patrol.degraded is log-only — no state drift.
+        assert_eq!(count(&l, "SELECT count(*) FROM events"), 3);
+        assert_eq!(count(&l, "SELECT count(*) FROM beads"), 0);
+        assert!(
+            l.refold_check().unwrap().drift.is_empty(),
+            "refold is clean"
+        );
     }
 
     #[test]

@@ -756,7 +756,7 @@ impl Dispatcher {
                         stdin,
                         released: None,
                         patrol_kill: None,
-                kill_reason: None,
+                        kill_reason: None,
                     },
                 );
                 Ok(())
@@ -2705,9 +2705,11 @@ mod tests {
         // sessions dir is a throwaway temp dir — no sessions are registered
         // in the graph tests, and OrdersRuntime.camp_root is private.
         let read_dir = tempfile::tempdir().unwrap();
-        let mut read_channel =
-            crate::daemon::read_channel::ReadChannelRuntime::new(read_dir.path().to_path_buf(), 256 * 1024 * 1024)
-                .unwrap();
+        let mut read_channel = crate::daemon::read_channel::ReadChannelRuntime::new(
+            read_dir.path().to_path_buf(),
+            256 * 1024 * 1024,
+        )
+        .unwrap();
         super::super::orders::settle(
             ledger,
             &mut readiness,
@@ -3825,6 +3827,59 @@ mod tests {
         assert_eq!(crashed.data["signal"], 9);
         assert_eq!(crashed.data["reason"], "patrol restart");
         assert_eq!(crashed.data["cause_seq"], 41);
+        assert!(dispatcher.children.is_empty());
+    }
+
+    /// cp-0 §2.3 / amendment fix 2: `kill_worker_with_reason` (the
+    /// max_stream_bytes ceiling kill) marks the worker with a custom reason
+    /// and cause_seq; the reap classifies the exit as `session.crashed`
+    /// carrying BOTH (so the ledger names the cap — invariant 3, and the
+    /// `patrol restart` prefix lets patrol::observe queue a Respawn — fix 6).
+    #[test]
+    fn cap_breach_kill_worker_with_reason_reaps_as_crashed_with_the_named_reason() {
+        let (dir, mut ledger) = temp_ledger();
+        wake_session(&mut ledger, "t/dev/1");
+        let mut dispatcher = test_dispatcher(dir.path());
+        let worker = held_cat_worker(dir.path(), "t/dev/1", "gc-1");
+        let pid = worker.child.id();
+        dispatcher.children.insert(pid, worker);
+
+        let reason = "patrol restart: stream cap exceeded max_stream_bytes".to_owned();
+        assert!(dispatcher.kill_worker_with_reason("t/dev/1", 57, reason.clone()));
+        assert!(
+            !dispatcher.kill_worker_with_reason("ghost", 57, reason),
+            "unknown session"
+        );
+        // SIGKILL lands; wait for the exit so try_wait sees it.
+        loop {
+            if dispatcher
+                .children
+                .get_mut(&pid)
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        dispatcher.reap(&mut ledger).unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        let crashed = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.crashed")
+            .expect("cap-breach kill must reap as crashed");
+        assert_eq!(crashed.data["signal"], 9);
+        assert_eq!(
+            crashed.data["reason"], "patrol restart: stream cap exceeded max_stream_bytes",
+            "the reap carries the custom kill reason (names the cap)"
+        );
+        assert_eq!(
+            crashed.data["cause_seq"], 57,
+            "cause_seq points at stream_capped"
+        );
         assert!(dispatcher.children.is_empty());
     }
 

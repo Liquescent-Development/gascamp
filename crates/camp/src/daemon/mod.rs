@@ -162,9 +162,8 @@ pub fn run(camp: &CampDir) -> Result<()> {
     // production uses MAX_STREAM_BYTES_DEFAULT until config.rs gains a
     // [control] field.
     let sessions_dir = camp.root.join("sessions");
-    let max_stream_bytes = read_channel::max_stream_bytes_from_env(
-        read_channel::MAX_STREAM_BYTES_DEFAULT,
-    )?;
+    let max_stream_bytes =
+        read_channel::max_stream_bytes_from_env(read_channel::MAX_STREAM_BYTES_DEFAULT)?;
     let mut read_channel =
         read_channel::ReadChannelRuntime::new(sessions_dir.clone(), max_stream_bytes)?;
     let (read_sender, mut read_receiver) =

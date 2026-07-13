@@ -95,6 +95,11 @@ pub struct ReadChannelRuntime {
     /// this drain — surfaced by `take_cap_breaches` for the event loop to
     /// append `session.stream_capped` + kill the worker.
     cap_breaches: Vec<CapBreach>,
+    /// cp-0 fix 8: per-session drain (open/seek/read) errors, captured
+    /// non-fatally so one bad stream does not crash campd or stop the drain
+    /// of the other tailed sessions. Drained into durable
+    /// `patrol.degraded` events by `take_drain_error_events`.
+    drain_errors: Vec<DrainError>,
     /// The notify watcher on `sessions/` (held for liveness; the drain-
     /// all-on-every-wake rule makes it latency-only — §2.3).
     watcher: Option<notify::RecommendedWatcher>,
@@ -113,12 +118,23 @@ pub struct CapBreach {
 }
 
 /// A non-JSON line surfaced from a drain (fail fast). The caller turns it
-/// into a durable `patrol.degraded` event (the read-channel component).
+/// into a durable `patrol.degraded` event (the read-channel source named in
+/// the error string — fix 1: the `PatrolDegraded` fold struct is
+/// deny_unknown_fields with only `error`/`session`, so the source/offset/
+/// line ride the `error` string, not separate keys).
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub session: String,
     pub line: String,
     pub offset: u64,
+    pub error: String,
+}
+
+/// cp-0 fix 8: a per-session drain (open/seek/read/stat) error, captured
+/// non-fatally. The caller turns it into a durable `patrol.degraded` event.
+#[derive(Debug, Clone)]
+pub struct DrainError {
+    pub session: String,
     pub error: String,
 }
 
@@ -144,6 +160,7 @@ impl ReadChannelRuntime {
             parsed_counts: HashMap::new(),
             parse_errors: Vec::new(),
             cap_breaches: Vec::new(),
+            drain_errors: Vec::new(),
             watcher: None,
         })
     }
@@ -204,7 +221,9 @@ impl ReadChannelRuntime {
         }
         let stdout_path = self.sessions_dir.join(format!("{}.json", munge(session)));
         let offset = ledger.stream_cursor(session)?;
-        lock_unpoisoned(&self.filter).registered.insert(stdout_path.clone());
+        lock_unpoisoned(&self.filter)
+            .registered
+            .insert(stdout_path.clone());
         self.tailed.insert(
             session.to_owned(),
             Tailed {
@@ -218,11 +237,23 @@ impl ReadChannelRuntime {
         Ok(())
     }
 
-    /// Unregister a session: drop the in-memory state and clear the
-    /// persisted offset row (the stream file is disposed at reap, §2.3).
+    /// Unregister a session: drop the in-memory state, clear the persisted
+    /// offset row, and best-effort dispose the stream file (§2.3: "stream
+    /// files append-only until reap"; fix 10: the reap-time unlink). The
+    /// unlink is best-effort — a just-killed worker may still hold the open
+    /// fd on Unix; unlink removes the directory entry (the inode persists
+    /// until the worker exits and the fd closes, which is fine).
     pub fn unregister(&mut self, ledger: &mut Ledger, session: &str) -> Result<()> {
         if let Some(t) = self.tailed.remove(session) {
-            lock_unpoisoned(&self.filter).registered.remove(&t.stdout_path);
+            lock_unpoisoned(&self.filter)
+                .registered
+                .remove(&t.stdout_path);
+            if let Err(e) = std::fs::remove_file(&t.stdout_path) {
+                eprintln!(
+                    "campd: stream file disposal of {}: {e}",
+                    t.stdout_path.display()
+                );
+            }
         }
         ledger.clear_stream_cursor(session)?;
         Ok(())
@@ -246,9 +277,15 @@ impl ReadChannelRuntime {
     /// the fd, seek to the offset, read to EOF, split complete lines on
     /// `\n`, buffer the trailing partial line, parse each complete line
     /// as JSON (validating — phase 1+ acts on control messages; phase 0
-    /// validates only), advance the offset past each complete line, and
-    /// persist the offset. A parse failure is surfaced via
-    /// `take_parse_errors` (fail fast) but does NOT stop the drain.
+    /// validates only), and advance the in-memory offset past each complete
+    /// line. A parse failure is surfaced via `take_parse_errors` (fail
+    /// fast) but does NOT stop the drain. A drain (open/seek/read) error
+    /// is captured per-session (fix 8: non-fatal — campd keeps draining the
+    /// other tailed sessions and stays up). The in-memory offset is
+    /// persisted AFTER the drain by `persist_offsets` (fix 7: persist after
+    /// the line's ledger effect commits — phase 0 has no per-line effect, so
+    /// after the drain block; phase 1+ reorders to after the
+    /// `permission.pending` event's transaction).
     pub fn drain_all(&mut self, ledger: &mut Ledger) -> Result<()> {
         let sessions: Vec<String> = self.tailed.keys().cloned().collect();
         for session in sessions {
@@ -257,33 +294,67 @@ impl ReadChannelRuntime {
         Ok(())
     }
 
-    fn drain_one(&mut self, ledger: &mut Ledger, session: &str) -> Result<()> {
+    fn drain_one(&mut self, _ledger: &mut Ledger, session: &str) -> Result<()> {
         let Some(t) = self.tailed.get_mut(session) else {
             return Ok(());
         };
-        // Open-or-reuse the fd at the offset. A missing file is NOT a
-        // hard fault: a just-crashed worker's stream file is reaped at the
-        // SIGCHLD reap, and the unregister lands only on the next settle —
-        // so a drain in that window sees the file gone. Skip it; the
-        // unregister will remove the session from the tailed set.
+        // Open-or-reuse the fd. A missing file is NOT a hard fault (the
+        // reap-race window: a just-crashed worker's stream file is unlinked
+        // before the unregister lands) — skip it. Any other open error is
+        // captured per-session (fix 8: non-fatal) and surfaced as a durable
+        // patrol.degraded event — one bad stream never crashes campd.
         let file = match t.file.as_mut() {
             Some(f) => f,
             None => match std::fs::OpenOptions::new().read(true).open(&t.stdout_path) {
                 Ok(f) => t.file.insert(f),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("opening {}", t.stdout_path.display()))
+                    self.drain_errors.push(DrainError {
+                        session: session.to_owned(),
+                        error: format!("opening {}: {e}", t.stdout_path.display()),
+                    });
+                    return Ok(());
                 }
             },
         };
-        file.seek(SeekFrom::Start(t.offset))
-            .with_context(|| format!("seeking {}", t.stdout_path.display()))?;
+        if let Err(e) = file.seek(SeekFrom::Start(t.offset)) {
+            self.drain_errors.push(DrainError {
+                session: session.to_owned(),
+                error: format!("seeking {}: {e}", t.stdout_path.display()),
+            });
+            return Ok(());
+        }
+        // cp-0 fix 9 (OOM-before-cap): the PRE-read cap check. A file
+        // already over the cap (e.g. a previous append) breaches WITHOUT
+        // reading a single byte — RSS stays bounded. file_size is read
+        // once here; the in-loop check below covers a file that grows past
+        // the cap during the read.
+        let file_size = match file.metadata() {
+            Ok(m) => m.len(),
+            Err(e) => {
+                self.drain_errors.push(DrainError {
+                    session: session.to_owned(),
+                    error: format!("stat {}: {e}", t.stdout_path.display()),
+                });
+                return Ok(());
+            }
+        };
+        if file_size > self.max_stream_bytes && !t.capped {
+            t.capped = true;
+            self.cap_breaches.push(CapBreach {
+                session: session.to_owned(),
+                bead: None, // the event loop fills the bead from the session registry
+                file: t.stdout_path.clone(),
+                file_size,
+                cap_bytes: self.max_stream_bytes,
+            });
+            return Ok(()); // no read — RSS-bounded
+        }
         // The trailing partial from a previous drain is still in the file
-        // at [t.offset..] (the stream file is append-only, never
-        // truncated — §2.3), so re-reading from `t.offset` re-reads it.
-        // Clear the in-memory partial so it is not double-counted; the
-        // bytes are re-read fresh from the file below.
+        // at [t.offset..] (the stream file is append-only, never truncated
+        // — §2.3), so re-reading from `t.offset` re-reads it. Clear the
+        // in-memory partial so it is not double-counted; the bytes are
+        // re-read fresh from the file below.
         t.partial.clear();
         let mut buf = [0u8; 8192];
         loop {
@@ -292,9 +363,30 @@ impl ReadChannelRuntime {
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    return Err(e).with_context(|| format!("reading {}", t.stdout_path.display()))
+                    self.drain_errors.push(DrainError {
+                        session: session.to_owned(),
+                        error: format!("reading {}: {e}", t.stdout_path.display()),
+                    });
+                    return Ok(());
                 }
             };
+            // cp-0 fix 9 (in-loop OOM-before-cap): a newline-less line that
+            // would push `partial` past the cap breaches NOW, BEFORE the
+            // extend — so `partial` never exceeds the cap (RSS-bounded).
+            // (A partial buffer only holds an incomplete line; if adding
+            // the new chunk crosses the cap, the line is over-cap → a loud
+            // breach is correct.)
+            if (t.partial.len() + n) as u64 > self.max_stream_bytes && !t.capped {
+                t.capped = true;
+                self.cap_breaches.push(CapBreach {
+                    session: session.to_owned(),
+                    bead: None,
+                    file: t.stdout_path.clone(),
+                    file_size,
+                    cap_bytes: self.max_stream_bytes,
+                });
+                break; // do NOT extend — partial stays <= cap
+            }
             t.partial.extend_from_slice(&buf[..n]);
             // Split complete lines on `\n`; keep the trailing partial.
             while let Some(pos) = t.partial.iter().position(|&b| b == b'\n') {
@@ -324,39 +416,21 @@ impl ReadChannelRuntime {
                 }
                 t.offset = new_offset;
             }
-            // Persist the offset after each read chunk. The offset is at
-            // the last complete line's end; the partial buffer is held in
-            // memory and re-read from `t.offset` on the next drain.
-            //
-            // cp-0 phase-1+ obligation: once consumed lines become
-            // `permission.pending` events with their own ledger effect,
-            // this persist must move to AFTER that effect's transaction
-            // commits (persist-after-event-commit), not after each read
-            // chunk — so a crash between parse and persist re-reads
-            // (dedup by request_id) rather than silently skipping. Phase 0
-            // has no per-line ledger effect, so persisting after the drain
-            // chunk is correct today.
-            ledger.set_stream_cursor(session, t.offset)?;
         }
-        // §2.3: max_stream_bytes ceiling — a loud session failure. The
-        // offset has already advanced to EOF (the breach is loud, not a
-        // silent truncation; invariant 5); the event loop appends
-        // session.stream_capped from the breach and kills the worker.
-        let file_size = t
-            .file
-            .as_ref()
-            .and_then(|f| f.metadata().ok())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if file_size > self.max_stream_bytes && !t.capped {
-            t.capped = true;
-            self.cap_breaches.push(CapBreach {
-                session: session.to_owned(),
-                bead: None, // the event loop fills the bead from the session registry
-                file: t.stdout_path.clone(),
-                file_size,
-                cap_bytes: self.max_stream_bytes,
-            });
+        Ok(())
+    }
+
+    /// cp-0 fix 7: persist every tailed session's in-memory offset to the
+    /// `stream_cursors` table. Called by the event loop as the LAST step of
+    /// the drain block — AFTER `take_parse_error_events` are appended AND
+    /// `take_cap_breaches` are processed — so the offset commits after the
+    /// line's ledger effect (phase 1+: the `permission.pending` event's
+    /// transaction; phase 0: the drain). A crash between read and persist
+    /// re-reads from the last persisted offset (no loss, no silent dup —
+    /// the ledger dedupes by request_id in phase 1+).
+    pub fn persist_offsets(&mut self, ledger: &mut Ledger) -> Result<()> {
+        for (session, t) in &self.tailed {
+            ledger.set_stream_cursor(session, t.offset)?;
         }
         Ok(())
     }
@@ -378,6 +452,27 @@ impl ReadChannelRuntime {
     /// loop appends `session.stream_capped` from each and kills the worker.
     pub fn take_cap_breaches(&mut self) -> Vec<CapBreach> {
         std::mem::take(&mut self.cap_breaches)
+    }
+
+    /// cp-0 fix 8: drain the per-session drain (open/seek/read) errors
+    /// captured non-fatally this drain — the event loop appends each as a
+    /// durable `patrol.degraded` event (the read-channel source + session
+    /// named in the `error` string; fix 1 shape — only `error`/`session`
+    /// ride the `PatrolDegraded` fold struct).
+    pub fn take_drain_error_events(&mut self) -> Vec<camp_core::event::EventInput> {
+        std::mem::take(&mut self.drain_errors)
+            .into_iter()
+            .map(|de| camp_core::event::EventInput {
+                kind: camp_core::event::EventType::PatrolDegraded,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": de.session,
+                    "error": format!("read_channel: stream drain: {}", de.error),
+                }),
+            })
+            .collect()
     }
 
     /// Hold the notify watcher for liveness (the patrol mold).
@@ -494,6 +589,18 @@ mod tests {
         }
     }
 
+    /// cp-0 fix 5: a SessionWoke with a custom actor (for the attended-
+    /// session filter test — actor "hook:session-start" must NOT register).
+    fn woke_input_with_actor(name: &str, bead: &str, actor: &str) -> EventInput {
+        EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gc".into()),
+            actor: actor.into(),
+            bead: Some(bead.into()),
+            data: serde_json::json!({ "name": name, "agent": "dev", "bead": bead }),
+        }
+    }
+
     fn stopped_input(name: &str) -> EventInput {
         EventInput {
             kind: EventType::SessionStopped,
@@ -539,7 +646,11 @@ mod tests {
         rc.observe(&stopped);
         rc.apply_tracking(&mut ledger).unwrap();
         assert!(rc.tailed_sessions().is_empty(), "unregistered");
-        assert_eq!(ledger.stream_cursor("t/dev/1").unwrap(), 0, "offset row cleared");
+        assert_eq!(
+            ledger.stream_cursor("t/dev/1").unwrap(),
+            0,
+            "offset row cleared"
+        );
     }
 
     /// A restart resumes from the persisted offset (§8 append-only-cursors):
@@ -553,7 +664,11 @@ mod tests {
         ledger.set_stream_cursor("t/dev/1", 8192).unwrap();
         let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
         rc.register(&mut ledger, "t/dev/1").unwrap();
-        assert_eq!(rc.offset_of("t/dev/1"), Some(8192), "resumed from the persisted offset");
+        assert_eq!(
+            rc.offset_of("t/dev/1"),
+            Some(8192),
+            "resumed from the persisted offset"
+        );
     }
 
     /// drain_all reads to EOF from offset 0 and persists the offset at the
@@ -573,9 +688,16 @@ mod tests {
         let mut rc = ReadChannelRuntime::new(sessions_dir.clone(), 256 * 1024 * 1024).unwrap();
         rc.register(&mut ledger, "t/dev/1").unwrap();
         rc.drain_all(&mut ledger).unwrap();
+        // cp-0 fix 7: drain_all advances the in-memory offset only;
+        // persist_offsets writes it to the stream_cursors table.
+        rc.persist_offsets(&mut ledger).unwrap();
         let file_len = std::fs::metadata(&stdout).unwrap().len();
         assert_eq!(rc.offset_of("t/dev/1"), Some(file_len), "offset at EOF");
-        assert_eq!(ledger.stream_cursor("t/dev/1").unwrap(), file_len, "persisted");
+        assert_eq!(
+            ledger.stream_cursor("t/dev/1").unwrap(),
+            file_len,
+            "persisted"
+        );
         assert_eq!(rc.parsed_lines("t/dev/1"), 2, "two complete lines consumed");
     }
 
@@ -597,17 +719,36 @@ mod tests {
         rc.register(&mut ledger, "t/dev/1").unwrap();
         rc.drain_all(&mut ledger).unwrap();
         let offset = rc.offset_of("t/dev/1").unwrap();
-        assert_eq!(offset, complete.len() as u64, "offset at the last complete line end");
-        assert_eq!(rc.parsed_lines("t/dev/1"), 1, "the partial line was NOT parsed");
+        assert_eq!(
+            offset,
+            complete.len() as u64,
+            "offset at the last complete line end"
+        );
+        assert_eq!(
+            rc.parsed_lines("t/dev/1"),
+            1,
+            "the partial line was NOT parsed"
+        );
         // Append the rest of the line + a newline.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&stdout).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stdout)
+            .unwrap();
         use std::io::Write;
         file.write_all(b"en\"}\n").unwrap();
         drop(file);
         rc.drain_all(&mut ledger).unwrap();
-        assert_eq!(rc.parsed_lines("t/dev/1"), 2, "the completed line is now parsed");
+        assert_eq!(
+            rc.parsed_lines("t/dev/1"),
+            2,
+            "the completed line is now parsed"
+        );
         let file_len = std::fs::metadata(&stdout).unwrap().len();
-        assert_eq!(rc.offset_of("t/dev/1"), Some(file_len), "offset at EOF after completion");
+        assert_eq!(
+            rc.offset_of("t/dev/1"),
+            Some(file_len),
+            "offset at EOF after completion"
+        );
     }
 
     /// A second drain with no new data is a no-op (idempotent): the offset
@@ -644,21 +785,39 @@ mod tests {
         let mut rc1 = ReadChannelRuntime::new(sessions_dir.clone(), 256 * 1024 * 1024).unwrap();
         rc1.register(&mut ledger, "t/dev/1").unwrap();
         rc1.drain_all(&mut ledger).unwrap();
+        // cp-0 fix 7: persist the in-memory offset so the second life
+        // registers from it (the append-only-cursors resumption).
+        rc1.persist_offsets(&mut ledger).unwrap();
         let persisted = ledger.stream_cursor("t/dev/1").unwrap();
         assert_eq!(rc1.parsed_lines("t/dev/1"), 2);
         // Append a third line after the "crash".
-        let mut file = std::fs::OpenOptions::new().append(true).open(&stdout).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stdout)
+            .unwrap();
         use std::io::Write;
         file.write_all(b"{\"type\":\"c\"}\n").unwrap();
         drop(file);
         // Second life: fresh runtime, register loads the persisted offset.
         let mut rc2 = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
         rc2.register(&mut ledger, "t/dev/1").unwrap();
-        assert_eq!(rc2.offset_of("t/dev/1"), Some(persisted), "resumed from persisted");
+        assert_eq!(
+            rc2.offset_of("t/dev/1"),
+            Some(persisted),
+            "resumed from persisted"
+        );
         rc2.drain_all(&mut ledger).unwrap();
-        assert_eq!(rc2.parsed_lines("t/dev/1"), 1, "only the NEW line — no duplication");
+        assert_eq!(
+            rc2.parsed_lines("t/dev/1"),
+            1,
+            "only the NEW line — no duplication"
+        );
         let file_len = std::fs::metadata(&stdout).unwrap().len();
-        assert_eq!(rc2.offset_of("t/dev/1"), Some(file_len), "no loss — offset at EOF");
+        assert_eq!(
+            rc2.offset_of("t/dev/1"),
+            Some(file_len),
+            "no loss — offset at EOF"
+        );
     }
 
     /// A non-JSON line surfaces as a durable error event (fail fast, §2.3:
@@ -678,10 +837,21 @@ mod tests {
         rc.register(&mut ledger, "t/dev/1").unwrap();
         rc.drain_all(&mut ledger).unwrap();
         let file_len = std::fs::metadata(&stdout).unwrap().len();
-        assert_eq!(rc.offset_of("t/dev/1"), Some(file_len), "the bad line's offset advances");
-        assert!(!rc.take_parse_errors().is_empty(), "the parse error is surfaced");
+        assert_eq!(
+            rc.offset_of("t/dev/1"),
+            Some(file_len),
+            "the bad line's offset advances"
+        );
+        assert!(
+            !rc.take_parse_errors().is_empty(),
+            "the parse error is surfaced"
+        );
         // the good line after it is still consumed
-        assert_eq!(rc.parsed_lines("t/dev/1"), 1, "the valid line after the bad one is parsed");
+        assert_eq!(
+            rc.parsed_lines("t/dev/1"),
+            1,
+            "the valid line after the bad one is parsed"
+        );
     }
 
     use mio::unix::pipe;
@@ -758,7 +928,10 @@ mod tests {
         let cap: u64 = 64;
         std::fs::write(&stdout, "{\"type\":\"assistant\"}\n").unwrap();
         // Grow the file past the cap.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&stdout).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stdout)
+            .unwrap();
         use std::io::Write;
         file.write_all(&[b' '; 128]).unwrap();
         drop(file);
@@ -770,5 +943,99 @@ mod tests {
         assert_eq!(breaches.len(), 1, "one breach surfaced");
         assert_eq!(breaches[0].session, "t/dev/1");
         assert!(breaches[0].file_size > cap, "the file exceeded the cap");
+    }
+
+    /// cp-0 fix 5: a hook-registered attended session (actor
+    /// "hook:session-start") queues NO Register — attended sessions have
+    /// no campd-created stdout file, so tailing them would crash campd via
+    /// drain_one's open. A campd-actor SessionWoke queues Register.
+    #[test]
+    fn observe_filters_attended_sessions_and_registers_only_campd_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        // attended (hook-registered) session.woke → NO register.
+        ledger
+            .append(woke_input_with_actor(
+                "t/attended/1",
+                "gc-1",
+                "hook:session-start",
+            ))
+            .unwrap();
+        let attended = ledger.events_range(1, None).unwrap().pop().unwrap();
+        rc.observe(&attended);
+        rc.apply_tracking(&mut ledger).unwrap();
+        assert!(
+            rc.tailed_sessions().is_empty(),
+            "attended sessions are not tailed"
+        );
+        // campd-spawned worker session.woke → register.
+        ledger.append(woke_input("t/dev/1", "gc-2")).unwrap();
+        let woke = ledger.events_range(2, None).unwrap().pop().unwrap();
+        rc.observe(&woke);
+        rc.apply_tracking(&mut ledger).unwrap();
+        assert_eq!(
+            rc.tailed_sessions(),
+            vec!["t/dev/1".to_string()],
+            "campd-spawned workers are tailed"
+        );
+    }
+
+    /// cp-0 fix 9 (OOM-before-cap): a single newline-less line larger than
+    /// the cap surfaces a CapBreach WITHOUT reading the whole line into
+    /// `partial` — `partial` never exceeds the cap (RSS-bounded). The
+    /// pre-read check (file_size > cap) breaches before any read; the
+    /// in-loop check (before-extend) covers a file that grows past the cap
+    /// during a drain (concurrent worker writes).
+    #[test]
+    fn drain_all_surfaces_a_cap_breach_for_a_huge_newlineless_line_without_unbounded_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        let cap: u64 = 200;
+        // A single newline-less line larger than the cap.
+        std::fs::write(&stdout, vec![b'x'; 500]).unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, cap).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        let breaches = rc.take_cap_breaches();
+        assert_eq!(breaches.len(), 1, "the huge line breached the cap");
+        // partial never exceeds the cap — the pre-read check breached
+        // before reading a single byte (partial stays 0).
+        let partial_len = rc.tailed.get("t/dev/1").map(|t| t.partial.len()).unwrap();
+        assert!(
+            partial_len as u64 <= cap,
+            "partial ({partial_len}) never exceeds the cap ({cap}) — RSS-bounded"
+        );
+    }
+
+    /// cp-0 fix 10 (reap-time stream-file disposal): unregister best-effort
+    /// unlinks the session's stdout file (§2.3: "stream files append-only
+    /// until reap"). After unregister, the file no longer exists.
+    #[test]
+    fn unregister_disposes_the_session_stream_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        std::fs::write(&stdout, b"{\"type\":\"assistant\"}\n").unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        assert!(stdout.exists(), "the stream file exists while tailed");
+        rc.unregister(&mut ledger, "t/dev/1").unwrap();
+        assert!(
+            !stdout.exists(),
+            "the stream file is disposed at unregister"
+        );
+        assert!(rc.tailed_sessions().is_empty(), "unregistered");
+        assert_eq!(
+            ledger.stream_cursor("t/dev/1").unwrap(),
+            0,
+            "offset row cleared"
+        );
     }
 }

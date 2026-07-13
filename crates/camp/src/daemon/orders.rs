@@ -575,7 +575,9 @@ mod tests {
 
     /// A read-channel runtime for settle threading (cp-0): empty tailed
     /// set, sessions dir under the camp root.
-    fn test_read_channel(camp_root: &std::path::Path) -> super::super::read_channel::ReadChannelRuntime {
+    fn test_read_channel(
+        camp_root: &std::path::Path,
+    ) -> super::super::read_channel::ReadChannelRuntime {
         super::super::read_channel::ReadChannelRuntime::new(
             camp_root.join("sessions"),
             256 * 1024 * 1024,
