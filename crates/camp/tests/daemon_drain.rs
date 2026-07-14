@@ -170,12 +170,17 @@ impl Camp {
     /// The bead's `step_id` — NOT on `BeadRow` (not in `BEAD_COLS`), so read from the
     /// fold. V-6 needs it: the money-invariant assertion must key on the STEP, not on
     /// a title `create_attempt` happens to copy.
+    ///
+    /// `None` means the row EXISTS and its `step_id` is NULL — the property that makes
+    /// a bead a run MEMBER. A MISSING row is a hard failure, not a `None`: the old
+    /// `.unwrap_or(None)` collapsed those two into one answer, and `close_member`'s
+    /// guard now rests on this distinction (invariant 5 — no silenced errors).
     fn step_id_of(&self, id: &str) -> Option<String> {
         self.conn()
             .query_row("SELECT step_id FROM beads WHERE id = ?1", [id], |r| {
                 r.get::<_, Option<String>>(0)
             })
-            .unwrap_or(None)
+            .unwrap_or_else(|e| panic!("bead {id} has no row, so it has no step_id: {e}"))
     }
 
     /// Every bead campd has woken a worker for, by bead id.
@@ -190,7 +195,27 @@ impl Camp {
             .collect()
     }
 
-    /// ⭐ No dispatch may have FAILED. Call this on every happy path.
+    /// ⭐ No dispatch may have FAILED. Called by EVERY happy-path test in this file —
+    /// all 13 of them.
+    ///
+    /// The comment here used to SAY "call this on every happy path" while 2 of 20 tests
+    /// called it. That is the same class of false in-code claim as a `die()` message
+    /// asserting something untrue (invariant 3): the file stated a coverage rule it did
+    /// not keep, so a reader trusted a guarantee that was not there. It is now kept, and
+    /// what follows is the whole truth about where this runs and what it can see.
+    ///
+    /// It is NOT called by the seven FAILURE-path tests, because they EXPECT a
+    /// `dispatch.failed` and assert its reason themselves: `a_conflicting_drain…`,
+    /// `a_reserve_conflict…`, `execute_drain_closes_the_anchor…`,
+    /// `a_post_reserve_failure…`, `a_failed_drain_does_not_poison…`,
+    /// `execute_drain_refuses…`, `a_drain_over_100_members…`. `dispatch.failed` is not
+    /// only a SPAWN failure — campd also emits it for a reservation conflict and an
+    /// unusable item formula, which those tests exist to provoke. So this is not a
+    /// universal invariant and must not be hoisted into `Drop`.
+    ///
+    /// And it can only see a dispatch that FAILED LOUDLY. A dispatch that never HAPPENS
+    /// logs nothing, and silence is not evidence — that gap is `close_dispatched`'s,
+    /// which requires `session.woke` on every accepting path.
     ///
     /// BD-R3-1: the V-5 fix (a valid TOML agent pack) was real and NOTHING asserted
     /// it. Restoring the bug — YAML in a TOML file — left all 20 tests GREEN while
@@ -236,7 +261,20 @@ impl Camp {
                     self.camp_ok(&["close", bead, "--outcome", outcome]);
                     return;
                 }
-                "closed" => return,
+                // Already closed — but "no fallback" has to mean EVERY accepting arm,
+                // not just the one below. This was the single path by which
+                // `close_dispatched` could return with no evidence a worker ever
+                // existed, which is precisely the indifference the method was split
+                // out to destroy. Same check, same reason.
+                "closed" => {
+                    assert!(
+                        self.woken_beads().contains(bead),
+                        "bead {bead} is closed but campd never woke a worker for it — \
+                         this method accepts a bead only on POSITIVE evidence a worker \
+                         existed (invariant 5), and `session.woke` is that evidence"
+                    );
+                    return;
+                }
                 _ => {
                     assert!(
                         Instant::now() < deadline,
@@ -260,7 +298,30 @@ impl Camp {
     /// Close a run MEMBER. A member is NEVER dispatched — campd excludes it from
     /// `dispatchable_beads` by design (a DRAIN scatters over it). So the harness
     /// claims it, and that is not a fallback: it is the only path a member has.
+    ///
+    /// **But it is a fallback the instant it is pointed at the wrong bead**, and until
+    /// the guard below existed, nothing stopped that: the choice between this method
+    /// and `close_dispatched` was AUTHOR CONVENTION. Both of the absorbing behaviours
+    /// just removed from `close_dispatched` still live here — the `in_progress` arm
+    /// closes with no `session.woke` check, and the `_` arm CLAIMS AN UNDISPATCHED
+    /// BEAD. So calling this on a bead campd should have dispatched silently reinstates
+    /// the V-5 blindness in its exact original shape.
+    ///
+    /// Not theoretical. Delete the member/root exclusion from `dispatchable_beads` and
+    /// `a_CLOSED_member_is_never_scattered` STILL PASSES, because this method absorbs
+    /// the wrongly-dispatched member. The guard is what turns that into a hard failure.
+    ///
+    /// It asserts the REAL contract, not a naming rule: a NULL `step_id` is *precisely*
+    /// the column `dispatchable_beads` uses to exclude members
+    /// (`NOT (run_id IS NOT NULL AND step_id IS NULL)`). Wrong-kind routing is now
+    /// impossible rather than merely discouraged.
+    /// `close_member_REFUSES_a_dispatched_bead` holds this shut.
     fn close_member(&self, bead: &str, outcome: &str) {
+        assert!(
+            self.step_id_of(bead).is_none(),
+            "close_member called on a bead with a step_id ({bead}) — that bead IS \
+             dispatched; use close_dispatched"
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let row = self.get_bead(bead);
@@ -513,6 +574,7 @@ fn an_exclusive_drain_reserves_every_member_with_gcs_verbatim_key() {
     // `bead.updated`.
     assert!(c.events_of_type("drain.reserved").is_empty());
     assert!(!c.events_of_type("bead.updated").is_empty());
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -631,6 +693,7 @@ fn the_reservation_is_released_when_the_drain_gathers() {
     let row = c.get_bead(&anchor);
     assert_eq!(row.status, "closed");
     assert_eq!(row.outcome.as_deref(), Some("pass"));
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -652,6 +715,7 @@ fn the_run_does_not_finalize_while_drain_items_are_open() {
     // `publish` needs `implement`, and `implement` is still open.
     let publish = c.step_bead(&run, "publish");
     assert!(!c.dispatchable().iter().any(|b| b.id == publish));
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -684,6 +748,9 @@ fn the_drains_outcome_reflects_a_failed_item_at_gather_and_the_others_still_ran(
         Some("fail"),
         "one failed item fails the drain"
     );
+    // An item that FAILS is a bead OUTCOME, not a dispatch failure: all three items
+    // were dispatched to real workers, and every one of them must have been.
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -710,6 +777,7 @@ fn a_CLOSED_member_is_never_scattered() {
         !c.bead_metadata(&done)
             .contains_key(EXCLUSIVE_DRAIN_RESERVATION)
     );
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -730,6 +798,7 @@ fn a_mail_bead_in_a_run_is_never_a_drain_member() {
         1,
         "the mail bead is not a member"
     );
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -752,6 +821,8 @@ fn a_drain_survives_a_campd_restart_without_double_materializing() {
         "reconcile re-queues the anchor, and execute_drain GATHERS rather than \
          re-scattering when children already exist"
     );
+    // The restart must not have cost a dispatch either.
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -816,6 +887,9 @@ fn doctor_lists_and_releases_orphaned_drain_reservations() {
             .contains_key(EXCLUSIVE_DRAIN_RESERVATION),
         "the orphan is released"
     );
+    // The anchor was closed BY HAND, not by a failed dispatch — campd dispatched
+    // everything it owed.
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -845,6 +919,7 @@ fn reconcile_releases_a_reservation_orphaned_by_a_kill_9() {
             .contains_key(EXCLUSIVE_DRAIN_RESERVATION),
         "reconcile sweeps a reservation whose anchor is closed or gone"
     );
+    c.assert_no_dispatch_failures();
 }
 
 impl Camp {
@@ -948,6 +1023,7 @@ fn each_item_run_NAMES_ITS_OWN_MEMBER_and_two_items_are_distinguishable() {
             .collect::<Vec<_>>(),
         "each item's WORK bead names its own member — the runs are not clones"
     );
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -1062,6 +1138,7 @@ fn a_member_that_CLOSES_MID_DRAIN_is_still_released_at_gather() {
             .contains_key(EXCLUSIVE_DRAIN_RESERVATION),
         "a member that closed mid-drain must still be released at gather"
     );
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -1138,4 +1215,74 @@ fn a_drain_over_100_members_fails_the_drain_and_scatters_nothing() {
                 .contains("limit_exceeded")),
         "the close names gc's reason"
     );
+}
+
+#[test]
+#[should_panic(expected = "use close_dispatched")]
+fn close_member_REFUSES_a_dispatched_bead() {
+    // ⭐ F1 — the harness's OWN routing is now a checked contract, not a convention.
+    //
+    // `close_member` must claim an unclaimed bead and close an in_progress one with no
+    // `session.woke` check — a member has no worker, so that is its only path. Pointed
+    // at a bead campd SHOULD have dispatched, those same two arms become exactly the
+    // fallback that `close_dispatched` was split out to destroy, and the suite goes
+    // blind in the V-5 shape again. Nothing but author convention prevented that.
+    //
+    // `decompose` is a STEP bead: campd dispatches it, and every other happy path here
+    // routes it to `close_dispatched` (via `close_decompose`). Sending it to
+    // `close_member` must be a HARD FAILURE.
+    //
+    // This test is the reason the guard cannot be quietly deleted: remove the assert
+    // and `close_member` absorbs the dispatched bead, no panic, and this goes RED.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("build");
+    c.create_member(&run, "member one");
+    // The bead must EXIST before its kind can be read — `step_id_of` hard-fails on a
+    // missing row rather than reporting a NULL `step_id`, which would look like a
+    // member and let the wrong-kind call through.
+    c.settle();
+
+    let decompose = c.step_bead(&run, "decompose");
+    assert_eq!(
+        c.step_id_of(&decompose).as_deref(),
+        Some("decompose"),
+        "precondition: this IS a dispatched step bead"
+    );
+    c.close_member(&decompose, "pass");
+}
+
+#[test]
+#[should_panic(expected = "campd never woke a worker for it")]
+fn close_dispatched_REFUSES_a_CLOSED_bead_no_worker_ever_touched() {
+    // ⭐ F2. `close_dispatched` promises it accepts a bead ONLY on positive evidence a
+    // worker existed — that promise is the entire reason it was split out of
+    // `close_member`. Its `closed` arm used to `return` unconditionally: the one
+    // accepting path that took the bead's word for it, while the adjacent `in_progress`
+    // arm demanded `session.woke`.
+    //
+    // Measured, not assumed: with a `panic!` as the first statement of that arm the
+    // whole suite still passed, so NO existing test reaches it — the arm was dead code
+    // and an assert dropped into it would have been an instrument nothing exercises.
+    // This test is what makes the arm live and the assert falsifiable.
+    //
+    // A run MEMBER is the honest witness. campd never dispatches one, so it carries no
+    // `session.woke` — close it as a member and it becomes exactly the thing the arm
+    // must refuse: a bead that is CLOSED but was NEVER WORKED. Restore the bare
+    // `"closed" => return` and `close_dispatched` swallows it, no panic, and this
+    // goes RED.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("build");
+    let m = c.create_member(&run, "member one");
+    c.settle();
+
+    c.close_member(&m, "pass");
+    assert_eq!(c.get_bead(&m).status, "closed");
+    assert!(
+        !c.woken_beads().contains(&m),
+        "precondition: a member is never dispatched, so no worker ever ran it"
+    );
+
+    c.close_dispatched(&m, "pass");
 }
