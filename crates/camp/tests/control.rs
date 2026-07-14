@@ -97,6 +97,12 @@ struct Daemon {
 }
 
 impl Daemon {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Daemon {
     /// Spawn campd with extra env vars. cp-0 note 1: pass
     /// `("CAMP_MAX_STREAM_BYTES", "64")` to inject a small stream cap; pass
     /// `("FAKE_AGENT_NUDGE_CLOSE", "1")` so the fake worker blocks on stdin
@@ -1207,8 +1213,23 @@ fn a_line_larger_than_the_cap_is_skipped_and_campd_does_not_livelock() {
     let campd = Daemon::spawn(
         &root,
         &[
-            ("FAKE_AGENT_HUGE_LINE", "2097152"), // 2 MiB: over the 1 MiB cap
-            ("FAKE_AGENT_HUGE_LINE_LINGER", "60"),
+            // 8 MiB — AND THE SIZE IS THE POINT.
+            //
+            // This gate was sized at 2 MiB and asserted "campd answers in < 5 s".
+            // The stream drain was O(n²) (B1), and 2 MiB cost only ~100 ms — so the
+            // gate PASSED while campd froze for MINUTES on a bigger line. A livelock
+            // gate calibrated just under the cliff is not a gate.
+            //
+            // 8 MiB is chosen because it is where the bug is UNMISSABLE: with the
+            // quadratic drain it costs ~1.1 s in release and ~11 s in debug (CI runs
+            // debug), so the 5 s deadline below FAILS. With the linear drain it costs
+            // ~36 ms. That is the signal this test exists to carry.
+            //
+            // THE BOUND THIS TEST DEFENDS: campd stays responsive while consuming a
+            // line far larger than one chunk AND larger than the subscriber cap —
+            // the ordinary case on any session whose worker reads a file.
+            ("FAKE_AGENT_HUGE_LINE", "8388608"),
+            ("FAKE_AGENT_HUGE_LINE_LINGER", "90"),
         ],
     );
     let (_bead, session) = dispatch_one(&root);
@@ -1218,8 +1239,40 @@ fn a_line_larger_than_the_cap_is_skipped_and_campd_does_not_livelock() {
             .contains("after the monster")
     });
 
+    // ── THE RESPONSIVENESS MONITOR — AND IT IS THE POINT OF THIS TEST ──────────
+    //
+    // "campd answered a status AFTER the stream finished" CANNOT SEE THE BUG: the
+    // freeze happens INSIDE the drain, and by the time the frames arrive it is long
+    // over. That assertion passed at 2 MiB *and* at 8 MiB with the O(n²) drain still
+    // in place — it merely took 17 s instead of 1 s. Sizing the fixture up was not
+    // enough; the probe was in the wrong PLACE.
+    //
+    // So: hammer campd with `status` on a FRESH connection THROUGHOUT, and keep the
+    // WORST round-trip. campd drains inside a single wake and answers NOTHING while
+    // it does — so a freeze lands squarely on one of these probes.
+    let probe_root = root.clone();
+    let probing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let probing_flag = probing.clone();
+    let monitor = std::thread::spawn(move || {
+        let mut worst = Duration::ZERO;
+        while probing_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            let t = Instant::now();
+            if let Ok(mut s) = UnixStream::connect(probe_root.join("campd.sock")) {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(90)));
+                if s.write_all(b"{\"op\":\"status\"}\n").is_ok() {
+                    let mut line = String::new();
+                    if BufReader::new(s).read_line(&mut line).is_ok() {
+                        worst = worst.max(t.elapsed());
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        worst
+    });
+
     let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut skipped: Option<serde_json::Value> = None;
     let mut after: Option<serde_json::Value> = None;
     while after.is_none() {
@@ -1243,7 +1296,7 @@ fn a_line_larger_than_the_cap_is_skipped_and_campd_does_not_livelock() {
 
     let skipped = skipped.expect("a skipped{over_cap} frame naming the monster");
     assert!(
-        skipped["bytes"].as_u64().unwrap() > 2_000_000,
+        skipped["bytes"].as_u64().unwrap() > 8_000_000,
         "the frame carries the line's TRUE byte count: {skipped}"
     );
     assert!(
@@ -1251,13 +1304,21 @@ fn a_line_larger_than_the_cap_is_skipped_and_campd_does_not_livelock() {
         "the NEXT line still arrived — the cursor advanced"
     );
 
-    // campd did not livelock: a FRESH connection is answered in < 5 s.
-    let started = Instant::now();
-    assert_eq!(
-        request(&mut connect(&root), r#"{"op":"status"}"#)["ok"],
-        true
+    probing.store(false, std::sync::atomic::Ordering::Relaxed);
+    let worst = monitor.join().unwrap();
+
+    // ── THE GATE ───────────────────────────────────────────────────────────────
+    // campd must stay RESPONSIVE THROUGHOUT. With an O(n²) newline scan in the drain,
+    // an 8 MiB line costs ~11 s of 100%-CPU freeze inside ONE wake (debug) — the
+    // socket, SIGCHLD and every patrol timer, all dead. With the linear scan it is
+    // ~0.1 s. And the cost grows with the SQUARE of the line length, while
+    // `max_stream_bytes` accepts lines 32x bigger than this one.
+    assert!(
+        worst < Duration::from_secs(5),
+        "campd went UNRESPONSIVE for {worst:?} while draining ONE large line — it \
+         answers nothing at all during a wake, so that is the socket, SIGCHLD and \
+         every patrol timer frozen together (invariant 1, §4.3)"
     );
-    assert!(started.elapsed() < Duration::from_secs(5));
 
     // The client was reading perfectly — it must not be dropped.
     assert!(events_of(&root, "subscriber.dropped").is_empty());
@@ -1377,10 +1438,18 @@ fn a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends() 
 
     assert!(["stopped", "crashed"].contains(&end["reason"].as_str().unwrap()));
 
-    // EOF FOLLOWS the end frame — and never precedes it.
+    // EOF FOLLOWS the end frame — and it must be a REAL EOF.
+    //
+    // `next_frame_within(..).is_none()` returns None for BOTH eof and a timeout, so
+    // it would pass on an fd + slot LEAK (campd never closing the connection) just as
+    // happily as on a correct close. Say what we mean.
     assert!(
-        sub.next_frame_within(Duration::from_secs(5)).is_none(),
-        "EOF must follow the end frame"
+        matches!(
+            sub.read_frame_or_eof(Duration::from_secs(10)),
+            FrameOrEof::Eof
+        ),
+        "campd must CLOSE the connection after the end frame — a timeout here is an \
+         fd and a MAX_SUBSCRIBERS slot leaked, and `is_none()` cannot tell the two apart"
     );
     drop(campd);
 }
@@ -1436,8 +1505,15 @@ fn a_subscriber_caught_up_at_the_tail_gets_an_end_frame_when_its_session_is_reap
         }
     }
     assert_eq!(end.unwrap()["frame"], "end");
-    // EOF follows.
-    assert!(sub.next_frame_within(Duration::from_secs(5)).is_none());
+    // ...and a REAL EOF follows (not merely silence — see above).
+    assert!(
+        matches!(
+            sub.read_frame_or_eof(Duration::from_secs(10)),
+            FrameOrEof::Eof
+        ),
+        "campd must CLOSE the connection after the end frame, or the fd and the \
+         subscriber slot are leaked"
+    );
     drop(campd);
 }
 
@@ -1617,6 +1693,192 @@ fn a_non_json_line_yields_a_skipped_frame_and_no_second_patrol_degraded() {
         1,
         "cp-0 already owns this fault; the subscriber path must not re-report it: \
          {non_json:#?}"
+    );
+    drop(campd);
+}
+
+// ===== §2.1: a worker that dies with an unanswered interrupt ===============
+
+/// The pids of THIS campd's worker children.
+///
+/// Scoped to one campd on purpose: `pgrep -f fake-agent.sh` would match every
+/// worker of every test running in parallel, and killing those is how one test
+/// silently breaks seven others.
+fn worker_pids(campd_pid: u32) -> Vec<u32> {
+    let out = std::process::Command::new("pgrep")
+        .args(["-P", &campd_pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+fn kill_pids(pids: &[u32]) {
+    for pid in pids {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+}
+
+/// VT-3 — §2.1, THROUGH THE DAEMON: a worker that DIES with an unanswered
+/// interrupt still faults LOUDLY.
+///
+/// `forget_session`'s unit test calls it directly; nothing proved its WIRING. This
+/// drives the real thing: campd delivers the interrupt, the worker is killed before
+/// it can answer, campd reaps it, disposes the session, and
+/// `close_disposed` -> `forget_session` must append
+/// `control.failed{cause:"session_ended"}`.
+///
+/// This is the MOST LIKELY real scenario (the interrupt worked; the worker died
+/// before flushing its ack) and the request must NEVER vanish with no event.
+#[test]
+fn a_worker_killed_with_an_unanswered_interrupt_faults_loudly_through_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    // The worker holds its answer for a long time, so it is provably UNANSWERED
+    // when we kill it.
+    let campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_CONTROL_LOOP", "1"),
+            ("FAKE_AGENT_CONTROL_ANSWER_DELAY", "600"),
+        ],
+    );
+    let mut stream = connect(&root);
+    let (_bead, session) = dispatch_one(&root);
+
+    let resp = request(
+        &mut stream,
+        &format!(r#"{{"op":"session.interrupt","session":"{session}"}}"#),
+    );
+    assert_eq!(resp["ok"], true, "{resp}");
+    let request_id = resp["request_id"].as_str().unwrap().to_owned();
+    wait_until(&root, "session.interrupted", |e| {
+        e.iter().any(|ev| {
+            ev["type"] == "session.interrupted" && ev["data"]["request_id"] == request_id.as_str()
+        })
+    });
+    assert!(
+        events_of(&root, "control.responded").is_empty(),
+        "the worker is holding its answer — the request is genuinely unanswered"
+    );
+
+    // The worker dies. campd is UP and watching.
+    let workers = worker_pids(campd.pid());
+    assert!(!workers.is_empty(), "campd must hold a worker child");
+    kill_pids(&workers);
+
+    wait_until(&root, "control.failed{session_ended}", |e| {
+        e.iter().any(|ev| {
+            ev["type"] == "control.failed"
+                && ev["data"]["request_id"] == request_id.as_str()
+                && ev["data"]["cause"] == "session_ended"
+        })
+    });
+    let failed = events_of(&root, "control.failed")
+        .into_iter()
+        .find(|e| e["data"]["request_id"] == request_id.as_str())
+        .unwrap();
+    assert_eq!(failed["data"]["session"], session.as_str());
+    assert_eq!(failed["data"]["verb"], "session.interrupt");
+    drop(campd);
+}
+
+/// BD-1 — THE SAME SEAM, ACROSS A RESTART. §2.1's SWALLOWED FAULT.
+///
+/// campd delivers an interrupt, campd dies, THE WORKER DIES DURING THE OUTAGE, and
+/// a fresh campd starts. Adoption marks the session `crashed`, so the session is
+/// never registered and therefore never disposed — `forget_session` NEVER RUNS.
+///
+/// `rehydrate` is the only thing left that can speak for that request, and it must:
+/// the ledger otherwise holds `session.interrupted{request_id}` with **no terminal
+/// event, forever**. That is precisely the swallowed fault §2.1 forbids — and it is
+/// worse than the residual the plan RECORDED for this case ("expires into a
+/// control.failed whose stated cause is false"), because it produces NO EVENT AT ALL.
+#[test]
+fn a_restart_after_the_worker_also_died_still_faults_the_unanswered_interrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let envs = [
+        ("FAKE_AGENT_CONTROL_LOOP", "1"),
+        ("FAKE_AGENT_CONTROL_ANSWER_DELAY", "600"),
+    ];
+    let campd = Daemon::spawn(&root, &envs);
+    let mut stream = connect(&root);
+    let (_bead, session) = dispatch_one(&root);
+
+    let resp = request(
+        &mut stream,
+        &format!(r#"{{"op":"session.interrupt","session":"{session}"}}"#),
+    );
+    assert_eq!(resp["ok"], true, "{resp}");
+    let request_id = resp["request_id"].as_str().unwrap().to_owned();
+    wait_until(&root, "session.interrupted", |e| {
+        e.iter().any(|ev| {
+            ev["type"] == "session.interrupted" && ev["data"]["request_id"] == request_id.as_str()
+        })
+    });
+
+    // BOTH die: campd first, then the worker, during the outage. The worker's pid
+    // is captured BEFORE the kill — once campd is gone the worker is orphaned and
+    // `pgrep -P` can no longer find it.
+    let workers = worker_pids(campd.pid());
+    assert!(!workers.is_empty(), "campd must hold a worker child");
+    campd.kill9();
+    kill_pids(&workers);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // A fresh campd. Adoption will find the worker gone and crash the session, so it
+    // is NEVER re-tailed and NEVER disposed. Only `rehydrate` can speak for the
+    // request now.
+    let campd = Daemon::spawn(&root, &envs);
+    let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+
+    wait_until(&root, "a TERMINAL event for the interrupt", |e| {
+        e.iter().any(|ev| {
+            (ev["type"] == "control.failed" || ev["type"] == "control.responded")
+                && ev["data"]["request_id"] == request_id.as_str()
+        })
+    });
+
+    let failed = events_of(&root, "control.failed")
+        .into_iter()
+        .find(|e| e["data"]["request_id"] == request_id.as_str())
+        .expect(
+            "SWALLOWED: the interrupt produced NEITHER control.responded NOR \
+             control.failed. The ledger holds session.interrupted with no terminal \
+             event, forever — §2.1's swallowed fault",
+        );
+    assert_eq!(
+        failed["data"]["cause"], "session_ended",
+        "the session ended with the request unanswered — byte-for-byte the event \
+         forget_session produces when campd is up"
+    );
+    assert_eq!(failed["data"]["session"], session.as_str());
+    let after_first = events_of(&root, "control.failed").len();
+    assert_eq!(after_first, 1, "exactly one fault");
+    drop(campd);
+
+    // ---- THE NEW CASE THIS FIX CREATES, AND IT MUST NOT REGRESS --------------
+    // `rehydrate` now APPENDS an event. An append that is not IDEMPOTENT would
+    // re-fault the same request on EVERY campd start, forever — a fault storm in
+    // place of a swallowed fault, which is not an improvement.
+    //
+    // It is idempotent BY CONSTRUCTION: the `control.failed{session_ended}` it just
+    // appended is a TERMINAL cause, so the next `rehydrate` routes this id to
+    // `answered` and says nothing. Restart twice and prove it.
+    let campd = Daemon::spawn(&root, &envs);
+    let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        events_of(&root, "control.failed").len(),
+        after_first,
+        "a SECOND restart must append NOTHING — the session_ended fault is terminal, \
+         so rehydrate must route this id to `answered`. A non-idempotent append would \
+         re-fault the same request on every start, forever"
     );
     drop(campd);
 }
