@@ -73,7 +73,7 @@ pub const PROJECTED_METADATA: &[(&str, &str)] = &[
     ("gc.work_branch", "work_branch"),
 ];
 
-fn row_to_bead(row: &rusqlite::Row<'_>) -> rusqlite::Result<BeadRow> {
+pub(crate) fn row_to_bead(row: &rusqlite::Row<'_>) -> rusqlite::Result<BeadRow> {
     let labels_json: String = row.get(8)?;
     let labels: Vec<String> = serde_json::from_str(&labels_json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))

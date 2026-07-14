@@ -1,0 +1,6 @@
+formula = "item"
+contract = "graph.v2"
+
+[[steps]]
+id = "work"
+title = "Work the member"

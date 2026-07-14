@@ -140,6 +140,23 @@ pub fn is_looping(step: &Step) -> bool {
     step.check.is_some() || step.retry.is_some()
 }
 
+/// A CAMPD-HELD step: campd claims its anchor and drives it, and NO WORKER is
+/// ever dispatched for the anchor itself.
+///
+/// gc calls a drain's anchor a *"controller-owned control bead"* (`types.go:318`),
+/// and that is exactly what this is. Two shapes hold an anchor, and they hold it
+/// for DIFFERENT reasons — which is why `is_campd_held` is not a rename of
+/// [`is_looping`]:
+///
+/// * **looping** (`check`/`retry`) — campd claims the anchor and dispatches
+///   worker ATTEMPTS against it. The attempts are the mechanism.
+/// * **drain** — campd claims the anchor and SCATTERS one item run per run
+///   member. There are no attempts, and a worker for the anchor would be a
+///   worker for a step that has no work (§13's money invariant).
+pub fn is_campd_held(step: &Step) -> bool {
+    is_looping(step) || step.drain.is_some()
+}
+
 /// A step reference resolved from a step id: the formula step and its
 /// anchor bead.
 pub struct StepRef<'a> {
@@ -543,6 +560,124 @@ pub fn substitute_vars(
         out.insert(key.clone(), result);
     }
     Ok(out)
+}
+
+/// gc's `defaultDrainMaxUnits` (`drain.go:24`). The authored KEY `drain.max_units`
+/// is refused by name (0 corpus uses); this is gc's RUNTIME cap, and camp honours
+/// it: a drain whose member set exceeds it CLOSES `fail` and scatters NOTHING
+/// (`drain.go:244-255`, reason `limit_exceeded`).
+pub const DRAIN_MAX_UNITS: usize = crate::formula::drain::DEFAULT_MAX_UNITS;
+
+/// A run MEMBER (D3): a bead with this run's `run_id`, **no `step_id`**,
+/// `type = 'task'`, and **not closed**.
+///
+/// gc: `convoycore.Members(store, id, includeClosed=false, …)`
+/// (`membership.go:96-144` — *"if !includeClosed && IsTerminalStatus(b.Status)
+/// { return }"*). A CLOSED member is not a member: it is finished work, and
+/// scattering an item run over it would redo it.
+///
+/// Members are added by `camp create --run <run_id>`. The run ROOT is excluded
+/// (it also has `step_id IS NULL`), and so is anything wearing a `bond:` or
+/// `drain:` label — those are cooked run roots, not work the operator handed the
+/// run.
+pub fn run_members(conn: &Connection, ctx: &RunContext) -> Result<Vec<BeadRow>, CoreError> {
+    let sql = format!(
+        "SELECT {cols} FROM beads b
+         WHERE b.run_id = ?1 AND b.step_id IS NULL AND b.type = 'task' AND b.status <> 'closed'
+           AND b.id <> ?2
+           AND b.labels NOT LIKE '%\"bond:%' AND b.labels NOT LIKE '%\"drain:%'
+         ORDER BY (SELECT MIN(e.seq) FROM events e WHERE e.bead = b.id AND e.type = 'bead.created'), b.id",
+        cols = crate::readiness::BEAD_COLS,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<BeadRow> = stmt
+        .query_map(rusqlite::params![ctx.run_id, ctx.root], |r| {
+            crate::readiness::row_to_bead(r)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    // The LIKEs are a PREFILTER only. Re-parse the labels Rust-side and drop the
+    // decoys — a bead whose title merely CONTAINS `"bond:` is not a bond child.
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            !row.labels
+                .iter()
+                .any(|l| parse_bond_label(l).is_some() || parse_drain_label(l).is_some())
+        })
+        .collect())
+}
+
+/// The label linking a drain item run's ROOT to the anchor that scattered it.
+pub fn drain_label(anchor: &str, index: usize) -> String {
+    format!("drain:{anchor}:{index}")
+}
+
+pub fn parse_drain_label(label: &str) -> Option<(&str, usize)> {
+    let rest = label.strip_prefix("drain:")?;
+    let (anchor, index) = rest.rsplit_once(':')?;
+    if anchor.is_empty() {
+        return None;
+    }
+    Some((anchor, index.parse().ok()?))
+}
+
+/// The item runs already scattered for a drain anchor, by index. The
+/// `bond_children` mold exactly — a LIKE prefilter, then a real label re-parse.
+pub fn drain_children(
+    conn: &Connection,
+    anchor: &str,
+) -> Result<std::collections::BTreeMap<usize, BeadRow>, CoreError> {
+    let escaped = anchor
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%\"drain:{escaped}:%");
+    let mut stmt = conn.prepare(
+        "SELECT id, labels FROM beads
+         WHERE run_id IS NOT NULL AND step_id IS NULL
+           AND labels LIKE ?1 ESCAPE '\\'",
+    )?;
+    let candidates: Vec<(String, String)> = stmt
+        .query_map([pattern], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut children = std::collections::BTreeMap::new();
+    for (id, labels_json) in candidates {
+        let labels: Vec<String> = serde_json::from_str(&labels_json)
+            .map_err(|e| CoreError::Corrupt(format!("bead {id} labels are not JSON: {e}")))?;
+        for label in &labels {
+            if let Some((parent, index)) = parse_drain_label(label)
+                && parent == anchor
+            {
+                let row = crate::readiness::get_bead(conn, &id)?
+                    .ok_or_else(|| CoreError::Corrupt(format!("bead {id} vanished mid-query")))?;
+                children.insert(index, row);
+                break;
+            }
+        }
+    }
+    Ok(children)
+}
+
+/// Reservations whose holding anchor is CLOSED or GONE — orphans.
+///
+/// A `kill -9` between the reserve batch and the cook leaves members held by an
+/// anchor that will never gather them. Without a sweep they are held FOREVER and
+/// no other drain can ever take them. Returns `(member_bead, holding_anchor)`.
+pub fn orphaned_reservations(conn: &Connection) -> Result<Vec<(String, String)>, CoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT m.bead_id, m.value
+           FROM bead_meta m
+           LEFT JOIN beads a ON a.id = m.value
+          WHERE m.key = ?1
+            AND (a.id IS NULL OR a.status = 'closed')
+          ORDER BY m.bead_id",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([crate::readiness::EXCLUSIVE_DRAIN_RESERVATION], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 /// The label linking a bond child's root to the anchor that fanned it out.

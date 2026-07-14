@@ -1,0 +1,26 @@
+formula = "two-drains"
+contract = "graph.v2"
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "drain-a"
+title = "Drain A"
+needs = ["decompose"]
+
+[steps.drain]
+context = "separate"
+formula = "item"
+member_access = "exclusive"
+
+[[steps]]
+id = "drain-b"
+title = "Drain B"
+needs = ["decompose"]          # PARALLEL with drain-a — both ready at once
+
+[steps.drain]
+context = "separate"
+formula = "item"
+member_access = "exclusive"

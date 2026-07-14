@@ -84,7 +84,7 @@ enum Command {
     },
     /// Verify ledger invariants
     #[command(group(
-        clap::ArgGroup::new("mode").required(true).args(["refold", "formula"])
+        clap::ArgGroup::new("mode").required(true).args(["refold", "formula", "drain_reservations"])
     ))]
     Doctor {
         /// Rebuild state from the event log and report drift (spec §13.5)
@@ -100,6 +100,16 @@ enum Command {
         /// — the VERDICT is the output, not the exit code (the §10 gate reads it).
         #[arg(long, requires = "formula")]
         json: bool,
+        /// List exclusive drain reservations, flagging ORPHANS (a reservation
+        /// whose holding anchor is closed or gone — a kill -9 between the reserve
+        /// batch and the cook).
+        #[arg(long, conflicts_with_all = ["refold", "formula"])]
+        drain_reservations: bool,
+        /// Release the orphans `--drain-reservations` finds. The operator escape:
+        /// a held member no drain will ever gather is a member no drain can ever
+        /// take.
+        #[arg(long, requires = "drain_reservations")]
+        release_orphans: bool,
     },
     /// Append events by hand (worker contract surface)
     Event {
@@ -574,6 +584,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             repair,
             formula,
             json,
+            drain_reservations,
+            release_orphans,
+        } if drain_reservations => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            let _ = (repair, formula, json);
+            cmd::doctor::run_drain_reservations(&camp, release_orphans)
+        }
+        Command::Doctor {
+            refold: _,
+            repair,
+            formula,
+            json,
+            ..
         } => match formula {
             // --formula compiles a file THROUGH THE LAYERS: an imported formula's
             // `extends`, `description_file` and routes only resolve against a real

@@ -1,0 +1,21 @@
+formula = "build"
+contract = "graph.v2"
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "implement"
+title = "Implement each member"
+needs = ["decompose"]          # S17 — a drain depends on its member-producer
+
+[steps.drain]
+context = "separate"
+formula = "item"
+member_access = "exclusive"
+
+[[steps]]
+id = "publish"
+title = "Publish"
+needs = ["implement"]

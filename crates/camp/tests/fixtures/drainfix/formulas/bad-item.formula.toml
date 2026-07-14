@@ -1,0 +1,16 @@
+formula = "bad-item"
+contract = "graph.v2"
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+needs = ["decompose"]
+
+[steps.drain]
+context = "separate"
+formula = "no-such-item-formula"
+member_access = "exclusive"

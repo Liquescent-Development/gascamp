@@ -221,6 +221,32 @@ impl Ledger {
         crate::readiness::bead_metadata(&self.conn, bead)
     }
 
+    /// The run MEMBERS a drain scatters over (D3).
+    pub fn run_members(
+        &self,
+        ctx: &crate::formula::runtime::RunContext,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::run_members(&self.conn, ctx)
+    }
+
+    /// The item runs already scattered for a drain anchor, by index.
+    pub fn drain_children(
+        &self,
+        anchor: &str,
+    ) -> Result<std::collections::BTreeMap<usize, crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::drain_children(&self.conn, anchor)
+    }
+
+    /// Reservations whose holding anchor is closed or gone (the orphan sweep).
+    pub fn orphaned_reservations(&self) -> Result<Vec<(String, String)>, CoreError> {
+        crate::formula::runtime::orphaned_reservations(&self.conn)
+    }
+
+    /// A bead row by id.
+    pub fn bead_row(&self, bead: &str) -> Result<Option<crate::readiness::BeadRow>, CoreError> {
+        crate::readiness::get_bead(&self.conn, bead)
+    }
+
     /// The attempts of a looping step (its beads minus the anchor),
     /// creation order.
     pub fn step_attempts(

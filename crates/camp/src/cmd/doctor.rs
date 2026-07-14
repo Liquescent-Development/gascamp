@@ -123,3 +123,40 @@ pub fn run_formula(
         }
     }
 }
+
+/// `camp doctor --drain-reservations [--release-orphans]` — THE OPERATOR ESCAPE.
+///
+/// A member held by an anchor that will never gather it is a member no drain can
+/// ever take. `reconcile` sweeps orphans on every campd start; this is the manual
+/// lever for when campd is not the one running, and the visibility for when an
+/// operator wants to know who holds what.
+pub fn run_drain_reservations(camp: &CampDir, release: bool) -> Result<()> {
+    let mut ledger = Ledger::open(&camp.db_path())?;
+    let orphans = ledger.orphaned_reservations()?;
+
+    if !release {
+        if orphans.is_empty() {
+            println!("no orphaned drain reservations");
+        } else {
+            for (member, anchor) in &orphans {
+                println!(
+                    "ORPHAN {member} held by {anchor} (that anchor is closed or gone — it will \
+                     never gather this member)"
+                );
+            }
+            println!(
+                "\n{} orphaned reservation(s). `camp doctor --drain-reservations \
+                 --release-orphans` releases them.",
+                orphans.len()
+            );
+        }
+        return Ok(());
+    }
+
+    let released = crate::daemon::dispatch::release_orphaned_reservations(&mut ledger)?;
+    println!("released {} orphaned drain reservation(s)", released.len());
+    for (member, anchor) in &released {
+        println!("  {member} (was held by {anchor})");
+    }
+    Ok(())
+}
