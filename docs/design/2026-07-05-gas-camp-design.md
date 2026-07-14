@@ -446,7 +446,7 @@ against `gc`'s own compiler in CI). Camp v1 accepts:
 
 | Construct | Semantics (as specified by Gas City formula-spec-v2) |
 |---|---|
-| `formula`, `description`, `[requires] formula_compiler = ">=2.0.0"` | file header; camp requires the same contract declaration for graph-only constructs |
+| `formula`, `description`, `[requires] formula_compiler = ">=2.0.0"` | file header; camp requires the same contract declaration for graph-only constructs — **and `contract = "graph.v2"` SATISFIES it** (amended by compat phase 2, 2026-07-13: only 4 of the 100 real Gas City corpus formulas declare `[requires]`, while all 36 that use a graph-only construct declare the contract; the two spellings say the same thing and camp accepted only one of them) |
 | `[[steps]]` with `id`, `title`, `description`, `needs` | dependency-gated steps |
 | `assignee` | routing hint to a pack agent (with Gas City's combination rules) |
 | `[steps.check]` | run/check verification loop: `max_attempts`, inner `check` with `mode = "exec"`, `path`, `timeout` — the checker is a script, which keeps verification mechanical; step-level `timeout` (general bound on the check script) as specified |

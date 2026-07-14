@@ -3,14 +3,38 @@
 //! records a Violation — the caller reports all of them at once.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use crate::formula::ast::{Disposition, Formula, Retry, Step, Violation};
 use crate::formula::parse::{RawFormula, RawStep};
+
+/// D1 — an expansion formula supplies `template` steps for an `expand` rule.
+/// It has no `steps` (S3) and is never directly runnable.
+pub(crate) fn is_expansion(raw: &RawFormula) -> bool {
+    raw.kind.as_deref() == Some("expansion")
+}
+
+/// S11, amended: either spelling of the compiler declaration satisfies it.
+fn declares_compiler(raw: &RawFormula) -> bool {
+    raw.formula_compiler.is_some() || raw.contract.as_deref() == Some("graph.v2")
+}
 
 /// Camp's formula-compiler capability. Mirrors gc's v2 host capability
 /// (gc formula-spec-v2 §5); `[requires] formula_compiler` comparators are
 /// checked against this version.
 pub const FORMULA_COMPILER_CAPABILITY: &str = "2.0.0";
+
+/// A formula's name: the file name minus `.toml`, minus an optional trailing
+/// `.formula`.
+///
+/// **S2, amended.** 92 of the 100 corpus formulas are named
+/// `<name>.formula.toml`, so the old "name == file stem" rule refused them all.
+/// compat-1's `orders::resolve_formula` already accepted both spellings — the
+/// resolver and the validator disagreed, and the validator was wrong.
+pub fn formula_stem(path: &Path) -> Option<&str> {
+    let stem = path.file_name()?.to_str()?.strip_suffix(".toml")?;
+    Some(stem.strip_suffix(".formula").unwrap_or(stem))
+}
 
 fn violation(out: &mut Vec<Violation>, construct: impl Into<String>, message: impl Into<String>) {
     out.push(Violation {
@@ -49,8 +73,10 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
         }
     }
 
-    // S3 — at least one step.
-    if raw.steps.is_empty() {
+    // S3 — at least one step, AMENDED: an `type = "expansion"` formula never
+    // has `steps`. It supplies `template` steps for an `expand` rule (14 of the
+    // 100 corpus formulas; the old rule refused every one of them).
+    if raw.steps.is_empty() && !is_expansion(raw) {
         violation(
             out,
             "steps",
@@ -175,18 +201,24 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
     // S7 — acyclic needs graph (unknown ids were already S6).
     check_cycles(raw, out);
 
-    // S11 — the explicit-declaration rule (gc compile.go:51 concept),
-    // gated on key presence so malformed tables never mute it.
+    // S11 — the explicit-declaration rule (gc compile.go:51 concept), gated on
+    // key presence so malformed tables never mute it. AMENDED (master spec line
+    // 449): `contract = "graph.v2"` SATISFIES the declaration. Only 4 of the 100
+    // corpus formulas declare `[requires]`, but all 36 that use a graph-only
+    // construct declare the contract — the two spellings say the same thing, and
+    // camp accepted only one of them. The rule is strictly WIDER, so no formula
+    // that passed before loses its verdict.
     let uses_graph_only = raw
         .steps
         .iter()
         .any(|s| s.has_check || s.has_retry || s.has_on_complete);
-    if uses_graph_only && raw.formula_compiler.is_none() {
+    if uses_graph_only && !declares_compiler(raw) {
         violation(
             out,
             "requires",
-            "formulas that use graph-only constructs must declare \
-             [requires] formula_compiler = \">=2.0.0\" (gc formula-spec-v2 §5)",
+            "formulas that use graph-only constructs must declare either \
+             [requires] formula_compiler = \">=2.0.0\" or contract = \"graph.v2\" \
+             (gc formula-spec-v2 §5; camp master spec line 449)",
         );
     }
 
@@ -386,12 +418,13 @@ pub(crate) fn assemble(raw: RawFormula, source: String) -> Formula {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use crate::formula::ast::Violation;
+    use crate::formula::keys::Origin;
     use crate::formula::parse::walk;
 
     fn violations_for(text: &str, stem: &str) -> Vec<Violation> {
-        let (raw, mut v) = walk(text);
-        super::check(&raw, Some(stem), &mut v);
-        v
+        let mut w = walk(text, Origin::CampLocal);
+        super::check(&w.raw, Some(stem), &mut w.violations);
+        w.violations
     }
 
     fn has(v: &[Violation], construct: &str, needle: &str) -> bool {
@@ -509,14 +542,10 @@ mod tests {
             "f",
         );
         assert!(
-            has(
-                &v,
-                "requires",
-                "graph-only constructs must declare [requires] formula_compiler"
-            ),
+            has(&v, "requires", "graph-only constructs must declare"),
             "{v:?}"
         );
-        // with the declaration the same formula is clean
+        // With the [requires] declaration the same formula is clean.
         let v = violations_for(
             &format!(
                 "{HEADER}[requires]\nformula_compiler = \">=2.0.0\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n{check}"
@@ -524,6 +553,84 @@ mod tests {
             "f",
         );
         assert!(v.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn a_graph_v2_contract_satisfies_the_compiler_declaration() {
+        // S11, AMENDED (master spec line 449). Only 4 of the 100 corpus formulas
+        // declare `[requires]` — but all 36 that use `check`/`retry`/`on_complete`
+        // declare `contract = "graph.v2"`. The two spellings say the same thing,
+        // and camp accepted only one of them. The rule is strictly WIDER, so no
+        // formula that passed before can lose its verdict.
+        let check = "[steps.check]\nmax_attempts = 1\n[steps.check.check]\nmode = \"exec\"\npath = \"v.sh\"\n";
+        let v = violations_for(
+            &format!(
+                "{HEADER}contract = \"graph.v2\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n{check}"
+            ),
+            "f",
+        );
+        assert!(v.is_empty(), "contract must satisfy S11: {v:?}");
+
+        // Any OTHER contract value does not.
+        let v = violations_for(
+            &format!(
+                "{HEADER}contract = \"molecule.v1\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n{check}"
+            ),
+            "f",
+        );
+        assert!(
+            has(&v, "requires", "graph-only constructs must declare"),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn the_file_stem_rule_strips_an_optional_trailing_dot_formula() {
+        // S2, AMENDED. 92 of the 100 corpus files are `<name>.formula.toml`, and
+        // the old "name == file stem" rule refused every one of them. compat-1's
+        // `orders::resolve_formula` already accepted both spellings — the
+        // resolver and the validator disagreed, and the validator was wrong.
+        use std::path::Path;
+        assert_eq!(
+            super::formula_stem(Path::new("/p/bmad-build.formula.toml")),
+            Some("bmad-build")
+        );
+        assert_eq!(
+            super::formula_stem(Path::new("/p/mol-digest-generate.toml")),
+            Some("mol-digest-generate")
+        );
+        // Not a `.toml` at all.
+        assert_eq!(super::formula_stem(Path::new("/p/x.yaml")), None);
+        // Both spellings validate clean against the same header name.
+        for stem in ["f", "f"] {
+            let v = violations_for(&format!("{HEADER}[[steps]]\nid=\"a\"\ntitle=\"t\"\n"), stem);
+            assert!(v.is_empty(), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn an_expansion_formula_may_declare_no_steps() {
+        // S3, AMENDED. 14 of the 100 are `type = "expansion"`: they supply
+        // `template` steps for another formula's `expand` rule and never have
+        // `steps` of their own. The old rule refused all 14.
+        //
+        // (`type` is still UNIMPLEMENTED at this rung, so the formula does not
+        // yet LOAD — but it must not fail for the wrong reason, and S3 is the
+        // wrong reason.)
+        let mut w = crate::formula::parse::walk(
+            "formula = \"f\"\ntype = \"expansion\"\n",
+            crate::formula::keys::Origin::CampLocal,
+        );
+        super::check(&w.raw, Some("f"), &mut w.violations);
+        assert!(
+            !has(&w.violations, "steps", "at least one step"),
+            "an expansion formula has no `steps` by design: {:?}",
+            w.violations
+        );
+
+        // A NON-expansion formula with no steps still fails S3.
+        let v = violations_for(HEADER, "f");
+        assert!(has(&v, "steps", "at least one step"), "{v:?}");
     }
 
     #[test]
@@ -548,12 +655,15 @@ mod tests {
     fn retry_defaults_and_on_complete_rules() {
         let requires = "[requires]\nformula_compiler = \">=2.0.0\"\n";
         // default on_exhausted = hard_fail
-        let (raw, mut v) = walk(&format!(
-            "{HEADER}{requires}[[steps]]\nid = \"a\"\ntitle = \"t\"\n[steps.retry]\nmax_attempts = 2\n"
-        ));
-        super::check(&raw, Some("f"), &mut v);
-        assert!(v.is_empty(), "{v:?}");
-        let formula = super::assemble(raw, String::new());
+        let mut w = walk(
+            &format!(
+                "{HEADER}{requires}[[steps]]\nid = \"a\"\ntitle = \"t\"\n[steps.retry]\nmax_attempts = 2\n"
+            ),
+            Origin::CampLocal,
+        );
+        super::check(&w.raw, Some("f"), &mut w.violations);
+        assert!(w.violations.is_empty(), "{:?}", w.violations);
+        let formula = super::assemble(w.raw, String::new());
         assert_eq!(
             formula.steps[0].retry.as_ref().unwrap().on_exhausted,
             crate::formula::ast::Disposition::HardFail

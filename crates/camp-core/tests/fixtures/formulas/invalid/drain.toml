@@ -1,6 +1,0 @@
-formula = "drain"
-
-[[steps]]
-id = "a"
-title = "t"
-drain = true

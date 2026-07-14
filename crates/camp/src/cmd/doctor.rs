@@ -44,13 +44,22 @@ pub fn run_formula(path: &std::path::Path) -> Result<()> {
             Ok(())
         }
         Err(err) => {
+            // BOTH buckets. A refusal is not a violation, and a `phase`-refused
+            // formula used to print nothing at all — the operator was told the
+            // load failed and never told why.
             for violation in &err.violations {
                 println!("{violation}");
             }
+            for refusal in &err.refusals {
+                println!("{refusal}");
+            }
             bail!(
-                "{}: {} violation(s) — camp accepts a strict subset of Gas City formula v2 (spec §8.2)",
+                "{}: {} violation(s), {} refusal(s) — camp reads Gas City formula v2 \
+                 permissively but refuses constructs it does not implement, by name \
+                 (compat §4)",
                 err.path.display(),
-                err.violations.len()
+                err.violations.len(),
+                err.refusals.len()
             );
         }
     }

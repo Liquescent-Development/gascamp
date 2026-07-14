@@ -376,6 +376,95 @@ Semantics an implementer must get right (each verified in gc's compiler):
   - **`member_access = "exclusive"` (25 uses)** — a per-member reservation, stored where gc stores it: **as metadata on the member bead** (`gc.exclusive_drain_reservation`, `beadmeta/keys.go:93`), written in the reserving transaction, released at drain end. A second drain reserving a held member **fails the reserving drain loudly** — never two drains mutating one bead. Camp mirrors the key verbatim (invariant 7).
 - **21 formulas declare no `contract` at all** — they are not `graph.v2` in gc. Camp must **not** run them under graph.v2 semantics by default. Refuse, or state the fidelity risk explicitly; do not silently assume.
 
+### §9 addendum (compat phase 2, 2026-07-13) — MEASURED by RUNNING gc's compiler (`ci/gc-compat/factshim.go`) and camp's own rule set over the corpus at `GCPACKS_REF`. It CORRECTS this section.
+
+- **The ceiling is 95, not 97–98.** Beyond `phase = "vapor"` (2) and the scope-check formula (1), two
+  more cannot load: `gascity/formulas/same-session-implement.formula.toml` (an **UNCONDITIONAL**
+  `context = "shared"` drain — §9 above assumes all 13 shared drains sit behind
+  `{{drain_policy}} == same-session`; **12 do**), and `gastown/formulas/mol-polecat-work.toml`
+  (`extends → mol-polecat-base`, absent from the corpus — **gc fails it too**; gc compiles 99/100).
+  The scope-check formula's scope-ness lives entirely in step-metadata VALUES (`gc.kind = "scope"`,
+  `gc.scope_*`) — **there is no `gc.scope_kind` key in the corpus.**
+- **Per-rung LOADABLE counts:** 2a **2** · 2b **31** · 2c **49** · 2d **76** · 2e **95** — computed
+  over the **extends-MERGED** step tree. Eight formulas inherit a late-rung key only from a parent
+  (7 inherit `drain`, 1 inherits `expand`/`expand_vars`); gc corroborates — 12 authored separate drain
+  steps compile to 19.
+- **RUNNABLE = 62**, pinned separately, **and the arithmetic closes: 95 − 19 − 14 + 0 = 62.**
+  "Corpus loading" means **compiles**, not **runnable**. Of the 95 loadable, **19** lack a
+  `contract = "graph.v2"`, **14** are `type = "expansion"`, and the two sets are **disjoint**.
+  **Where §9's "21" went:** `21 = 19 + mol-digest-generate + mol-polecat-work` — **both of those are
+  among the 5 formulas camp refuses**, so they are outside the 95. **Inheritance is NOT the reason:
+  measured, ZERO formulas inherit `contract` or `type` from a parent, so the authored and merged counts
+  are both 19.** *(Runnability is nonetheless evaluated over the merged `extends` chain — that is the
+  correct rule, and the corpus does not exercise it, so it is pinned by a unit fixture rather than by
+  the gate.)* All 33 compile, and are refused at **run** time by all three cook entry points
+  (`camp sling`, the order-fire path, the drain's item cook).
+- **Three camp-local rules were refusing the corpus and are amended:** the file-stem rule strips an
+  optional trailing `.formula` (92/100); `type = "expansion"` formulas declare `template`, not `steps`
+  (14/100); and the compiler-declaration rule is satisfied by `contract = "graph.v2"` (master spec
+  line 449, amended in the same change).
+- **§4's permissiveness rule is scoped BY ORIGIN:** unrecognised keys are ignored+warned in imported
+  pack layers and are a **hard error** in camp's own `<root>/formulas/`.
+
+- **⚠️ §9's SUBSTITUTION-ASYMMETRY BULLET IS WRONG, and is replaced.** Measured in gc's compiled
+  output: **`{{var}}` is NOT substituted at compile at all** — 561 steps with a residual Description, 55
+  residual `gc.run_target` routes, 1 residual Title, **even where the var has a default**. Substitution
+  happens at **instantiation** (`stepToBead`), over **every field and every metadata value, with NO
+  exemption list** (`molecule.go:1035-1037`) — **including `check.path`** (→ `gc.check_path`,
+  `ralph.go:76`) **and `drain.formula`** (→ `gc.drain_formula`, `compile.go:590`). A templated
+  `drain.formula` is blocked **separately, by a validation reject**
+  (`graphv2_validation.go:417-419`), not by substitution scoping.
+  **AND gc has a SECOND grammar §9 never mentions:** single-brace **`{name}`** (`range.go:32`, applied
+  inside `expandStep`, `expand.go:255`) is **FULLY RESOLVED AT COMPILE** — 435 corpus occurrences, of
+  which 362 are the fixed `{target}` family and the rest are general vars **including 8 `gc.run_target`
+  routes**. So §2's *"0 bare route values, corpus-wide"* is also wrong: **8 route sites are
+  single-brace and resolve at compile.** Camp reproduces both stages — **with one deliberate
+  divergence, below.** Its two exemptions are **`description_file`** (121 corpus asset files are
+  literally named `{target}.*.md`, and 130 `description_file` values carry the braces — substituting
+  there breaks every one of them) **and `condition`** (`expand.go:272`).
+
+- **⚠️ DELIBERATE DIVERGENCE: gc CORRUPTS `{{var}}` during expansion. Camp does not.** gc's
+  `substituteVars` (`range.go:94`) is an unguarded `ReplaceAllStringFunc` over `\{(\w+)\}`, so inside
+  `expandStep` it matches the **inner** `{x}` of an authored `{{x}}` and substitutes it. **Measured in
+  gc's real compiled output: 52 corrupted sites across 49 steps in 20 formulas**
+  (`{superpowers.implementer}` ×16, `{interactive}` ×9, `{gstack.implementer}` ×8, `{autonomous}` ×6,
+  `{bmad.story-implementer}` ×4, `{compound-engineering.ce-work}` ×4, `{gc.implementation-worker}` ×4,
+  `{report}` ×1). The 55 `{{}}` routes that survive do so because their step is **not inside an
+  expansion template** — `substituteVars` runs ONLY inside `expandStep`, never as a global pass.
+  **SCOPE is the protection, not binding**: `bmad-build`'s `implementation_target` HAS a default and
+  its `{{implementation_target}}` route survives compile anyway. **gc's own residual CHECKER carries
+  the double-brace guard (`parser.go:664-672`) that its MUTATOR lacks** — its authors knew about the
+  ambiguity and guarded one side only. This is a bug, not a semantic. **Camp carries the guard.**
+  Invariant 6 is unaffected: it requires every valid camp formula to be a valid gc formula — it is
+  about **validity**, not bug-compatibility. **Cost, stated:** `ci/gc-compat/differential.py` excludes
+  those 49 steps from its description diff, so **at those sites the oracle can never catch a real
+  camp≠gc divergence.**
+
+- **⚠️ §9's DRAIN RUNTIME BULLET IS WRONG, and is replaced.** *"`item.single_lane` — camp honours it
+  mechanically: the drain's ready items enter dispatch with concurrency 1"* is a source-read mistake.
+  Measured: **`single_lane` has ZERO production readers in gc** (`types.go:371` — *"reserved for future
+  shared drains"*; its only readers are the compiler that writes it and the validator), and
+  **`on_item_failure` is read ONLY by `advanceSharedDrain`** (`drain.go:467`), so **for
+  `context = "separate"` gc is ALWAYS effectively `continue`**. gc's separate drain is **EAGER and
+  ALL-OR-NOTHING**: `reserveDrainMembers` takes the **whole member set** before the materialize loop
+  (`drain.go:113-118`, `:1212-1219`); a conflict closes the drain with **nothing materialized**. Camp
+  matches gc: `single_lane` and `on_item_failure` are **parsed, validated and round-tripped into
+  `gc.drain_*` metadata with no runtime behavior behind them.** Camp also honours gc's **runtime cap**:
+  `max_units` defaults to **100** and a drain whose member set exceeds it **fails**
+  (`drain.go:24`, `:244-255`, reason `limit_exceeded`).
+- **gc's compiler defaulting** is at `compile.go:584-614` at `GASCITY_REF` (§9 above cites `:579-608`).
+- **The metadata key `gc.continuation_group` (29 authored uses, 14 surviving compilation) is distinct
+  from the `drain.` key (0 uses).** The former is **accepted and carried verbatim**; camp does not
+  honour it (§11.4). `gc.build.artifact_schema` / `gc.build.artifact_path_keys` (74/74) and
+  `gc.on_fail` (1) likewise — **accepted fidelity costs**, named.
+- **A run's pinned artifact is the INSTANTIATED recipe** (`runs/<id>/recipe.json`, `recipe_version: 1`),
+  beside the authored source (`<formula>.toml`, kept verbatim for audit). campd reloads the recipe by
+  deserialization; it never re-parses the authored file, which for an imported formula could not
+  resolve its layers.
+- **gc expands check/retry loops at COMPILE** into namespaced `.iteration.N` steps (1523 compiled steps
+  for 99 formulas); **camp keeps them as RUNTIME loops.** A full step-list diff against gc is therefore
+  structurally impossible; `ci/gc-compat/differential.py` scopes to what is comparable.
+
 ## 10. The compatibility gate
 
 Today's CI proves **camp ⊆ gc** (camp's corpus compiles under the real gc compiler). That is **the wrong direction** and proves nothing about running gc packs.

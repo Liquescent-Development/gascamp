@@ -1,6 +1,0 @@
-formula = "template"
-template = true
-
-[[steps]]
-id = "a"
-title = "t"

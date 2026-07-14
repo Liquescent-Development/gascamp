@@ -49,6 +49,7 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         // state fold (the materialized tree under <root>/imports/ is the
         // state, owned by `camp import`).
         EventType::ImportAdded | EventType::ImportRefused => Ok(()),
+        EventType::FormulaRefused => formula_refused(event),
     }
 }
 
@@ -476,6 +477,40 @@ fn non_empty(event: &Event, field: &str, value: &str) -> Result<(), CoreError> {
             event_type: event.kind.as_str().to_owned(),
             reason: format!("empty {field}"),
         });
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FormulaRefused {
+    formula: String,
+    /// The KEY camp refused — not always the key that carried it: a
+    /// `gc.kind = "scope"` inside an accepted `metadata` map refuses as
+    /// `gc.kind` (compat §4 trap 2).
+    key: String,
+    reason: String,
+    /// The step the refusal belongs to, when it belongs to one.
+    #[serde(default)]
+    step: Option<String>,
+}
+
+/// `formula.refused` is log-only (compat §4 rule 1): a formula named a Gas City
+/// construct camp does not implement, and camp declined to load it rather than
+/// approximate its semantics. No state fold — the formula never became a run.
+///
+/// It has no bead: the refusal happens BEFORE anything is cooked. That is the
+/// whole point — §13's money invariant says a formula camp cannot honour must
+/// never reach a worker.
+fn formula_refused(event: &Event) -> Result<(), CoreError> {
+    let p: FormulaRefused = payload(event)?;
+    non_empty(event, "formula", &p.formula)?;
+    non_empty(event, "key", &p.key)?;
+    non_empty(event, "reason", &p.reason)?;
+    // Present-but-empty is a bug in the producer, not a step-less refusal:
+    // a formula-scoped refusal omits the field entirely.
+    if let Some(step) = &p.step {
+        non_empty(event, "step", step)?;
     }
     Ok(())
 }

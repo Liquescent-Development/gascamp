@@ -42,6 +42,7 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "session.nudged",
     "import.added",
     "import.refused",
+    "formula.refused",
 ];
 
 /// Values `bead.closed` accepts for `outcome` — a strict subset of gc's
