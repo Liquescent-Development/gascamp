@@ -39,7 +39,12 @@ RUNGS = [
 EXCLUDED = DEAD_TOP | ANNO_TOP | ANNO_STEP
 
 SEED_RUNGS = {"2a": 2, "2b": 31, "2c": 49, "2d": 76, "2e": 95}
-SEED_RUNNABLE = 62
+# Operator ruling E (2026-07-13). The PREDICATE changed — from `contract` alone
+# to gc's real "contract OR [requires] formula_compiler" — and the number FOLLOWED
+# it. The seed was not tuned to the code; the rule was corrected and re-derived.
+# The three formulas this adds are mol-idea-to-plan, mol-refinery-patrol and
+# mol-review-leg.
+SEED_RUNNABLE = 65
 SEED_REFUSED = {
     "mol-digest-generate.toml": "phase",
     "mol-pr-from-issue.formula.toml": "phase",
@@ -290,10 +295,27 @@ def analyze(root: Path):
         loadable[rung] = sorted(names)
         counts[rung] = len(names)
 
+    # D1 (operator ruling E) — gc's REAL predicate: a formula declares the graph
+    # compiler by EITHER spelling. gc's `directFormulaCompilerConstraints`
+    # (requirements.go:137-149) emits a constraint for `contract = "graph.v2"`
+    # AND for `[requires] formula_compiler`, and `UsesGraphCompiler` is true for
+    # either.
+    #
+    # This is also camp's OWN S11 rule. Gating runnability on `contract` alone
+    # would leave camp VALIDATING a formula as a graph formula (its check/retry
+    # steps legal) and then REFUSING TO RUN it as one — mol-idea-to-plan,
+    # mol-refinery-patrol and mol-review-leg, all of which gc runs happily.
+    #
+    # (Origin-scoping is the other half of ruling E: camp-LOCAL formulas are
+    # exempt from the gate entirely. Every corpus formula is IMPORTED, so it does
+    # not move this count.)
     runnable = 0
     for basename in loadable["2e"]:
         tv = views[basename]["top_values"]
-        if tv.get("contract") == "graph.v2" and tv.get("type") != "expansion":
+        declares_compiler = tv.get("contract") == "graph.v2" or bool(
+            (tv.get("requires") or {}).get("formula_compiler")
+        )
+        if declares_compiler and tv.get("type") != "expansion":
             runnable += 1
 
     return counts, runnable, loadable["2e"], refused

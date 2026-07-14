@@ -157,7 +157,9 @@ pub fn compile(
         });
     }
 
-    let not_runnable = validate::not_runnable(&walked.raw).map(|reason| Refusal {
+    // D1 (ruling E) — origin-scoped, exactly as D2′ scopes permissiveness.
+    let origin = layers.origin_of(path);
+    let not_runnable = validate::not_runnable(&walked.raw, origin).map(|reason| Refusal {
         construct: "formula".to_owned(),
         key: "contract".to_owned(),
         reason,

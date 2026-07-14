@@ -454,11 +454,30 @@ pub fn execute_fire(
             return Ok(None);
         }
     };
-    // D1 + §13's money invariant: a formula camp cannot honour must never reach a
-    // worker. The refusal is NOT wired here yet — the plan's D1 predicate refuses
-    // camp's own shipped formulas (`one-step` declares no compiler at all), and
-    // every candidate rule moves the pinned RUNNABLE count. REPORTED TO THE LEAD;
-    // awaiting a ruling. `compiled.not_runnable` is computed and unit-tested.
+    // D1 (ruling E) + §13's MONEY INVARIANT: a formula camp cannot honour must
+    // NEVER reach a worker. The order-fire path is a cook entry point like any
+    // other, and it refuses HERE — loudly, as a ledger event — rather than firing
+    // a run under semantics the formula never claimed.
+    if let Some(why) = &compiled.not_runnable {
+        let mut data = serde_json::json!({
+            "formula": order.formula, "key": why.key, "reason": why.reason,
+        });
+        if let Some(step) = &why.step {
+            data["step"] = serde_json::json!(step);
+        }
+        ledger.append(EventInput {
+            kind: EventType::FormulaRefused,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data,
+        })?;
+        fail(
+            ledger,
+            format!("formula {:?} cannot be run: {}", order.formula, why.reason),
+        )?;
+        return Ok(None);
+    }
     let formula = compiled.formula;
     let rig = match resolve_rig(config, order) {
         Ok(rig) => rig.clone(),

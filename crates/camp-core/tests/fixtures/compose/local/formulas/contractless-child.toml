@@ -1,0 +1,5 @@
+# The child declares NO contract and NO [requires]. Its parent declares
+# `contract = "graph.v2"`, and `contract` INHERITS (gc parser.go:308-309), so the
+# MERGED formula declares the graph compiler and IS runnable.
+formula = "contractless-child"
+extends = "contract-parent"

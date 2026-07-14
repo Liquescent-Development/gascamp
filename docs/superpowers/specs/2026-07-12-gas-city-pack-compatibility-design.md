@@ -389,16 +389,36 @@ Semantics an implementer must get right (each verified in gc's compiler):
   over the **extends-MERGED** step tree. Eight formulas inherit a late-rung key only from a parent
   (7 inherit `drain`, 1 inherits `expand`/`expand_vars`); gc corroborates — 12 authored separate drain
   steps compile to 19.
-- **RUNNABLE = 62**, pinned separately, **and the arithmetic closes: 95 − 19 − 14 + 0 = 62.**
-  "Corpus loading" means **compiles**, not **runnable**. Of the 95 loadable, **19** lack a
-  `contract = "graph.v2"`, **14** are `type = "expansion"`, and the two sets are **disjoint**.
-  **Where §9's "21" went:** `21 = 19 + mol-digest-generate + mol-polecat-work` — **both of those are
-  among the 5 formulas camp refuses**, so they are outside the 95. **Inheritance is NOT the reason:
-  measured, ZERO formulas inherit `contract` or `type` from a parent, so the authored and merged counts
-  are both 19.** *(Runnability is nonetheless evaluated over the merged `extends` chain — that is the
-  correct rule, and the corpus does not exercise it, so it is pinned by a unit fixture rather than by
-  the gate.)* All 33 compile, and are refused at **run** time by all three cook entry points
-  (`camp sling`, the order-fire path, the drain's item cook).
+- **RUNNABLE = 65** (operator ruling E, 2026-07-13), pinned separately, **and the arithmetic closes:
+  95 − 16 − 14 = 65.** "Corpus loading" means **compiles**, not **runnable**. Of the 95 loadable,
+  **16** declare **NO graph compiler at all** and **14** are `type = "expansion"`, and the two sets are
+  **disjoint**.
+
+  **⚠️ The PREDICATE, and an earlier revision of this addendum had it wrong.** A formula declares the
+  graph compiler by **EITHER** spelling — `contract = "graph.v2"` **OR** `[requires] formula_compiler`
+  — which is **gc's own rule** (`directFormulaCompilerConstraints`, `requirements.go:137-149`, emits a
+  constraint for each; `UsesGraphCompiler` is true for either). It is also **camp's own S11**. Gating
+  runnability on `contract` ALONE gives 62 and leaves camp with **two contradictory definitions of
+  "declares the graph compiler"**: S11 would VALIDATE `mol-idea-to-plan`, `mol-refinery-patrol` and
+  `mol-review-leg` as graph formulas — their `check`/`retry` steps legal — and D1 would then REFUSE TO
+  RUN them as graph formulas. **gc runs all three.** Measured gc behavior beats this section's prose,
+  as it has every other time this wave.
+
+  **The gate is scoped BY ORIGIN**, exactly as §4's permissiveness rule is (D2′): an **IMPORTED**
+  formula must declare the graph compiler to run; a **CAMP-LOCAL** formula is **EXEMPT**. The
+  operator's own formula is not a Gas City pack making a contract claim, and camp has always run plain
+  DAG formulas (`packs/starter/formulas/guarded-change.toml` declares `[requires]` and no `contract`).
+
+  **Where §9's "21" went:** `21 = 19 + mol-digest-generate + mol-polecat-work` — both of those are among
+  the 5 camp refuses, so they are outside the 95; and of the 19, three declare `[requires]` and are
+  runnable, leaving **16**. **Inheritance is NOT the reason: measured, ZERO formulas inherit `contract`
+  or `type` from a parent.** *(Runnability is nonetheless evaluated over the merged `extends` chain —
+  that is the correct rule, the corpus does not exercise it at all, and it is therefore pinned by a unit
+  fixture rather than by the gate.)* All 30 compile, and are refused at **run** time by **all three**
+  cook entry points (`camp sling`, the order-fire path, and `execute_drain`'s item cook).
+
+  **This is a FIDELITY IMPROVEMENT:** camp's runnability rule now matches gc's exactly for imported
+  formulas.
 - **Three camp-local rules were refusing the corpus and are amended:** the file-stem rule strips an
   optional trailing `.formula` (92/100); `type = "expansion"` formulas declare `template`, not `steps`
   (14/100); and the compiler-declaration rule is satisfied by `contract = "graph.v2"` (master spec

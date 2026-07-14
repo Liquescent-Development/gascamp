@@ -14,19 +14,47 @@ pub(crate) fn is_expansion(raw: &RawFormula) -> bool {
     raw.kind.as_deref() == Some("expansion")
 }
 
-/// S11, amended: either spelling of the compiler declaration satisfies it.
+/// S11, amended: EITHER spelling of the compiler declaration satisfies it — and
+/// this is gc's own rule (`requirements.go:137-149`,
+/// `directFormulaCompilerConstraints`, which emits a constraint for
+/// `contract = "graph.v2"` AND for `[requires] formula_compiler`).
+///
+/// It is the single definition of "declares the graph compiler", used by BOTH
+/// S11 (are this formula's graph-only constructs LEGAL?) and [`not_runnable`]
+/// (may it RUN?). **Two definitions is the bug.** Under the plan's original D1,
+/// `mol-idea-to-plan`, `mol-refinery-patrol` and `mol-review-leg` (all
+/// `[requires] formula_compiler = ">=2.0.0"`, no `contract`) would have been
+/// VALIDATED as graph formulas — their `check`/`retry` steps legal — and then
+/// REFUSED TO RUN as graph formulas. gc runs all three.
 fn declares_compiler(raw: &RawFormula) -> bool {
     raw.formula_compiler.is_some() || raw.contract.as_deref() == Some("graph.v2")
 }
 
-/// D1 — RUNNABLE, evaluated over the extends-MERGED formula: a `graph.v2`
-/// contract AND not an expansion.
+/// D1 (**operator ruling E**) — RUNNABLE, evaluated over the extends-MERGED
+/// formula and **SCOPED BY ORIGIN**, exactly as D2′ scopes permissiveness.
+///
+/// * **IMPORTED** ⇒ gc's real predicate: it must DECLARE the graph compiler (by
+///   either spelling) and must not be an expansion. Camp will not run a Gas City
+///   formula under graph.v2 semantics that never declared them.
+/// * **CAMP-LOCAL** ⇒ **EXEMPT.** The operator's own formula is not a gc pack
+///   making a contract claim, and camp has always run plain DAG formulas
+///   (`packs/starter/formulas/guarded-change.toml` declares `[requires]` and no
+///   contract; `one-step` declares neither). Gating them would be a straight
+///   regression of shipped behavior.
 ///
 /// **Compiling is not enough to `camp sling` something.** Of the 95 corpus
-/// formulas camp LOADS, 19 declare no contract and 14 are expansions (disjoint)
-/// — so only 62 can actually be run. "95/100" alone is a misleading headline and
-/// both numbers are stated wherever one is.
-pub(crate) fn not_runnable(raw: &RawFormula) -> Option<String> {
+/// formulas camp LOADS, 16 declare no graph compiler at all and 14 are
+/// expansions (disjoint) — so **95 − 16 − 14 = 65** can actually be run.
+/// "95/100" alone is a misleading headline, and both numbers are stated wherever
+/// one is.
+pub(crate) fn not_runnable(
+    raw: &RawFormula,
+    origin: crate::formula::keys::Origin,
+) -> Option<String> {
+    // The operator's own formulas are exempt from the gate entirely.
+    if origin == crate::formula::keys::Origin::CampLocal {
+        return None;
+    }
     if is_expansion(raw) {
         Some(
             "this is a `type = \"expansion\"` formula: it supplies `template` steps for another \
@@ -35,9 +63,9 @@ pub(crate) fn not_runnable(raw: &RawFormula) -> Option<String> {
         )
     } else if !declares_compiler(raw) {
         Some(
-            "this formula declares no graph compiler — neither `contract = \"graph.v2\"` nor \
-             `[requires] formula_compiler`: camp compiles it, but only graph formulas can be run \
-             (compat §9)"
+            "this imported formula declares no graph compiler — neither \
+             `contract = \"graph.v2\"` nor `[requires] formula_compiler`: camp compiles it, but \
+             it never claimed graph.v2 semantics and camp will not run it under them (compat §9)"
                 .to_owned(),
         )
     } else {

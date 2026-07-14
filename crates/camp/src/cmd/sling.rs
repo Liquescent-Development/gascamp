@@ -59,15 +59,17 @@ fn sling_formula(camp: &CampDir, name: &str, rig: Option<String>) -> Result<()> 
     )
     .map_err(|e| anyhow::anyhow!("formula {name:?} did not compile:\n{e}"))?;
 
-    // D1 — LOADABLE ≠ RUNNABLE. The compiler COMPUTES runnability
-    // (`compiled.not_runnable`, unit-tested in tests/compose.rs), but this entry
-    // point does not yet ENFORCE it: the plan's D1 predicate
-    // (`contract == "graph.v2"`) refuses camp's OWN shipped formulas, which
-    // declare the compiler the other legal way or not at all
-    // (packs/starter/formulas/guarded-change.toml declares `[requires]`;
-    // daemon_orders' `one-step` declares neither). Enforcing it as written is a
-    // regression of merged behavior, and every candidate rule moves the pinned
-    // RUNNABLE count (62 / 65 / 81). REPORTED TO THE LEAD; awaiting a ruling.
+    // D1 (ruling E) — LOADABLE ≠ RUNNABLE. Of the 95 corpus formulas camp
+    // compiles, 16 declare no graph compiler at all and 14 are expansions: 30
+    // that camp refuses at RUN time rather than run under semantics they never
+    // claimed. Camp-LOCAL formulas are exempt from the gate (the operator's own
+    // formula is not a gc pack making a contract claim), so this refuses only
+    // imported ones.
+    if let Some(why) = &compiled.not_runnable {
+        let mut ledger = Ledger::open(&camp.db_path())?;
+        refuse_formula(&mut ledger, name, why)?;
+        bail!("formula {name:?} cannot be run: {}", why.reason);
+    }
 
     let opts = camp_core::formula::CookOptions {
         config: Some(config.clone()),
@@ -152,6 +154,35 @@ fn sling_bead(
              only a healthy, running campd dispatches; it runs as soon as one is (campd \
              catches up from its cursor on start)"
         ))
+    })?;
+    Ok(())
+}
+
+/// A refusal LANDS IN THE LEDGER (compat §4 rule 1; exit criterion: "refusals
+/// name their key and land as ledger events").
+///
+/// "The formula did not run" is not an answer an operator can act on. The event
+/// NAMES THE KEY — which, for a scope-check hiding in step metadata, is not even
+/// the key that carried it (§4 trap 2).
+pub(crate) fn refuse_formula(
+    ledger: &mut Ledger,
+    name: &str,
+    refusal: &camp_core::formula::Refusal,
+) -> Result<()> {
+    let mut data = serde_json::json!({
+        "formula": name,
+        "key": refusal.key,
+        "reason": refusal.reason,
+    });
+    if let Some(step) = &refusal.step {
+        data["step"] = serde_json::json!(step);
+    }
+    ledger.append(EventInput {
+        kind: EventType::FormulaRefused,
+        rig: None,
+        actor: "cli".into(),
+        bead: None,
+        data,
     })?;
     Ok(())
 }

@@ -34,7 +34,7 @@ import tempfile
 # ---- the pins. Moving GCPACKS_REF means re-running factshim AND rungs.py and
 # updating these AND the §9 addendum, in ONE PR. See README.md.
 CEILING = 95
-RUNNABLE = 62
+RUNNABLE = 65
 RUNG_COUNTS = {"2a": 2, "2b": 31, "2c": 49, "2d": 76, "2e": 95}
 
 # basename -> a key the refusal MUST name.
@@ -172,8 +172,9 @@ try:
         if len(runnable) != RUNNABLE:
             die(
                 f"{len(runnable)} runnable, expected {RUNNABLE} "
-                f"(of the {CEILING} loadable, 19 declare no graph contract and 14 "
-                f"are expansions, and the two sets are disjoint)"
+                f"(of the {CEILING} loadable, 16 declare NO graph compiler at all — "
+                f"neither `contract` nor `[requires] formula_compiler` — and 14 are "
+                f"expansions, and the two sets are disjoint: 95 - 16 - 14 = 65)"
             )
 
         # ---- 3. the falsifiable cross-check: SET vs SET.

@@ -187,15 +187,30 @@ fn a_run_target_is_carried_verbatim_and_NOT_substituted_at_compile() {
 }
 
 #[test]
-fn a_no_contract_formula_compiles_and_is_not_runnable() {
-    // D1 — LOADABLE ≠ RUNNABLE. 19 of the 95 corpus formulas camp loads declare
-    // no contract and 14 are expansions (disjoint): only 62 can be slung. "95/100"
-    // alone is a misleading headline.
+fn an_IMPORTED_formula_with_no_graph_declaration_compiles_and_is_not_runnable() {
+    // D1 (ruling E) — LOADABLE ≠ RUNNABLE. Of the 95 corpus formulas camp loads,
+    // 16 declare NO graph compiler at all and 14 are expansions (disjoint): only
+    // 65 can be slung. "95/100" alone is a misleading headline, and both numbers
+    // are stated wherever one is.
+    //
+    // The camp-LOCAL equivalent is EXEMPT — see
+    // `a_CAMP_LOCAL_formula_is_exempt_from_the_runnability_gate`.
     let c = camp();
-    let compiled = compile_named(&c.layers, &c.cfg, "no-contract", &no_vars()).unwrap();
+    let imported = fixtures().join("parent/formulas/undeclared.formula.toml");
+    std::fs::write(
+        &imported,
+        "formula = \"undeclared\"\n\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n",
+    )
+    .unwrap();
+    let compiled = compile(&c.layers, &c.cfg, &imported, &no_vars()).unwrap();
+    std::fs::remove_file(&imported).unwrap();
     assert!(!compiled.is_runnable());
     let why = compiled.not_runnable.unwrap();
-    assert!(why.reason.contains("graph.v2"), "{}", why.reason);
+    assert!(
+        why.reason.contains("never claimed graph.v2"),
+        "{}",
+        why.reason
+    );
 
     // And a contract-bearing one IS runnable.
     let ok = compile_named(&c.layers, &c.cfg, "inherited", &no_vars()).unwrap();
@@ -716,5 +731,84 @@ fn the_metadata_key_gc_continuation_group_is_ACCEPTED_and_carried() {
             .map(String::as_str),
         Some("x"),
         "an accepted-but-unhonoured annotation rides through untouched"
+    );
+}
+
+// ---- D1, operator ruling E: runnability follows the DECLARATION -------------
+
+#[test]
+fn a_contractless_child_extending_a_graph_v2_parent_IS_runnable() {
+    // ⭐ THE MERGED-CHAIN RULE, and it is DOUBLY load-bearing: measured, ZERO
+    // corpus formulas inherit `contract` or `type` from a parent, so the gate
+    // cannot exercise this at all. Only this fixture can.
+    //
+    // The child declares NOTHING but `extends`. `contract` inherits (gc
+    // parser.go:308-309), so the MERGED formula declares the graph compiler.
+    // Evaluate runnability on the authored file alone and this is wrong — and
+    // every gate still passes.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "contractless-child", &no_vars()).unwrap();
+    assert!(
+        compiled.is_runnable(),
+        "the contract came from the parent: {:?}",
+        compiled.not_runnable
+    );
+}
+
+#[test]
+fn either_spelling_of_the_graph_compiler_declaration_makes_a_formula_runnable() {
+    // D1, RULING E. gc's real predicate (`directFormulaCompilerConstraints`,
+    // requirements.go:137-149) emits a constraint for `contract = "graph.v2"` AND
+    // for `[requires] formula_compiler` — either declares the graph compiler.
+    //
+    // This is also camp's OWN S11 rule. Gating runnability on `contract` alone
+    // would leave camp VALIDATING a formula as a graph formula (its check/retry
+    // steps legal) and then REFUSING TO RUN it as one. gc runs all three of the
+    // corpus formulas that would have hit it (mol-idea-to-plan,
+    // mol-refinery-patrol, mol-review-leg).
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "requires-parent", &no_vars()).unwrap();
+    assert!(
+        compiled.is_runnable(),
+        "`[requires] formula_compiler` declares the graph compiler just as `contract` does"
+    );
+}
+
+#[test]
+fn a_CAMP_LOCAL_formula_is_exempt_from_the_runnability_gate() {
+    // RULING E's other half, and it is the same origin-scoping D2′ already
+    // applies to permissiveness. `no-contract.toml` declares NO graph compiler at
+    // all — and it is the operator's OWN formula, not a gc pack making a contract
+    // claim. Camp has always run plain DAG formulas
+    // (packs/starter/formulas/guarded-change.toml declares `[requires]` and no
+    // contract; daemon_orders' `one-step` declares neither). Gating them would be
+    // a straight regression of shipped behavior.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "no-contract", &no_vars()).unwrap();
+    assert!(
+        compiled.is_runnable(),
+        "a camp-local formula is exempt: {:?}",
+        compiled.not_runnable
+    );
+
+    // But the SAME shape, IMPORTED, is refused — it never claimed graph.v2.
+    let imported = fixtures().join("parent/formulas/no-declaration.formula.toml");
+    std::fs::write(
+        &imported,
+        "formula = \"no-declaration\"\n\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n",
+    )
+    .unwrap();
+    let compiled = compile(&c.layers, &c.cfg, &imported, &no_vars()).unwrap();
+    std::fs::remove_file(&imported).unwrap();
+    assert!(
+        !compiled.is_runnable(),
+        "an IMPORTED formula that declares no graph compiler is refused at run time"
+    );
+    assert!(
+        compiled
+            .not_runnable
+            .unwrap()
+            .reason
+            .contains("never claimed graph.v2")
     );
 }
