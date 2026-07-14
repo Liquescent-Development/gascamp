@@ -28,6 +28,21 @@ use std::time::Duration;
 /// compile — the pin is not optional.
 const PINNED_VERSION: &str = include_str!("../../../ci/claude-compat/CLAUDE_VERSION");
 
+/// cp-1 (B14): CAMP'S OWN INTERRUPT BYTES. Task 1 pins `ParentMessage::Interrupt`
+/// against THIS file (byte-equal), and this gate sends THIS file to the REAL CLI.
+/// Transitively: **the bytes camp produces are the bytes the CLI accepts.**
+///
+/// Precisely: this does NOT make the fixture "recorded" — camp AUTHORED it. What
+/// the gate proves is ACCEPTANCE, and PROVENANCE.md says exactly that and no
+/// more. An integration test cannot call `ParentMessage::to_line` (`camp` is a
+/// binary-only crate), so the FIXTURE is the shared truth between the two.
+const INTERRUPT_REQUEST: &str = include_str!("fixtures/control/interrupt_request.json");
+
+/// The fixture with its `request_id` retargeted — the only field a caller varies.
+fn interrupt_line(request_id: &str) -> String {
+    INTERRUPT_REQUEST.replace("camp-fixture-1", request_id)
+}
+
 /// The HeldStream worker flag list, mirroring `spawn.rs::build_spec`'s
 /// `StdinMode::HeldStream` arm (its exact output is pinned by that module's
 /// `stream_argv_matches_probe_p2_and_the_fixture_facts` unit test — keep the
@@ -329,7 +344,7 @@ fn wait_within_timeout(child: &mut Child) -> std::process::ExitStatus {
 ///     real CLI with the #86 error. This proves the gate catches #86's class.
 ///  2. The FIXED argv is ACCEPTED (no `requires --verbose`, argv validation
 ///     passes) and the `initialize` handshake round-trips.
-///  3. A pre-turn `interrupt` is acknowledged.
+///  3. A pre-turn `interrupt` is acknowledged — with CAMP'S OWN BYTES.
 #[test]
 #[ignore = "real-claude $0 gate: run via `make compat` (CAMP_COMPAT=1)"]
 fn claude_compat_zero_cost() {
@@ -388,13 +403,10 @@ fn claude_compat_zero_cost() {
         await_success(&rx, "camp-compat-init");
         eprintln!("[compat] initialize round-tripped");
 
-        // pre-turn interrupt.
-        send(
-            &mut worker.child,
-            r#"{"type":"control_request","request_id":"camp-compat-interrupt","request":{"subtype":"interrupt"}}"#,
-        );
+        // pre-turn interrupt — CAMP'S OWN BYTES, not a hand-written literal.
+        send(&mut worker.child, &interrupt_line("camp-compat-interrupt"));
         await_success(&rx, "camp-compat-interrupt");
-        eprintln!("[compat] pre-turn interrupt acknowledged");
+        eprintln!("[compat] pre-turn interrupt acknowledged (camp's own bytes)");
 
         // Clean shutdown: close stdin (EOF) and confirm the fixed argv exits 0
         // with no `requires --verbose` on stderr — argv was accepted.
@@ -414,4 +426,64 @@ fn claude_compat_zero_cost() {
         );
         eprintln!("[compat] fixed argv accepted; worker exited cleanly ($0, no turn sent)");
     }
+}
+
+/// The interrupt fixture is a well-formed control request.
+///
+/// This one RUNS IN CI (it is not `#[ignore]`d). It cannot prove the real CLI
+/// accepts the bytes — only the $0 gate can — but it stops them rotting between
+/// compat runs.
+#[test]
+fn the_interrupt_fixture_is_a_well_formed_control_request() {
+    let v: serde_json::Value = serde_json::from_str(INTERRUPT_REQUEST).unwrap();
+    assert_eq!(v["type"], "control_request");
+    assert_eq!(v["request"]["subtype"], "interrupt");
+    assert!(v["request_id"].as_str().unwrap().starts_with("camp-"));
+    // The retarget is a pure substitution — it must not disturb the shape.
+    let v: serde_json::Value = serde_json::from_str(&interrupt_line("camp-x")).unwrap();
+    assert_eq!(v["request_id"], "camp-x");
+    assert_eq!(v["request"]["subtype"], "interrupt");
+}
+
+/// B15 — THE CONFIGURATION CAMP ACTUALLY SHIPS: **no `initialize`, ever.**
+///
+/// Every recorded ack in this repo is POST-initialize, and the fake worker acks
+/// anything — so nothing here proves camp's REAL configuration works. camp sends an
+/// interrupt into a worker it spawned with NO handshake at all. This gate sends
+/// camp's own interrupt bytes straight at the real pinned CLI, before any turn. $0,
+/// no auth, no API spend.
+///
+/// If this ever goes RED, cp-1's interrupt path is BROKEN against the real CLI and
+/// camp MUST start sending `initialize` (§9's "camp sends it anyway"). Do NOT paper
+/// over it by adding the handshake to this test.
+#[test]
+#[ignore = "real-claude $0 gate: run via `make compat` (CAMP_COMPAT=1)"]
+fn no_initialize_pre_turn_interrupt_is_acked() {
+    assert_eq!(
+        std::env::var("CAMP_COMPAT").as_deref(),
+        Ok("1"),
+        "the compat gate is opt-in: set CAMP_COMPAT=1 (use `make compat`)"
+    );
+    let claude = resolve_claude();
+    let version = claude_version(&claude);
+    let pinned = PINNED_VERSION.trim();
+    assert_eq!(
+        version, pinned,
+        "installed claude {version:?} != pinned {pinned:?} — never widen the pin silently."
+    );
+
+    let (mut cmd, _cfg) = claude_command(&claude, &held_stream_flags(SESSION_ID, true));
+    let mut worker = Worker {
+        child: cmd.spawn().unwrap(),
+    };
+    let rx = stdout_lines(&mut worker.child);
+
+    // NO initialize. Just camp's interrupt, exactly as campd sends it.
+    send(&mut worker.child, &interrupt_line("camp-b15"));
+    await_success(&rx, "camp-b15");
+    eprintln!("[compat] pre-turn interrupt acked with NO initialize");
+
+    worker.child.stdin.take(); // EOF
+    let status = wait_within_timeout(&mut worker.child);
+    assert!(status.success(), "the worker must exit 0 on stdin EOF");
 }
