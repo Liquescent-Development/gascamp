@@ -1654,6 +1654,17 @@ fn a_non_json_line_yields_a_skipped_frame_and_no_second_patrol_degraded() {
     let (_bead, session) = dispatch_one(&root);
     let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
 
+    // WAIT FOR THE WORKER'S OWN FIRST LINE BEFORE TOUCHING ITS FILE.
+    //
+    // campd hands the worker an fd positioned at 0 with NO O_APPEND, while this test
+    // opens its own fd WITH O_APPEND. If the test writes first, the worker's next
+    // write lands at ITS position — byte 0 — and the two INTERLEAVE, corrupting both
+    // lines and producing a second, spurious non-JSON fault. (Exactly that happened
+    // on Linux: a `non-JSON at offset 0` plus a truncated `e":"init"…` at offset 24.)
+    // Once the init line is on disk the worker is blocked on stdin and writes nothing
+    // more, so an append is safe.
+    wait_for_stdout(&root, &session, "\"subtype\":\"init\"");
+
     let mut sub = SubClient::open(&root, &session, None).unwrap();
 
     // Append a NON-JSON line directly to the stream file.

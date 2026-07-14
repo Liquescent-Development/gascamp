@@ -164,6 +164,10 @@ This is the property herdr could not offer: its `events.wait` is a 100ms sleep l
 
 **Obligation: extend the `make perf` idle gate to hold M quiescent workers with tailed stdout files and N connected subscribers** (fake workers, held open, no output), and assert the same 0.0% CPU / <20 MB RSS numbers. Then §4.3 is a measured property, not an argument.
 
+**DISCHARGED by cp-1** (`perf_daemon.rs::idle_campd_with_tailed_workers_zero_cpu_under_20mb`): M=4 tailed workers **+ N=4 connected subscribers**, held across a 30 s idle window ⇒ **0 ns CPU delta, RSS 10–13 MB** (machine-dependent; comfortably inside the bound). A subscription costs ZERO WAKEUPS when its session is quiet, which is the property §4.3 was actually asking for.
+
+**AND THE BOUND IS EXPLICITLY AN *IDLE* ONE — cp-1 amends the wording, because the code now makes the difference real.** Those four subscribers hold EMPTY buffers. A LOADED campd is outside the 20 MB figure BY DESIGN: each subscriber may hold `out` ≤ `subscriber_buffer_bytes` **and** `partial` ≤ `subscriber_buffer_bytes` (~2 MiB each), so `MAX_SUBSCRIBERS` saturated is ~16 MiB **on top of** idle RSS. cp-1's loaded perf arm (`loaded_subscribers_do_not_spin_or_livelock_campd`) therefore asserts **< 64 MB** and measures ~24–27 MB. Quoting "<20 MB" for a *streaming* campd would be a spec/code divergence, so it is stated here instead: **<20 MB is the IDLE bound; the subscriber cap is what bounds the loaded one.**
+
 ### 4.4 `subscribe` is a new connection MODE, not just a new verb
 
 Camp's socket is **one-shot** today: *"Send one request, read one response line"* (`socket.rs:314-318`), and `event_loop.rs:321-352` deregisters the connection after responding. `respond()` even documents its assumption — *"Responses are a few bytes; a WouldBlock here means the client is not reading."*
@@ -307,7 +311,7 @@ State-machine tests that must exist, each dying against a mutation of what it gu
 - **Append-only cursors:** kill campd mid-stream, restart, re-subscribe from the prior byte offset; assert no loss and no duplication. Assert the ceiling: a stream crossing `max_stream_bytes` fails the session loudly with the named event.
 - **Adoption:** ledger shows pending + no live stdin ⇒ the worker is killed with reason `"adoption: unanswerable permission request"` and the bead is dispatchable again; ledger shows *answered* + quiet worker ⇒ no adoption kill (the stall ladder owns it).
 - **Subscriber backpressure** (per §4.4 as amended by cp-1): a subscriber that **stops reading** — zero bytes accepted for `SUBSCRIBER_STALL_TIMEOUT` with data buffered — is dropped with the `subscriber.dropped` event, naming the high-water mark; campd never blocks. A subscriber that is merely **BEHIND** is never dropped: the `subscriber_buffer_bytes` cap is a **STOP** (campd holds the line and stops framing), not a kill. The hello arrives within `REQUEST_TIMEOUT` even against a busy daemon.
-- **Invariant 1:** the **extended** perf gate (§4.3): M quiescent workers with tailed stdout files, N connected subscribers, zero activity ⇒ 0.0% CPU delta, <20 MB RSS.
+- **Invariant 1:** the **extended** perf gate (§4.3): M quiescent workers with tailed stdout files, N connected subscribers, zero activity ⇒ 0.0% CPU delta, <20 MB RSS **(an IDLE bound — a loaded campd is bounded instead by `MAX_SUBSCRIBERS` × the buffer cap; see §4.3)**.
 
 ## 9. Decisions that were open questions
 

@@ -488,14 +488,24 @@ fn loaded_subscribers_do_not_spin_or_livelock_campd() {
         "[daemon] loaded: 4 subscribers x 2 MiB monster in {elapsed:?}; cpu delta {delta:?}, rss {rss1} KB"
     );
 
-    // (a) BOUNDED CPU. A spin would peg a core for the whole window; anything near
+    // (a) BOUNDED CPU. A spin pegs a core for the whole window; anything near
     // `elapsed` means campd was busy-looping rather than sleeping.
+    //
+    // THE BAR IS 30%, not 50%. At 50% it sat only slightly above the measured value
+    // (90 ms / 205 ms = 44%) — close enough that a modest regression could slip
+    // under it, or a modest slowdown could trip it. Fixing the O(n²) drain (B1) took
+    // the measurement to ~20 ms / 135 ms = 15%, which is what makes a tighter bar
+    // honest: it now has real headroom AND real teeth.
     assert!(
-        delta < elapsed.mul_f64(0.5),
-        "campd burned {delta:?} of CPU over a {elapsed:?} window — that is a SPIN \
-         (poll(0) -> pump -> WouldBlock -> poll(0)), not a sleep (invariant 1, §4.3)"
+        delta < elapsed.mul_f64(0.30),
+        "campd burned {delta:?} of CPU over a {elapsed:?} window (>30% of a core) — \
+         that is a SPIN (poll(0) -> pump -> WouldBlock -> poll(0)), not a sleep \
+         (invariant 1, §4.3). Measured healthy: ~15%"
     );
-    // (b) and its memory stayed bounded while doing it.
+    // (b) and its memory stayed bounded while doing it. NOTE the bound is 64 MB,
+    // NOT §14's 20 MB: that figure is an IDLE bound (see the idle gate above), and a
+    // campd with saturated subscriber buffers is outside it BY DESIGN. Measured
+    // loaded: ~24-27 MB.
     assert!(
         rss1 < 64 * 1024,
         "loaded RSS {rss1} KB — the per-subscriber buffers are not bounded"
