@@ -50,6 +50,30 @@ import time
 # t=5s and is stable to t=90s with zero duplicates across 12 consecutive runs.
 EXPECTED_DISPATCHED = 14
 
+# The ROUTE each of those 14 dispatches resolves to, as an agent multiset. The count
+# above proves 14 workers EXIST; this proves each went to the RIGHT agent — BD-A is a
+# routing defect, so a valid-but-wrong agent (same count) must fail. DERIVED from the
+# real dispatch stream on the pinned GCPACKS_REF, identical across repeated runs, NOT
+# hand-transcribed. Sums to EXPECTED_DISPATCHED (asserted at import below).
+EXPECTED_AGENTS = collections.Counter(
+    {
+        "bmad.acceptance-auditor": 1,
+        "bmad.blind-hunter-reviewer": 1,
+        "bmad.bmad-review-synthesizer": 1,
+        "bmad.edge-case-reviewer": 1,
+        "bmad.prd-writer": 1,
+        "bmad.story-implementer": 1,
+        "bmad.story-self-checker": 1,
+        "gc.run-operator": 2,
+        "superpowers.code-quality-reviewer": 1,
+        "superpowers.implementer": 3,
+        "superpowers.spec-reviewer": 1,
+    }
+)
+assert sum(EXPECTED_AGENTS.values()) == EXPECTED_DISPATCHED, (
+    f"EXPECTED_AGENTS sums to {sum(EXPECTED_AGENTS.values())}, not {EXPECTED_DISPATCHED}"
+)
+
 FORMULA_PACKS = [
     "bmad",
     "compound-engineering",
@@ -214,8 +238,13 @@ try:
     # anomaly (4) exists to catch — so if both fire, this one names the cause.
     crashed = events("session.crashed")
     if crashed:
+        # The FULL payload, not just `reason`: an uncaused SIGKILL has no `reason` and
+        # would print a literal `None`, naming the session but not the cause. The payload
+        # carries `cause_seq` and the signal/exit fields that distinguish a patrol
+        # restart from an uncaused kill — the very distinction this assertion exists to
+        # surface when it and (4) fire together.
         detail = "\n    ".join(
-            f"{e['data'].get('name')}: {e['data'].get('reason')}" for e in crashed
+            f"{e['data'].get('name')}: {json.dumps(e['data'])}" for e in crashed
         )
         die(f"campd crashed {len(crashed)} session(s):\n    {detail}")
 
@@ -251,7 +280,36 @@ try:
     # question the gate itself raised had been discarded. It now prints the beads.
     woke = events("session.woke")
     dispatched = [e for e in woke if e["data"].get("bead")]
+    # A bead-less wake is FAILED, not filtered. The old `[… if …get("bead")]` silently
+    # discarded any `session.woke` with no bead — "the evidence for the question the gate
+    # raised had been discarded", reproduced in the filter that builds the gate's own
+    # population. A real dispatch always names its bead; a wake without one is itself the
+    # anomaly, so it fails here rather than shrinking the population it is counted in.
+    if len(woke) != len(dispatched):
+        beadless = [e["data"] for e in woke if not e["data"].get("bead")]
+        die(f"{len(beadless)} session.woke event(s) carry no bead: {beadless}")
     beads = [e["data"]["bead"] for e in dispatched]
+
+    # Every dispatched bead must BELONG TO ONE OF THE TWO RUNS. `session.woke` carries no
+    # run_id, so the map comes from `bead.created` (top-level `bead`, `data.run_id`). This
+    # closes the `swap` gap — a bead relabelled to a foreign id, count and agent held —
+    # which the agent-multiset check below does NOT catch (a pure bead-id relabel leaves
+    # the route multiset unchanged). It is derived from the ledger, not from pinned `gc-N`
+    # ids, so it is not brittle: it says "this bead is from a run we started", nothing
+    # about which number it got.
+    run_ids = set(results.values())
+    bead_run = {
+        e["bead"]: e["data"].get("run_id")
+        for e in events("bead.created")
+        if e.get("bead")
+    }
+    foreign = {b: bead_run.get(b) for b in set(beads) if bead_run.get(b) not in run_ids}
+    if foreign:
+        die(
+            f"campd dispatched {len(foreign)} bead(s) belonging to NO run we started "
+            f"(run_ids={sorted(run_ids)}): {foreign}"
+        )
+
     repeats = {b: n for b, n in collections.Counter(beads).items() if n > 1}
     if repeats:
         die(
@@ -278,6 +336,29 @@ try:
             die(f"campd dispatched an UNROUTED worker for bead {e['data']['bead']} (BD-A)")
         if "{{" in agent:
             die(f"campd dispatched with an unsubstituted route {agent!r} (BD-A)")
+
+    # ⭐ PIN THE ROUTE IDENTITY, not just its COUNT. Everything above proves 14 distinct
+    # workers, each with SOME non-empty, substituted route — and is BLIND to WHICH agent
+    # each bead went to. BD-A is a ROUTING defect: a binding-namespace regression can
+    # resolve a var to a valid-but-WRONG agent (the corpus makes `superpowers.implementer`
+    # vs `bmad.story-implementer` confusable), yielding a real name, non-empty, no `{{`,
+    # count still 14 — and the gate above waves it through. Measured: re-pointing all 13
+    # non-named beads to `bmad.story-implementer` left the count-and-shape gate GREEN.
+    #
+    # The mapping is fully deterministic at the pinned GCPACKS_REF, so pin the AGENT
+    # MULTISET. Beads (`gc-N`) are ledger-assigned and order-sensitive — brittle — but the
+    # agent each route resolves to is stable and is the thing BD-A would corrupt. This
+    # closes both `misroute` (wrong agent) and `swap` (foreign bead: it changes the
+    # multiset). EXPECTED_AGENTS was DERIVED from the real dispatch stream on the pinned
+    # corpus, identical across repeated runs — not hand-transcribed.
+    got_agents = collections.Counter(e["data"]["agent"] for e in dispatched)
+    if got_agents != EXPECTED_AGENTS:
+        die(
+            "campd's dispatch ROUTES do not match the pinned corpus. Same count can hide "
+            "a misroute to a valid-but-wrong agent (BD-A is a routing defect).\n"
+            f"  unexpected/extra: {dict(got_agents - EXPECTED_AGENTS)}\n"
+            f"  missing:          {dict(EXPECTED_AGENTS - got_agents)}"
+        )
 
     # ⭐ THE NAMED ONE, and its scope stated HONESTLY.
     #
