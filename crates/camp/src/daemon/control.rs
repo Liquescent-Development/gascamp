@@ -2292,13 +2292,18 @@ mod tests {
     fn a_frame_that_would_cross_the_cap_stalls_and_the_line_is_held() {
         let cap = 4 * 1024;
         let line = "{\"type\":\"assistant\",\"text\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n";
-        let content = line.repeat(400); // far more than the cap can hold at once
+        // The SOCKET buffer must fill BEFORE `out` can ever reach the cap — and it is
+        // wildly platform-dependent (~8 KiB on macOS, ~208 KiB on Linux). Size the
+        // history past BOTH, then drive until a line is actually held: a fixed pump
+        // count would silently prove nothing on the roomier kernel.
+        let content = line.repeat(20_000);
         let (_d, file, tail) = stream_file(content.as_bytes());
 
         let mut rt = ControlRuntime::new(cap);
         // The client NEVER reads => the socket fills, then `out` fills to the cap.
         let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
-        for _ in 0..4 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !rt.test_sub(T).held {
             match rt.pump(T, &mut conn, t0()) {
                 PumpOutcome::Ok => {}
                 PumpOutcome::Drop(_) => panic!(
@@ -2307,6 +2312,11 @@ mod tests {
                 ),
                 PumpOutcome::Gone => panic!("the peer is still there"),
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no line was ever HELD — the cap was never reached, so this test proves \
+                 nothing"
+            );
         }
         let sub = rt.test_sub(T);
         assert!(sub.out.len() <= cap, "out is bounded by the cap");
@@ -2605,10 +2615,22 @@ mod tests {
         }
         assert!(rt.test_sub(T).blocked_since.is_some());
 
-        // The peer accepts SOME bytes — it is reading, however slowly.
-        let mut chunk = [0u8; 4096];
-        let n = client.read(&mut chunk).unwrap_or(0);
-        assert!(n > 0, "the test peer must actually accept some bytes");
+        // The peer READS. It must drain enough that campd's NEXT write genuinely
+        // accepts bytes — `blocked_since` is cleared by an accepted WRITE, not by the
+        // peer's read, and the kernel's write granularity is not ours to assume
+        // (freeing 4 KiB is enough on macOS; on Linux the next skb may still not fit,
+        // so the write returns EAGAIN with ZERO bytes accepted and the peer looks
+        // stalled — which, per §4.4, it correctly would be).
+        let mut chunk = [0u8; 65536];
+        let mut drained = 0usize;
+        loop {
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => drained += n,
+                Err(_) => break, // WouldBlock: the socket is empty
+            }
+        }
+        assert!(drained > 0, "the test peer must actually accept some bytes");
 
         // WELL PAST the original stall deadline — but the peer accepted bytes, so
         // its stall clock RESTARTED and it is never dropped.
