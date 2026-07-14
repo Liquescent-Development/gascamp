@@ -186,9 +186,7 @@ pub struct DrainError {
 /// TOGETHER WITH ITS READER.
 #[derive(Debug, Clone)]
 pub struct StreamLine {
-    #[allow(dead_code)] // cp-1: first read in Task 6 (ingest)
     pub session: String,
-    #[allow(dead_code)] // cp-1: first read in Task 6 (ingest)
     pub line: String,
 }
 
@@ -198,9 +196,7 @@ pub struct StreamLine {
 /// stream, not a truncated prefix.
 #[derive(Debug, Clone)]
 pub struct Disposed {
-    #[allow(dead_code)] // cp-1: first read in Task 8 (close_disposed)
     pub session: String,
-    #[allow(dead_code)] // cp-1: first read in Task 8 (close_disposed — the end frame's offset)
     pub final_offset: u64,
 }
 
@@ -237,13 +233,11 @@ impl ReadChannelRuntime {
 
     /// cp-1: harvest the complete lines the drains consumed. `mem::take`-drained
     /// — the caller ingests them exactly once.
-    #[allow(dead_code)] // cp-1: first read in Task 6
     pub fn take_stream_lines(&mut self) -> Vec<StreamLine> {
         std::mem::take(&mut self.stream_lines)
     }
 
     /// cp-1 (D7/§4.1): when this session last produced a complete line.
-    #[allow(dead_code)] // cp-1: first read in Task 7
     pub fn last_activity(&self, session: &str) -> Option<jiff::Timestamp> {
         self.last_activity.get(session).copied()
     }
@@ -261,7 +255,6 @@ impl ReadChannelRuntime {
     /// `drain_one`), so a worker that exits mid-line leaves those bytes OUTSIDE
     /// `tail`. A future phase that advanced the offset mid-line would make a
     /// subscriber's `end` frame unreachable.
-    #[allow(dead_code)] // cp-1: first read in Task 8
     pub fn tail_state(&self, session: &str) -> Option<(PathBuf, u64)> {
         self.tailed
             .get(session)
@@ -277,7 +270,6 @@ impl ReadChannelRuntime {
     /// is structural precisely because no black-box test can prove it (the
     /// stream watch always delivers another wake, which would mask a broken
     /// ordering by making the frame merely LATE rather than absent).
-    #[allow(dead_code)] // cp-1: first read in Task 8
     pub fn take_disposed(&mut self) -> Vec<Disposed> {
         std::mem::take(&mut self.disposed)
     }
@@ -384,12 +376,20 @@ impl ReadChannelRuntime {
     /// Returns `true` when it appended events (the caller settles to advance
     /// the campd cursor past them).
     ///
-    /// cp-1 (C5): this is now a THIN WRAPPER over the two halves — the final
-    /// drain and the disposal — kept so every merged cp-0 caller and unit test
-    /// keeps working unchanged. The EVENT LOOP calls the halves separately, with
-    /// the control-plane harvest BETWEEN them: a reaped worker's last line
-    /// carries the `control_response` to an interrupt, and it must be INGESTED
-    /// before its file is unlinked, not merely read.
+    /// cp-1 (C5): this is now a THIN WRAPPER over the two halves — the final drain
+    /// and the disposal.
+    ///
+    /// **The EVENT LOOP no longer calls it**: it calls the halves separately, with
+    /// the control-plane harvest BETWEEN them, because a reaped worker's last line
+    /// carries the `control_response` to an interrupt and must be INGESTED before
+    /// its file is unlinked, not merely read.
+    ///
+    /// It is KEPT — and it is `#[cfg(test)]` — so that every merged cp-0 unit test
+    /// that pins the COMBINED behaviour (drain-then-dispose, the ordering guard,
+    /// the fault flushes) keeps testing exactly what it always tested. The split
+    /// must not change what those tests assert; that is how we know the split
+    /// preserved cp-0's invariants rather than quietly redefining them.
+    #[cfg(test)]
     pub fn apply_pending_unregisters(&mut self, ledger: &mut Ledger) -> Result<bool> {
         let appended = self.final_drain_pending(ledger)?;
         self.dispose_pending(ledger)?;

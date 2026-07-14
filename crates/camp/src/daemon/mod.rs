@@ -265,9 +265,10 @@ pub fn run(camp: &CampDir) -> Result<()> {
     // interrupt in flight must neither LIE (invent a fault for a request the
     // worker actually answered) nor FORGET (drop one it never did). The ledger
     // is the only thing that survives a kill -9, so it is the only honest source.
-    let mut control = control::ControlRuntime::new(control::subscriber_buffer_bytes_from_env(
-        control::SUBSCRIBER_BUFFER_BYTES_DEFAULT,
-    )?);
+    let mut control = control::ControlRuntime::with_stall_timeout(
+        control::subscriber_buffer_bytes_from_env(control::SUBSCRIBER_BUFFER_BYTES_DEFAULT)?,
+        control::subscriber_stall_timeout_from_env(control::SUBSCRIBER_STALL_TIMEOUT_DEFAULT)?,
+    );
     let restored = control.rehydrate(&ledger, jiff::Timestamp::now())?;
     if restored > 0 {
         eprintln!("campd: restored {restored} in-flight control request(s) from the ledger");

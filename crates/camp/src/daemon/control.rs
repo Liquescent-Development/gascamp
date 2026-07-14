@@ -34,9 +34,12 @@ use camp_core::ledger::Ledger;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
+use mio::Token;
+
 use super::dispatch::{ControlWrite, Dispatcher, NudgeOutcome};
+use super::event_loop::Conn;
 use super::patrol::PatrolRuntime;
-use super::read_channel::{ReadChannelRuntime, StreamLine};
+use super::read_channel::{Disposed, ReadChannelRuntime, StreamLine};
 use super::socket::{Response, SessionInfo};
 
 /// Every request id camp mints carries this prefix. It is what lets campd
@@ -393,17 +396,47 @@ pub struct ControlRuntime {
     /// forbid. That was only possible because `control.failed` had no
     /// machine-readable cause; G5 added one, and `rehydrate` routes on it.
     timed_out: HashMap<String, Pending>,
-    #[allow(dead_code)] // cp-1: first read in Task 8 (the subscriber hard cap)
+    /// §4.4: the per-subscriber outbound buffer cap. A STOP, not a kill.
     subscriber_buffer_bytes: usize,
+    /// R1: how long a peer may accept ZERO bytes before campd drops it.
+    stall_timeout: Duration,
+    /// The subscriber registry, keyed by connection token.
+    subscribers: HashMap<Token, Subscriber>,
+    /// `pump` cannot take `&mut Ledger` (it is called with a `&mut Conn` already
+    /// borrowed out of the same map), so its durable events ride this collector —
+    /// cp-0's `cap_breaches`/`parse_errors` mold — drained by the caller.
+    pending_events: Vec<EventInput>,
+    /// G11: the `over_cap` `patrol.degraded` dedupe. N subscribers hit the SAME
+    /// over-cap line and must not append N identical events.
+    degraded_seen: HashSet<(String, u64)>,
+    next_subscription: u64,
 }
 
 impl ControlRuntime {
+    /// Test-only: production goes through `with_stall_timeout`, which reads the
+    /// env override (the `max_stream_bytes_from_env` mold).
+    #[cfg(test)]
     pub fn new(subscriber_buffer_bytes: usize) -> ControlRuntime {
+        ControlRuntime::with_stall_timeout(
+            subscriber_buffer_bytes,
+            SUBSCRIBER_STALL_TIMEOUT_DEFAULT,
+        )
+    }
+
+    pub fn with_stall_timeout(
+        subscriber_buffer_bytes: usize,
+        stall_timeout: Duration,
+    ) -> ControlRuntime {
         ControlRuntime {
             pending: HashMap::new(),
             answered: HashMap::new(),
             timed_out: HashMap::new(),
             subscriber_buffer_bytes,
+            stall_timeout,
+            subscribers: HashMap::new(),
+            pending_events: Vec::new(),
+            degraded_seen: HashSet::new(),
+            next_subscription: 0,
         }
     }
 
@@ -440,13 +473,61 @@ impl ControlRuntime {
         }
     }
 
-    /// The earliest due request, as a Duration from now. `None` when nothing is
-    /// pending — an idle campd blocks forever (invariant 1).
+    /// THE control plane's whole wakeup story. `None` when nothing is pending —
+    /// an idle campd with idle subscribers still blocks FOREVER (invariant 1).
     ///
-    /// Task 8 extends this with the subscriber continuation.
+    /// Three sources, and each corresponds to a state with NO other wakeup:
+    ///
+    /// 1. a pending control request's silence/ceiling deadline;
+    /// 2. a subscriber with PUMPABLE FILE WORK and an EMPTY `out` — no fd will
+    ///    ever signal that, so it needs an armed continuation;
+    /// 3. R1: a peer that accepts NOTHING generates NO events at all — not a
+    ///    WRITABLE edge, not an EOF — so the stall drop needs its own deadline,
+    ///    and it is the ONLY thing that can ever fire for that subscriber.
+    ///
+    /// G2 — A NON-EMPTY `out` MUST NOT ARM ANYTHING. It means the last write
+    /// returned WouldBlock, and the correct wakeup for that is the WRITABLE EDGE,
+    /// which is already registered. Arming ZERO on top of it turns every blocked
+    /// write into a SPIN — and since macOS's socket send buffer (~8 KiB) is far
+    /// smaller than one chunk's worth of frames, EVERY healthy subscriber
+    /// WouldBlocks on essentially every chunk. campd would spin for the duration of
+    /// any stream (invariant 1, §4.3).
     pub fn poll_timeout(&self, now: Timestamp) -> Option<Duration> {
-        let earliest = self.pending.values().map(Pending::due_at).min()?;
-        Some(duration_until(earliest, now))
+        let earliest_control = self.pending.values().map(Pending::due_at).min();
+
+        // B3(c): `|| s.held` — a line HELD at `scan == tail` (the normal terminal
+        // state of a catch-up that ran at the cap) is real, pending work. Requiring
+        // `scan < tail` strands it: `blocked_since` is None (the peer IS reading),
+        // no WRITABLE edge is pending once `out` drains, and the last line of the
+        // history is never delivered.
+        let subscriber_work = self
+            .subscribers
+            .values()
+            .any(|s| s.out.is_empty() && (s.held || s.scan < s.tail) && !s.end_sent);
+
+        let earliest_stall = self
+            .subscribers
+            .values()
+            .filter_map(|s| s.blocked_since)
+            .map(|t| t + signed(self.stall_timeout))
+            .min();
+
+        let mut best: Option<Duration> = None;
+        for candidate in [
+            earliest_control.map(|d| duration_until(d, now)),
+            if subscriber_work {
+                Some(Duration::ZERO)
+            } else {
+                None
+            },
+            earliest_stall.map(|d| duration_until(d, now)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            best = Some(best.map_or(candidate, |b: Duration| b.min(candidate)));
+        }
+        best
     }
 
     /// Every request past its `due_at` becomes a durable `control.failed` and
@@ -714,7 +795,6 @@ impl ControlRuntime {
     ///
     /// A late answer cannot arrive after disposal: the session is no longer
     /// tailed, so there is nothing left to re-read.
-    #[allow(dead_code)] // cp-1: first read in Task 8 (close_disposed)
     pub fn forget_session(&mut self, session: &str, _now: Timestamp) -> Vec<EventInput> {
         let doomed: Vec<String> = self
             .pending
@@ -1965,5 +2045,854 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+// ===========================================================================
+// cp-1 (§4.4, §9): session.subscribe — ONE monotone cursor, a Closing state,
+// a skip policy.
+//
+// D6": a subscriber holds an open stream FILE, a single `cursor` (the next byte
+// it needs) and `tail` (what campd has actually DRAINED). `pump` reads only
+// [cursor, tail), frames each complete line, and advances the cursor. There is
+// no catch-up/live distinction, hence no boundary to get wrong:
+//   - truncation is impossible   — the cursor never skips a byte;
+//   - duplication is impossible  — the cursor is monotone and is the sole gate;
+//   - reading undrained bytes is impossible — reads are bounded by `tail`.
+// A "live" line is just `tail` advancing.
+// ===========================================================================
+
+/// §4.4's number: the per-subscriber outbound buffer cap.
+pub const SUBSCRIBER_BUFFER_BYTES: usize = SUBSCRIBER_BUFFER_BYTES_DEFAULT;
+
+/// One file read per FILL pass.
+pub const HISTORY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// G1: this bounds the SCAN, not merely the delivered bytes — otherwise an
+/// over-cap line (which is scanned but never buffered) would be unbounded work
+/// on the event loop. A 256 MiB line is consumed over many wakes, each doing
+/// bounded work, and it TERMINATES.
+pub const MAX_PUMP_BYTES_PER_WAKE: usize = 256 * 1024;
+
+/// §4.4 bounds BYTES PER CONNECTION; nothing bounded the CONNECTION COUNT.
+///
+/// WORST CASE, STATED: each subscriber holds `out` <= cap AND `partial` <= cap,
+/// so ~2 MiB each, ~16 MiB at 8 — on top of campd's idle RSS. That CAN approach
+/// the spec's <20 MB figure, so plainly: **<20 MB is an IDLE bound** (and it is
+/// what `make perf` measures — N subscribers with EMPTY buffers). A campd with 8
+/// SATURATED subscribers is outside that bound BY DESIGN, and this cap is what
+/// keeps it bounded at all. Raising it is a spec question, not a local call.
+pub const MAX_SUBSCRIBERS: usize = 8;
+
+/// R1: how long a peer may accept ZERO bytes, with data buffered for it, before
+/// campd drops it.
+///
+/// THIS — not the size of `out` — is what a drop MEANS. A subscriber that is
+/// merely BEHIND is not stalled; one whose socket has accepted nothing for 30 s
+/// has stopped reading. The cap protects campd's memory against a peer that has
+/// STOPPED READING; it must never be a verdict on a peer that is reading fast and
+/// is simply behind, because during catch-up the producer is `pump` reading a
+/// FILE and a file ALWAYS outruns a socket (macOS's unix-socket send buffer is
+/// 8 KiB). Conflating the two drops every client that joins more than ~1 MiB
+/// behind the tail, however fast it reads.
+pub const SUBSCRIBER_STALL_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
+
+/// Test-only override, the `CAMP_SUBSCRIBER_BUFFER_BYTES` twin. WITHOUT IT the
+/// stall tests are mandatory 30-second wall-clock tests, and their hard deadlines
+/// would have to EXCEED 30 s — which makes a deadline useless as the hang
+/// detector it exists to be. Fail fast on a malformed or zero value.
+pub fn subscriber_stall_timeout_from_env(default: Duration) -> anyhow::Result<Duration> {
+    match std::env::var("CAMP_SUBSCRIBER_STALL_TIMEOUT_MS") {
+        Ok(raw) => {
+            let ms: u64 = raw.parse().with_context(|| {
+                format!("CAMP_SUBSCRIBER_STALL_TIMEOUT_MS={raw:?} is not a u64")
+            })?;
+            if ms == 0 {
+                anyhow::bail!("CAMP_SUBSCRIBER_STALL_TIMEOUT_MS must be > 0");
+            }
+            Ok(Duration::from_millis(ms))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(v)) => {
+            anyhow::bail!("CAMP_SUBSCRIBER_STALL_TIMEOUT_MS={v:?} is not valid UTF-8")
+        }
+    }
+}
+
+// ---- the frame wire — TAGGED FROM BIRTH ------------------------------------
+
+#[derive(Serialize)]
+struct FramePrefix<'a> {
+    frame: &'static str,
+    session: &'a str,
+    offset: u64,
+}
+
+#[derive(Serialize)]
+struct SkippedFrame<'a> {
+    frame: &'static str,
+    session: &'a str,
+    offset: u64,
+    bytes: u64,
+    reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct EndFrame<'a> {
+    frame: &'static str,
+    session: &'a str,
+    offset: u64,
+    reason: &'a str,
+}
+
+/// C2/R7 — THE ONE SIGNATURE. `body` is BYTES, and `pump` never decodes UTF-8
+/// anywhere.
+///
+/// The worker's line is SPLICED IN VERBATIM — never round-tripped through a
+/// `serde_json::Value`, which would SORT its keys (serde_json has no
+/// `preserve_order`, and `raw_value` is a cargo feature this phase does not add).
+/// A subscriber therefore sees EXACTLY the bytes the worker wrote.
+///
+/// The alternative — decoding to `&str` — invites `from_utf8_lossy`, which
+/// SILENTLY REWRITES the worker's bytes (substituting U+FFFD): precisely the
+/// corruption this byte-splice exists to prevent, and no ASCII fixture would
+/// ever catch it.
+///
+/// Returns `None` when `body` is not a JSON OBJECT (splicing it would emit
+/// invalid JSON); the caller emits `skipped{reason:"not_a_json_object"}`. NOTE
+/// this is deliberately STRICTER than cp-0's parse, which accepts any JSON value
+/// (a bare array or number counts as parsed there). That difference is honest,
+/// not an agreement.
+fn event_frame(session: &str, offset: u64, body: &[u8]) -> Option<Vec<u8>> {
+    let body = trim_ascii_whitespace(body);
+    if body.first() != Some(&b'{') {
+        return None;
+    }
+    // from_SLICE, not from_str: no UTF-8 decode, ever. (JSON text IS UTF-8 by
+    // definition and `from_slice` ENFORCES it — a line carrying raw non-UTF-8 is
+    // therefore REFUSED here, and refusing is right. The `&str` +
+    // `from_utf8_lossy` path would instead substitute U+FFFD and splice the
+    // CORRUPTED bytes onto the wire.)
+    if serde_json::from_slice::<serde_json::Value>(body).is_err() {
+        return None;
+    }
+    let prefix = serde_json::to_string(&FramePrefix {
+        frame: "event",
+        session,
+        offset,
+    })
+    .ok()?;
+    // prefix == {"frame":"event","session":"…","offset":N} — replace its final
+    // '}' with ,"event":<body>} so the raw bytes land untouched.
+    let mut out = prefix.into_bytes();
+    out.pop()?; // drop the closing '}'
+    out.extend_from_slice(b",\"event\":");
+    out.extend_from_slice(body); // VERBATIM
+    out.extend_from_slice(b"}\n");
+    Some(out)
+}
+
+fn skipped_frame(session: &str, offset: u64, bytes: u64, reason: &'static str) -> Vec<u8> {
+    let mut line = serde_json::to_string(&SkippedFrame {
+        frame: "skipped",
+        session,
+        offset,
+        bytes,
+        reason,
+    })
+    .unwrap_or_else(|_| String::from("{\"frame\":\"skipped\"}"));
+    line.push('\n');
+    line.into_bytes()
+}
+
+fn end_frame(session: &str, offset: u64, reason: &str) -> Vec<u8> {
+    let mut line = serde_json::to_string(&EndFrame {
+        frame: "end",
+        session,
+        offset,
+        reason,
+    })
+    .unwrap_or_else(|_| String::from("{\"frame\":\"end\"}"));
+    line.push('\n');
+    line.into_bytes()
+}
+
+/// R3: the exact byte cost of an `event` frame's wrapper for THIS session,
+/// MEASURED — never computed. At `u64::MAX`, the widest possible offset, so it
+/// can never UNDER-estimate.
+///
+/// The over-cap decision is made on the FRAME, not the raw line. Testing the line
+/// against the cap and the frame against the drop leaves a ~60-byte band in which
+/// a perfectly-readable line is neither skipped nor deliverable — and its
+/// subscriber is dropped, permanently, on every re-subscribe.
+fn measure_frame_overhead(session: &str) -> usize {
+    event_frame(session, u64::MAX, b"{}")
+        .map(|f| f.len().saturating_sub(2))
+        .unwrap_or(128)
+}
+
+fn trim_ascii_whitespace(mut b: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = b.split_first() {
+        if first.is_ascii_whitespace() {
+            b = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((last, rest)) = b.split_last() {
+        if last.is_ascii_whitespace() {
+            b = rest;
+        } else {
+            break;
+        }
+    }
+    b
+}
+
+/// What `pump` decided.
+pub enum PumpOutcome {
+    /// Nothing more to do RIGHT NOW. (`poll_timeout` owns any continuation.)
+    Ok,
+    /// The peer STOPPED READING — a durable `subscriber.dropped` (§4.4).
+    Drop(EventInput),
+    /// The peer is gone, or the `end` frame has flushed (C7).
+    Gone,
+}
+
+/// One subscriber. Three reader positions, and the distinction is what makes a
+/// long line survivable.
+struct Subscriber {
+    id: String,
+    session: String,
+    /// The open stream file. Held across disposal ON PURPOSE — on Unix an
+    /// unlinked inode survives while an fd is open, so a Closing subscriber
+    /// FINISHES ITS HISTORY (C7).
+    file: std::fs::File,
+
+    /// THE DELIVERY CURSOR (D6"): the byte offset just past the last COMPLETE
+    /// line delivered. MONOTONE, and the sole delivery gate — this is what a
+    /// client RESUMES FROM (§9), so it may only ever advance past a whole line.
+    cursor: u64,
+    /// THE READ POSITION: how far `pump` has read. `scan >= cursor` always; the
+    /// gap is exactly the in-progress line.
+    ///
+    /// G1: with only a cursor, a line longer than one 64 KiB chunk contains no
+    /// '\n', advances nothing, and LIVELOCKS campd at 100% CPU. A Read/Bash/Grep
+    /// tool-result line routinely exceeds 64 KiB.
+    scan: u64,
+    /// The bytes of the in-progress line, [cursor, scan). BOUNDED BY THE CAP.
+    ///
+    /// B1: when a line COMPLETES its '\n' IS PUSHED HERE before `try_emit_line`
+    /// is called — because `off = cursor + partial.len()` must land PAST the
+    /// newline. Omitting it makes `cursor` land ON the newline and drift ONE BYTE
+    /// PER LINE, cumulatively — and §9 makes these offsets the durable RESUME
+    /// CURSORS, so a client reconnecting with a cursor campd handed it lands
+    /// mid-file at the wrong byte. A drifting offset still INCREASES, which is why
+    /// no "offsets are strictly increasing" assertion can ever catch it.
+    partial: Vec<u8>,
+    /// B3: `partial` holds a COMPLETE line (terminated by its '\n') that did not
+    /// fit `out`. A REAL FLAG — inspecting `partial` for a trailing '\n' is not a
+    /// substitute, because the newline-first rule makes that test ALWAYS FALSE:
+    /// the held line would never be retried, the next line's bytes would be
+    /// appended onto it, and TWO LINES WOULD BE CONCATENATED into one body —
+    /// rejected by `event_frame` and reported as `skipped{not_a_json_object}`:
+    /// corruption with a FALSE CAUSE.
+    ///
+    /// `try_emit_line` is the ONLY writer and clears it on EVERY success path
+    /// (including the blank-line path).
+    held: bool,
+    /// OVERSIZE SCAN (G1/C8): the in-progress line's FRAME cannot fit the whole
+    /// cap. `partial` is DROPPED (memory freed) and bytes are merely COUNTED while
+    /// scanning for the terminating '\n'. At the newline a
+    /// `skipped{reason:"over_cap"}` frame carries the TRUE byte count — which is
+    /// why the frame can carry a count at all. A `skipped` frame for a line that
+    /// could never be LEXED would be structurally unreachable.
+    oversize: Option<u64>,
+
+    /// What campd has actually DRAINED. Refreshed every wake from
+    /// `read_channel.tail_state`; PINNED to the final offset at disposal. `pump`
+    /// reads ONLY [scan, tail), so it can never hand out bytes campd has not
+    /// consumed.
+    tail: u64,
+    /// C7: set at disposal (`stopped` | `crashed`). A Closing subscriber keeps
+    /// pumping until `scan == tail` AND `out` is empty; only THEN does the `end`
+    /// frame go out, and the connection closes when that flush completes.
+    closing: Option<String>,
+    /// R2: the `end` frame has been APPENDED. Without this the TERMINAL branch
+    /// re-fires on every loop iteration — appending an UNBOUNDED stream of
+    /// duplicate `end` frames, never reaching the `out.is_empty()` test that is the
+    /// ONLY path to `Gone`, so EOF never arrives and the fd and one of 8 subscriber
+    /// slots are never released.
+    end_sent: bool,
+
+    /// Bytes queued for this socket. Bounded by the cap — and the cap is a STOP,
+    /// never a kill.
+    out: Vec<u8>,
+    /// R3: the measured byte cost of an `event` frame's wrapper for this session.
+    frame_overhead: usize,
+    /// R1: when the peer last accepted ZERO bytes with data buffered. Stamped on a
+    /// zero-accept write, CLEARED the moment ANY byte is accepted.
+    blocked_since: Option<Timestamp>,
+    /// The largest `out` reached — `buffered_bytes` in `subscriber.dropped`
+    /// (§4.4: "naming the session and the high-water mark").
+    high_water: usize,
+}
+
+/// R1/R3: emit ONE complete line from `partial`, or report that `out` has no room
+/// for it.
+///
+/// Returns `false` => the caller STALLS: `partial` KEEPS the complete line, `held`
+/// stays true, `cursor` does NOT advance, and NOTHING IS LOST. The cap is a STOP.
+///
+/// PRECONDITION (established by the only caller): `sub.held` is true and
+/// `sub.partial` ENDS WITH '\n'.
+///
+/// It can never stall FOREVER: the pre-push guard bounds
+/// `partial.len() + frame_overhead <= cap` BEFORE the '\n' goes in, and `body`
+/// strips that '\n' again — so `frame.len() = frame_overhead + body.len() <= cap`
+/// and this frame ALWAYS fits an EMPTY `out`. A held line goes out the moment the
+/// socket drains what is ahead of it.
+fn try_emit_line(sub: &mut Subscriber, cap: usize) -> bool {
+    // B1: `partial` INCLUDES the '\n', so `off` lands PAST the newline — which is
+    // what makes it a valid §9 resume cursor (the start of the NEXT line).
+    let off = sub.cursor + sub.partial.len() as u64;
+
+    let frame = {
+        let mut end = sub.partial.len().saturating_sub(1); // strip '\n'
+        if end > 0 && sub.partial[end - 1] == b'\r' {
+            end -= 1;
+        }
+        let body = &sub.partial[..end];
+        if trim_ascii_whitespace(body).is_empty() {
+            // G11: a blank line is a SILENT no-op — no frame, no event — exactly
+            // as cp-0 treats it. Emitting a `skipped` frame for a no-op would be
+            // noise a client has to filter.
+            sub.cursor = off;
+            sub.partial.clear();
+            sub.held = false;
+            return true;
+        }
+        match event_frame(&sub.session, off, body) {
+            Some(f) => f,
+            None => skipped_frame(&sub.session, off, body.len() as u64, "not_a_json_object"),
+        }
+    };
+
+    if sub.out.len() + frame.len() > cap {
+        return false; // STALL (R1) — never a Drop.
+    }
+
+    sub.out.extend_from_slice(&frame);
+    sub.high_water = sub.high_water.max(sub.out.len());
+    sub.cursor = off;
+    sub.partial.clear();
+    sub.held = false;
+    true
+}
+
+fn degraded_event(session: &str, error: String) -> EventInput {
+    EventInput {
+        kind: EventType::PatrolDegraded,
+        rig: None,
+        actor: "campd".into(),
+        bead: None,
+        data: serde_json::json!({ "session": session, "error": error }),
+    }
+}
+
+/// THE ONE DATA PATH (D6"), and the only place bytes reach a subscriber's socket.
+///
+/// A free function, not a method, because it needs `&mut Subscriber` and
+/// `&mut ControlRuntime`'s collectors at the same time — disjoint fields, which
+/// the borrow checker only accepts when they are named separately.
+#[allow(clippy::too_many_arguments)]
+fn pump_subscriber(
+    sub: &mut Subscriber,
+    conn: &mut Conn,
+    now: Timestamp,
+    cap: usize,
+    stall_timeout: Duration,
+    pending_events: &mut Vec<EventInput>,
+    degraded_seen: &mut HashSet<(String, u64)>,
+) -> PumpOutcome {
+    use std::io::Write as _;
+    use std::os::unix::fs::FileExt as _;
+
+    // G1: bounds the SCAN, not merely the output.
+    let mut scanned = 0usize;
+
+    loop {
+        // B3(e): RESET every outer iteration. Declared outside the loop and never
+        // reset, "the socket took bytes, so FILL may resume" is simply false.
+        let mut stalled = false;
+
+        // ---- (A) FILL: turn file bytes into frames, STOPPING at the cap -------
+        //
+        // R1: the cap is a STOP, not a kill.
+        // B3(b): the guard admits a HELD line even at `scan == tail` — the normal
+        // terminal state of any catch-up that ran at the cap. Gating FILL on
+        // `scan < tail` alone strands such a line: nothing is armed to wake it, the
+        // last line of the history is never delivered, and TERMINAL (which requires
+        // an empty `partial`) can never fire — no end frame, no EOF, fd + slot leaked.
+        while !stalled && (sub.held || sub.scan < sub.tail) && scanned < MAX_PUMP_BYTES_PER_WAKE {
+            // B3(a): a COMPLETE line held over because `out` was full. (No
+            // `stalled` flag needed here: this `break` leaves the FILL loop
+            // directly. The flag exists for the BYTE loop below, whose `break`
+            // only exits the inner `for` — the `while` guard then re-reads it and
+            // stops FILL from pulling another chunk on top of a held line.)
+            if sub.held {
+                if !try_emit_line(sub, cap) {
+                    break;
+                }
+                continue; // try_emit_line cleared `held`
+            }
+
+            let want = std::cmp::min(HISTORY_CHUNK_BYTES as u64, sub.tail - sub.scan) as usize;
+            let mut buf = vec![0u8; want];
+            let n = match sub.file.read_at(&mut buf, sub.scan) {
+                // R4: the stream file is append-only; it CANNOT shrink. `scan <
+                // tail` with a zero-byte read is a genuine inconsistency, not a
+                // benign EOF — and left unhandled it advances neither `scan` nor
+                // `out` while the loop guard stays true: campd HANGS inside pump.
+                Ok(0) => {
+                    pending_events.push(degraded_event(
+                        &sub.session,
+                        format!(
+                            "subscribe: the stream file is SHORTER than campd's own drained \
+                             offset (read 0 bytes at {} with tail {}). The file is append-only \
+                             and cannot shrink, so this is a real inconsistency — the \
+                             subscription is closed rather than looping forever",
+                            sub.scan, sub.tail
+                        ),
+                    ));
+                    return PumpOutcome::Gone;
+                }
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    pending_events.push(degraded_event(
+                        &sub.session,
+                        format!("subscribe: reading the stream file at {}: {e}", sub.scan),
+                    ));
+                    return PumpOutcome::Gone;
+                }
+            };
+
+            for &b in &buf[..n] {
+                // B2: `scan` and `scanned` advance PER BYTE ABSORBED — never per
+                // chunk read. Advancing over the whole chunk up front and then
+                // breaking mid-buffer on a stall THROWS AWAY every byte after the
+                // stall point while `scan` already points past it: up to 64 KiB of
+                // SILENT LINE LOSS (§9: "never a silently truncated stream"), plus
+                // a permanent cursor/scan desync. With per-byte accounting a stall
+                // simply leaves the remainder at [scan, ..) and the next FILL
+                // re-reads it. Nothing is lost.
+                sub.scan += 1;
+                scanned += 1;
+
+                // ---- oversize: the line's FRAME cannot fit the whole cap.
+                //      COUNT, never buffer.
+                if let Some(count) = sub.oversize {
+                    if b == b'\n' {
+                        let off = sub.cursor + count + 1; // + the newline
+                        sub.out.extend_from_slice(&skipped_frame(
+                            &sub.session,
+                            off,
+                            count,
+                            "over_cap",
+                        ));
+                        sub.high_water = sub.high_water.max(sub.out.len());
+                        // G11: ONE durable event, deduped per (session, offset) —
+                        // N subscribers hit the SAME over-cap line and must not
+                        // append N events. (This dedupe is the whole reason the set
+                        // exists.)
+                        if degraded_seen.insert((sub.session.clone(), sub.cursor)) {
+                            pending_events.push(degraded_event(
+                                &sub.session,
+                                format!(
+                                    "subscribe: a stream line of {count} bytes at offset {} \
+                                     exceeds the subscriber buffer cap ({cap} bytes) and was \
+                                     SKIPPED — subscribers received a skipped frame naming it. \
+                                     campd itself never buffered it (§4.4)",
+                                    sub.cursor
+                                ),
+                            ));
+                        }
+                        sub.cursor = off;
+                        sub.oversize = None;
+                    } else {
+                        sub.oversize = Some(count + 1);
+                    }
+                    continue;
+                }
+
+                // ---- R3: THE NEWLINE IS TESTED FIRST, before any push or cap
+                //      check. Pushing first and testing after means that when the
+                //      CROSSING byte IS the '\n', the cap `continue` bypasses the
+                //      newline check, `oversize` arms, and the scan runs on to the
+                //      NEXT line's '\n' — silently consuming a whole line with no
+                //      frame, and reporting a byte count spanning two.
+                if b == b'\n' {
+                    sub.partial.push(b'\n'); // B1: THE NEWLINE GOES IN.
+                    sub.held = true;
+                    if !try_emit_line(sub, cap) {
+                        stalled = true; // R1: HOLD the line. Never Drop.
+                        break;
+                    }
+                    continue;
+                }
+
+                // ---- R3: the over-cap decision is made on the FRAME, not the raw
+                //      line. Otherwise a line whose raw length is under the cap but
+                //      whose FRAME is not can be neither skipped nor delivered, and
+                //      its subscriber is dropped — deterministically, on every
+                //      re-subscribe.
+                if sub.partial.len() + 1 + sub.frame_overhead > cap {
+                    sub.oversize = Some(sub.partial.len() as u64 + 1);
+                    sub.partial.clear(); // free the memory
+                    continue;
+                }
+
+                sub.partial.push(b);
+            }
+        }
+
+        // ---- (B) TERMINAL: the full history FIRST, then the end frame, ONCE ----
+        //
+        // B3(d): `!sub.held` — a HELD line is unfinished history, and an
+        // `partial.is_empty()` test alone is satisfied while a held line waits.
+        if !sub.end_sent
+            && sub.out.is_empty()
+            && sub.closing.is_some()
+            && sub.scan == sub.tail
+            && !sub.held
+            && sub.partial.is_empty()
+            && sub.oversize.is_none()
+        {
+            let reason = sub.closing.clone().unwrap_or_else(|| "stopped".into());
+            sub.out
+                .extend_from_slice(&end_frame(&sub.session, sub.tail, &reason));
+            // R2: WITHOUT THIS, (B) re-fires on every iteration — unbounded
+            // duplicate end frames, and `Gone` is never reached.
+            sub.end_sent = true;
+        }
+
+        // ---- (C) FLUSH --------------------------------------------------------
+        if sub.out.is_empty() {
+            // R2: the ONLY path to Gone, and it is now REACHABLE.
+            if sub.end_sent {
+                return PumpOutcome::Gone;
+            }
+            return PumpOutcome::Ok;
+        }
+        match conn.stream.write(&sub.out) {
+            Ok(0) => return PumpOutcome::Gone,
+            Ok(n) => {
+                sub.out.drain(..n);
+                sub.blocked_since = None; // R1: it IS reading.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // G2: the WRITABLE EDGE re-arms us. Do NOT arm a timeout here — a
+                // zero timeout on a blocked write turns it into a SPIN, and since
+                // macOS's socket buffer (~8 KiB) is far smaller than a chunk's worth
+                // of frames, EVERY healthy subscriber hits this on essentially every
+                // chunk.
+                //
+                // R1: but a peer that accepts ZERO bytes is a peer that has STOPPED
+                // READING — and THAT, not the size of `out`, is what a drop means.
+                if sub.blocked_since.is_none() {
+                    sub.blocked_since = Some(now);
+                }
+                if let Some(since) = sub.blocked_since
+                    && now.duration_since(since) >= signed(stall_timeout)
+                {
+                    sub.high_water = sub.high_water.max(sub.out.len());
+                    return PumpOutcome::Drop(EventInput {
+                        kind: EventType::SubscriberDropped,
+                        rig: None,
+                        actor: "campd".into(),
+                        bead: None,
+                        data: serde_json::json!({
+                            "session": sub.session,
+                            "subscription": sub.id,
+                            "buffered_bytes": sub.high_water as u64,
+                            "cap_bytes": cap as u64,
+                        }),
+                    });
+                }
+                return PumpOutcome::Ok;
+            }
+            // EPIPE / ECONNRESET: the peer is gone. A normal detach is NOT a fault
+            // and appends NO event (§5.2).
+            Err(_) => return PumpOutcome::Gone,
+        }
+        // Loop: the socket took bytes, so `out` has room and FILL may resume.
+    }
+}
+
+impl ControlRuntime {
+    /// §4.4/§9: open a subscription.
+    ///
+    /// It REGISTERS; it never WRITES. The hello must be the FIRST bytes on the
+    /// socket, and `respond()` uses `write_all` on a NON-BLOCKING stream — a
+    /// WouldBlock there drops the connection. The caller writes the hello, then
+    /// pumps.
+    pub fn serve_subscribe(
+        &mut self,
+        token: Token,
+        session: &str,
+        cursor: Option<u64>,
+        read_channel: &ReadChannelRuntime,
+    ) -> Response {
+        if self.subscribers.len() >= MAX_SUBSCRIBERS {
+            return Response::Error {
+                ok: false,
+                error: format!(
+                    "campd already has {MAX_SUBSCRIBERS} subscriptions open (the \
+                     MAX_SUBSCRIBERS cap). Each one holds an fd and up to \
+                     {SUBSCRIBER_BUFFER_BYTES} bytes of outbound buffer; the cap is what \
+                     stops 8 idle connections from disabling `subscribe` for everyone"
+                ),
+            };
+        }
+        // §9: a session that is not tailed (it never existed, or it was reaped and
+        // disposed) is an EXPLICIT ERROR — never an empty stream that looks like a
+        // quiet one.
+        let Some((path, tail)) = read_channel.tail_state(session) else {
+            return Response::Error {
+                ok: false,
+                error: format!(
+                    "campd is not tailing {session} — it never existed, or it ended and its \
+                     stream file was disposed. A reaped stream cannot be replayed (§9): the \
+                     bytes are gone with the file"
+                ),
+            };
+        };
+        let c = cursor.unwrap_or(tail);
+        if c > tail {
+            return Response::Error {
+                ok: false,
+                error: format!(
+                    "cursor {c} is past the {tail} bytes campd has consumed from {session}. \
+                     A cursor is a byte offset campd itself issued; it can never run ahead of \
+                     what campd has drained"
+                ),
+            };
+        }
+        // ORDINARY HISTORY IS NOT AN ERROR (D6"): a late joiner simply starts with
+        // a low cursor and catches up.
+        let file = match std::fs::OpenOptions::new().read(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                return Response::Error {
+                    ok: false,
+                    error: format!("opening {session}'s stream file {}: {e}", path.display()),
+                };
+            }
+        };
+        self.next_subscription += 1;
+        let id = format!("sub-{}", self.next_subscription);
+        self.subscribers.insert(
+            token,
+            Subscriber {
+                id: id.clone(),
+                session: session.to_owned(),
+                file,
+                // The invariant `cursor <= scan <= tail`, from birth.
+                cursor: c,
+                scan: c,
+                partial: Vec::new(),
+                held: false, // B3: a REAL flag, never a `partial` inspection
+                oversize: None,
+                tail,
+                closing: None,
+                end_sent: false, // R2
+                out: Vec::new(),
+                high_water: 0,
+                frame_overhead: measure_frame_overhead(session), // R3: MEASURED
+                blocked_since: None,                             // R1
+            },
+        );
+        Response::Subscribed {
+            ok: true,
+            v: 1,
+            subscription: id,
+            cursor: c,
+        }
+    }
+
+    /// D6": refresh every subscriber's `tail` from the read channel, then pump.
+    /// It no longer touches `lines` at all — a "live" line is just `tail`
+    /// advancing.
+    ///
+    /// Returns the tokens to close and the durable events (`subscriber.dropped`
+    /// plus any `over_cap` `patrol.degraded` from the collector).
+    pub fn fanout(
+        &mut self,
+        read_channel: &ReadChannelRuntime,
+        conns: &mut HashMap<Token, Conn>,
+        now: Timestamp,
+    ) -> (Vec<Token>, Vec<EventInput>) {
+        let cap = self.subscriber_buffer_bytes;
+        let stall = self.stall_timeout;
+        let mut gone = Vec::new();
+        let mut events = Vec::new();
+
+        let tokens: Vec<Token> = self.subscribers.keys().copied().collect();
+        for token in tokens {
+            let Some(sub) = self.subscribers.get_mut(&token) else {
+                continue;
+            };
+            // The tail refresh, specified for all three cases:
+            match read_channel.tail_state(&sub.session) {
+                // A CLOSING subscriber's tail is PINNED at the final offset,
+                // whatever `tail_state` now says.
+                _ if sub.closing.is_some() => {}
+                Some((_, t)) => sub.tail = t,
+                // The session is no longer tailed. LEAVE `tail` UNCHANGED — never
+                // zero it, never panic. This is the window between `dispose_pending`
+                // and `close_disposed` within ONE wake, and `close_disposed` pins
+                // the authoritative value immediately after.
+                None => {}
+            }
+            let Some(conn) = conns.get_mut(&token) else {
+                gone.push(token);
+                continue;
+            };
+            match pump_subscriber(
+                sub,
+                conn,
+                now,
+                cap,
+                stall,
+                &mut self.pending_events,
+                &mut self.degraded_seen,
+            ) {
+                PumpOutcome::Ok => {}
+                PumpOutcome::Gone => gone.push(token),
+                PumpOutcome::Drop(event) => {
+                    events.push(event);
+                    gone.push(token);
+                }
+            }
+        }
+        events.append(&mut self.pending_events);
+        (gone, events)
+    }
+
+    /// Pump ONE subscriber (the WRITABLE-edge path, and the hello's first bytes).
+    pub fn pump(&mut self, token: Token, conn: &mut Conn, now: Timestamp) -> PumpOutcome {
+        let cap = self.subscriber_buffer_bytes;
+        let stall = self.stall_timeout;
+        let Some(sub) = self.subscribers.get_mut(&token) else {
+            return PumpOutcome::Gone;
+        };
+        pump_subscriber(
+            sub,
+            conn,
+            now,
+            cap,
+            stall,
+            &mut self.pending_events,
+            &mut self.degraded_seen,
+        )
+    }
+
+    /// Drain the durable events `pump` collected (it cannot take `&mut Ledger` —
+    /// it is called with a `&mut Conn` already borrowed out of the same map).
+    pub fn take_pending_events(&mut self) -> Vec<EventInput> {
+        std::mem::take(&mut self.pending_events)
+    }
+
+    /// B12/C7/G4: the sessions the read channel just DISPOSED.
+    ///
+    /// Called from the event loop AFTER `dispose_pending` — never from inside
+    /// `control_step`. That ordering is the whole fix: consuming the disposed list
+    /// BEFORE `dispose_pending` produced it leaves it empty, `closing` is never
+    /// set, and a subscriber that is exactly CAUGHT UP (the steady state of every
+    /// long-lived watch) gets NO end frame and NO EOF, ever.
+    pub fn close_disposed(
+        &mut self,
+        disposed: &[Disposed],
+        ledger: &Ledger,
+        conns: &mut HashMap<Token, Conn>,
+        now: Timestamp,
+    ) -> (Vec<Token>, Vec<EventInput>) {
+        let cap = self.subscriber_buffer_bytes;
+        let stall = self.stall_timeout;
+        let mut gone = Vec::new();
+        let mut events = Vec::new();
+
+        for d in disposed {
+            // `stopped` or `crashed` — NEVER `capped`: that value does not exist in
+            // the sessions table's status column, and a phantom value on the wire is
+            // a contract nobody can honour.
+            let reason = ledger
+                .session_status(&d.session)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "stopped".into());
+
+            let tokens: Vec<Token> = self
+                .subscribers
+                .iter()
+                .filter(|(_, s)| s.session == d.session)
+                .map(|(t, _)| *t)
+                .collect();
+
+            for token in tokens {
+                let Some(sub) = self.subscribers.get_mut(&token) else {
+                    continue;
+                };
+                sub.closing = Some(reason.clone());
+                // The AUTHORITATIVE end of the stream (Task 4's `dispose_pending`
+                // recorded it). The `end` frame's offset comes from HERE.
+                sub.tail = d.final_offset;
+                let Some(conn) = conns.get_mut(&token) else {
+                    gone.push(token);
+                    continue;
+                };
+                // A CAUGHT-UP subscriber hits the TERMINAL branch immediately and its
+                // `end` frame goes out ON THIS WAKE.
+                match pump_subscriber(
+                    sub,
+                    conn,
+                    now,
+                    cap,
+                    stall,
+                    &mut self.pending_events,
+                    &mut self.degraded_seen,
+                ) {
+                    PumpOutcome::Ok => {}
+                    PumpOutcome::Gone => gone.push(token),
+                    PumpOutcome::Drop(event) => {
+                        events.push(event);
+                        gone.push(token);
+                    }
+                }
+            }
+
+            // G7: the session is gone — expire its still-pending control requests
+            // LOUDLY, and prune its settled ones.
+            events.extend(self.forget_session(&d.session, now));
+        }
+        events.append(&mut self.pending_events);
+        (gone, events)
+    }
+
+    /// Drop a subscription. EVERY close path calls this — a normal detach appends
+    /// NO event (§5.2: it is not a fault).
+    pub fn forget(&mut self, token: Token) {
+        self.subscribers.remove(&token);
+    }
+
+    pub fn is_subscriber(&self, token: Token) -> bool {
+        self.subscribers.contains_key(&token)
+    }
+
+    #[allow(dead_code)] // PERMANENT: test observable (the read_channel.rs:445 precedent)
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.len()
     }
 }

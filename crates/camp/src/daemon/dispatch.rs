@@ -98,7 +98,6 @@ pub enum NudgeOutcome {
 /// simply CANNOT be interrupted, and answering `{"ok":true}` to that would be a
 /// silent no-op dressed as success.
 #[derive(Debug)]
-#[allow(dead_code)] // cp-1: first read in Task 6
 pub enum ControlWrite {
     /// The control line is in the worker's stdin pipe.
     Delivered,
@@ -256,7 +255,6 @@ impl Dispatcher {
     /// On failure the pipe may hold a TORN PARTIAL LINE, so it is dropped: no
     /// later turn or control message may interleave garbage behind it. The
     /// worker sees EOF after draining (the release shape).
-    #[allow(dead_code)] // cp-1: first read in Task 6
     pub fn write_control(&mut self, session: &str, line: &str) -> ControlWrite {
         let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
             return ControlWrite::NoPipe;

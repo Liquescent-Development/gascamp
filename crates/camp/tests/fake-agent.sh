@@ -208,6 +208,10 @@ if [[ -n "${FAKE_AGENT_CLOSE_STDIN:-}" ]]; then
   # cannot be used, because the first write that fails TEARS the pipe down, so
   # any later interrupt would report NoPipe instead.
   exec 0<&-
+  # The HAPPENS-BEFORE marker. The test waits for this line in the stdout file
+  # before interrupting — without it, campd can deliver the interrupt while the
+  # pipe is still open, the write SUCCEEDS, and the test flakes.
+  emit_stream '{"type":"system","subtype":"stdin_closed"}'
   sleep "${FAKE_AGENT_CLOSE_STDIN}"
   exit 0
 fi

@@ -231,6 +231,28 @@ fn dispatch_one(root: &Path) -> (String, String) {
     (bead, session)
 }
 
+/// Wait until a session's stdout FILE contains `needle`. A worker's own stdout is
+/// the only place its internal progress is observable — the ledger records what
+/// CAMPD did, not what the worker has reached.
+fn wait_for_stdout(root: &Path, session: &str, needle: &str) {
+    let path = stdout_path(root, session);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {needle:?} in {session}'s stdout: {:?}",
+            std::fs::read_to_string(&path).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn events_of(root: &Path, kind: &str) -> Vec<serde_json::Value> {
     events_json(root)
         .into_iter()
@@ -376,6 +398,12 @@ fn an_interrupt_whose_pipe_write_fails_is_loud_in_both_the_response_and_the_ledg
     let campd = Daemon::spawn(&root, &[("FAKE_AGENT_CLOSE_STDIN", "30")]);
     let mut stream = connect(&root);
     let (_bead, session) = dispatch_one(&root);
+
+    // HAPPENS-BEFORE: wait until the worker has ACTUALLY closed its read end.
+    // `session.woke` fires when campd SPAWNS the worker — long before the worker
+    // gets there — so interrupting on that alone races the close, the write
+    // succeeds, and the test flakes.
+    wait_for_stdout(&root, &session, "stdin_closed");
 
     // The write is ATTEMPTED against a pipe whose reader is gone => EPIPE.
     let resp = request(

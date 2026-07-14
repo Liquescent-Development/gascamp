@@ -55,6 +55,20 @@ pub enum Request {
     /// previous campd life is a live session too.
     #[serde(rename = "sessions.list")]
     SessionsList,
+    /// cp-1 (§4.4/§9): SUBSCRIBE to a session's raw stream — a connection MODE,
+    /// not a request/response.
+    ///
+    /// `cursor` is a BYTE OFFSET campd itself issued (the hello's, or any
+    /// `offset` off the wire). `null` means "start at the tail". Ordinary history
+    /// is NEVER refused: a late joiner simply starts with a low cursor and catches
+    /// up. §4.4: the hello is bounded by REQUEST_TIMEOUT; after it, the connection
+    /// is TIMEOUT-EXEMPT — a quiet stream is not a wedged daemon.
+    #[serde(rename = "session.subscribe")]
+    SessionSubscribe {
+        session: String,
+        #[serde(default)]
+        cursor: Option<u64>,
+    },
     /// cp-1 (§4.1): interrupt a live worker's turn.
     ///
     /// D1 — ACK-then-ASYNC. campd answers with the `request_id` as soon as the
@@ -133,6 +147,16 @@ pub enum Response {
     SendTurn {
         ok: bool,
         via: String,
+    },
+    /// cp-1 (§4.4) `session.subscribe`'s HELLO — the FIRST bytes on the socket,
+    /// and the last free place for a protocol version. `v` costs one field now and
+    /// is unbuyable later: cp-2/3/4/5 all extend this wire. What breaks untagged
+    /// resolution is a later phase adding a field to an EXISTING variant.
+    Subscribed {
+        ok: bool,
+        v: u8,
+        subscription: String,
+        cursor: u64,
     },
     /// cp-1 (§4.1) `session.interrupt`: D1's ACK. The interrupt is IN THE PIPE;
     /// the worker's answer lands in the ledger as `control.responded`, keyed by
