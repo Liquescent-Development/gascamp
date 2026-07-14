@@ -1353,7 +1353,10 @@ mod tests {
         .unwrap();
 
         // ONE control.failed per legal cause (G5).
-        for cause in crate::ledger::fold::CONTROL_FAILURE_CAUSES {
+        for cause in crate::vocab::ControlFailureCause::ALL
+            .iter()
+            .map(|c| c.as_str())
+        {
             l.append(EventInput {
                 kind: EventType::ControlFailed,
                 rig: None,
@@ -1409,7 +1412,7 @@ mod tests {
         // All audit-only: durable truth, zero state drift.
         assert_eq!(
             count(&l, "SELECT count(*) FROM events"),
-            4 + crate::ledger::fold::CONTROL_FAILURE_CAUSES.len() as i64
+            4 + crate::vocab::ControlFailureCause::ALL.len() as i64
         );
         assert_eq!(count(&l, "SELECT count(*) FROM beads"), 0);
         assert_eq!(count(&l, "SELECT count(*) FROM sessions"), 0);

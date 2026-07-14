@@ -1279,37 +1279,26 @@ struct SubscriberDropped {
     cap_bytes: u64,
 }
 
-/// The CLOSED set of `control.failed` causes (§2.1). Rehydration routes on
-/// these, so an unknown value is a HARD ERROR, never a default: a cause this
-/// camp does not know means the ledger was written by a NEWER camp, and
-/// guessing its meaning is exactly the silent divergence invariant 5 forbids.
-///
-/// The two TIMEOUT causes are the ones that keep a request answerable: a late
-/// `control_response` for one of them appends a CORRECTION (C11). Every other
-/// cause is TERMINAL — no answer can ever arrive.
-pub const CONTROL_FAILURE_CAUSES: &[&str] = &[
-    "silence_timeout",
-    "ceiling_timeout",
-    "session_ended",
-    "write_failed",
-    "unknown_request",
-    "unparsable",
-    "dialog_refused",
-    "permission_unanswerable",
-];
-
 /// `control.failed` (§2.1): a control request campd could not complete.
 /// Audit-only, but `cause` is validated against the closed set — an event
 /// carrying a cause nothing can route is worse than no event at all.
 fn control_failed(event: &Event) -> Result<(), CoreError> {
     let p: ControlFailed = payload(event)?;
     non_empty(event, "reason", &p.reason)?;
-    if !CONTROL_FAILURE_CAUSES.contains(&p.cause.as_str()) {
+    // The cause is validated through the SHARED enum (`vocab::ControlFailureCause`),
+    // which is also what the daemon routes on — so the fold and the routing cannot
+    // drift apart. An event carrying a cause nothing can route is worse than no
+    // event at all.
+    if crate::vocab::ControlFailureCause::parse(&p.cause).is_none() {
+        let known: Vec<&str> = crate::vocab::ControlFailureCause::ALL
+            .iter()
+            .map(|c| c.as_str())
+            .collect();
         return Err(CoreError::InvalidEventData {
             event_type: event.kind.as_str().to_owned(),
             reason: format!(
-                "unknown cause {:?} (one of {CONTROL_FAILURE_CAUSES:?}). Rehydration ROUTES on \
-                 this value: an unroutable cause is a swallowed fault waiting to happen",
+                "unknown cause {:?} (one of {known:?}). Rehydration ROUTES on this value: \
+                 an unroutable cause is a swallowed fault waiting to happen",
                 p.cause
             ),
         });

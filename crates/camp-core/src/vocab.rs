@@ -100,3 +100,86 @@ mod tests {
         }
     }
 }
+
+/// Why a control request failed (§2.1). **A CLOSED SET, and the partition into
+/// TERMINAL vs CORRECTABLE is a COMPILE-TIME obligation.**
+///
+/// It used to be two independent hand-maintained string arrays — one in the fold
+/// (for validation), one in the daemon (for rehydration routing). They had to
+/// partition consistently, and nothing made them. Adding a ninth cause to the fold
+/// without classifying it in the daemon made campd `bail!` at STARTUP on any ledger
+/// containing it: loud (invariant 5), but a footgun for the phases that will add
+/// causes. Here, a new variant that is not classified below **does not compile**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlFailureCause {
+    /// The session went quiet with the request unanswered.
+    SilenceTimeout,
+    /// The session kept producing output but never answered within the ceiling.
+    CeilingTimeout,
+    /// The session was disposed with the request still unanswered.
+    SessionEnded,
+    /// The pipe write itself failed; the request never reached the worker.
+    WriteFailed,
+    /// A `control_response` for an id camp never sent.
+    UnknownRequest,
+    /// A control message camp could not parse.
+    Unparsable,
+    /// A `request_user_dialog` met camp's deterministic refusal.
+    DialogRefused,
+    /// A `can_use_tool` arrived, which cp-1 cannot answer (§5.3.1).
+    PermissionUnanswerable,
+}
+
+impl ControlFailureCause {
+    pub const ALL: &'static [ControlFailureCause] = &[
+        ControlFailureCause::SilenceTimeout,
+        ControlFailureCause::CeilingTimeout,
+        ControlFailureCause::SessionEnded,
+        ControlFailureCause::WriteFailed,
+        ControlFailureCause::UnknownRequest,
+        ControlFailureCause::Unparsable,
+        ControlFailureCause::DialogRefused,
+        ControlFailureCause::PermissionUnanswerable,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ControlFailureCause::SilenceTimeout => "silence_timeout",
+            ControlFailureCause::CeilingTimeout => "ceiling_timeout",
+            ControlFailureCause::SessionEnded => "session_ended",
+            ControlFailureCause::WriteFailed => "write_failed",
+            ControlFailureCause::UnknownRequest => "unknown_request",
+            ControlFailureCause::Unparsable => "unparsable",
+            ControlFailureCause::DialogRefused => "dialog_refused",
+            ControlFailureCause::PermissionUnanswerable => "permission_unanswerable",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ControlFailureCause> {
+        ControlFailureCause::ALL
+            .iter()
+            .find(|c| c.as_str() == s)
+            .copied()
+    }
+
+    /// TERMINAL: no answer can EVER arrive, so a `control_response` for a request
+    /// settled by this cause is a DUPLICATE, never a correction.
+    ///
+    /// The two false cases are the whole reason this distinction exists: campd said
+    /// "no answer came", and an answer may yet come — so a late `control_response`
+    /// must append `control.responded{late:true}` and CORRECT the premature fault,
+    /// not be swallowed. **The `match` is exhaustive: a new variant must decide.**
+    pub fn is_terminal(self) -> bool {
+        match self {
+            // Correctable — the request may still be answered.
+            ControlFailureCause::SilenceTimeout | ControlFailureCause::CeilingTimeout => false,
+            // Terminal — nothing can ever arrive for these.
+            ControlFailureCause::SessionEnded
+            | ControlFailureCause::WriteFailed
+            | ControlFailureCause::UnknownRequest
+            | ControlFailureCause::Unparsable
+            | ControlFailureCause::DialogRefused
+            | ControlFailureCause::PermissionUnanswerable => true,
+        }
+    }
+}
