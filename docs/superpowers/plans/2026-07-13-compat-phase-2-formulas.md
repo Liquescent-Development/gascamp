@@ -4,731 +4,349 @@
 > superpowers:subagent-driven-development) to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** rev 2 — after an adversarial plan gate returned **REJECT** (unanimous BLOCK, 4
-panelists). Every ruling and every B-defect is addressed below; the map is the first section.
+**Status:** rev 3 — after two adversarial plan gates (REJECT, REJECT). **This revision was written
+from the output of gc's real compiler, not from a reading of its source** (Ruling 5). Every fidelity
+claim below is measured; the shim that measured it is Task 0 and ships in the repo.
 
-**Goal:** Make camp load and compile the real Gas City formula corpus at
-`ci/gc-compat/GCPACKS_REF` — **95 of 100**, of which **62 are runnable** — refusing the other 5
-by name, with every §9 rung's count pinned by a CI gate that runs **the real binary**, and every
-fidelity claim verified against **the real gc compiler** rather than against a reading of its
-source.
+**Goal:** camp loads and compiles the real Gas City formula corpus at `ci/gc-compat/GCPACKS_REF` —
+**95 of 100 loadable, 62 runnable** — refusing the other 5 by name, with every §9 rung pinned by a
+gate that runs the real binary, every fidelity claim pinned by a differential gate against the real
+gc compiler, and **at least one imported corpus formula cooked and run end-to-end**.
 
-**Architecture:** camp's formula compiler today is a *strict subset* validator that rejects every
-Gas City construct by name (`parse.rs` `CITY_ONLY_TOP`/`CITY_ONLY_STEP`). Phase 2 inverts it into
-a *permissive, layered compiler* following compat §4's three rules — **permissive for imported
-pack layers, strict for camp's own `<root>/formulas/`** (D2′). `parse_and_validate` grows a
-layered sibling, `compose::compile`, running gc's pipeline order. `drain` (2e) becomes a
-**campd-owned** step, the fourth arm of `GraphRuntime` beside check/retry/fanout, and gc's convoy
-maps onto camp's run.
+**Architecture:** camp's formula compiler is today a *strict subset validator* that rejects every Gas
+City construct by name. Phase 2 inverts it into a **permissive, layered, two-stage compiler** matching
+gc's real staging:
 
-**Tech Stack:** Rust (camp-core, camp), `toml`, SQLite; Go (the gc oracle shim, in the existing
-`ci/gc-compat` Go job); Python 3 stdlib (`tomllib`) for the corpus gates.
+| stage | gc | camp (this plan) |
+|---|---|---|
+| **COMPILE** | `extends` → `expand` → **single-brace `{name}` fully resolved** → `condition` pruned → `description_file` inlined. **`{{var}}` survives verbatim.** | identical |
+| **INSTANTIATE** (gc `stepToBead`; camp `cook`) | **`{{var}}` substituted over every field and every metadata value, incl. `check.path`** | identical |
+
+`drain` (2e) becomes a **campd-owned** step — gc's *"controller-owned control bead"* — with gc's
+**real** runtime semantics: eager, all-members, all-or-nothing reservation.
+
+**Tech Stack:** Rust (camp-core, camp); Go (the gc oracle shims, in the existing `ci/gc-compat` Go
+job); Python 3 stdlib (`tomllib`).
+
+---
+
+## Task 0 came first, and it rewrote this plan
+
+Ruling 5 ordered the gc shim built **before** any Rust and **before** rev 3 was finalized. It was.
+`ci/gc-compat/factshim.go` compiles the corpus with all 10 formula dirs as search paths. Output at
+`GCPACKS_REF` / `GASCITY_REF`:
+
+```
+layers=10 formulas=100 OK=99 FAIL=1        (mol-polecat-work: extends mol-polecat-base — not found)
+steps                          1523
+drain_steps                    20     (drain_ctx_separate 19 · drain_ctx_shared 1)
+resid_desc                     567    ({{...}} SURVIVING in compiled Descriptions)
+resid_title                    1
+resid_md_gc.run_target         55     ({{...}} SURVIVING in compiled routes)
+resid_md_gc.continuation_group 14
+```
+
+and, from the compiled Recipe of `bmad-build`:
+
+```jsonc
+"bmad-build.implement": { "Assignee": "",
+  "Metadata": { "gc.kind": "drain", "gc.drain_context": "separate",
+                "gc.drain_formula": "bmad-story-development",
+                "gc.drain_member_access": "exclusive",
+                "gc.drain_on_item_failure": "continue",          // DEFAULTED by the compiler
+                "gc.run_target": "{{implementation_target}}" } } // UNRESOLVED, despite a default
+```
+and from `superpowers-code-review` — same corpus, the *other* grammar:
+```jsonc
+"…main.process-code-review": { "Metadata": { "gc.run_target": "superpowers.implementer" } }
+// authored as  metadata = { "gc.run_target" = "{implementation_target}" }  — SINGLE brace, RESOLVED at compile
+```
+
+**That output invalidated four things rev 2 asserted**, and everything downstream of them. It is why
+rev 3 exists. Do not re-derive any fidelity claim from gc's source; **re-run the shim.**
 
 ---
 
 ## What changed in this revision, and why
 
-| Ruling / defect | What was wrong | Where it is fixed now |
+| Item | What was wrong in rev 2 | Fixed in |
 |---|---|---|
-| **RULING 1** — re-derive by running the loader, amend §9 to measured truth | Seeds came from **key-set containment only**. Running camp's full rule set finds 3 more unloadable formulas. **Ceiling is 95, not 97.** A **runnable** count (62) was never pinned. | Whole plan re-seeded from `ci/gc-compat/rungs.py` (new, in-repo). **§9 addendum now records 95 + 62** (Task 1). Rungs: **2a=2, 2b=31, 2c=57, 2d=83, 2e=95**. |
-| **RULING 1** — third camp-local rule, **S3** | `validate.rs:52-57` requires ≥1 step. **25 corpus formulas have no `steps`**: 11 inherit them via `extends`, **14 are `type = "expansion"` and never have steps**. Task 1 was titled "the two rules" — there are three. | Task 1 now amends **S2, S3, S11**. |
-| **RULING 2** — D2 too permissive | "camp cannot distinguish a dead key from a typo" was **false** — `FormulaLayers` knows the origin. Permissiveness for `<root>/formulas/` permits silent graph corruption (`dependson` ⇒ steps run out of order). | **D2′**: permissive for imported layers, **hard error for the camp-local tier**. Task 2. It also saves 2 existing fixtures (B7). |
-| **RULING 3** — use the gc oracle | Every fidelity claim (pointer prompt, drain defaulting, extends merge, expand, condition-prune) was read from gc's *source*, never *run*. `camp_corpus_validate.go` already links gc's real compiler and **throws the compiled formula away**. | **New Task 11: the differential gate.** gc and camp both compile all 100; the step lists, descriptions, metadata and drain specs are diffed. Settles B15 for free. |
-| **B1** — `bead_meta` escapes refold | I updated the **test's** `DUMPS`, not the **production** `refold.rs::STATE_TABLES` (:28-60). ⇒ `refold_check` never diffs it; **`refold_repair` hard-fails on the FK**; and the property test is **vacuous** (no op emits metadata). | Task 3: `STATE_TABLES` gains `bead_meta` **after `beads`**; `refold_prop::Op` gains `SetMeta`/`Reserve`/`Release`. |
-| **B2** — no `SCHEMA_VERSION` bump | `bead_meta` is fold truth. Without a bump, an existing camp.db opens fine and dies later at `no such table`. | Task 3: **SCHEMA_VERSION 2 → 3**. |
-| **B3** — nothing actually refused the 3 (now 5) | `classify(site, key)` is **value-blind**. `phase` was in no table (⇒ ignored, **deleting a merged refusal**); `design-review`'s scope-ness is entirely in **metadata values**; and **`gc.scope_kind` does not exist in the corpus** — I fabricated it. | Task 2: a **value-aware refusal table** (`refuse(site, key, value)`), covering `phase` (any value) and metadata `gc.kind = "scope"` / `gc.scope_*`. Real keys only. |
-| **B4** — drain anchor specified 3 ways, guaranteed `InvalidTransition` | Trigger said "queue on anchor closed pass"; finalize said "close the anchor" ⇒ closing a closed bead. Tests described a different system. | **Task 9: ONE model — the drain anchor is campd-owned.** campd claims it when ready (`is_campd_held`, the `maybe_claim_looping` mold), scatters, gathers, then closes it. Tests re-derived. |
-| **B5** — run finalizes while items run | My justification was false: `flow::finalization` iterates **step anchors only**; bond children never block quiescence. | Falls out of B4's fix: the campd-held anchor stays `in_progress` until gather, so the run is not quiescent and downstream `needs` stay blocked. Pinned by a test. |
-| **B6** — `single_lane`'s mechanism is inert | `dispatchable_beads` **excludes run roots outright** (readiness.rs:139) ⇒ a `needs` edge on an item root gates nothing. And lazy materialization alone imports `skip_remaining` semantics. | Task 9: an explicit **4-cell materialization matrix**; `single_lane + continue` advances on the previous root **closing at all** (any outcome), `skip_remaining` on it **closing pass**. Test with a failing item. |
-| **B7** — Task 2 detonates `formula_corpus.rs` | Never named. 52 invalid fixtures, a 55-row table, `assert_eq!(on_disk, in_table)`. ~27 rejections become non-rejections; a `Refusal` is not a `Violation` so even the still-refused ones would return `Ok`. | Task 2 §"Fixture disposition": exact fate of all 55 rows; `FormulaError` gains `refusals` + `names()`. |
-| **B8** — seeds not re-derivable | `measure_corpus.py` computes **no rung count**. The seeds came from a throwaway script. The gate's counting rule existed only as prose. | **`ci/gc-compat/rungs.py`** (new, in-repo), implementing §9's text with the arithmetic **written as pseudocode** and independent of camp's `RUNGS` table. It is the arbiter. |
-| **B9** — vacuous rung test | `for k in r.top { assert classify(Top,k) == Accepted }` is true by construction (`accepted_top` is *defined* as base ∪ RUNGS). | Task 2: replaced with an assertion against a **literal transcription of §9's table**. |
-| **B10** — no test harness, no fixtures | ~12 undefined helpers; the two zero-coverage semantics rest on fixtures given nowhere. | Task 9: harness named (**copy `Daemon`/`wait_until`/`scaffold` from `daemon_dispatch.rs`**), every helper defined, and **full TOML for both zero-coverage fixtures**. |
-| **B11** — reservations leak, no escape | Release specified only on clean finalize. Conflict / dead-end / kill-9 / `skip_remaining` all leak, and `bd update --set-metadata` is deferred ⇒ **no operator escape**. | Task 9: release on **every** exit path + a reconcile sweep for orphans + `camp doctor --drain-reservations [--release-orphans]`. |
-| **B12** — order-fire refusal has no task | Exit criterion claimed it; only `sling.rs` was changed. A cron order could fire one of the 21 under graph.v2 with nothing refusing it (§13's money invariant). | **Task 4 Step 6** (new): the daemon order-fire path refuses `not_runnable`, with a test in `daemon_orders.rs`. |
-| **B13** — `run_members` has no type filter | compat-4's `mail` beads (dispatch-excluded) would be scattered and reserved. | Task 9: `AND b.type = 'task'`. |
-| **B14** — `advice`/`pointcuts` contradiction | Deferrals table said *dropped*; `REFUSED_TOP` said *refused*. | **D4**: **REFUSED** (§4 rule 1). Preserves the merged behaviour and 2 fixtures; 0 corpus uses. §9's "dropped" describes *gc's merge*, not camp's acceptance. |
-| **B15** — `description_file` vs `{{var}}` unspecified | Worse: my pipeline had vars **before** description_file. gc resolves description_file at **parse** time (`parser.go:187`) and substitutes vars **later** — so inlined contents **are** substituted, which is precisely what the pointer prompt's `Formula Variables` block is for. | **Pipeline order corrected** (Task 4). Verified by Task 11's differential gate. |
-| Non-blocking notes | 12 items | Folded in; see below. |
+| **F1** `{{var}}` is NOT substituted at compile (567 residual descriptions, 55 residual routes) | rev 2 substituted at **compile** | **Task 5** — `{{var}}` moves to **cook**. |
+| **F4** gc has a **SECOND grammar**: single-brace `{name}`, **fully resolved at compile** | rev 2 had **no single-brace grammar at all**, and claimed *"0 bare route values"* — **there are 8** | **Task 7** — `{name}` resolution, inside expansion only. |
+| **F8** gc **DOES** substitute `check.path` and `drain.formula`; there is **no exemption list** | rev 2 shipped two tests locking in the opposite | **Task 5** — the exemption list is deleted; a templated `drain.formula` is rejected at **validation** (`{{`-check), as gc does. §9's asymmetry bullet is **amended**. |
+| **F2** gc's Recipe has **no `Drain` struct** — drain lives entirely in `Metadata` | rev 2's oracle demanded a `"drain": {…}` object gc **cannot emit** ⇒ all 20 drain steps fail the diff | **Task 11** — compare `gc.drain_*` metadata. |
+| **F5/F6 + RULING 4** `single_lane` has **zero production readers**; `on_item_failure` is read **only** by `advanceSharedDrain` ⇒ separate drains are **always `continue`** | rev 2 built a **4-cell materialization matrix** + 2 synthetic fixtures for behavior **gc does not have** | **Tasks 8/9** — matrix **KILLED**. Parsed, validated, round-tripped, **no runtime behavior**. §9 amended. |
+| **F7 + BD4** gc's separate drain reserves the **WHOLE member set FIRST**, then materializes | rev 2 reserved incrementally ⇒ on a conflict at k+1 it released m1 **while item-run 1 was live on it** — *two drains mutating one bead*, the exact thing the reservation prevents | **Task 9** — all-or-nothing reserve in **one `append_batch`**. |
+| **BD1** rungs 2c/2d were still **key-set containment** | camp validates the **extends-MERGED** step list; **8 formulas inherit a late-rung key only from a parent** | **Rungs re-derived: 2 · 31 · 49 · 76 · 95.** `rungs.py` now simulates the pipeline it arbitrates. |
+| **BD2** the value-aware refusal fired at **parse** ⇒ 19 formulas with a *conditional* shared drain refuse ⇒ **ceiling 76, not 95** | rev 2 asserted the right answer in a test comment and specified the opposite mechanism | **Tasks 1+2 / 8** — `Refusal`s are **step-scoped** and die with their pruned step. |
+| **BD3** `is_campd_held` **re-detonated B4** | `maybe_claim_looping`'s tail calls `create_attempt` **unconditionally** ⇒ every drain step gets a **real worker**, the anchor closes early, gather hits `InvalidTransition`. **All four of rev 2's tests still passed.** | **Task 9** — `create_attempt` gated on `is_looping`; tests assert `flow::attempts(..).is_empty()` and that **nothing carrying the drain's `step_id`** is dispatchable. |
+| **BD5** a reserve conflict **deadlocks the run forever** | `dispatch.failed` only appends an event; the campd-held anchor never closes ⇒ `NotQuiescent` forever | **Task 9** — the conflict **closes the anchor** `fail`/`hard_fail`. |
+| **BD8** ⚠️ **the phase-killer: the pinned-formula round-trip** | `cook` pins the **raw authored source**; `load_run` **re-parses it with no layers and a default config** ⇒ **every one of the 62 runnable corpus runs dead-ends** — and no gate in rev 2 could see it | **Task 4** (pin the **compiled recipe**) + **Task 12** (a gate that **cooks and runs an imported corpus formula end-to-end**). |
+| **BD6** `multi-violation.toml` detonates inside B7's own answer | its `tags` key becomes **accepted** ⇒ `violations.len() >= 5` fails | **Tasks 1+2** — fixture reworked, new counts given. (It is a **52**-row table, not 55.) |
+| **BD7** Task 2 used types only Task 4 creates | no ordering remedy | **Tasks 1+2 merged**; `UNIMPLEMENTED` named with its initial contents. |
+| **BD9** `SCHEMA_VERSION` bumped in **one** of **two** places | `schema.rs:78` writes the literal `'2'` ⇒ **every fresh camp fails to open on its next process** | **Task 3** — both sites + the module doc. |
+| **BD10** the anti-tuning cross-check was **unimplementable or vacuous** | `--formula-rungs` takes no formula path; recomputing counts reproduces `rungs.py` by construction | **Task 4** — `--formula-rungs` JSON specified exactly; the cross-check becomes **set-vs-set** (camp's real per-file verdicts vs the arbiter's prediction) — falsifiable. |
+| **BD11** the harness is not executable | `daemon_dispatch.rs` has free functions and a `Daemon` with one method; 3 of 5 fixtures undefined; the conflict fixture possibly unconstructible | **Task 9** — the `Camp` struct defined in full; every fixture given as TOML; the conflict fixture is **two drain steps in ONE run** (the only constructible shape — a bead has one `run_id`). |
+| **RULING 5** | Task 11 — the thing meant to stop source-read errors — was **itself a source-read** | **Task 0**: the shim ships **first**; rev 3 is written from its output. |
 
-### Corrections folded in (non-blocking notes)
-
-- **Counts, recursive (incl. `template` and `children` steps — they become real steps after
-  expand):** `gc.run_target` **327** occurrences; `description_file` **328** targets in **67**
-  formulas (**53** carry one on a *top-level* step — the §9 figure); **8** targets exceed 4096
-  bytes. Corrected from 187/188/7.
-- **There are 4 distinct conditions, not 3.** The one I missed is `{{review_mode}} != report`
-  (4 uses), and it lives inside `children` — so **condition pruning must recurse into children**.
-  Its default **varies by pack** (`report` in `code-review-base`/`review`/`planning-base`,
-  `agent` in `build-base`, `interactive` in `gstack-build`), so it prunes on the default path.
-- `mol-pr-from-issue.formula.toml` lives in **`pr-pipeline/formulas/`**, not `gastown/`.
-- `reconcile` is at **dispatch.rs:1645**.
-- `formula/mod.rs:1-5`'s module doc says camp "accepts no unknown keys, where gc silently ignores
-  them" — **D2′ inverts that sentence**; Task 2 amends the doc.
-- `DEAD_TOP` was declared and never read ⇒ `-D warnings` dead_code. It is now **read**: D2′ needs
-  it, because a **known-dead gc key** and an **unrecognised key** are different classes.
-- `substitute`/`eval_condition`/`parse_drain` are `pub(crate)` ⇒ their unit tests live **inside**
-  `compose.rs`/`drain.rs` (`#[cfg(test)] mod tests`), not in the external `tests/compose.rs`.
-- `crates/camp/tests/cli_doctor_formula.rs` asserts doctor's exit codes + the ArgGroup — adding
-  `--json` / `--formula-rungs` touches it. Named in Task 4.
-- **`gc.work_branch` / `gc.routed_to` must NOT be writable in `bead_meta`** — `beads` already has
-  a `work_branch` column and `assignee`. **Rule (Task 3): a metadata key that has a dedicated
-  column is PROJECTED at read time and REFUSED at write time, naming the column.** compat-3
-  inherits one source of truth, not two.
-- **`ready_task_count` (readiness.rs:160) lacks the run-root exclusion** that
-  `dispatchable_beads` has, so every `camp create --run` member would be counted "ready" and never
-  dispatched — a permanently non-decreasing count in `camp top`. Task 3 adds the exclusion.
-- **`description_file` is an unbounded read from an untrusted pack.** The non-asset branch was a
-  bare `base_dir.join(raw)`. **Task 4 contains it to the pack root** and refuses an escape.
-- **Corpus-drift procedure** written down (Task 10).
-- `camp_corpus_validate.go` derives a formula's name as `TrimSuffix(basename, ".toml")` ⇒ new
-  fixtures must **not** be named `*.formula.toml` or gc receives the name `"x.formula"`. Task 10.
+**The standing instruction — *"for every fix, ask what NEW failure it permits, and write the test that
+catches THAT"* — is applied explicitly.** Tasks 4, 5, 7, 9 each carry a **"What this fix could newly
+break"** block naming the failure and the test that catches it.
 
 ---
 
-## Authority and provenance
+## Authority, and the spec amendments this plan makes
 
-| Rank | Document | What it decides |
+| Rank | Document | Amended? |
 |---|---|---|
-| 1 | `docs/design/2026-07-05-gas-camp-design.md` | Master spec; §4 decision record settled. **This plan amends line 449** (Task 1). |
-| 2 | `docs/superpowers/specs/2026-07-12-gas-city-pack-compatibility-design.md` (rev 4) | **§4** (permissiveness + three traps), **§9** (rung semantics), **§10** (the gate), **§12.2**. **This plan amends §9's ceiling to measured truth** (Task 1). |
-| 3 | `docs/superpowers/specs/2026-07-12-KNOWN-DEFECTS.md` | "Verified correct" list is settled. |
-| 4 | `docs/superpowers/plans/2026-07-13-wave-2-compat-orchestration.md` | Branch, gates, shared-file protocol. |
+| 1 | `docs/design/2026-07-05-gas-camp-design.md` | **Yes — line 449** (S11: `contract` satisfies the compiler declaration). |
+| 2 | compat spec §4/§9/§10/§12.2 | **Yes — a §9 addendum**: the ceiling (95), S2/S3/S11, D2′, **§9's substitution bullet (wrong — F1/F4/F8)** and **§9's drain-runtime bullet (wrong — F5/F6/F7)**. |
+| 3 | `2026-07-12-KNOWN-DEFECTS.md` | No. |
+| 4 | `2026-07-13-wave-2-compat-orchestration.md` | No. |
 
-`AGENTS.md` invariants bind every task. Invariant 5 (**fail fast; no fallbacks; no panics in
-library code**), invariant 6 (**camp ⊆ gc**), invariant 7 (**vocabulary mirror**).
+Invariant 5 (**fail fast, no fallbacks, no panics in library code**), invariant 6 (**camp ⊆ gc**),
+invariant 7 (**vocabulary mirror**) bind every task.
 
-**Provenance of every number:** corpus at `GCPACKS_REF = 44b2eef94f035283b70df62d3bd1fc77bce13d56`,
-gc source at `GASCITY_REF = 12410301884b51131a35e101a335dbaae16cdcb0`, walked with `tomllib`
-(never regex — KNOWN-DEFECTS' two traps), globbing `formulas/*.toml` (not `*.formula.toml` —
-gastown's 8 `mol-*.toml` break the convention). **Re-derive with `ci/gc-compat/rungs.py`, which
-this plan adds to the repo** (B8).
+**Provenance:** corpus `GCPACKS_REF = 44b2eef94f035283b70df62d3bd1fc77bce13d56`; gc
+`GASCITY_REF = 12410301884b51131a35e101a335dbaae16cdcb0`. Re-derivable with
+`ci/gc-compat/factshim.go` (gc's real compiler) and `ci/gc-compat/rungs.py` (the arbiter). Both ship
+in this phase.
 
 ---
 
 ## Global Constraints
 
-- **Branch:** `compat-2-formulas`. One reviewable PR. Never commit to main.
-- **Gates before every push:** `cargo fmt --all --check` && `cargo clippy --workspace
-  --all-targets --all-features -- -D warnings` && `cargo test --workspace`. Not complete until
-  pushed and `gh pr checks --watch` is green.
-- **TDD, strictly.** Write the failing test, run it, *watch it fail with the expected message*,
+- **Branch** `compat-2-formulas`; one PR; never commit to main.
+- **Gates before every push:** `cargo fmt --all --check` && `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings` && `cargo test --workspace`. Not complete until pushed and
+  `gh pr checks --watch` is green.
+- **TDD strictly.** Write the failing test, run it, **watch it fail with the expected message**,
   implement, watch it pass.
-- **No panics in library code.** `unwrap_used`/`expect_used`/`panic` are clippy-denied;
-  `unsafe_code` forbidden. Tests carry the existing `#[allow(...)]` on `mod tests`.
-- **No network in `cargo test`.** The corpus is never vendored (§10 — `gascity-packs` has no
-  top-level LICENSE; gascamp is AGPL-3.0). Corpus assertions live **only** in CI gate scripts.
-- **New events:** four lockstep edits — `EventType` enum + `ALL` + `as_str` (`event.rs`), a `match`
-  arm in `fold::apply` (`fold.rs`), and `CAMP_SPECIFIC_EVENTS` (`vocab.rs`). Payloads: private,
-  `#[serde(deny_unknown_fields)]`, validated in the fold (the `check_passed` mold, fold.rs:680).
-- **New fold state:** a state table must be added to **BOTH** `refold.rs::STATE_TABLES` (production)
-  **and** `refold_prop.rs::DUMPS` (test), and needs a **`SCHEMA_VERSION` bump** (B1, B2).
-- **Shared files — ADDITIVE ONLY, no refactors.** `cp-1-control-protocol` is in flight and owns the
-  socket/protocol/daemon-control surface. Contended: `daemon/dispatch.rs`, `daemon/event_loop.rs`,
-  `camp/src/main.rs`, `event.rs`, `vocab.rs`, `ledger/fold.rs`, `Cargo.toml`/`Cargo.lock`,
-  `.github/workflows/ci.yml`. Expect a real rebase.
-- **Commits:** no co-author trailers, never mention the agent.
+- **No panics in library code** (`unwrap_used`/`expect_used`/`panic` denied; `unsafe_code` forbidden).
+- **No network in `cargo test`.** The corpus is never vendored (§10); corpus assertions live only in
+  CI gate scripts.
+- **New events:** four lockstep edits — `EventType` + `ALL` + `as_str` (`event.rs`), a `fold::apply`
+  arm, `CAMP_SPECIFIC_EVENTS` (`vocab.rs`). Payloads private, `deny_unknown_fields`, validated in the
+  fold (`check_passed` mold, fold.rs:680).
+- **New fold state:** the table goes in **BOTH** `refold.rs::STATE_TABLES` (production) **and**
+  `refold_prop.rs::DUMPS` (test), **and** needs a `SCHEMA_VERSION` bump **in both literal sites**.
+- **Shared files — ADDITIVE ONLY.** `cp-1` is in flight. Contended: `daemon/dispatch.rs`,
+  `daemon/event_loop.rs` (**not touched at all**), `main.rs`, `event.rs`, `vocab.rs`, `fold.rs`,
+  `Cargo.*`, `.github/workflows/ci.yml`. Expect a real rebase.
+- **Commits:** no co-author trailers; never mention the agent.
 
 ---
 
-## Decisions this plan pins
+## Decisions
 
-### D1. "Corpus loading" = COMPILES, not RUNNABLE. **RATIFIED by the plan gate — unchanged.**
+### D1. LOADABLE ≠ RUNNABLE. **95 loadable, 62 runnable.** *(Ratified at gate 1.)*
+Compile = parse, extends, expand, `{name}`, prune, inline `description_file`. Runnable = additionally
+`contract = "graph.v2"` **and** `type != "expansion"`. The 21 no-contract + 14 expansion formulas
+compile and are refused at **run** time by **all three cook entry points**: `camp sling`, the daemon's
+**order-fire** path, and **`execute_drain`**'s item cook. **Both numbers go in the PR body.**
 
-§9's rung column measures **compilation**. The 21 no-contract formulas (§9: *"camp must not **run**
-them under graph.v2 semantics"* — *run*, not *load*) **compile**, and are refused at **run** time.
-Two independent supports: §9's own wording, and the arithmetic (no reading that subtracts the 21
-can reach §9's stated 97–98; 100−3−21 = 76).
+### D2′. Permissive for IMPORTED layers; STRICT for camp-local `<root>/formulas/`. *(Ratified.)*
+Unrecognised key: **ignored+warned** when imported, **hard error** in `<root>/formulas/`. Known-dead
+gc keys (`version`, `target_required`, `internal`, top-level `mode`/`single_lane`,
+`sling_container_mode`) are ignored+warned in **both** tiers. Annotations (`notes`, `catalog`,
+formula-level `metadata`) are silent in both. **Migration:** an operator whose camp-local formula
+carries a now-fatal key must remove it. Zero known users — named, not built for.
 
-- **Compile:** parse, resolve `extends`, expand, inline `description_file`, substitute vars, prune
-  conditions, resolve routes; report every ignored key and every refused key.
-- **Runnable:** only a formula with `contract = "graph.v2"` **and** `type != "expansion"` may be
-  cooked. `camp sling` **and the daemon's order-fire path** (B12) refuse a `not_runnable` formula,
-  naming the key, with a `formula.refused` ledger event.
+### D3. gc's convoy is camp's run. *(Ratified.)*
+A **run member** is a bead with `run_id = <the drain's run>`, `step_id IS NULL`, **`type = 'task'`**,
+**`status <> 'closed'`** (gc: `convoycore.Members(store, id, includeClosed=false, …)`,
+`membership.go:96-144` — *"if !includeClosed && IsTerminalStatus(b.Status) { return }"*), not the run
+root, no `bond:`/`drain:` label. Added by `camp create --run <run_id>`.
 
-**Both numbers are pinned and both go in the PR body: LOADABLE = 95, RUNNABLE = 62.** "95/100"
-alone is misleading — 62 is the number that answers *"can camp run gc's packs?"*
+### D4. `advice`/`pointcuts` are **REFUSED** (§4 rule 1; 0 corpus uses).
 
-### D2′. Permissive for IMPORTED layers; STRICT for camp's own `<root>/formulas/`. **(Ruling 2)**
+### D5 (**NEW — F1/F4/F8**). Two grammars, two stages. This is the heart of rev 3.
 
-Rev 1 argued camp *cannot* distinguish a gc-dead key from a typo. That was wrong: **`FormulaLayers`
-— this plan's own new type — knows which layer a formula came from.** §4's permissiveness argument
-is about *consuming someone else's pack*; extending it to the operator's own formulas is a choice,
-and a bad one: `dependson = ["build"]` in a camp-local formula would be silently ignored, the step
-would **run out of order**, and the only surface would be an opt-in `camp doctor`. That is silent
-graph corruption — invariant 5.
+| grammar | resolved | scope | unknown token |
+|---|---|---|---|
+| **`{name}`** (gc `rangeVarPattern = \{(\w+)\}`, `range.go:32`; applied by `substituteVars`, `range.go:94`, **inside `expandStep`**, `expand.go:255`) | **AT COMPILE**, during expansion | every field `expand.go:265-342` touches — ID, Title, Description, Notes, Assignee, Expand, Timeout, Labels[], Needs[], **Metadata[]**, ExpandVars[], Gate.*, Loop.*, OnComplete.*, Ralph.Check.* — **but NOT `DescriptionFile`** | **left verbatim** (`range.go:103`) |
+| **`{{name}}`** (`varPattern`, `parser.go:557`; applied by `Substitute`, `parser.go:617`) | **AT INSTANTIATION** — gc `stepToBead`; camp **`cook`** | **every field, and EVERY metadata value, with NO exemption list** (`molecule.go:1035-1037`) — **including `check.path`** (→ `gc.check_path`, `ralph.go:76`) **and `drain.formula`** (→ `gc.drain_formula`, `compile.go:590`) | **left verbatim** |
 
-| origin | unrecognised key | known-dead gc key | annotation | gc-semantics-camp-lacks |
-|---|---|---|---|---|
-| **imported layer** (`.camp/imports/**`, incl. transitive) | **ignored + warned**, aggregated into `import.added`'s `ignored_keys` (§5.4) | ignored + warned | silent | **refused, naming the key** |
-| **camp-local** (`<root>/formulas/`) | **HARD ERROR, naming the key** | ignored + warned | silent | **refused, naming the key** |
+**Measured:** 435 single-brace occurrences — **362 are the fixed `{target}` family** (`{target}`,
+`{target.id}`, `{target.title}`, `{target.description}` — `substituteTargetPlaceholders`,
+`expand.go:446-464`, a plain `strings.ReplaceAll`, **not** the var grammar); the general single-brace
+vars are the rest (`{implementation_target}` ×8 — **all in `children.metadata.gc.run_target`**,
+`{ISSUE_NUM}` ×7, `{artifact_path_keys}` ×4, …). **Zero single-brace residuals in compiled metadata.**
+Conversely **55 `{{}}` routes and 567 `{{}}` descriptions survive compilation.**
 
-A **known-dead** gc key (`version`, `target_required`, `internal`, top-level `mode`/`single_lane`,
-`sling_container_mode`) is ignored-and-warned in **both** tiers — it is a real gc key, not a typo,
-and a camp formula may legitimately carry it to stay portable. Only **unrecognised** keys differ by
-tier. This is why `DEAD_TOP` is now load-bearing (it was dead code in rev 1).
+**⇒ §9's substitution-asymmetry bullet is WRONG and is amended.** Camp does **not** exempt
+`check.path` or `drain.formula`. A templated `drain.formula` is instead rejected **at validation**, as
+gc does: `if strings.Contains(formulaName, "{{")` → *"templated item formula names are not supported
+in v0"* (`graphv2_validation.go:417-419`).
 
-### D3. gc's **convoy** is camp's **run**; a drain's members are the run's member beads. *(Unchanged; `camp create --run` ratified.)*
+**Conditions are evaluated at COMPILE** over the merged var **values** (never by text substitution).
+Proof: 13 authored shared drains → **1** in gc's compiled output; the other 12 are pruned by
+`{{drain_policy}} == same-session` under the default `separate`.
 
-gc: *"Drain scatters the input convoy into one-member unit convoys"* (`types.go:317-319`), member
-set = `convoycore.Members(store, parentConvoyID)` (`dispatch/drain.go:211`).
+### D6 (**NEW — BD8**). What is pinned in `runs/<id>/`, and how `load_run` reconstitutes it.
 
-> **A run member** is a bead with `run_id = <the drain's run>`, `step_id IS NULL`,
-> **`type = 'task'`** (B13), which is **not** the run root and carries **no** `bond:`/`drain:` label.
+**The bug rev 2 shipped:** `cook.rs:176` writes `formula.source` — *"verbatim bytes of the authored
+file"* (`ast.rs:15`) — and `runtime.rs:67-69`'s `load_run` **re-parses that file** with
+`parse_and_validate` (**no layers, no config**). `dispatch.rs:1774-1783`'s `ctx()` turns any error into
+`None`, and every caller then **dead-ends the run**. For **all 62 runnable corpus formulas** (they
+carry `extends`, `description_file`, and routes needing `cfg.imports`) that re-parse **cannot succeed**
+⇒ **every cooked corpus run dead-ends on campd's first event.** Rev 2's gates could not see it:
+`formula_gate.py` only *compiles*; `differential.py` diffs *compilers*; and the drain fixtures were
+layer-free camp-local packs that happen to re-parse cleanly.
 
-Members enter a run via `camp create --run <run_id>` (additive flag; `bead.created` already folds
-`run_id`). compat-3's `bd create` maps onto it. Members are **never dispatchable** —
-`dispatchable_beads` already excludes `run_id IS NOT NULL AND step_id IS NULL` (readiness.rs:139)
-— which is correct: a member is *data for the drain*, not work. (Task 3 fixes `ready_task_count`,
-which lacks that exclusion.)
-
-### D4. `advice` / `pointcuts` are **REFUSED**, not dropped. **(B14)**
-
-§9's *"`advice`/`pointcuts` are dropped entirely"* describes **gc's `extends` merge** (a parent's
-advice is not inherited), not camp's *acceptance*. Camp does not implement advice ⇒ §4 rule 1 ⇒
-**refuse, naming the key**. **0 corpus uses**, so no count moves; it preserves camp's merged
-behaviour and two existing fixtures. If a future corpus parent carries `advice`, camp refuses
-loudly rather than silently dropping semantics — invariant 5.
+**The fix — pin the COMPILED recipe beside the authored source:**
+```
+runs/<run_id>/
+  manifest.json      unchanged (already carries `vars`, cook.rs:186-188)
+  <formula>.toml     the authored bytes, VERBATIM — invariant 3 ("human-readable run files").
+                     AUDIT ONLY. Nothing re-parses it.
+  recipe.json        NEW: serde_json of the COMPILED `Formula`. THIS is what load_run reads.
+```
+- `Formula`/`Step`/`Check`/`Retry`/`OnComplete`/`Drain` derive `Serialize`/`Deserialize`.
+- `cook` writes both. `ast.rs:15`'s doc comment is amended: `source` is the **authored** artifact and
+  is no longer the reload path.
+- **`load_run` deserializes `recipe.json` — no re-parse, no layers, no config, no vars.** It cannot
+  fail for a corpus formula, and `Step.metadata` / `Step.assignee` / `Step.drain` — which exist **only**
+  post-compose — survive.
+- Condition pruning is **not re-derived at load** (rev 2's silent `Corrupt` on a differently-pruned
+  step set disappears): the pinned recipe has exactly the steps cook materialized, so `load_run`'s
+  *"manifest steps do not match the pinned formula"* check passes by construction.
 
 ---
 
-## Deliberately deferred (named, so nothing is a silent gap)
+## Deliberately deferred / accepted fidelity costs (named)
 
-| Deferred | Why |
+| Item | Disposition |
 |---|---|
-| `drain.max_units` | gc key (`DrainSpec.MaxUnits`), semantics camp does not implement. **0 corpus uses.** §4 rule 1 ⇒ **refused by name**. |
-| `drain.continuation_group` | Valid only with `context = "shared"`, which camp refuses (§6.2, §11.4: *"`gc.continuation_group` is not honoured"*). **0 uses.** **Refused.** |
+| `drain.max_units` (the **key**) | **Refused by name** (§4 rule 1; 0 corpus uses). **BUT gc applies a runtime default of 100 and hard-closes a drain with more members** (`drain.go:24`, `:244-255`, reason `limit_exceeded`). **Camp implements the cap at 100**: a drain over it **closes `fail`/`hard_fail` and scatters nothing.** Refusing the authored key while honouring the runtime cap is the only combination that neither invents semantics nor scatters 200 workers where gc fails. |
+| `drain.continuation_group` (the **key**: 0 uses) | Refused by name. **The METADATA key `gc.continuation_group` (29 authored uses, 14 surviving compilation) is a DIFFERENT thing** — rev 2 conflated them — and is **accepted and carried verbatim**; camp does not honour it (§11.4). |
+| `gc.build.artifact_schema` / `gc.build.artifact_path_keys` (74/74), `gc.on_fail` (1) | **Accepted and carried verbatim.** 148 sites; refusing is not an option. Camp does not act on them. **Named as accepted fidelity costs.** |
 | `context = "shared"` drains | §9: *"REFUSED, loudly."* |
-| `gate`, `loop`, `pour`, `compose`, `tally`, `waits_for`, `depends_on` | §4 rule 1 refusals; **0 corpus uses** each. `tally`'s existing message (parse.rs:324-329) survives verbatim. |
-| `bd update --set-metadata` (the CLI verb) | compat-3. Task 3 ships the **event + fold** it will use. **B11's operator escape does not depend on it** — `camp doctor --drain-reservations --release-orphans` ships here. |
-| `gc.routed_to` / `gc.work_branch` **stamping**, `hook --claim`, the shims | compat-3 (§6.1/§6.2). Task 3 fixes their **storage rule** now (projected, not stored) so compat-3 cannot inherit two sources of truth. |
-| **compat-2's `drain` ≠ compat-3's `drain-ack`** | Three unrelated things share the word: gc's `runtime drain-ack` is a *worker-session exit handshake* (§6.2); compat-2's `drain` is the *formula scatter/gather*; "released at drain end" is the *reservation release*. **compat-2's drain is triggered entirely by ledger events and does NOT depend on compat-3.** |
+| `single_lane`, `on_item_failure` | **Parsed, validated, carried into `gc.drain_*` metadata — with NO runtime behavior**, exactly as gc (F5/F6). |
+| `gate`, `loop`, `pour`, `compose`, `tally`, `waits_for`, `depends_on` | §4 rule 1 refusals; 0 corpus uses each. |
+| `bd update --set-metadata` | compat-3. The operator escape (`camp doctor --drain-reservations`) does **not** depend on it. |
+| `gc.routed_to` / `gc.work_branch` | compat-3 stamps them. Task 3 fixes their **storage rule now** (projected from the column, refused as metadata) so compat-3 cannot inherit two sources of truth. |
+| gc's **ralph/scope loop expansion** (`.iteration.N` steps, `gc.kind: ralph`/`scope`, `gc.attempt`) | gc expands check/retry loops **at COMPILE** into namespaced steps (1523 for 99 formulas); **camp keeps them as RUNTIME loops** (`PendingCheck`, `create_attempt`). A pre-existing architectural difference, **not** changed here — and why a full step-list diff against gc is structurally impossible (Task 11 scopes around it). |
 
 ---
 
 ## The measured seed table
 
-Re-derived by simulating camp's **full rule set** (pipeline + S-rules as amended), not key-set
-containment. Reproduce with `ci/gc-compat/rungs.py <corpus>` (Task 2 adds it).
+Re-derived by simulating the **real** pipeline (extends-**merged** key sets; value-aware refusals
+evaluated **after** pruning). Arbiter: `ci/gc-compat/rungs.py`.
 
-| rung | key set added (§9) | **loadable** | rev-1 claim (wrong) |
+| rung | key set added (§9) | **loadable** | rev-2 (wrong) |
 |---|---|---|---|
-| 2a | dead keys ignored; annotations; `contract`; `description_file`; step `metadata` (incl. `gc.run_target`) | **2** | 2 |
+| 2a | dead keys ignored; annotations; `contract`; `description_file`; step `metadata` | **2** | 2 |
 | 2b | `vars`, `condition` | **31** | 31 |
-| 2c | `extends` | **57** | 58 |
-| 2d | `type`, `template`, `expand`, `expand_vars`, `children` | **83** | 84 |
-| **2e** | **`drain`** | **95** ← the ceiling | 97 |
-| | **RUNNABLE** (`contract = "graph.v2"` ∧ `type != "expansion"`) | **62** | *never pinned* |
+| 2c | `extends` | **49** | 57 |
+| 2d | `type`, `template`, `expand`, `expand_vars`, `children` | **76** | 83 |
+| **2e** | **`drain`** | **95** ← the ceiling | 95 |
+| | **RUNNABLE** | **62** | 62 |
 
-**The 5 formulas camp cannot load, each for a reason §9 did not anticipate:**
+**Why 2c/2d moved:** camp resolves `extends` at stage 2 and validates at stage 6, so it validates the
+**MERGED** step list. **Eight formulas inherit a late-rung key ONLY from a parent** —
+`build-from-convoy`, `build-from-decompose-base`, `build-from-decompose`, `build-from-plan-base`,
+`build-from-plan`, `build-from-requirements-base`, `build-from-requirements` (all inherit **`drain`**)
+and `github-issue-fix` (inherits **`expand`** + **`expand_vars`**). **Independently corroborated by gc:**
+the corpus *authors* 12 separate drain steps and gc *compiles* **19** — the seven extra are inherited.
 
-| file | refusal | note |
-|---|---|---|
-| `gastown/formulas/mol-digest-generate.toml` | `phase` (= `"vapor"`) | §9's 2 vapor formulas… |
-| `pr-pipeline/formulas/mol-pr-from-issue.formula.toml` | `phase` (= `"vapor"`) | …in `pr-pipeline`, not gastown |
-| `gascity/formulas/design-review.formula.toml` | step metadata `gc.kind = "scope"` (+ `gc.scope_name`/`gc.scope_role`/`gc.scope_ref`) | §9's scope-check formula. **`gc.scope_kind` does not exist anywhere in the corpus** — rev 1 fabricated it (B3). |
-| **`gascity/formulas/same-session-implement.formula.toml`** | `drain.context = "shared"` | **NEW.** §9 and rev 1 both assert all shared drains sit behind `{{drain_policy}} == same-session`. **12 do. This one has NO `condition`** — nothing prunes it. |
-| **`gastown/formulas/mol-polecat-work.toml`** | `extends` → `mol-polecat-base` **does not exist in the corpus** | **NEW.** The parent ships inside gc's binary-embedded core pack, which `gascity-packs` does not distribute. An unresolvable parent is a hard error (invariant 5). |
+**The 5 camp cannot load:**
 
-**95 < §9's declared 97–98. That is a real spec contradiction, and Task 1 amends the spec to the
-measured truth** (`AGENTS.md`: spec and code never silently diverge).
-
-Corroborating: `contract = "graph.v2"` 79 / absent 21 · `[requires]` in exactly 4 · 36 top-level
-steps use `check`/`retry`/`on_complete` (50 counting template steps) and **all** declare
-`contract` · `version` 93 · `target_required` 64 · `internal` 40 · top-level `mode` 7 ·
-top-level `single_lane` 6 · `sling_container_mode` 1 · `catalog` 17 · formula-level `metadata` 16
-· **step `assignee`: 0** (routing is *exclusively* step metadata) · **0 bare route values** · 25
-drain steps (12 `separate`, 13 `shared`; all 25 `member_access = "exclusive"`; `on_item_failure`
-and `item.single_lane` appear **only** on the 13 shared ones) · **no two of the 100 share a
-basename** (so one camp root imports all 10 formula-bearing packs with no within-tier collision).
-
----
-
-## File Structure
-
-**Created:** `formula/keys.rs` (the value-aware key table + the §9 rung table) · `formula/layers.rs`
-(`FormulaLayers` — search path + origin tier) · `formula/compose.rs` (the pipeline) ·
-`formula/drain.rs` (the `Drain` AST + refusals) · `camp-core/tests/compose.rs` +
-`tests/fixtures/compose/**` · `camp/tests/cli_doctor_corpus.rs` · `camp/tests/daemon_drain.rs` ·
-**`ci/gc-compat/rungs.py`** (the independent arbiter, B8) · **`ci/gc-compat/formula_gate.py`** (the
-§10 gate: runs the real binary) · **`ci/gc-compat/gc_compile_json.go`** + **`ci/gc-compat/differential.py`**
-(the gc oracle, Ruling 3) · `ci/gc-compat/README.md` (the drift procedure).
-
-**Modified:** `formula/{parse,ast,validate,mod,cook,runtime}.rs` · `ledger/{schema,fold,refold,mod}.rs`
-· `event.rs` · `vocab.rs` · `readiness.rs` · `orders/mod.rs` · `camp/src/cmd/{doctor,sling,create}.rs`
-· `camp/src/main.rs` · `camp/src/daemon/{dispatch,orders}.rs` (**additive**) ·
-`camp-core/tests/{refold_prop,formula_corpus,cook}.rs` · `camp/tests/{cli_doctor_formula,daemon_orders}.rs`
-· `tests/fixtures/formulas/{valid,invalid}/**` · `.github/workflows/ci.yml` · the two spec docs.
+| file | refusal |
+|---|---|
+| `gastown/formulas/mol-digest-generate.toml` | `phase` (`= "vapor"`) |
+| `pr-pipeline/formulas/mol-pr-from-issue.formula.toml` | `phase` (`= "vapor"`) |
+| `gascity/formulas/design-review.formula.toml` | step metadata `gc.kind = "scope"` / `gc.scope_*` (**`gc.scope_kind` does not exist in the corpus**) |
+| `gascity/formulas/same-session-implement.formula.toml` | `drain.context = "shared"` — **UNCONDITIONAL**; 12 of the 13 shared drains are pruned by `{{drain_policy}}`, this one has no `condition`. **gc compiles it; camp deliberately refuses it.** |
+| `gastown/formulas/mol-polecat-work.toml` | `extends → mol-polecat-base`, absent from the corpus. **gc fails it too** — gc compiles 99/100. |
 
 ---
 
 # Tasks
 
-## Task 1: The three camp-local rules that refuse the corpus, and the spec amendments
+## Task 0: The gc oracle shim — BUILD IT FIRST (RULING 5)
 
-**Measured** (all reproduced independently by the plan gate):
+**Nothing else in this plan may be trusted until this runs.** Rev 2's Task 11 was meant to stop
+source-read errors and was itself a source-read; four of its fidelity claims were false.
 
-| rule | where | how it refuses the corpus |
+**Files:** create `ci/gc-compat/factshim.go`
+
+- [ ] **Step 1: Write the shim.** `usage: factshim <corpus-root> [formula-name]`. Walk the corpus for
+  every `*/formulas` dir (**all 10 — cross-pack `extends` needs them; with fewer, 33/100 fail and
+  every count is wrong**, F9), sort them into `searchPaths`, and call the entry point
+  `camp_corpus_validate.go` already uses:
+  `formula.CompileWithoutRuntimeVarValidation(ctx, name, layers, nil)`. With a name →
+  `json.MarshalIndent` the `*Recipe`. Without → compile all; print `FAIL <name>: <err>` and a summary
+  (step count, drain steps by context, `{{`-residuals in Title/Description/Metadata).
+- [ ] **Step 2: Run it; pin the baseline.**
+```bash
+mkdir -p /tmp/gascity/cmd/factshim && cp ci/gc-compat/factshim.go /tmp/gascity/cmd/factshim/main.go
+(cd /tmp/gascity && go build -o /tmp/factshim ./cmd/factshim)
+/tmp/factshim /tmp/gcpacks
+```
+  **Expected, exactly:** `layers=10 formulas=100 OK=99 FAIL=1` (`mol-polecat-work`) · `steps 1523` ·
+  `drain_steps 20` (`separate 19`, `shared 1`) · `resid_desc 567` · `resid_title 1` ·
+  `resid_md_gc.run_target 55` · `resid_md_gc.continuation_group 14`.
+  **If any number differs, STOP and report to the lead — the pin moved.**
+- [ ] **Step 3: Commit** — `"ci(gc-compat): factshim — gc's real compiler as this phase's oracle"`
+
+---
+
+## Task 1+2: The three camp-local rules, the value-aware key table, D2′, the fixture corpus
+
+*(Merged — BD7: Task 2's `parse_and_validate` needs Task 4's types and Task 1's tests need Task 2's
+`Origin`. One commit, one `cargo test --workspace`.)*
+
+**Files:** `formula/validate.rs` · create `formula/keys.rs` · `parse.rs` (replace `CITY_ONLY_*` /
+`ACCEPTED_*`, :42-87, and both key loops) · `ast.rs` · `formula/mod.rs` (**incl. the module doc**) ·
+`event.rs`, `vocab.rs`, `fold.rs` · `tests/formula_corpus.rs`, `tests/fixtures/formulas/**` · create
+`ci/gc-compat/rungs.py` · `docs/design/…:449` · the compat spec §9 addendum
+
+### The three camp-local rules (measured)
+
+| rule | site | corpus impact |
 |---|---|---|
-| **S2** — formula name == file stem | `validate.rs:34-50` | Corpus files are `<name>.formula.toml` ⇒ stem `bmad-build.formula` ≠ name `bmad-build`. **92/100 violate.** (compat-1's `orders::resolve_formula` **already** accepts both spellings — the resolver and validator disagree today.) |
-| **S3** — at least one step | `validate.rs:52-57` | **25/100 have no `steps` key.** 11 inherit steps via `extends` (fine — validate runs after extends, at stage 8). **14 are `type = "expansion"`: template-only, and they NEVER have steps.** |
-| **S11** — graph-only construct requires `[requires] formula_compiler` | `validate.rs:178-191`; **master spec line 449** | **Only 4/100 declare `[requires]`**, while 36 use `check`/`retry`/`on_complete`. **All 36 declare `contract = "graph.v2"`** — gc's own compiler declaration. |
-
-**Files:** `crates/camp-core/src/formula/validate.rs` · `docs/design/2026-07-05-gas-camp-design.md:449`
-· `docs/superpowers/specs/2026-07-12-gas-city-pack-compatibility-design.md` (§9 addendum)
-
-**Interfaces produced:**
-```rust
-// validate.rs
-/// The canonical stem: file name minus `.toml`, minus an optional trailing
-/// `.formula`. 92 of the 100 corpus formulas are `<name>.formula.toml`
-/// declaring `formula = "<name>"`; compat-1's `orders::resolve_formula`
-/// already resolves both spellings.
-pub(crate) fn formula_stem(path: &Path) -> Option<&str>;
-```
-`RawFormula` gains `pub contract: Option<String>` and `pub kind: Option<String>` (the top-level
-`type`) — one line each in `parse::walk`; S3 and S11 cannot be expressed without them.
-
-- [ ] **Step 1: Write the failing tests** (in `validate.rs`'s `mod tests`)
+| **S2** name == file stem | `validate.rs:34-50` | **92/100 violate** — files are `<name>.formula.toml`. compat-1's `orders::resolve_formula` already accepts both spellings: **resolver and validator disagree today.** |
+| **S3** ≥1 step | `validate.rs:52-57` | **25/100 have no `steps`** — 11 inherit via `extends` (fine: validate runs after the merge), **14 are `type = "expansion"` and never have steps**. |
+| **S11** graph-only ⇒ `[requires] formula_compiler` | `validate.rs:178-191`; **master spec line 449** | only **4/100** declare `[requires]`; **36 use `check`/`retry`/`on_complete` and ALL 36 declare `contract = "graph.v2"`**. |
 
 ```rust
-#[test]
-fn the_corpus_file_naming_satisfies_the_stem_rule() {
-    assert_eq!(formula_stem(Path::new("/p/bmad-build.formula.toml")), Some("bmad-build"));
-    assert_eq!(formula_stem(Path::new("/p/mol-digest-generate.toml")), Some("mol-digest-generate"));
-    assert_eq!(formula_stem(Path::new("/p/formula.toml")), Some("formula"),
-               "`.formula` is stripped only as a SUFFIX, never as the whole stem");
-}
-
-#[test]
-fn an_expansion_formula_needs_no_steps() {
-    // S3 amended: 14 corpus formulas are `type = "expansion"` — template-only,
-    // and they never have `steps`. Rev 1 missed this rule entirely.
-    let text = "formula = \"e\"\ntype = \"expansion\"\ncontract = \"graph.v2\"\n\
-                [[template]]\nid = \"t\"\ntitle = \"T\"\n";
-    let (raw, mut v) = crate::formula::parse::walk(text, Origin::CampLocal);
-    check(&raw, Some("e"), &mut v);
-    assert!(!v.iter().any(|v| v.message.contains("at least one step")), "{v:?}");
-}
-
-#[test]
-fn a_non_expansion_formula_with_no_steps_is_still_a_violation() {
-    let text = "formula = \"e\"\ncontract = \"graph.v2\"\n";
-    let (raw, mut v) = crate::formula::parse::walk(text, Origin::CampLocal);
-    check(&raw, Some("e"), &mut v);
-    assert!(v.iter().any(|v| v.message.contains("at least one step")), "{v:?}");
-}
-
-#[test]
-fn contract_graph_v2_satisfies_the_compiler_declaration_rule() {
-    // S11 amended: master spec line 449. All 36 corpus formulas using
-    // graph-only constructs declare `contract`; NONE declares [requires].
-    let text = "formula = \"x\"\ncontract = \"graph.v2\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n\
-                [steps.retry]\nmax_attempts = 2\n";
-    let (raw, mut v) = crate::formula::parse::walk(text, Origin::CampLocal);
-    check(&raw, Some("x"), &mut v);
-    assert!(!v.iter().any(|v| v.message.contains("formula_compiler")), "{v:?}");
-}
-
-#[test]
-fn a_graph_only_construct_with_neither_declaration_is_still_a_violation() {
-    let text = "formula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n\
-                [steps.retry]\nmax_attempts = 2\n";
-    let (raw, mut v) = crate::formula::parse::walk(text, Origin::CampLocal);
-    check(&raw, Some("x"), &mut v);
-    assert!(v.iter().any(|v| v.message.contains("formula_compiler")), "{v:?}");
-}
-```
-
-*(Task 1 lands before Task 2's `Origin` parameter exists. Write `walk(text)` here and add the
-`Origin` argument in Task 2 — or land Task 2's `walk` signature first. The plan orders Task 1
-first because its rules are what let the corpus load at all; if the implementer prefers, Tasks 1
-and 2 may be merged into one commit. **Do not skip either.**)*
-
-- [ ] **Step 2: Run and watch them fail**
-  `cargo test -p camp-core --lib formula::validate 2>&1 | tail -20`
-  Expected: `formula_stem` not found; then the `.formula.toml` case fails; S3 and S11 tests fail
-  with the violation present.
-
-- [ ] **Step 3: Implement**
-
-```rust
+/// file name minus `.toml`, minus an optional trailing `.formula`.
 pub(crate) fn formula_stem(path: &Path) -> Option<&str> {
     let stem = path.file_name()?.to_str()?.strip_suffix(".toml")?;
     Some(stem.strip_suffix(".formula").unwrap_or(stem))
 }
 ```
-Route S2's call site (`formula/mod.rs:24`, which computes `stem`) through it.
+S3 → `if raw.steps.is_empty() && raw.kind.as_deref() != Some("expansion") { …existing violation… }`,
+plus *"an `type = \"expansion\"` formula must declare at least one `[[template]]` step"*.
+S11 → `raw.formula_compiler.is_some() || raw.contract.as_deref() == Some("graph.v2")` — strictly
+wider, so no merged formula loses its verdict.
 
-**S3** — the "at least one step" check becomes:
-```rust
-// An `type = "expansion"` formula supplies `template` steps for `expand`; it
-// declares no `steps` and is not directly runnable (compat §9). 14 corpus
-// formulas — every one of them.
-let is_expansion = raw.kind.as_deref() == Some("expansion");
-if raw.steps.is_empty() && !is_expansion { /* the existing violation */ }
-if is_expansion && raw.template.is_empty() {
-    out.push(Violation { construct: "template".into(),
-        message: "a `type = \"expansion\"` formula must declare at least one [[template]] step".into() });
-}
-```
-
-**S11** — the predicate becomes strictly wider (so no merged formula loses its verdict):
-```rust
-let declares_compiler =
-    raw.formula_compiler.is_some() || raw.contract.as_deref() == Some("graph.v2");
-```
-Message: `"a graph-only construct (check/retry/on_complete/drain) requires a compiler declaration:
-either contract = \"graph.v2\" (Gas City's spelling) or [requires] formula_compiler (master spec
-§8.2 as amended by compat §9)"`. Update `check-without-requires`'s expectations if the text is
-asserted.
-
-- [ ] **Step 4: Run and watch them pass** — `cargo test -p camp-core --lib formula:: 2>&1 | tail -10`
-
-- [ ] **Step 5: Amend the specs**
-
-`docs/design/2026-07-05-gas-camp-design.md` **line 449** — replace the cell with:
-
-> `| `formula`, `description`, `contract = "graph.v2"` **or** `[requires] formula_compiler = ">=2.0.0"` | file header; camp requires a compiler declaration for graph-only constructs — **either** Gas City's `contract` **or** the `[requires]` form. *(Amended 2026-07-13, compat phase 2: 36 of 100 corpus formulas use graph-only constructs; all declare `contract`, none declares `[requires]`.)* |`
-
-`docs/superpowers/specs/2026-07-12-gas-city-pack-compatibility-design.md` — append to §9:
-
-```markdown
-**§9 addendum (compat phase 2, 2026-07-13) — MEASURED at `GCPACKS_REF` by running camp's own rule
-set over the corpus. It CORRECTS this section.**
-
-- **The ceiling is 95, not 97–98.** §9's "97–98" counted only `phase = "vapor"` (2) and
-  `scope-check` (1). Three further formulas cannot load, for reasons §9 did not anticipate:
-
-  | file | why |
-  |---|---|
-  | `gascity/formulas/same-session-implement.formula.toml` | an **UNCONDITIONAL** `context = "shared"` drain. §9 states all shared drains sit behind `{{drain_policy}} == same-session`; **12 of the 13 do — this one has no `condition`**, so nothing prunes it and camp refuses it (§9's own "REFUSED, loudly"). |
-  | `gastown/formulas/mol-polecat-work.toml` | `extends = ["mol-polecat-base"]`, a parent that **exists nowhere in `gascity-packs`** (it ships inside gc's binary-embedded core pack). An unresolvable parent is a hard error (invariant 5). |
-  | `gascity/formulas/design-review.formula.toml` | the scope-check formula. Its scope-ness lives **entirely in step-metadata VALUES** — `gc.kind = "scope"`, `gc.scope_name`, `gc.scope_role`, `gc.scope_ref`. **There is no `gc.scope_kind` key in the corpus.** |
-
-- **Per-rung LOADABLE counts, pinned by the gate:** 2a **2** · 2b **31** · 2c **57** · 2d **83** ·
-  2e **95**.
-- **RUNNABLE = 62**, pinned separately. "Corpus loading" means **compiles**, not **runnable**: the
-  21 no-contract formulas and the 14 `type = "expansion"` formulas compile (they are inside the 95)
-  and are refused at **run** time by `camp sling` **and by the daemon's order-fire path**, with a
-  `formula.refused` ledger event. Any reading that excluded them from the load count would cap the
-  ceiling at 76 and contradict this section's own 97–98.
-- **Three camp-local rules were refusing the corpus and are amended:** the file-stem rule strips an
-  optional trailing `.formula` (92/100 files are `<name>.formula.toml`); **`type = "expansion"`
-  formulas declare `template`, not `steps`** (14/100 — the "at least one step" rule no longer
-  applies to them); and the compiler-declaration rule is satisfied by `contract = "graph.v2"` as
-  well as by `[requires] formula_compiler` (master spec line 449, amended in the same change).
-- **The permissiveness rule (§4) is scoped BY ORIGIN.** Unrecognised keys are ignored-and-warned in
-  **imported pack layers** and are a **hard error in camp's own `<root>/formulas/`**. camp *can*
-  tell them apart — the formula's layer is known. Ignoring a `dependson` typo in an operator's own
-  formula would silently reorder their graph (invariant 5). Known-dead gc keys (`version`,
-  `target_required`, `internal`, top-level `mode`/`single_lane`, `sling_container_mode`) are
-  ignored-and-warned in **both** tiers.
-- **gc's convoy is camp's run.** A drain's members (gc `internal/dispatch/drain.go:211`,
-  `convoycore.Members`) are the run's member beads: `run_id = <run>`, `step_id IS NULL`,
-  `type = 'task'`, not the root, no `bond:`/`drain:` label. `camp create --run <run_id>` adds one.
-- **`description_file` is resolved at PARSE time, BEFORE `{{var}}` substitution** (gc
-  `parser.go:186-190`), so inlined contents **are** substituted — which is exactly what the >4096
-  pointer prompt's `## Formula Variables` block is for.
-- **Fidelity is VERIFIED, not asserted.** `ci/gc-compat/differential.py` compiles all 100 formulas
-  in **the real gc compiler** and in camp and diffs the results (step lists and order, descriptions,
-  metadata, drain specs). The pointer prompt, gc's drain defaulting, the `extends` merge, `expand`,
-  and condition-pruning are checked against gc's *behaviour*, not its source.
-- **Deferred, by name:** `drain.max_units`, `drain.continuation_group`, `advice`, `pointcuts` (all
-  §4 rule 1 refusals; 0 corpus uses each). §9's "`advice`/`pointcuts` are dropped entirely"
-  describes **gc's `extends` merge**, not camp's acceptance.
-```
-
-- [ ] **Step 6: Full gates and commit**
-```bash
-cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace 2>&1 | tail -20
-git add -A && git commit -m "fix(formula): the stem, expansion-steps and compiler-declaration rules accept the gc corpus"
-```
-Any *other* test that breaks is asserting the old rules — fix it here.
-
----
-
-## Task 2: The key table (value-aware), D2′, the refusal event, and the fixture corpus
-
-**Files:** create `formula/keys.rs`, `ci/gc-compat/rungs.py` · modify `parse.rs` (replace
-`CITY_ONLY_*`/`ACCEPTED_*`, :42-87, and the key loops at :228-236 and :318-335), `ast.rs`,
-`formula/mod.rs` (**incl. its module doc — D2′ inverts it**), `event.rs`, `vocab.rs`, `fold.rs`,
-`tests/formula_corpus.rs`, `tests/fixtures/formulas/**`
-
-**Interfaces produced:**
+### `keys.rs`
 
 ```rust
-// formula/keys.rs
-
-/// Where a key sits. §4 trap 1 — "key off NESTING, never name": top-level
-/// `mode`/`single_lane` are DEAD; `steps.check.check.mode` and
-/// `steps.drain.item.single_lane` are load-bearing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// §4 trap 1 — key off NESTING, never name. Top-level `mode`/`single_lane` are
+/// DEAD; `steps.check.check.mode` and `steps.drain.item.single_lane` are load-bearing.
 pub enum Site { Top, Step, Check, CheckInner, Retry, OnComplete, Drain, DrainItem }
 
-/// Which tier a formula came from. D2′ — the permissiveness rule is scoped by
-/// ORIGIN, and `FormulaLayers` knows the origin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// D2′ — the permissiveness rule is scoped by ORIGIN, and FormulaLayers knows it.
 pub enum Origin { Imported, CampLocal }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
     Accepted,
-    /// gc has semantics camp does not implement → refuse, naming the key (rule 1).
-    Refused,
-    /// A real gc key with NO semantics in gc → ignore + warn, in BOTH tiers (rule 2).
-    DeadInGc,
-    /// Pure annotation → ignore silently (rule 3).
-    Annotation,
-    /// Recognised by nobody. Imported ⇒ ignore + warn. Camp-local ⇒ HARD ERROR (D2′).
-    Unknown,
+    Refused,     // gc semantics camp does not implement → §4 rule 1
+    DeadInGc,    // a real gc key with NO gc semantics → ignore+warn, BOTH tiers
+    Annotation,  // silent, both tiers
+    Unknown,     // recognised by nobody. Imported ⇒ ignore+warn. CampLocal ⇒ HARD ERROR.
 }
-
 pub fn classify(site: Site, key: &str) -> Class;
 
-/// The VALUE-AWARE refusal layer (B3). `classify` alone cannot express
-/// `phase = "vapor"`, nor a scope-check hiding in step-metadata VALUES.
+/// The VALUE-AWARE refusal layer. `classify` alone cannot express `phase = "vapor"`
+/// nor a scope-check hiding in step-metadata VALUES. STEP-SCOPED when the site is a
+/// step — see BD2.
 pub fn refuse(site: Site, key: &str, value: &toml::Value, at: &str) -> Option<Refusal>;
 
-#[derive(Debug, Clone, Copy)]
-pub struct Rung { pub id: &'static str, pub top: &'static [&'static str], pub step: &'static [&'static str] }
-pub const RUNGS: &[Rung] = &[ /* §9's table, verbatim — Step 3 */ ];
-```
-
-```rust
-// formula/ast.rs
-/// A key camp REFUSES (§4 rule 1). Distinct from `Violation` (a shape or
-/// semantic error). Both make a formula fail to compile; only a Refusal names
-/// a Gas City construct camp deliberately does not implement.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Refusal { pub construct: String, pub key: String, pub reason: String }
-
-/// FormulaError now carries BOTH lists (B7 — a Refusal is not a Violation, and
-/// `parse_and_validate` must Err on either).
-#[derive(Debug)]
-pub struct FormulaError {
-    pub path: PathBuf,
-    pub violations: Vec<Violation>,
-    pub refusals: Vec<Refusal>,
-}
-impl FormulaError {
-    /// True when any violation or refusal names `construct` — the predicate
-    /// `formula_corpus.rs`'s REJECTIONS table uses.
-    pub fn names(&self, construct: &str) -> bool;
-}
-```
-
-### The value-aware refusal rules (B3) — real keys only
-
-| site | key | condition | refusal key reported |
-|---|---|---|---|
-| `Top` | `phase` | **any value** | `phase` |
-| `Step` | `metadata` | the map has `gc.kind = "scope"` | `gc.kind` |
-| `Step` | `metadata` | the map has any `gc.scope_*` key | that key |
-| `Drain` | `context` | value == `"shared"` | `context` |
-| `Drain` | `continuation_group` / `max_units` | present | that key |
-
-**`phase` refuses on the KEY, not the value.** §9 writes `phase = "vapor"` and **the corpus contains
-only `vapor`** (measured), so the two are indistinguishable in practice — and refusing the key
-preserves camp's *merged* behaviour (`parse.rs:44` already lists `phase` in `CITY_ONLY_TOP`; rev 1's
-table silently **deleted** that refusal). The reason string names the value it saw. This cannot
-regress and cannot under-refuse.
-
-**Metadata is `Accepted` as a KEY (§4 trap 3 — it is routing) and its VALUES are inspected.**
-`gc.run_target` is honoured (routing, Task 4); `gc.kind = "scope"` and `gc.scope_*` are refused;
-**`gc.kind = "cleanup"` — also in `design-review` — is NOT refused.** Every other metadata key rides
-along untouched (invariant 7).
-
-Corpus-wide, the entire scope surface is (measured, verbatim): `gc.kind=scope` ×1,
-`gc.scope_name=design-review` ×1, `gc.scope_role=body` ×1, `gc.scope_ref=body` ×2,
-`gc.scope_role=member` ×1 — **all inside `design-review.formula.toml`**.
-
-### Fixture disposition (B7) — the exact fate of all 55 REJECTIONS rows
-
-`crates/camp-core/tests/formula_corpus.rs` holds a 55-row table over 52 invalid fixtures, plus
-`assert_eq!(on_disk, in_table)` and a hard-coded 5-name list for `valid/`. Rewriting the parser
-without rewriting this file walls the implementer at Step 9 with ~30 unexplained failures.
-
-**(a) STILL REJECTED — row unchanged** (D2′ and D4 are what save these):
-`phase`, `pour`, `compose`, `advice`, `pointcuts` (D4), `gate`, `loop`, `waits-for`, `tally`,
-`depends-on` — §4 rule 1 refusals; **`unknown-key` (`dependson`) and `nested-unknown-key`** — these
-are **camp-local** fixtures, and **D2′ keeps unrecognised keys a hard error in the camp-local
-tier**; **`type-step-level`** — gc formula-v2 has no step `type` (0 corpus uses) ⇒ `Unknown` ⇒
-camp-local hard error; and **every semantic row** (`dup-step-id`, `unknown-needs-id`, `cycle`, the
-five `requires.*` rows, `check-without-requires`, `check-with-retry`, `check-with-assignee`,
-`retry-with-on-complete`, `for-each-not-output`, `on-complete-missing-bond`,
-`parallel-and-sequential`, `timeout-without-check`, `check-mode-not-exec`, `check-zero-attempts`,
-`retry-zero-attempts`, `bad-on-exhausted`, `name-stem-mismatch`, `missing-title`,
-`multi-violation`).
-
-The assertion changes from `err.violations.iter().any(|v| v.construct == c)` to **`err.names(c)`**,
-so refusals count too. `multi_violation_fixture_reports_every_problem_at_once` likewise.
-
-**(b) DELETED from `invalid/` AND from the table — the key is now ACCEPTED (16 rows):**
-`extends`, `vars`, `type-top-level`, `contract`, `catalog`, `template`, `drain`, `expand`,
-`expand-vars`, `children`, `condition`, `metadata`, `description-file`, `priority`, `tags`, `notes`.
-Delete the `.toml` files and the rows **together** — `assert_eq!(on_disk, in_table)` enforces the
-pair.
-
-**(c) `valid/` grows** (Task 10 adds them, so the invariant-6 gate compiles them with real gc):
-`vars-condition`, `extends-parent`, `drain-separate`. Update the hard-coded list in
-`every_valid_fixture_is_accepted`. **`extends-child` and `expansion` do NOT go in `valid/`** — the
-child needs a parent *layer* and the expansion formula is compiled *standalone* by the gc shim; both
-live in `tests/fixtures/compose/` (Task 10 explains why).
-
-**`parse_and_validate` survives** with an unchanged signature, as the **no-layer, camp-local** entry
-point:
-```rust
-pub fn parse_and_validate(path: &Path) -> Result<Formula, FormulaError> {
-    compose::compile(&FormulaLayers::local_only(path), &CampConfig::default(), path)
-        .map(|c| c.formula)          // Err when violations OR refusals is non-empty
-}
-```
-A formula needing layers (`extends`, an `../assets/` `description_file`) fails there, naming what it
-needed — correct: those fixtures live in `tests/compose.rs`.
-
-- [ ] **Step 1: Write the failing tests** — `formula/keys.rs`'s `mod tests`
-
-```rust
-#[test]
-fn classify_matches_section_4s_permissiveness_table() {
-    use {Class::*, Site::*};
-    // rule 2 — DEAD in gc (93/100 formulas name at least one).
-    for k in ["version","target_required","internal","mode","single_lane","sling_container_mode"] {
-        assert_eq!(classify(Top, k), DeadInGc, "top {k}");
-    }
-    // trap 1 — the SAME names are load-bearing when nested.
-    assert_eq!(classify(CheckInner, "mode"), Accepted);
-    assert_eq!(classify(DrainItem, "single_lane"), Accepted);
-    // trap 3 — step metadata is ROUTING, not annotation.
-    assert_eq!(classify(Step, "metadata"), Accepted);
-    assert_eq!(classify(Top, "metadata"), Annotation);
-    for k in ["notes","catalog"] { assert_eq!(classify(Top, k), Annotation); }
-    // rule 1 — gc semantics camp does not implement (D4 puts advice/pointcuts here).
-    for k in ["pour","compose","advice","pointcuts"] { assert_eq!(classify(Top, k), Refused); }
-    for k in ["gate","loop","tally","waits_for","depends_on"] { assert_eq!(classify(Step, k), Refused); }
-    // Unrecognised — a DIFFERENT class from DeadInGc. D2′ treats them differently BY ORIGIN.
-    assert_eq!(classify(Step, "dependson"), Unknown);
-    assert_eq!(classify(Top, "wat"), Unknown);
-    assert_eq!(classify(Step, "type"), Unknown, "gc formula-v2 has no step `type`; 0 corpus uses");
-}
-
-#[test]
-fn the_rung_table_is_section_9s_table_verbatim() {
-    // B9: rev 1 looped `assert classify(k) == Accepted`, which was TRUE BY
-    // CONSTRUCTION (accepted_top is DEFINED as base ∪ RUNGS) and could never
-    // fail. Assert against a literal transcription of §9 instead.
-    let expect: &[(&str, &[&str], &[&str])] = &[
-        ("2a", &["contract"],         &["description_file", "metadata"]),
-        ("2b", &["vars"],             &["condition"]),
-        ("2c", &["extends"],          &[]),
-        ("2d", &["type", "template"], &["expand", "expand_vars", "children"]),
-        ("2e", &[],                   &["drain"]),
-    ];
-    assert_eq!(RUNGS.len(), expect.len());
-    for (r, (id, top, step)) in RUNGS.iter().zip(expect) {
-        assert_eq!(r.id, *id);
-        assert_eq!(r.top, *top, "rung {id} top");
-        assert_eq!(r.step, *step, "rung {id} step");
-    }
-}
-
-#[test]
-fn phase_is_refused_by_key_and_the_reason_names_the_value() {
-    // B3: rev 1 put `phase` in NO table, so it fell through to the ignore
-    // catch-all — DELETING a refusal merged camp already has (parse.rs:44).
-    let r = refuse(Site::Top, "phase", &toml::Value::String("vapor".into()), "phase")
-        .expect("phase is refused");
-    assert_eq!(r.key, "phase");
-    assert!(r.reason.contains("vapor"), "{}", r.reason);
-}
-
-#[test]
-fn a_scope_check_hiding_in_step_metadata_values_is_refused() {
-    // B3: design-review's scope-ness is ENTIRELY in metadata VALUES. There is
-    // NO `gc.scope_kind` key anywhere in the corpus — rev 1 invented it.
-    let md: toml::Value = toml::from_str(
-        "\"gc.kind\" = \"scope\"\n\"gc.scope_name\" = \"design-review\"\n\"gc.scope_role\" = \"body\"\n"
-    ).unwrap();
-    let r = refuse(Site::Step, "metadata", &md, "steps.body.metadata").expect("scope is refused");
-    assert_eq!(r.key, "gc.kind");
-    assert!(r.reason.contains("scope"), "{}", r.reason);
-}
-
-#[test]
-fn a_cleanup_kind_and_a_run_target_are_not_refused() {
-    // design-review's `finalize` step also carries gc.kind = "cleanup"; ONLY
-    // `scope` is refused. And gc.run_target is ROUTING (trap 3), never refused.
-    let md: toml::Value = toml::from_str(
-        "\"gc.kind\" = \"cleanup\"\n\"gc.run_target\" = \"gc.run-operator\"\n").unwrap();
-    assert!(refuse(Site::Step, "metadata", &md, "steps.finalize.metadata").is_none());
-}
-```
-
-And in `parse.rs`'s `mod tests`:
-
-```rust
-#[test]
-fn an_unknown_key_is_ignored_in_an_IMPORTED_layer_and_fatal_in_the_CAMP_LOCAL_one() {
-    // D2′ (Ruling 2). camp CAN tell them apart — FormulaLayers knows the origin.
-    let text = "formula = \"x\"\nbogus = 1\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ndependson = [\"b\"]\n";
-
-    let (raw, v) = walk(text, Origin::Imported);
-    assert!(v.is_empty(), "an imported pack's unknown keys must not be fatal: {v:?}");
-    assert!(raw.ignored_keys.contains(&"bogus".to_owned()));
-    assert!(raw.ignored_keys.contains(&"dependson".to_owned()));
-
-    let (_, v) = walk(text, Origin::CampLocal);
-    // `dependson` silently ignored in the operator's OWN formula would reorder
-    // their graph. Invariant 5.
-    assert!(v.iter().any(|v| v.construct == "dependson"), "{v:?}");
-    assert!(v.iter().any(|v| v.construct == "bogus"), "{v:?}");
-}
-
-#[test]
-fn a_key_dead_in_gc_is_ignored_in_BOTH_tiers() {
-    // 93/100 corpus formulas name at least one. A camp formula may carry them
-    // to stay portable — they are real gc keys, not typos.
-    let text = "formula = \"x\"\nversion = \"1\"\ntarget_required = true\ninternal = true\n\
-                mode = \"solo\"\nsingle_lane = true\nsling_container_mode = \"x\"\n\
-                [[steps]]\nid = \"a\"\ntitle = \"t\"\n";
-    for origin in [Origin::Imported, Origin::CampLocal] {
-        let (raw, v) = walk(text, origin);
-        assert!(v.is_empty(), "{origin:?}: {v:?}");
-        assert_eq!(raw.ignored_keys.len(), 6, "{origin:?}: {:?}", raw.ignored_keys);
-    }
-}
-
-#[test]
-fn annotations_are_silent_in_both_tiers() {
-    let text = "formula = \"x\"\nnotes = \"hi\"\n[catalog]\nx = 1\n[metadata]\ny = \"z\"\n\
-                [[steps]]\nid = \"a\"\ntitle = \"t\"\n";
-    for origin in [Origin::Imported, Origin::CampLocal] {
-        let (raw, v) = walk(text, origin);
-        assert!(v.is_empty() && raw.ignored_keys.is_empty(), "{origin:?}");
-    }
-}
-
-#[test]
-fn a_refused_key_names_itself_in_both_tiers() {
-    let text = "formula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ngate = { path = \"x\" }\n";
-    for origin in [Origin::Imported, Origin::CampLocal] {
-        let (raw, _) = walk(text, origin);
-        let r = raw.refusals.iter().find(|r| r.key == "gate").expect("gate refusal");
-        assert!(r.construct.contains("steps.a"), "{}", r.construct);
-    }
-}
-```
-
-- [ ] **Step 2: Run and watch them fail** — `cargo test -p camp-core --lib formula:: 2>&1 | tail -20`
-
-- [ ] **Step 3: Implement `keys.rs`**
-
-`classify` is a pure nesting-scoped lookup. **There is no `else { Dead }` catch-all** — the
-fall-through is `Class::Unknown`, a **different** class from `DeadInGc`. That distinction is D2′'s
-entire mechanism, and it is what makes `DEAD_TOP` load-bearing rather than dead code.
-
-```rust
 pub const RUNGS: &[Rung] = &[
     Rung { id: "2a", top: &["contract"],         step: &["description_file", "metadata"] },
     Rung { id: "2b", top: &["vars"],             step: &["condition"] },
@@ -736,264 +354,265 @@ pub const RUNGS: &[Rung] = &[
     Rung { id: "2d", top: &["type", "template"], step: &["expand", "expand_vars", "children"] },
     Rung { id: "2e", top: &[],                   step: &["drain"] },
 ];
+
+/// Accepted by the table, NOT YET IMPLEMENTED by the pipeline. Each of Tasks 5–8
+/// removes its own keys; TASK 8 DELETES THIS CONST AND ITS VIOLATION. Without it an
+/// accepted key silently compiles to nothing — §4 trap 3 — and every intermediate
+/// rung count is a lie.
+pub const UNIMPLEMENTED: &[&str] = &[
+    "vars", "condition",                                     // Task 5 removes
+    "extends",                                               // Task 6 removes
+    "type", "template", "expand", "expand_vars", "children", // Task 7 removes
+    "drain",                                                 // Task 8 removes
+];
 ```
 
-**The `unimplemented` scaffold.** A key accepted by the table but not yet implemented by the
-pipeline must NOT silently compile to nothing. `RawFormula.unimplemented: Vec<String>` records them
-and `validate::check` turns each into a hard `Violation`. Tasks 5–8 each remove their own keys;
-**Task 8 deletes the field.** This is what makes every intermediate rung count real.
+### **BD2 — refusals are STEP-SCOPED and die with their step**
 
-- [ ] **Step 4: Implement the parse-side changes**
-
-`walk(text, origin)`. `RawFormula` gains `contract`, `kind`, `template: Vec<RawStep>`, `vars`,
-`extends`, `ignored_keys: Vec<String>` (deduped, sorted), `refusals: Vec<Refusal>`,
-`unimplemented: Vec<String>`. One shared key loop replaces both existing ones:
+Rev 2 called `keys::refuse` from `walk_keys` at **stage 1** and pushed into a flat, formula-level
+`Vec<Refusal>` **nothing ever re-filtered**. Because 19 formulas carry a *conditional* `same-session`
+drain arm (12 authored + 7 inherited), **every one would refuse at parse ⇒ ceiling 76, not 95** —
+taking `bmad-build`, `gstack-build` and `compound-build` with it. Rev 2 asserted the correct answer in
+a **test comment** and specified the opposite mechanism.
 
 ```rust
-fn walk_keys(site: Site, origin: Origin, table: &toml::Table, at: &dyn Fn(&str) -> String,
-             ignored: &mut Vec<String>, refusals: &mut Vec<Refusal>, out: &mut Vec<Violation>) {
-    for key in sorted_keys(table) {
-        if let Some(r) = keys::refuse(site, key, &table[key], &at(key)) { refusals.push(r); continue; }
-        match keys::classify(site, key) {
-            Class::Accepted | Class::Annotation => {}
-            Class::Refused  => refusals.push(Refusal { construct: at(key), key: key.into(),
-                                                       reason: refusal_reason(site, key) }),
-            Class::DeadInGc => ignored.push(key.to_owned()),
-            Class::Unknown  => match origin {                          // D2′
-                Origin::Imported  => ignored.push(key.to_owned()),
-                Origin::CampLocal => out.push(unknown(&at(key), key)), // the merged message
-            },
-        }
+pub struct Refusal {
+    pub construct: String,
+    pub key: String,
+    pub reason: String,
+    /// Some(step_id) ⇒ belongs to a STEP; DISCARDED with it when the step is pruned
+    /// (stage 5) or replaced in place by `extends` (stage 2).
+    /// None ⇒ formula-level (e.g. `phase`) — never discarded.
+    pub step: Option<String>,
+}
+```
+Pruning drops every refusal whose `step` left the surviving set; **stage 6 collects only survivors**.
+Corroborated by gc: it prunes the same 12 (13 authored shared drains → **1** compiled).
+
+**What this fix could newly break:** a refusal carried from a **parent** step that the child
+**replaces in place**. Test: `a_refusal_on_a_parent_step_that_the_child_replaces_is_discarded` (Task 6).
+
+### The value-aware refusal rules — real keys only
+
+| site | key | condition | reported key | scope |
+|---|---|---|---|---|
+| `Top` | `phase` | any value | `phase` | formula |
+| `Step` | `metadata` | map has `gc.kind = "scope"` | `gc.kind` | step |
+| `Step` | `metadata` | map has any `gc.scope_*` key | that key | step |
+| `Drain` | `context` | `== "shared"` | `context` | step |
+| `Drain` | `continuation_group` / `max_units` | present | that key | step |
+
+`phase` refuses on the **key** (all corpus uses are `vapor`; this preserves the merged refusal at
+`parse.rs:44`, which rev 2's table silently deleted). **`gc.kind = "cleanup"` is NOT refused** — only
+`scope`. `gc.run_target`, `gc.continuation_group`, `gc.build.*`, `gc.on_fail` ride through untouched.
+*(gc's **compiler** emits `gc.kind: scope` on generated ralph-loop bodies — measured in `bmad-build`'s
+Recipe. Camp inspects the **AUTHORED** metadata, where only `design-review` carries it, and generates
+no scope steps.)*
+
+### Fixture disposition (B7 + **BD6**)
+
+`tests/formula_corpus.rs` holds a **52**-row table over **52** invalid fixtures + `assert_eq!(on_disk,
+in_table)` + a 5-name `valid/` list.
+
+- **STILL REJECTED, row unchanged:** `phase`, `pour`, `compose`, `advice`, `pointcuts`, `gate`,
+  `loop`, `waits-for`, `tally`, `depends-on`; **`unknown-key`, `nested-unknown-key`,
+  `type-step-level`** (D2′ keeps unrecognised keys fatal in the camp-local tier); and every semantic
+  row. **The assertion becomes `err.names(c)`** (a `Refusal` is not a `Violation`).
+- **DELETED — file *and* row (16):** `extends`, `vars`, `type-top-level`, `contract`, `catalog`,
+  `template`, `drain`, `expand`, `expand-vars`, `children`, `condition`, `metadata`,
+  `description-file`, `priority`, `tags`, `notes`.
+- **`multi-violation.toml` — BD6.** It carries step-level `tags = ["x"]`, which **becomes accepted**,
+  so the fixture yields **3** violations + 1 refusal and both `names("tags")` and
+  `violations.len() >= 5` fail — inside the answer to B7. **Replace `tags = ["x"]` with
+  `gate = { path = "x" }`** (still refused) and rewrite the test:
+```rust
+#[test]
+fn multi_violation_fixture_reports_every_problem_at_once() {
+    let err = parse_and_validate(&corpus("invalid").join("multi-violation.toml")).unwrap_err();
+    for construct in ["pour", "steps.a.gate", "formula", "steps.a.needs", "steps.a.timeout"] {
+        assert!(err.names(construct), "missing {construct:?} in:\n{err}");
     }
+    assert_eq!(err.violations.len(), 3, "{err}");   // formula-stem, needs, timeout
+    assert_eq!(err.refusals.len(), 2, "{err}");     // pour, gate
 }
 ```
-`refusal_reason` returns the `tally` message **verbatim** from parse.rs:324-329 for `tally`; else
-`"`{key}` is a Gas City construct camp does not implement; camp refuses rather than silently
-approximating (compat §4 rule 1)"`.
+- **`valid/` grows** (Task 10): `vars-condition.toml`, `extends-parent.toml`, `drain-separate.toml`.
 
-- [ ] **Step 5: The `formula.refused` event**
+`FormulaError` gains `refusals: Vec<Refusal>` and `names(&self, construct: &str) -> bool`.
+**`FormulaError::Display` (ast.rs:116-126) must render refusals too** — it currently prints only
+violations, so a refusal-only error (`phase`) would print *"0 violation(s):"* and list nothing, and
+both `camp doctor --formula`'s human mode and several `err.to_string().contains(…)` assertions read
+that string.
 
-Verified: gc's pinned vocabulary (`tests/fixtures/gc-vocab.json`, 71 events) has **no** `formula.*`
-event ⇒ safely camp-specific (`check_vocab.sh` enforces no collision). Verified:
-`vocab.rs::no_reservation_vocabulary_exists` scans **event names only** ⇒ the metadata key
-`gc.exclusive_drain_reservation` is safe, but **no event may ever be named `drain.reserved`**
-(Task 9 depends on this).
+**`parse_and_validate` survives** with its signature, as the **no-layer, camp-local** entry:
+`compose::compile(&FormulaLayers::local_only(path), &CampConfig::default(), path, &BTreeMap::new())`,
+returning `Err` when violations **or** refusals is non-empty.
 
-`event.rs`: `EventType::FormulaRefused` → `"formula.refused"` (enum + `ALL` + `as_str`).
-`vocab.rs`: add to `CAMP_SPECIFIC_EVENTS`. `fold.rs`: a log-only validating arm, `check_passed` mold:
+### `ci/gc-compat/rungs.py` — the arbiter (BD1), and its scope stated honestly
 
-```rust
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FormulaRefused { formula: String, path: String, key: String, construct: String, reason: String }
+**It simulates the pipeline it arbitrates.** Rev 2's claim that it modelled *"camp's FULL rule set"*
+was false.
 
-/// Log-only: a formula camp refused to COMPILE or to RUN, naming the key.
-/// compat §4 rule 1; §5.4 "Every refusal ... appends a ledger event."
-fn formula_refused(_conn: &Connection, event: &Event) -> Result<(), CoreError> {
-    let p: FormulaRefused = payload(event)?;
-    non_empty(event, "formula", &p.formula)?;
-    non_empty(event, "key", &p.key)?;
-    non_empty(event, "reason", &p.reason)?;
-    Ok(())
-}
-```
-No state effect ⇒ the refold property stays trivially green **for this event** (unlike `bead_meta`,
-Task 3).
+> **In scope:** the extends chain (merged key sets; cycles; missing parents), the value-aware refusals
+> (incl. condition-pruning of shared drains under merged vars), the §4 rule-1 key refusals, and
+> cumulative rung key-set containment over the **recursively merged** step tree (`steps` + `template`
+> + `children`).
+> **Out of scope, and therefore NOT certified by it:** S2/S3/S11, route/binding resolution,
+> `description_file` resolution, the `{name}` grammar, expansion depth, `needs` validity after
+> pruning. Those are pinned by `cargo test` and by `formula_gate.py` driving the **real binary**.
 
-- [ ] **Step 6: Rewrite `tests/formula_corpus.rs`** per the disposition above (delete 16 fixtures +
-  rows; switch to `err.names(c)`; update the `valid/` list in Task 10).
-
-- [ ] **Step 7: Amend `formula/mod.rs`'s module doc.** It says camp "rejects every city-only
-  construct by name and accepts no unknown keys, where gc silently ignores them." That sentence is
-  now **false**. Replace it with D2′'s rule. *(AGENTS.md: spec and code never silently diverge.)*
-
-- [ ] **Step 8: Write `ci/gc-compat/rungs.py` — the independent arbiter (B8)**
-
-It implements **§9's text**, not camp's `RUNGS` table, so the two can disagree and be caught. The
-counting rule, as pseudocode — this is the rule rev 1 left as prose, and two implementers would
-have written two scripts and got two numbers:
-
+The four base sets, **stated literally** — rev 2 referenced them and never defined them, and a
+panelist reproduced the seeds only after supplying them from `parse.rs:74-87`; with plausible guesses
+the counts collapsed to 0·0·11·25·25:
 ```python
-# For each of the 100 corpus formulas F and each cumulative rung set R = {2a..r}:
-#
-#   ACCEPTED(R) = BASE_TOP ∪ BASE_STEP ∪ (⋃ rung.top ∪ rung.step for rung in R)
-#
-#   F is LOADABLE at r  iff ALL of:
-#     (1) no VALUE-AWARE refusal fires:
-#           `phase` present;  OR  a step (RECURSIVELY — incl. `template` and
-#           `children`) whose metadata has gc.kind == "scope" or any gc.scope_*;
-#           OR  (drain ∈ ACCEPTED(R)) AND a step whose drain.context == "shared"
-#               AND that step SURVIVES condition pruning under the merged vars
-#               (parent defaults first, child overrides win);
-#           OR  drain.continuation_group / drain.max_units present.
-#     (2) no rule-1 KEY refusal: pour/compose/advice/pointcuts (top);
-#           gate/loop/tally/waits_for/depends_on (step).
-#     (3) (extends ∈ ACCEPTED(R)) ⇒ every parent in the transitive chain RESOLVES
-#           by bare name across all 10 packs, and the chain is acyclic.
-#     (4) every REMAINING key of F — top-level, and on every step reached
-#           RECURSIVELY through `steps`, `template` and `children` — is in
-#           ACCEPTED(R) ∪ DEAD ∪ ANNOTATION.
-#           * DEAD and ANNOTATION keys are EXCLUDED from this check. Without
-#             that exclusion 2a = 0, not 2.
-#           * NESTED sites (check.*, retry.*, on_complete.*, drain.item.*) are
-#             NOT walked — §9's rungs are top-level and step-level keys only.
-#
-#   COUNT(r) = |{F : LOADABLE at r}|
-#     The 5 refused formulas are IN the denominator (100) and OUT of every count.
-#
-#   RUNNABLE = |{F loadable at 2e : F.contract == "graph.v2" and F.type != "expansion"}|
+BASE_TOP  = {"description", "formula", "requires", "steps"}
+BASE_STEP = {"assignee", "check", "description", "id", "needs", "on_complete", "retry",
+             "timeout", "title"}
+DEAD_TOP  = {"version", "target_required", "internal", "mode", "single_lane",
+             "sling_container_mode"}
+ANNO_TOP  = {"notes", "catalog", "metadata"}
+ANNO_STEP = {"notes", "tags", "priority"}
 ```
-Expected output: `2a 2 · 2b 31 · 2c 57 · 2d 83 · 2e 95 · RUNNABLE 62`, and the 5 refused named.
-
-- [ ] **Step 9: Run every test; run the arbiter**
-```bash
-cargo test -p camp-core 2>&1 | tail -20
-cargo test -p camp-core --test vocab_pin --test refold_prop 2>&1 | tail -6
-git clone -q https://github.com/gastownhall/gascity-packs /tmp/gcpacks \
-  && git -C /tmp/gcpacks checkout -q "$(cat ci/gc-compat/GCPACKS_REF)"
-python3 ci/gc-compat/rungs.py /tmp/gcpacks
+```python
+# ACCEPTED(R) = BASE_TOP ∪ BASE_STEP ∪ (⋃ rung.top ∪ rung.step for rung in R)
+# MERGED(F)   = F's keys ∪ EVERY ancestor's keys, over the RECURSIVE step tree
+#               (steps + template + children).                              <-- BD1
+# F LOADABLE at r iff:
+#   (1) the extends chain resolves and is acyclic;
+#   (2) no formula-level refusal (`phase`);
+#   (3) no step-level refusal ON A SURVIVING STEP — a step whose `condition` is false
+#       under the MERGED vars (parent defaults first, child overrides win) is PRUNED,
+#       and its refusals die with it;                                       <-- BD2
+#   (4) MERGED(F) ⊆ ACCEPTED(R) ∪ DEAD ∪ ANNOTATION.
+#       DEAD/ANNOTATION are EXCLUDED from the check (else 2a = 0, not 2).
+#       Nested sites (check.*, retry.*, on_complete.*, drain.item.*) are NOT walked.
+# RUNNABLE = |{F loadable at 2e : contract == "graph.v2" and type != "expansion"}|
 ```
-Expected: the seed table, exactly. **If it differs, STOP — the pin moved or a rule is wrong.
-`rungs.py` is the arbiter; never edit a seed to match code.**
+Expected: **`2a 2 · 2b 31 · 2c 49 · 2d 76 · 2e 95 · RUNNABLE 62`**, and the 5 refused named.
 
-- [ ] **Step 10: Full gates and commit**
-```bash
-cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace 2>&1 | tail -20
-git add -A && git commit -m "feat(formula): the permissiveness rule — value-aware keys, origin-scoped strictness (compat §4)"
+- [ ] **Steps:** failing tests → run → watch fail → implement → run → pass.
+  `keys.rs`: `classify_matches_section_4s_table` · `the_rung_table_is_section_9s_table_verbatim`
+  (asserted against a **literal transcription**, not by construction — rev 2's version was true by
+  construction and could never fail) · `phase_is_refused_by_key_and_the_reason_names_the_value` ·
+  `a_scope_check_hiding_in_step_metadata_values_is_refused` ·
+  `a_cleanup_kind_and_a_run_target_are_not_refused` · `a_step_scoped_refusal_carries_its_step_id`.
+  `parse.rs`: `an_unknown_key_is_ignored_in_an_IMPORTED_layer_and_fatal_in_the_CAMP_LOCAL_one` ·
+  `a_key_dead_in_gc_is_ignored_in_BOTH_tiers` · `annotations_are_silent_in_both_tiers`.
+  `validate.rs`: the three rule tests.
+- [ ] Add `EventType::FormulaRefused` → `"formula.refused"` (+ `ALL`, `as_str`,
+  `CAMP_SPECIFIC_EVENTS`, a log-only `deny_unknown_fields` fold arm). **Verified:** gc's 71-event
+  vocabulary has no `formula.*`; `no_reservation_vocabulary_exists` scans **event names only** (the
+  metadata key is safe; **no event may ever be named `drain.reserved`**).
+- [ ] Rewrite `formula_corpus.rs` per the disposition; amend `formula/mod.rs`'s module doc (it says
+  camp *"accepts no unknown keys, where gc silently ignores them"* — **D2′ inverts that sentence**).
+- [ ] Write `rungs.py`; run it; expect the seed table exactly.
+- [ ] Amend **master spec line 449** and append the **§9 addendum** (below).
+- [ ] Gates; commit — `"feat(formula): the permissiveness rule — value-aware, step-scoped, origin-scoped (compat §4)"`
+
+### The §9 addendum (append to the compat spec, in this task)
+
+```markdown
+**§9 addendum (compat phase 2, 2026-07-13) — MEASURED by RUNNING gc's compiler
+(`ci/gc-compat/factshim.go`) and camp's own rule set over the corpus at `GCPACKS_REF`.
+It CORRECTS this section.**
+
+- **The ceiling is 95, not 97–98.** Beyond `phase = "vapor"` (2) and the scope-check formula (1), two
+  more cannot load: `gascity/formulas/same-session-implement.formula.toml` (an **UNCONDITIONAL**
+  `context = "shared"` drain — §9 assumes all 13 shared drains sit behind
+  `{{drain_policy}} == same-session`; **12 do**), and `gastown/formulas/mol-polecat-work.toml`
+  (`extends → mol-polecat-base`, absent from the corpus — **gc fails it too**; gc compiles 99/100).
+  The scope-check formula's scope-ness lives entirely in step-metadata VALUES (`gc.kind = "scope"`,
+  `gc.scope_*`) — **there is no `gc.scope_kind` key in the corpus.**
+- **Per-rung LOADABLE counts:** 2a **2** · 2b **31** · 2c **49** · 2d **76** · 2e **95** — computed
+  over the **extends-MERGED** step tree. Eight formulas inherit a late-rung key only from a parent
+  (7 inherit `drain`, 1 inherits `expand`/`expand_vars`); gc corroborates — 12 authored separate drain
+  steps compile to 19.
+- **RUNNABLE = 62**, pinned separately. "Corpus loading" means **compiles**, not **runnable**: the 21
+  no-contract and 14 `type = "expansion"` formulas compile and are refused at **run** time by all
+  three cook entry points (`camp sling`, the order-fire path, the drain's item cook).
+- **Three camp-local rules were refusing the corpus and are amended:** the file-stem rule strips an
+  optional trailing `.formula` (92/100); `type = "expansion"` formulas declare `template`, not `steps`
+  (14/100); and the compiler-declaration rule is satisfied by `contract = "graph.v2"` (master spec
+  line 449, amended in the same change).
+- **§4's permissiveness rule is scoped BY ORIGIN:** unrecognised keys are ignored+warned in imported
+  pack layers and are a **hard error** in camp's own `<root>/formulas/`.
+
+- **⚠️ §9's SUBSTITUTION-ASYMMETRY BULLET IS WRONG, and is replaced.** Measured in gc's compiled
+  output: **`{{var}}` is NOT substituted at compile at all** — 567 residual Descriptions, 55 residual
+  `gc.run_target` routes, 1 residual Title, **even where the var has a default**. Substitution happens
+  at **instantiation** (`stepToBead`), over **every field and every metadata value, with NO exemption
+  list** (`molecule.go:1035-1037`) — **including `check.path`** (→ `gc.check_path`, `ralph.go:76`)
+  **and `drain.formula`** (→ `gc.drain_formula`, `compile.go:590`). A templated `drain.formula` is
+  blocked **separately, by a validation reject** (`graphv2_validation.go:417-419`), not by
+  substitution scoping.
+  **AND gc has a SECOND grammar §9 never mentions:** single-brace **`{name}`** (`range.go:32`, applied
+  inside `expandStep`, `expand.go:255`) is **FULLY RESOLVED AT COMPILE** — 435 corpus occurrences, of
+  which 362 are the fixed `{target}` family and the rest are general vars **including 8 `gc.run_target`
+  routes**. So §2's *"0 bare route values, corpus-wide"* is also wrong: **8 route sites are
+  single-brace and resolve at compile.** Camp reproduces both stages exactly.
+- **⚠️ §9's DRAIN RUNTIME BULLET IS WRONG, and is replaced.** *"`item.single_lane` — camp honours it
+  mechanically: the drain's ready items enter dispatch with concurrency 1"* is a source-read mistake.
+  Measured: **`single_lane` has ZERO production readers in gc** (`types.go:371` — *"reserved for future
+  shared drains"*; its only readers are the compiler that writes it and the validator), and
+  **`on_item_failure` is read ONLY by `advanceSharedDrain`** (`drain.go:467`), so **for
+  `context = "separate"` gc is ALWAYS effectively `continue`**. gc's separate drain is **EAGER and
+  ALL-OR-NOTHING**: `reserveDrainMembers` takes the **whole member set** before the materialize loop
+  (`drain.go:113-118`, `:1212-1219`); a conflict closes the drain with **nothing materialized**. Camp
+  matches gc: `single_lane` and `on_item_failure` are **parsed, validated and round-tripped into
+  `gc.drain_*` metadata with no runtime behavior behind them.** Camp also honours gc's **runtime cap**:
+  `max_units` defaults to **100** and a drain whose member set exceeds it **fails**
+  (`drain.go:24`, `:244-255`, reason `limit_exceeded`).
+- **The metadata key `gc.continuation_group` (29 authored uses) is distinct from the `drain.` key
+  (0 uses).** The former is **accepted and carried verbatim**; camp does not honour it (§11.4).
+  `gc.build.artifact_schema` / `gc.build.artifact_path_keys` (74/74) and `gc.on_fail` (1) likewise —
+  **accepted fidelity costs**, named.
+- **A run's pinned artifact is the COMPILED recipe** (`runs/<id>/recipe.json`), beside the authored
+  source (`<formula>.toml`, kept verbatim for audit). campd reloads the recipe by deserialization; it
+  never re-parses the authored file, which for an imported formula could not resolve its layers.
+- **gc expands check/retry loops at COMPILE** into namespaced `.iteration.N` steps (1523 compiled steps
+  for 99 formulas); **camp keeps them as RUNTIME loops.** A full step-list diff against gc is therefore
+  structurally impossible; `ci/gc-compat/differential.py` scopes to what is comparable.
 ```
 
 ---
 
-## Task 3: Bead metadata — the store, the refold wiring, and the schema bump
+## Task 3: Bead metadata — the store, the refold wiring, the schema bump
 
-camp has **no bead metadata**. §9 requires the drain reservation *"where gc stores it: as metadata on
-the member bead (`gc.exclusive_drain_reservation`, `beadmeta/keys.go:93`)"*, verbatim. §4 trap 3
-requires step metadata to survive onto the bead. compat-3 needs the same door. Build it once — and
-**wire it into refold**, which rev 1 did not (B1).
+**Files:** `ledger/{schema,fold,refold,mod}.rs` · `readiness.rs` · `main.rs` + `cmd/create.rs` ·
+`tests/refold_prop.rs`
 
-**Files:** `ledger/schema.rs` · `ledger/fold.rs` · **`ledger/refold.rs`** · `ledger/mod.rs` ·
-`readiness.rs` · `camp/src/main.rs` + `cmd/create.rs` · `tests/refold_prop.rs`
-
-**Interfaces produced:**
 ```rust
-// readiness.rs — pure, connection-scoped (usable inside the cursor txn)
+// readiness.rs
 pub fn bead_metadata(conn: &Connection, bead: &str) -> Result<BTreeMap<String, String>, CoreError>;
-
-/// gc's key, VERBATIM (beadmeta/keys.go:93; invariant 7). Value = the reserving
-/// drain's anchor bead id.
+/// gc's key VERBATIM (beadmeta/keys.go:93; invariant 7). Value = the reserving drain's anchor id.
 pub const EXCLUSIVE_DRAIN_RESERVATION: &str = "gc.exclusive_drain_reservation";
-
-/// Metadata keys that have a DEDICATED COLUMN. They are PROJECTED from the
-/// column at read time and REFUSED at write time, naming the column — so
-/// compat-3 (§6.1) inherits ONE source of truth, not two.
+/// Keys with a DEDICATED COLUMN: PROJECTED at read, REFUSED at write, naming the column —
+/// so compat-3 (§6.1) inherits ONE source of truth, not two.
 pub const PROJECTED_METADATA: &[(&str, &str)] =
     &[("gc.routed_to", "assignee"), ("gc.work_branch", "work_branch")];
-
-// ledger/mod.rs
-pub fn bead_metadata(&self, bead: &str) -> Result<BTreeMap<String, String>, CoreError>;
 ```
+`bead.created` gains `metadata: BTreeMap<String,String>` (default `{}`); `bead.updated` gains
+`metadata: BTreeMap<String, Option<String>>` (null = unset), and its emptiness check becomes "title
+and/or description **and/or metadata**".
 
-Event shapes (both events already exist — additive):
-```jsonc
-// bead.created — `metadata` is new, default {}
-{ "title": "...", "metadata": { "gc.run_target": "gc.run-operator" }, ... }
-// bead.updated — `metadata` is new; a null value UNSETS. The existing
-// "must set title and/or description" check becomes "...or metadata".
-{ "metadata": { "gc.exclusive_drain_reservation": "cmp-12" } }   // set
-{ "metadata": { "gc.exclusive_drain_reservation": null } }        // release
-```
+**The CAS lives in the fold** *(ratified twice)*: `fold::apply` already makes state-dependent
+acceptance decisions (fold.rs:234-236); `append` is one transaction that rolls back on `Err`
+(ledger/mod.rs:982 — *"rejections appended nothing"*); `build_shadow` (refold.rs:110-120) replays the
+**accepted** log through the **same** `fold::apply`. The CAS is therefore a pure function of the
+accepted prefix. A read-then-append would be a real TOCTOU race.
 
-**The compare-and-set lives in the FOLD.** *(Attacked at the gate and RATIFIED: `fold::apply` already
-makes state-dependent acceptance decisions (`bead_updated` rejects on UnknownBead, fold.rs:234-236);
-`append` is one transaction that rolls back on Err (ledger/mod.rs:982 — "rejections appended
-nothing"); `build_shadow` (refold.rs:110-120) replays the **accepted** log in seq order through the
-**same** `fold::apply`. So the CAS's outcome is a pure function of the accepted event prefix —
-exactly what the refold property demands. A read-then-append would be a genuine TOCTOU race between
-two drains.)*
-
-- [ ] **Step 1: Write the failing tests**
-
-In `fold.rs`'s `mod tests` (`meta_update(bead, json)` is a new local helper beside the existing ones):
-
-```rust
-#[test]
-fn bead_created_carries_metadata_and_bead_updated_sets_and_unsets_it() {
-    let (mut l, _t) = ledger();
-    l.append(bead_created_input("b-1", json!({ "gc.run_target": "gc.run-operator" }))).unwrap();
-    assert_eq!(l.bead_metadata("b-1").unwrap()["gc.run_target"], "gc.run-operator");
-    l.append(meta_update("b-1", json!({ "x": "1" }))).unwrap();
-    let m = l.bead_metadata("b-1").unwrap();
-    assert_eq!(m["x"], "1");
-    assert_eq!(m["gc.run_target"], "gc.run-operator", "a set must not clobber");
-    l.append(meta_update("b-1", json!({ "x": null }))).unwrap();
-    assert!(!l.bead_metadata("b-1").unwrap().contains_key("x"));
-}
-
-#[test]
-fn a_second_drain_cannot_reserve_a_held_member() {
-    // compat §9: "never two drains mutating one bead."
-    let (mut l, _t) = ledger();
-    l.append(bead_created_input("m-1", json!({}))).unwrap();
-    let reserve = |who: &str| meta_update("m-1", json!({ EXCLUSIVE_DRAIN_RESERVATION: who }));
-    l.append(reserve("drain-a")).unwrap();
-    let err = l.append(reserve("drain-b")).unwrap_err();
-    assert!(err.to_string().contains("gc.exclusive_drain_reservation"), "{err}");
-    assert!(err.to_string().contains("drain-a"), "the holder must be named: {err}");
-    l.append(reserve("drain-a")).unwrap();          // idempotent for the SAME holder
-    l.append(meta_update("m-1", json!({ EXCLUSIVE_DRAIN_RESERVATION: null }))).unwrap();
-    l.append(reserve("drain-b")).unwrap();          // released ⇒ takeable
-}
-
-#[test]
-fn a_metadata_key_with_a_dedicated_column_is_projected_at_read_and_refused_at_write() {
-    // ONE source of truth for compat-3 (§6.1): `beads` already has
-    // `work_branch` and `assignee`.
-    let (mut l, _t) = ledger();
-    l.append(bead_created_input("b-1", json!({}))).unwrap();
-    let err = l.append(meta_update("b-1", json!({ "gc.work_branch": "camp/b-1" }))).unwrap_err();
-    assert!(err.to_string().contains("work_branch"), "names the column: {err}");
-    l.append(work_branch_update("b-1", "camp/b-1")).unwrap();      // the existing path
-    assert_eq!(l.bead_metadata("b-1").unwrap()["gc.work_branch"], "camp/b-1");
-}
-
-#[test]
-fn bead_updated_still_requires_at_least_one_field() {
-    let (mut l, _t) = ledger();
-    l.append(bead_created_input("b-1", json!({}))).unwrap();
-    let err = l.append(EventInput { kind: EventType::BeadUpdated, rig: None, actor: "t".into(),
-                                    bead: Some("b-1".into()), data: json!({}) }).unwrap_err();
-    assert!(err.to_string().contains("title"), "{err}");
-}
-```
-
-In `tests/refold_prop.rs` — **the vacuity fix (B1c).** Rev 1 added `bead_meta` to `DUMPS` and
-declared victory; but `Op` emits **no metadata**, so both ledgers dump zero rows and the property
-passes while exercising **nothing** (the PR #79 bug class, verbatim). Add ops **and** the dump:
-
-```rust
-enum Op {
-    // ... existing Create/Claim/Update/Close/Woke/Stop/Crash ...
-    /// Plain metadata set/unset — exercises the bead_meta fold.
-    SetMeta { id: u8, key: u8, unset: bool },
-    /// The exclusive-reservation CAS — the ONLY real test of its determinism.
-    /// Deliberately generates CONFLICTS (two drains, one member): a rejected
-    /// append must append NOTHING, and the replay must reach an identical state.
-    Reserve { member: u8, drain: u8 },
-    Release { member: u8 },
-}
-```
-extend `op_strategy` to generate them, and add `("bead_meta", "bead_id, key, value")` to `DUMPS`.
-
-- [ ] **Step 2: Run and watch them fail**
-```bash
-cargo test -p camp-core --lib ledger::fold 2>&1 | tail -20
-cargo test -p camp-core --test refold_prop 2>&1 | tail -10
-```
-Expected: `bead_metadata` not found; `no such table: bead_meta`.
-
-- [ ] **Step 3: Schema + the version bump (B2)**
-
-`schema.rs`, in `STATE_DDL`, **after** `beads`:
+- [ ] **Step 1: Failing tests.** `bead_created_carries_metadata_and_bead_updated_sets_and_unsets_it` ·
+  `a_second_drain_cannot_reserve_a_held_member` (conflict names the holder; same-holder re-reserve is
+  idempotent; release-then-retake works) ·
+  `a_metadata_key_with_a_dedicated_column_is_projected_at_read_and_refused_at_write` ·
+  `bead_updated_still_requires_at_least_one_field`.
+  **`refold_prop.rs`: `Op` gains `SetMeta` / `Reserve` / `Release`** — `Reserve` **deliberately
+  generates conflicts** (a rejected append must append nothing; the replay must reach an identical
+  state) — **and `DUMPS` gains `("bead_meta", "bead_id, key, value")`.** Without the new ops the
+  property is **vacuous** (the PR #79 class): no op emits metadata, both ledgers dump zero rows, and
+  it passes while exercising nothing.
+- [ ] **Step 2: Run; watch fail.**
+- [ ] **Step 3: Schema + BOTH version sites (BD9).** In `STATE_DDL`, **after `beads`**:
 ```sql
 CREATE TABLE bead_meta (
   bead_id TEXT NOT NULL REFERENCES beads(id),
@@ -1003,798 +622,620 @@ CREATE TABLE bead_meta (
 ) STRICT;
 CREATE INDEX bead_meta_key ON bead_meta(key, value);
 ```
-(The index serves the query every drain expansion runs: *"is this member reserved?"*)
-
-**`SCHEMA_VERSION: 2 → 3`.** `bead_meta` is **fold truth**, not consumer bookkeeping — cp-0's own
-merged comment (schema.rs:97-107) states the rule verbatim: *"fold-state schema changes go through
-FULL_DDL_PREFIX + a SCHEMA_VERSION bump, which makes an existing camp fail to open so the operator
-re-inits (the v1 'no auto-upgrade' contract). Consumer-bookkeeping infrastructure tables like this
-one evolve additively."* Without the bump an existing camp.db opens **successfully** and then dies at
-the first `bead.created` with `no such table: bead_meta` — a late runtime failure where the codebase
-gives a fail-fast **open-time** one (invariant 5). **State the re-init consequence in the PR body.**
-
-- [ ] **Step 4: The fold**
-
-`BeadCreated` gains `#[serde(default)] metadata: BTreeMap<String, String>`; `BeadUpdated` gains
-`#[serde(default)] metadata: BTreeMap<String, Option<String>>`, and its emptiness check becomes
-`title.is_none() && description.is_none() && metadata.is_empty()`. Per entry:
-
-```rust
-// ONE source of truth (compat-3, §6.1): a key with a dedicated column is
-// projected at read time and refused here.
-if let Some((_, col)) = PROJECTED_METADATA.iter().find(|(k, _)| *k == key) {
-    return Err(CoreError::InvalidEventData { event_type: ..., reason: format!(
-        "bead {id}: metadata key {key:?} is projected from the `{col}` column and may not be \
-         written as metadata — set the column instead") });
-}
-match value {
-    None => { conn.execute("DELETE FROM bead_meta WHERE bead_id = ?1 AND key = ?2", (id, key))?; }
-    Some(v) => {
-        // compat §9's compare-and-set, ATOMIC with the event insert.
-        if key == EXCLUSIVE_DRAIN_RESERVATION {
-            if let Some(holder) = current_meta(conn, id, key)? {
-                if holder != *v {
-                    return Err(CoreError::InvalidEventData { event_type: ..., reason: format!(
-                        "bead {id}: {key} is already held by {holder:?}; a second drain may not \
-                         reserve a held member (compat §9)") });
-                }
-            }
-        }
-        conn.execute("INSERT INTO bead_meta (bead_id, key, value) VALUES (?1, ?2, ?3) \
-                      ON CONFLICT(bead_id, key) DO UPDATE SET value = excluded.value", (id, key, v))?;
-    }
-}
-```
-`bead_metadata(conn, bead)` reads `bead_meta` **and overlays the projections** from
-`beads.assignee` / `beads.work_branch` when non-NULL.
-
-- [ ] **Step 5: Wire refold (B1a, B1b) — the PRODUCTION constant, not just the test**
-
-`refold.rs::STATE_TABLES` (:28-60) is the real list; `diff_all` (:166-185) and
-`replace_state_from_shadow` (:142-163) iterate **only** it. Add, **positioned AFTER `beads`** so
-`.iter().rev()` deletes the child before the parent and the FK holds (`foreign_keys = ON`,
-schema.rs:126):
-
+  **`SCHEMA_VERSION` lives in TWO places and rev 2 bumped ONE:** `schema.rs:14`
+  (`pub const SCHEMA_VERSION: i64 = 2;`) **and `schema.rs:78`**, inside `FULL_DDL_PREFIX`:
+  `INSERT INTO meta (key, value) VALUES ('schema_version', '2');`. `init_schema` writes the **literal**
+  and returns early without verifying; every later open calls `verify_schema_version`, which compares
+  the **const**. With one bumped, **every freshly-initialized camp writes `'2'` and then fails to open
+  on its very next process** (`UnsupportedSchema { found: 2, supported: 3 }`). **Bump both, and the
+  module doc at `schema.rs:1`** (*"Schema v2 for camp.db"*). Test: `a_fresh_camp_reopens` (init, drop,
+  re-open).
+- [ ] **Step 4: The fold.** Projected-key refusal first; then `None ⇒ DELETE`; `Some ⇒` the reservation
+  CAS (a different holder ⇒ `InvalidEventData` naming it) then upsert. `bead_metadata` reads
+  `bead_meta` **and overlays** the projections from `beads.assignee` / `beads.work_branch`.
+- [ ] **Step 5: Refold — the PRODUCTION constant.** `refold.rs::STATE_TABLES` (:28-60) is the real
+  list; `diff_all` (:166-185) and `replace_state_from_shadow` (:142-163) iterate **only** it. Add
+  **after `beads`** (so `.iter().rev()` deletes the child first and the FK holds — `foreign_keys = ON`,
+  schema.rs:126):
 ```rust
 TableSpec { name: "bead_meta", cols: "bead_id, key, value", key: "bead_id || '/' || key" },
 ```
-Without this, `camp doctor --refold` never diffs a drain reservation, and **`--repair` HARD-FAILS**
-(`DELETE FROM main.beads` while `bead_meta` rows still reference them ⇒ `FOREIGN KEY constraint
-failed`) — breaking a merged, working, tested command the moment one bead carries metadata.
-
-- [ ] **Step 6: `camp create --run` + the `ready_task_count` fix**
-
-`main.rs`'s `Create`: `#[arg(long)] run: Option<String>` — *"Add this bead to a formula run as a
-MEMBER (gc's convoy member). A drain step scatters the run's members (compat §9)."* Thread into
-`bead.created`'s `run_id` (already folded). **Fail fast** on an unknown run:
-`bail!("no such run: {run}")`.
-
-`readiness.rs::ready_task_count` (:160) lacks the run-root exclusion that `dispatchable_beads`
-(:139) has, so every member would be counted "ready" forever and never dispatched — a permanently
-non-decreasing count in `camp top`. Add `AND NOT (b.run_id IS NOT NULL AND b.step_id IS NULL)`.
-Test: `a_run_member_is_never_ready_and_never_dispatchable`.
-
-- [ ] **Step 7: Run and watch them pass**
-```bash
-cargo test -p camp-core 2>&1 | tail -20
-cargo test -p camp-core --test refold_prop 2>&1 | tail -10   # NON-vacuous now: Reserve/Release replay
-cargo test -p camp 2>&1 | tail -10
-```
-
-- [ ] **Step 8: Full gates and commit**
-```bash
-cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace 2>&1 | tail -20
-git add -A && git commit -m "feat(ledger): bead metadata — refold-wired, schema 3, with the exclusive-reservation CAS"
-```
+  Without it, `--refold` never diffs a reservation and **`--repair` hard-fails** on the FK.
+- [ ] **Step 6: `camp create --run` + `ready_task_count`.** `#[arg(long)] run: Option<String>` on
+  `Create`, threaded into `bead.created`'s `run_id` (already folded); **fail fast** on an unknown run.
+  `readiness.rs::ready_task_count` (:160) lacks the run-root exclusion `dispatchable_beads` has
+  (**:141**), so every member would be "ready" forever and never dispatched. Add
+  `AND NOT (b.run_id IS NOT NULL AND b.step_id IS NULL)`. **This changes `camp top`'s ready count for
+  every existing run — say so in the PR body**; merged tests asserting a ready count after `camp sling`
+  will move.
+- [ ] **Step 7–8: Run; pass; gates; commit** —
+  `"feat(ledger): bead metadata — refold-wired, schema 3, exclusive-reservation CAS"`
 
 ---
 
-## Task 4: Rung 2a — the layered compiler, `description_file`, routing, the runnability refusal, and the gate
+## Task 4: Rung 2a — the layered compiler, the pinned recipe (BD8), `description_file`, the gate
 
 **Files:** create `formula/layers.rs`, `formula/compose.rs`, `tests/compose.rs`,
 `tests/fixtures/compose/**`, `camp/tests/cli_doctor_corpus.rs`, `ci/gc-compat/formula_gate.py` ·
-modify `formula/{mod,ast,parse,cook}.rs`, `orders/mod.rs`, `camp/src/cmd/{doctor,sling}.rs`,
-`camp/src/main.rs`, **`camp/src/daemon/orders.rs`** (B12), `camp/tests/cli_doctor_formula.rs`,
-`camp/tests/daemon_orders.rs`, `.github/workflows/ci.yml`
+modify `formula/{mod,ast,parse,cook,runtime}.rs`, `orders/mod.rs`, `cmd/{doctor,sling}.rs`, `main.rs`,
+`daemon/orders.rs`, `camp/tests/{cli_doctor_formula,daemon_orders}.rs`, `ci.yml`
 
-**Interfaces produced:**
 ```rust
-// formula/layers.rs
-/// The formula/asset search path, LOWEST → HIGHEST priority — compat-1's
-/// tiering: transitive imports < direct imports < camp-local `<root>/formulas/`.
-/// gc's `Parser.searchPaths` has this order and `winningAssetPath` takes the
-/// LAST match (gascity parser.go:855-873).
-pub struct FormulaLayers { layers: Vec<Layer> }   // Layer { binding, dir, origin }
-
+// layers.rs
+pub struct FormulaLayers { layers: Vec<Layer> }   // Layer { binding, dir, pack_root, origin }
 impl FormulaLayers {
     pub fn from_config(cfg: &CampConfig, root: &Path) -> Result<Self, CoreError>;
-    /// A single camp-local file with no import layers — what `parse_and_validate` uses.
     pub fn local_only(path: &Path) -> Self;
-    /// Which tier a formula FILE came from. D2′ keys off this.
-    pub fn origin_of(&self, path: &Path) -> Origin;
-    /// Bare name → file, highest layer wins. DELEGATES to compat-1's
-    /// `orders::resolve_formula` — do NOT write a second resolver.
-    pub fn formula_path(&self, name: &str) -> Result<PathBuf, CoreError>;
-    /// gc's asset shadowing, with camp's containment rule (below).
-    pub fn asset_path(&self, raw: &str, base_dir: &Path, pack_root: &Path)
-        -> Result<PathBuf, CoreError>;
+    pub fn origin_of(&self, path: &Path) -> Origin;                        // D2′
+    pub fn formula_path(&self, name: &str) -> Result<PathBuf, CoreError>;  // DELEGATES to orders::resolve_formula
+    pub fn asset_path(&self, raw: &str, base_dir: &Path) -> Result<PathBuf, CoreError>;
 }
 
-// formula/compose.rs
+// compose.rs
 pub struct Compiled {
-    pub formula: Formula,
+    pub formula: Formula,              // Serialize + Deserialize (D6)
     pub ignored_keys: Vec<String>,
-    /// Empty ⇒ it compiled.
-    pub refusals: Vec<Refusal>,
-    /// None ⇒ runnable. Some ⇒ it compiles and must NEVER be cooked (D1).
-    pub not_runnable: Option<Refusal>,
+    pub refusals: Vec<Refusal>,        // SURVIVING refusals only (BD2)
+    pub not_runnable: Option<Refusal>, // D1
 }
-pub fn compile(layers: &FormulaLayers, cfg: &CampConfig, path: &Path) -> Result<Compiled, FormulaError>;
-pub fn compile_named(layers: &FormulaLayers, cfg: &CampConfig, name: &str) -> Result<Compiled, FormulaError>;
+pub fn compile(layers: &FormulaLayers, cfg: &CampConfig, path: &Path,
+               vars_override: &BTreeMap<String, String>) -> Result<Compiled, FormulaError>;
+pub fn compile_named(layers: &FormulaLayers, cfg: &CampConfig, name: &str,
+                     vars_override: &BTreeMap<String, String>) -> Result<Compiled, FormulaError>;
 ```
-`Formula` gains `contract`, `kind`, `vars`; `Step` gains `metadata: BTreeMap<String,String>` and
-keeps `assignee` — **the route lands in `assignee`**.
+`vars_override` exists because **gc's `Compile` takes vars** and conditions + `{name}` resolve at
+compile: a sling-time `--var drain_policy=same-session` must change what is pruned. (`camp sling` has
+no `--var` today; the parameter is threaded now and passed empty, so compat-3/4 can add the flag
+without re-plumbing.)
 
-### The pipeline order — CORRECTED (B15). It is gc's, and it is not negotiable.
+### The pipeline — gc's real staging (D5)
 
 ```
-1. parse::walk(text, origin)                                (Task 2)
-2. extends resolution                                       (Task 6 — 2c)
-3. expansion: type/template/expand/expand_vars/children     (Task 7 — 2d)
-4. description_file resolution                              (THIS task — 2a)   ← gc: parser.go:186-190, at PARSE time
-5. vars merge + {{var}} substitution                        (Task 5 — 2b)      ← therefore inlined contents ARE substituted
-6. condition eval + prune (RECURSIVE into children)         (Task 5 — 2b)
-7. route: step metadata gc.run_target → assignee            (THIS task)
-8. validate::check (S1..S18) + refusals + runnability       (THIS task)
+1. parse::walk(text, origin)                                    Tasks 1+2
+2. extends: merge (deepest ancestor first; parents' steps APPEND;
+   a matching child id REPLACES IN PLACE, position preserved)   Task 6 — 2c
+3. expansion: type/template/expand/expand_vars/children,
+   + the {target} family, + single-brace {name} RESOLUTION      Task 7 — 2d   <- F4
+4. description_file: inline, or gc's >4096 pointer prompt       THIS TASK — 2a
+5. condition: evaluate over merged var VALUES; PRUNE the step
+   with its children AND ITS REFUSALS (BD2); drop dangling
+   `needs`. Recurses into `children` AND `template`.            Task 5 — 2b
+6. validate (S1..S18) + collect SURVIVING refusals + runnability THIS TASK
 ```
+**`{{var}}` is NOT substituted here — it is substituted in `cook` (Task 5).** Rev 2 substituted at
+compile and had no single-brace grammar at all.
 
-**Rev 1 had vars (4) before description_file (6) — backwards.** gc resolves `description_file` in the
-parser (`parser.go:186-190`) and applies `Substitute` later, so the inlined contents pass through
-substitution like any other description. That is exactly what the >4096 pointer prompt's
-`## Formula Variables` block is **for**: it emits `name="{{name}}"` lines *so substitution resolves
-them* for the worker. **Task 11's differential gate verifies this against real gc** — compilation
-succeeds either way, so no camp-only test can catch the wrong choice.
+In this task, stages 2/3/5 are identity stubs and `validate` hard-fails any formula whose merged key
+set touches `keys::UNIMPLEMENTED` — which is what makes the 2a count really **2**.
 
-In this task, stages 2/3/5/6 are **identity stubs** and `validate::check` hard-fails any formula with
-a non-empty `unimplemented` list — which is what makes the 2a count really **2**.
+### `description_file` — measured
 
-### `description_file` — verified in gc at `GASCITY_REF`
+- Contents **replace** `step.description` at parse time; the key is consumed (`parser.go:808`).
+- **`../assets/<rel>`** resolves **through the layers**, highest wins (`winningAssetPath`,
+  `parser.go:855-873`; `searchPaths` is lowest→highest and the **last** match wins). Anything else
+  resolves against the formula file's own directory.
+- **>4096 bytes ⇒ gc's pointer prompt** (`descriptionFileInlineMaxBytes = 4*1024`, `parser.go:27`;
+  `descriptionFileReferenceDescription`, `:977`). **Reproduce it byte-for-byte** — Task 11 diffs its
+  sha256 against gc's, because a mis-transcribed paragraph is a divergence no camp test can see. Its
+  `## Formula Variables` block emits `name="{{name}}"` lines **deliberately**: they resolve at **cook**,
+  which is exactly what D5 now does.
+- **All 328 targets resolve; 8 exceed 4096 bytes.** An unresolved `description_file` in a `graph.v2`
+  formula is a **hard error** (`parser.go:186`, `:1007`).
+- **Containment (security).** gc's non-asset branch is a bare `base_dir.join(raw)`. Camp imports
+  **arbitrary third-party packs**, so a pack could set `description_file = "../../../../.ssh/id_rsa"`
+  and have it inlined into a bead description a tool-enabled worker reads. Camp canonicalises and
+  **refuses any path outside the pack root**. **The containment root is the WINNING LAYER's pack root,
+  not the declaring formula's** — 32 cross-pack `extends` edges inherit a step whose asset lives in the
+  **parent's** pack, so anchoring on the declaring formula would refuse `bmad-build` inheriting
+  `gascity`'s `../assets/implement.md` as an "escape". Test:
+  `an_inherited_asset_in_the_parents_pack_resolves_and_is_not_an_escape`.
 
-- `resolveDescriptionFiles` (parser.go:808): contents **replace** `step.Description`; the key is then
-  cleared ("consumed").
-- `readDescriptionFile` (:840): the documented **`../assets/<rel>`** form (`descriptionAssetRelPath`,
-  :964 — rejects a `rel` starting with `../`) resolves **through the layers**: for each layer,
-  `<layer>/../assets/<rel>` (a layer is `<pack>/formulas`, so this is the **pack's** `assets/`), and
-  the **LAST (highest)** match wins. **Anything else** resolves relative to `baseDir` = the formula
-  file's own directory.
-- **`descriptionFileInlineMaxBytes = 4 * 1024`** (parser.go:27). Over it, the description becomes
-  gc's **pointer prompt** (`descriptionFileReferenceDescription`, :977) — reproduce it byte-for-byte.
-  A mis-transcribed paragraph is a silent divergence **no camp test can detect**, which is exactly
-  why Task 11 diffs it against real gc:
+### Routing (§4 trap 3) — and where it now happens
 
-```rust
-/// gc's `descriptionFileReferenceDescription` (gascity parser.go:977) —
-/// byte-for-byte. The worker READS this text; a paraphrase is a divergence.
-fn pointer_prompt(raw: &str, resolved: &Path, size: usize, vars: &BTreeMap<String, String>) -> String {
-    let mut b = String::new();
-    b.push_str("# External Prompt Required\n\n");
-    b.push_str("This bead still follows the normal runtime and lifecycle protocol from your startup prompt and current agent prompt, including claiming work, honoring result contracts, checking for follow-on work, and draining only when appropriate.\n\n");
-    b.push_str("In addition to that protocol, this bead's task-specific instructions come from a formula `description_file` that is too large to inline safely into bead storage.\n\n");
-    b.push_str("Before you start the task-specific work, you MUST read the file below and treat it as the task prompt for this bead. Do not proceed from memory, ambient skills, or prior workflow knowledge until you have read it.\n\n");
-    b.push_str(&format!("- Resolved prompt file: `{}`\n", resolved.display()));
-    b.push_str(&format!("- Original formula description_file: `{raw}`\n"));
-    b.push_str(&format!("- Prompt file size: {size} bytes\n\n"));
-    b.push_str("Treat the file contents as the authoritative task prompt for this bead. It augments the startup/runtime protocol; it does not replace the startup prompt, the current agent prompt, or any bead lifecycle/result-contract instructions already given to you.\n");
-    b.push_str("Follow the section matching this bead's `gc.step_id` metadata and title, plus any result, closure, lifecycle, or post-close contract sections in that file.\n");
-    if !vars.is_empty() {
-        b.push_str("\n## Formula Variables\n\n");
-        b.push_str("Use these resolved formula values when interpreting `{{...}}` placeholders in the prompt file:\n\n");
-        b.push_str("```bash\n");
-        for name in vars.keys() {              // BTreeMap ⇒ sorted, matching gc's slices.Sort
-            b.push_str(&format!("{name}=\"{{{{{name}}}}}\"\n"));
-        }
-        b.push_str("```\n");
-    }
-    b
-}
-```
+**327 `gc.run_target` occurrences; ZERO step `assignee`.** Routing is *entirely* step metadata.
+- **At compile:** the value is `{name}`-resolved (stage 3) and carried **verbatim**. It is **NOT**
+  `{{}}`-substituted and **NOT** binding-resolved here — 55 corpus routes are still
+  `{{implementation_target}}` at this point, exactly as in gc's Recipe.
+- **At cook:** `{{var}}` is substituted (Task 5), the value is split at the first dot, and the binding
+  is resolved via compat-1's **`pack::resolve_agent(cfg, name)`** (pack.rs:251 — it already emits
+  `camp import add <source> --name <binding>`; **do not write a second resolver**). The result is
+  written to the bead's `assignee`. An unbound binding is a **hard cook error naming the remedy**.
 
-**A `description_file` that resolves to nothing is a hard compile error** for a `graph.v2` formula
-(gc: `strict = UsesGraphCompiler(f)`, parser.go:186; `validateResolvedGraphV2DescriptionFiles`,
-:1007). Measured: **all 328 targets resolve; 8 exceed 4096 bytes.**
-
-**SECURITY — path containment (fixed here).** gc's non-asset branch is a bare `base_dir.join(raw)`.
-Camp now imports **arbitrary third-party packs** (compat-1), so a pack could set
-`description_file = "../../../../../.ssh/id_rsa"` and have it inlined into a bead description that a
-tool-enabled LLM worker then reads. **`asset_path` canonicalises the result and refuses any path
-outside the declaring pack's root**, naming the escape. (gc doing otherwise is not a security
-argument for camp.) The >4096 pointer prompt embeds the resolved **absolute path** into the ledger —
-acceptable, and it stays inside the pack root by the same rule.
-
-### Routing — step metadata `gc.run_target` → the step's assignee
-
-Measured: **327 `gc.run_target` occurrences; ZERO step `assignee`.** Routing is *entirely* step
-metadata (§4 trap 3).
-
-- `compose` sets `step.assignee = Some(<resolved gc.run_target>)` when metadata carries it and
-  `assignee` is unset. An explicit `assignee` wins (0 corpus uses).
-- The value is `{{var}}`-substituted **first** (stage 5; 46 of 99 route sites are var references),
-  **then** split at the first dot; the prefix must be a binding in `cfg.imports`.
-- **An unbound binding is a hard compile error naming the remedy** (§7.1; §14's routing test).
-  **Reuse compat-1's `pack::resolve_agent(cfg, name)` (pack.rs:251)** — it already splits at the
-  first dot, checks the binding, and emits exactly `camp import add <source> --name <binding>`.
-  **Do not write a second resolver.**
-- A value with no dot resolves as a camp-local agent (0 corpus uses).
-
-### The runnability verdict (D1) and its TWO enforcement points (B12)
-
-`not_runnable = Some(Refusal { key, .. })` when **`contract != "graph.v2"`** (key `contract` — the 21)
-**or `type == "expansion"`** (key `type` — the 14; §9: *"not directly runnable"*).
-
-**Both cook entry points must refuse it:**
-1. `camp sling` (`cmd/sling.rs:53`).
-2. **The daemon's order-fire path** (`camp/src/daemon/orders.rs`) — rev 1 changed only `sling.rs`, so
-   a cron order could fire one of the 21 under graph.v2 semantics **with nothing refusing it**: the
-   exact silent assumption §9 forbids, on the path where *"an order fires a formula; a formula
-   dispatches workers; workers cost real money"* (§13). Both append `formula.refused`; the order path
-   also fires `order.failed`.
-
-- [ ] **Step 1: Write the failing tests** (`tests/compose.rs`; fixtures under
-  `tests/fixtures/compose/` — a `child` pack whose `pack.toml` declares
-  `[imports.gc] source = "../parent"`, and a `parent` pack with `formulas/` + `assets/`)
-
-```rust
-#[test] fn description_file_contents_replace_the_step_description() { /* == "PARENT PROSE\n" */ }
-#[test] fn an_asset_reference_resolves_through_the_layers_highest_wins() { /* child shadows parent */ }
-#[test] fn an_oversize_description_file_becomes_gcs_pointer_prompt() {
-    let d = c.formula.steps[0].description.clone().unwrap();
-    assert!(d.starts_with("# External Prompt Required\n\n"), "{d}");
-    assert!(d.contains("- Prompt file size: 5000 bytes"), "{d}");
-    assert!(d.contains("Resolved prompt file: `"));
-}
-#[test] fn a_missing_description_file_is_a_hard_error_for_a_graph_v2_formula() { }
-#[test] fn a_description_file_escaping_the_pack_root_is_refused() {
-    // "../../../../../.ssh/id_rsa" — camp imports UNTRUSTED packs (compat-1).
-    let err = compile_named(&layers, &cfg, "escapee").unwrap_err();
-    assert!(err.to_string().contains("outside the pack"), "{err}");
-}
-#[test] fn a_step_metadata_run_target_becomes_the_steps_assignee() {
-    assert_eq!(step.assignee.as_deref(), Some("gc.run-operator"));
-    assert_eq!(step.metadata["gc.run_target"], "gc.run-operator");
-}
-#[test] fn a_route_to_an_unbound_binding_fails_at_compile_time_naming_the_remedy() {
-    assert!(err.to_string().contains("camp import add"), "{err}");
-}
-#[test] fn a_no_contract_formula_compiles_and_is_not_runnable() {
-    let c = compile_named(&layers, &cfg, "plain").unwrap();
-    assert!(c.refusals.is_empty(), "it COMPILES: {:?}", c.refusals);
-    assert_eq!(c.not_runnable.expect("not runnable").key, "contract");
-}
-#[test] fn phase_is_refused_by_name() {
-    assert_eq!(c.refusals.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), vec!["phase"]);
-}
-#[test] fn a_scope_check_formula_is_refused_by_its_metadata() {
-    // The REAL shape (design-review.formula.toml) — NOT rev 1's invented `gc.scope_kind`.
-    assert!(c.refusals.iter().any(|r| r.key == "gc.kind"), "{:?}", c.refusals);
-}
-```
-
-`camp/tests/cli_doctor_corpus.rs`:
-```rust
-#[test] fn doctor_formula_json_reports_ok_runnable_ignored_and_refusals() { /* pins the gate's contract */ }
-#[test] fn doctor_formula_json_exits_zero_even_when_the_formula_is_refused() {
-    // The gate reads the verdict from JSON; a non-zero exit on 5 of 100 files
-    // would make the script fight the exit code. HUMAN mode keeps 0/1.
-}
-#[test] fn doctor_formula_rungs_json_emits_camps_own_key_classification() { /* base/rungs/dead/annotation/refused */ }
-#[test] fn sling_refuses_a_no_contract_formula_and_events_the_refusal() {
-    assert_eq!(camp.events_of_type("formula.refused")[0]["data"]["key"], "contract");
-}
-#[test] fn sling_refuses_an_expansion_formula() { /* key == "type" */ }
-```
-
-`camp/tests/daemon_orders.rs` (**B12**):
-```rust
-#[test]
-fn a_due_order_naming_a_no_contract_formula_fires_nothing_and_events_the_refusal() {
-    // §13's money invariant: an order fires a formula; a formula dispatches
-    // workers; workers cost real money. Rev 1 left this path UNGUARDED.
-    let mut d = daemon_with_enabled_order_on("plain");   // plain = no `contract`
-    d.tick_until_order_due();
-    assert_eq!(d.beads_created(), 0, "NOTHING cooked");
-    assert_eq!(d.events_of_type("formula.refused")[0]["data"]["key"], "contract");
-    assert_eq!(d.events_of_type("order.failed").len(), 1);
-}
-```
-
-- [ ] **Step 2: Run and watch them fail** —
-  `cargo test -p camp-core --test compose 2>&1 | tail -20`;
-  `cargo test -p camp --test cli_doctor_corpus --test daemon_orders 2>&1 | tail -20`
-
-- [ ] **Step 3: Implement `layers.rs` + `compose.rs`** (the pipeline above; stages 2/3/5/6 stubbed).
-
-- [ ] **Step 4: Wire the CLI.** `main.rs`'s `Doctor` (:86-99) gains `--json` and `--formula-rungs`,
-  the latter added to the existing **required** `ArgGroup("mode")` so exactly one mode is still
-  required (`cli_doctor_formula.rs` asserts that group — update it). `cmd/doctor.rs::run_formula`
-  gains `json: bool` and prints:
+- [ ] **Step 1: Failing tests.** `tests/compose.rs` (two-layer fixture: a `child` pack whose
+  `pack.toml` declares `[imports.gc] source = "../parent"`):
+  `description_file_contents_replace_the_step_description` ·
+  `an_asset_reference_resolves_through_the_layers_highest_wins` ·
+  `an_inherited_asset_in_the_parents_pack_resolves_and_is_not_an_escape` ·
+  `an_oversize_description_file_becomes_gcs_pointer_prompt` (exact first line; the
+  `- Prompt file size: 5000 bytes` line; and that the `{{var}}` lines **survive compile**) ·
+  `a_missing_description_file_is_a_hard_error_for_a_graph_v2_formula` ·
+  `a_description_file_escaping_the_pack_root_is_refused` ·
+  **`a_run_target_is_carried_verbatim_and_NOT_substituted_at_compile`** (F1:
+  `assert_eq!(step.metadata["gc.run_target"], "{{implementation_target}}")`) ·
+  `a_no_contract_formula_compiles_and_is_not_runnable` · `phase_is_refused_by_name` ·
+  `a_scope_check_formula_is_refused_by_its_metadata` (key `gc.kind`).
+  **BD8 tests** (`tests/cook.rs`): `cook_pins_the_compiled_recipe_and_the_authored_source` ·
+  `cook_pins_a_recipe_whose_step_ids_are_exactly_the_manifest_steps` ·
+  **`load_run_reconstitutes_a_run_cooked_from_an_IMPORTED_formula_with_extends_and_description_file`**
+  — *the test that would have caught the phase-killer*: cook from the two-layer fixture, then call
+  `flow::load_run` and assert `Ok`, with `ctx.formula.steps[..].drain` / `.metadata` / `.assignee`
+  surviving.
+  `cli_doctor_corpus.rs`: the `--json` contract; `doctor_formula_json_exits_zero_even_when_refused`.
+  `daemon_orders.rs`: `a_due_order_naming_a_no_contract_formula_fires_nothing_and_events_the_refusal`
+  (§13's money invariant).
+- [ ] **Step 2: Run; watch fail.**
+- [ ] **Step 3: Implement `layers.rs` + `compose.rs`.**
+- [ ] **Step 4: BD8 — the pinned recipe.** Derive `Serialize`/`Deserialize`; `cook` writes
+  `recipe.json` beside `<formula>.toml`; rewrite `runtime.rs:67-69`'s `load_run` to **deserialize
+  `recipe.json`**, deleting its `parse_and_validate` call; amend `ast.rs:15`'s doc comment.
+- [ ] **Step 5: CLI.** `Doctor` gains `--json` and `--formula-rungs` (into the existing required
+  `ArgGroup("mode")` — `cli_doctor_formula.rs` asserts that group and must be updated). `run_formula`
+  prints `{path, formula, ok, runnable, ignored_keys, refusals, not_runnable}` and exits **0 even when
+  `ok` is false** in `--json` mode (human mode keeps 0/1). **`--formula-rungs --json` (BD10) takes no
+  formula path and emits exactly:**
 ```jsonc
-{ "path": "...", "formula": "bmad-build", "ok": true, "runnable": true,
-  "ignored_keys": ["internal","target_required","version"],
-  "refusals": [], "not_runnable": null }
+{ "base":       { "top": ["description","formula","requires","steps"], "step": ["assignee", …] },
+  "dead":       { "top": ["internal","mode", …], "step": [] },
+  "annotation": { "top": ["catalog","metadata","notes"], "step": ["notes","priority","tags"] },
+  "refused":    { "top": ["advice","compose","pointcuts","pour"], "step": ["depends_on", …] },
+  "rungs":      [ { "id": "2a", "top": ["contract"], "step": ["description_file","metadata"] }, … ] }
 ```
-  exiting **0 even when `ok` is false** in `--json` mode; human mode keeps 0/1.
-
-- [ ] **Step 5: `cook.rs` carries metadata + the route.** Add `"metadata": step.metadata` to the
-  step-bead `EventInput` when non-empty. `assignee` is already written verbatim — compose has already
-  put the resolved route there, so **cook needs no routing logic.** Test in `tests/cook.rs`:
-  `cook_stamps_the_steps_metadata_and_route_onto_the_bead`.
-
-- [ ] **Step 6: The order-fire refusal (B12).** In `camp/src/daemon/orders.rs`, the order-fire path
-  compiles via `compose::compile_named` and, on `not_runnable`, appends `formula.refused` +
-  `order.failed` and cooks **nothing**.
-
-- [ ] **Step 7: Write `ci/gc-compat/formula_gate.py` — the §10 gate (runs the REAL binary)**
-
+- [ ] **Step 6: `cook.rs`** writes `"metadata": step.metadata` on the step bead; `assignee` comes from
+  the route resolution Task 5 adds at cook.
+- [ ] **Step 7: The order-fire refusal** in `daemon/orders.rs`.
+- [ ] **Step 8: `ci/gc-compat/formula_gate.py`** — the §10 gate, driving the **real binary**. Setup is
+  `load_corpus_packs.py`'s mold verbatim: `camp init --no-service --no-import`; append
+  `[agent_defaults] tools = ["Read","Bash","Skill"]`; `camp import add <corpus>/<pack> --name <pack>`
+  for the **10 formula-bearing packs** (bmad, compound-engineering, contributing, discord, gascity,
+  gastown, github, gstack, pr-pipeline, superpowers) + `camp import add <corpus>/gascity/roles --name gc`.
+  *(Measured: no two of the 100 share a basename ⇒ no within-tier collision.)*
 ```python
-"""compat §10: assert camp loads EXACTLY what it claims, at GCPACKS_REF.
-
-usage: formula_gate.py <corpus> <camp-binary> [--expect-loaded N]
-
-Setup (the load_corpus_packs.py mold, verbatim): `camp init --no-service
---no-import`; append [agent_defaults] tools = ["Read","Bash","Skill"]; then
-`camp import add <corpus>/<pack> --name <pack>` for each of the 10
-formula-bearing packs (bmad, compound-engineering, contributing, discord,
-gascity, gastown, github, gstack, pr-pipeline, superpowers) plus
-`camp import add <corpus>/gascity/roles --name gc` (the corpus's own recipe,
-§3/§7.3). Measured: no two of the 100 formulas share a basename, so no
-within-tier collision arises. Every camp call is checked; a non-zero exit is a
-gate failure with stderr printed. No fallbacks.
-
-THREE assertions:
-  1. REAL LOADER: `camp doctor --formula <path> --json` over all 100.
-     Exactly CEILING compile; the NOT_LOADABLE ones refuse with the named keys.
-  2. RUNNABLE: exactly RUNNABLE of them report runnable=true.
-  3. CROSS-CHECK: rungs.py's per-rung counts must match camp's OWN
-     classification (`camp doctor --formula-rungs --json`) applied to the
-     corpus. A TUNED RUNG TABLE FAILS HERE.
-"""
-CEILING  = 95
-RUNNABLE = 62
-RUNG_COUNTS = {"2a": 2, "2b": 31, "2c": 57, "2d": 83, "2e": 95}
-NOT_LOADABLE = {                          # basename -> a key the refusal must name
-    "mol-digest-generate.toml":            "phase",
-    "mol-pr-from-issue.formula.toml":      "phase",
-    "design-review.formula.toml":          "gc.kind",   # NOT gc.scope_kind — that key does not exist
+CEILING = 95; RUNNABLE = 62
+RUNG_COUNTS = {"2a": 2, "2b": 31, "2c": 49, "2d": 76, "2e": 95}
+NOT_LOADABLE = {  # basename -> a key the refusal MUST name
+    "mol-digest-generate.toml": "phase",  "mol-pr-from-issue.formula.toml": "phase",
+    "design-review.formula.toml": "gc.kind",            # NOT gc.scope_kind — that key does not exist
     "same-session-implement.formula.toml": "context",   # an UNCONDITIONAL shared drain
-    "mol-polecat-work.toml":               "extends",   # parent ships in gc's embedded core pack
+    "mol-polecat-work.toml": "extends",                 # gc fails this one too
 }
 ```
-
-- [ ] **Step 8: Run the gate locally**
-```bash
-cargo build --bin camp
-python3 ci/gc-compat/formula_gate.py /tmp/gcpacks target/debug/camp --expect-loaded 2
-```
-Expected **at this point**: the rung-table cross-check passes; the real loader reports **2** — rungs
-2b–2e are `unimplemented` hard violations. **That is the correct failing signal: the gate is now the
-TDD driver for Tasks 5–8.**
-
-- [ ] **Step 9: Wire CI.** In `.github/workflows/ci.yml`'s **existing** `gcpacks-compat` job (the
-  corpus checkout and `cargo build --bin camp` are already there — do **not** add a job), append:
+  **Three assertions.** (1) `camp doctor --formula <path> --json` over all 100: exactly `CEILING`
+  compile; the five refuse naming those keys. (2) exactly `RUNNABLE` report `runnable: true`.
+  (3) **The falsifiable cross-check (BD10):** the **SET of basenames camp actually loaded** must equal
+  the **SET `rungs.py` predicts loadable at 2e**. *(Rev 2's version compared counts the gate would have
+  had to recompute from camp's key table — reproducing `rungs.py` by construction, so it could not
+  fail. Comparing the two **sets** — one from the real binary, one from the arbiter — is a real check:
+  a tuned key table changes camp's set and the comparison breaks.)*
+- [ ] **Step 9: Run the gate** — `--expect-loaded 2` at this point (rungs 2b–2e are `UNIMPLEMENTED`
+  hard violations). **That is the correct failing signal: the gate is the TDD driver for Tasks 5–8.**
+- [ ] **Step 10: CI** — one step appended to the **existing** `gcpacks-compat` job:
 ```yaml
-      - name: phase-2 formula gate (rung counts, the ceiling, and RUNNABLE)
+      - name: phase-2 formula gate (rungs, the ceiling, RUNNABLE)
         run: python3 ci/gc-compat/formula_gate.py gcpacks-src target/debug/camp
 ```
+- [ ] **Step 11: Gates; commit** —
+  `"feat(formula): rung 2a — layered compiler, the pinned recipe, description_file, the §10 gate"`
 
-- [ ] **Step 10: Full gates and commit** —
-  `git commit -m "feat(formula): rung 2a — layered compiler, description_file, routing, order-fire refusal, the §10 gate"`
+**What this task's fixes could newly break:** `recipe.json` is a **run-dir schema change**. A campd
+started against a run cooked by an *older* camp finds none. `load_run` must **fail loudly** —
+`Corrupt("run <id> has no recipe.json — cooked by an older camp; re-sling it")` — and **never** fall
+back to the old re-parse. Test: `load_run_on_a_pre_recipe_run_dir_fails_loudly`.
 
 ---
 
-## Task 5: Rung 2b — `vars`, the substitution asymmetry, `condition` pruning
+## Task 5: Rung 2b — `vars`, `condition` pruning, and `{{var}}` substitution AT COOK
 
-**Files:** `compose.rs` (stages 5 & 6; **unit tests INSIDE the module** — these fns are
-`pub(crate)`), `parse.rs`, `ast.rs`, `validate.rs`, `tests/compose.rs`
+**Files:** `compose.rs` (stage 5; unit tests **inside** the module — `pub(crate)` fns) · **`cook.rs`**
+(substitution + route resolution) · `parse.rs`, `ast.rs`, `validate.rs`, `tests/compose.rs`,
+`tests/cook.rs`
 
 ```rust
-/// §9: substitution applies to `title`, `description`, `assignee`, metadata
-/// VALUES, `notes`, `tags` — and NOT to `id`, `needs`, `check.path`, or
-/// `drain.formula`. An undefined var KEEPS THE LITERAL PLACEHOLDER.
-/// "Reproduce that asymmetry or diverge." gc: `Substitute` (parser.go:617),
-/// `varPattern = \{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}` (parser.go:557).
-pub(crate) fn substitute(text: &str, vars: &BTreeMap<String, String>) -> String;
-
-/// §9: `==` and `!=` only; LHS a single `{{var}}`. False ⇒ the step is PRUNED
-/// WITH ITS CHILDREN, and dangling `needs` edges are silently dropped.
+// compose.rs — COMPILE
+/// §9: `==` and `!=` only; LHS a single `{{var}}`. False ⇒ the step is PRUNED WITH
+/// ITS CHILDREN and ITS REFUSALS (BD2); dangling `needs` are dropped. Evaluated over
+/// merged var VALUES — never by text substitution.
 pub(crate) fn eval_condition(expr: &str, vars: &BTreeMap<String, String>) -> Result<bool, Violation>;
+
+// cook.rs — INSTANTIATION (gc: stepToBead)
+/// gc's `Substitute` (parser.go:617); varPattern `\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}`
+/// (parser.go:557). Applied to EVERY field and EVERY metadata value, with NO exemption
+/// list (molecule.go:1035-1037) — INCLUDING `check.path` and `drain.formula` (F8).
+/// An unknown token is LEFT VERBATIM.
+pub(crate) fn substitute_vars(text: &str, vars: &BTreeMap<String, String>) -> String;
 ```
 
-Measured: **4 distinct conditions, 29 uses** — `{{drain_policy}} == separate` (12),
-`{{drain_policy}} == same-session` (12), **`{{review_mode}} != report` (4 — inside `children`)**,
-`{{pr_mode}} != none` (1). The RHS is an **unquoted bare word**; trim both sides, accept a quoted RHS
-too. **Pruning must RECURSE into `children`** — that is where `review_mode` lives, and rev 1 missed
-it.
+**Measured: 4 distinct conditions, 29 uses** — `{{drain_policy}} == separate` (12), `== same-session`
+(12), **`{{review_mode}} != report` (4 — inside `children`, on the `template` tree)**,
+`{{pr_mode}} != none` (1). The RHS is an **unquoted bare word**; trim, and accept a quoted RHS too.
+**Pruning must recurse into `children` AND `template`** — rev 2 said `children` only, and all four
+`review_mode` conditions live at `template/children`. `review_mode`'s default **varies by pack**
+(`report` in `code-review-base`/`review`/`planning-base`, `agent` in `build-base`, `interactive` in
+`gstack-build`), so the merged chain decides.
 
-`[vars]` merge (load-bearing — §3: *"`drain_policy = "separate"` is declared in `build-base`, not in
-the children"*): **parent defaults first, child overrides win** (merged in Task 6's extends stage).
-An entry may be a bare string **or** a table with `default`; **a var with no default stays
-undefined** and its placeholder survives (the 4 route sites with no default rely on this — they get a
-qualified value via `expand_vars`, Task 7). **`review_mode`'s default VARIES BY PACK** (`report` in
-`code-review-base`/`review`/`planning-base`, `agent` in `build-base`, `interactive` in
-`gstack-build`) — so the merged chain, not a global default, decides pruning.
+`[vars]`: a bare string **or** a table with `default`; **no default ⇒ undefined**, and the placeholder
+survives. Merge = **parent defaults first, child overrides win** (Task 6's stage). Load-bearing:
+`drain_policy = "separate"` is declared in gascity's `build-base`, not in the children.
 
-**The residual check is title-only** (§9). A `description` still containing `{{` is fine.
+**The residual check is title-only** (§9) and now runs **at cook**, after substitution.
 
-- [ ] **Step 1: Write the failing tests**
+**§9's asymmetry list is DELETED** (F8): no exemption for `check.path` or `drain.formula`. Instead,
+**validation rejects a templated `drain.formula`** — `if formula.contains("{{")` → *"templated item
+formula names are not supported"* (gc `graphv2_validation.go:417-419`).
+
+- [ ] **Step 1: Failing tests**
 ```rust
-#[test] fn substitution_never_touches_id_needs_check_path_or_drain_formula() {
-    assert_eq!(s.id, "{{id_var}}");
-    assert_eq!(s.needs, vec!["{{needs_var}}".to_owned()]);
-    assert_eq!(s.check.as_ref().unwrap().path, PathBuf::from(".gc/{{p}}.sh"));
-}
-#[test] fn an_undefined_var_keeps_its_literal_placeholder_and_only_title_is_residual_checked() { }
-#[test] fn a_false_condition_prunes_the_step_with_its_children_and_drops_dangling_needs() {
-    // bmad-build's real shape: two drain steps, mutually exclusive on
-    // {{drain_policy}}, default "separate" (declared in gascity's build-base).
-    assert!(ids.contains(&"implement") && !ids.contains(&"implement-same-session"));
-    assert_eq!(publish.needs, vec!["implement".to_owned()], "the dangling need is dropped");
-}
-#[test] fn condition_pruning_recurses_into_children() {
-    // {{review_mode}} != report — 4 uses, ALL inside `children`. Rev 1 missed it.
-    let c = compile_named(&layers, &cfg, "review").unwrap();   // review_mode default = "report"
-    assert!(!ids(&c).contains(&"review-agent-leg"), "a CHILD step is pruned too");
-}
+// compose.rs (compile stage)
+#[test] fn a_false_condition_prunes_the_step_its_children_AND_its_refusals() { }   // BD2
+#[test] fn condition_pruning_recurses_into_children_and_template() { }             // the 4 review_mode uses
 #[test] fn vars_merge_parent_defaults_under_child_overrides() { }
-#[test] fn a_condition_outside_the_subset_is_a_violation_naming_the_step() { /* "{{a}} > 1" */ }
+#[test] fn a_condition_outside_the_subset_is_a_violation_naming_the_step() { }
+#[test] fn a_templated_drain_formula_is_rejected_at_validation() {                 // F8 — gc's own rule
+    assert!(err.to_string().contains("templated item formula"), "{err}");
+}
+#[test] fn compile_does_NOT_substitute_double_brace_vars_anywhere() {              // F1
+    let c = compile_named(&layers, &cfg, "b", &no_overrides).unwrap();
+    assert_eq!(c.formula.steps[0].metadata["gc.run_target"], "{{implementation_target}}");
+    assert!(c.formula.steps[0].description.as_ref().unwrap().contains("{{"));
+}
+
+// cook.rs (instantiation stage)
+#[test] fn cook_substitutes_double_brace_vars_over_every_field_INCLUDING_check_path() {   // F8
+    // §9 claimed check.path is exempt. gc substitutes it (→ gc.check_path, ralph.go:76).
+    assert_eq!(bead_check_path, ".gc/scripts/checks/build.sh");  // authored ".gc/scripts/checks/{{kind}}.sh"
+}
+#[test] fn cook_substitutes_every_metadata_value_with_no_exemption_list() { }
+#[test] fn an_undefined_var_keeps_its_literal_placeholder_and_only_title_is_residual_checked() { }
+#[test] fn cook_resolves_the_route_through_the_binding_namespace_into_assignee() {
+    assert_eq!(bead.assignee.as_deref(), Some("superpowers.implementer"));
+}
+#[test] fn cook_fails_loudly_when_a_route_names_an_unbound_binding() {
+    assert!(err.to_string().contains("camp import add"), "{err}");
+}
 ```
-- [ ] **Step 2: Run and watch them fail** (`vars`/`condition` are still `unimplemented`)
-- [ ] **Step 3: Implement.** Remove `vars`/`condition` from `unimplemented`. `substitute` is a
-  **single left-to-right pass** (never re-scan inserted values). **Do NOT merge it with
-  `cook::substitute` (cook.rs:51)** — that one is `{name}`, this is `{{name}}`: two grammars, two
-  scopes. Prune post-order, recursing into `children`, then filter every surviving step's `needs`
-  against the surviving id set.
-- [ ] **Step 4: Run; then the gate** —
-  `python3 ci/gc-compat/formula_gate.py /tmp/gcpacks target/debug/camp --expect-loaded 31`
-- [ ] **Step 5: Full gates and commit** —
-  `"feat(formula): rung 2b — vars, the substitution asymmetry, condition pruning (31/100)"`
+- [ ] **Steps 2–3: Watch fail; implement.** Remove `vars`/`condition` from `UNIMPLEMENTED`.
+  `substitute_vars` is a **single left-to-right pass**. **Do NOT merge it with `cook::substitute`
+  (cook.rs:51)** — that one is `{name}` over `CookOptions.vars` for bond children: a different grammar
+  with a different scope. **Three substitution functions, three grammars, three stages — name them and
+  keep them apart:** `compose::resolve_single_brace` (Task 7), `cook::substitute_vars` (this task),
+  and the existing `cook::substitute`.
+- [ ] **Step 4: Gate** — `--expect-loaded 31`
+- [ ] **Step 5: Gates; commit** —
+  `"feat(formula): rung 2b — vars, condition pruning, and {{var}} substitution at cook (31/100)"`
+
+**What this fix could newly break:** substituting `check.path` at cook means a check-script path can
+now contain a var — while `trust_exec` (compat-1) inventories `check.path` **at import**, before
+substitution. **Substitution must never turn an untrusted path into a trusted one.** Test:
+`a_substituted_check_path_still_requires_trust_exec_and_the_inventory_reports_the_AUTHORED_path`.
 
 ---
 
 ## Task 6: Rung 2c — `extends`
 
-§9, verbatim: *"child seeds scalars; parents' steps **append**; a child step whose `id` matches a
-parent's **replaces it whole, in place, preserving position**. No field-level merge. Parents resolve
-by bare name through the formula layers."* (`advice`/`pointcuts` are **refused** — D4.)
+§9: *child seeds scalars; parents' steps **append**; a child step whose `id` matches a parent's
+**replaces it whole, in place, preserving position**. No field-level merge. Parents resolve by bare
+name through the layers.*
 
-Measured: **48 formulas extend; every resolvable parent lives in `gascity/formulas/`; no formula
-extends more than one parent** (implement the list anyway — it is gc's shape — left-to-right); and
-**`mol-polecat-work.toml`'s parent `mol-polecat-base` does not exist in the corpus** ⇒ a hard error,
-and it is one of the 5.
+Measured: **48 formulas extend**; every resolvable parent lives in `gascity/formulas/`; **none extends
+more than one parent** (implement the list anyway — gc's shape — left-to-right); **`mol-polecat-work`'s
+parent is absent ⇒ a hard error, and gc fails it too.**
 
-**Files:** `compose.rs`, `parse.rs`, `ast.rs`, `tests/compose.rs`
-
-- [ ] **Step 1: Write the failing tests**
-```rust
-#[test] fn a_parents_steps_append_and_a_matching_child_id_replaces_in_place() {
-    assert_eq!(ids, vec!["a","b","c","d"], "position preserved; new steps append");
-    assert_eq!(b.title, "CHILD B");
-    assert_eq!(b.description, None, "replaced WHOLE — no field-level merge (§9)");
-}
-#[test] fn the_child_seeds_scalars_and_inherits_the_parents_vars() {
-    // §3: without this, 24 formulas lose `drain_policy = "separate"`.
-    assert_eq!(c.formula.vars["drain_policy"], "separate");
-    assert_eq!(c.formula.vars["overridden"], "by-child");
-}
-#[test] fn a_parent_resolves_by_bare_name_through_the_TRANSITIVE_layer() { /* §7.2 is load-bearing */ }
-#[test] fn an_unresolvable_parent_is_a_hard_error_naming_it() {
-    // The REAL case: mol-polecat-work extends mol-polecat-base, which ships
-    // inside gc's binary-embedded core pack and is NOT in gascity-packs.
-    assert!(err.to_string().contains("mol-polecat-base"), "{err}");
-}
-#[test] fn an_extends_cycle_is_a_hard_error_never_a_stack_overflow() { }
-```
-- [ ] **Step 2: Run and watch them fail**
-- [ ] **Step 3: Implement.** Remove `extends` from `unimplemented`. Resolve depth-first with a
-  visited-stack cycle guard. Merge **deepest ancestor first**; each descendant then applies its steps
-  (append-or-replace-in-place) and its scalars/vars over the accumulator.
-- [ ] **Step 4: Gate** — `--expect-loaded 57`
-- [ ] **Step 5: Commit** — `"feat(formula): rung 2c — extends, append and replace-in-place (57/100)"`
+- [ ] Tests: `a_parents_steps_append_and_a_matching_child_id_replaces_in_place` (position preserved;
+  **`assert_eq!(b.description, None)` — replaced WHOLE, no field-level merge**) ·
+  `the_child_seeds_scalars_and_inherits_the_parents_vars` (`drain_policy == "separate"`) ·
+  `a_parent_resolves_by_bare_name_through_the_TRANSITIVE_layer` ·
+  `an_unresolvable_parent_is_a_hard_error_naming_it` (`mol-polecat-base`) ·
+  `an_extends_cycle_is_a_hard_error_never_a_stack_overflow` ·
+  **`a_refusal_on_a_parent_step_that_the_child_replaces_is_discarded`** (BD2's new failure) ·
+  **`a_formula_that_inherits_drain_ONLY_from_its_parent_is_blocked_until_rung_2e`** (BD1 — the seven
+  `build-from-*` formulas; this is what moves 2c from 57 to **49**).
+- [ ] Implement: depth-first with a visited-stack cycle guard; merge **deepest ancestor first**. Remove
+  `extends` from `UNIMPLEMENTED`.
+- [ ] **Gate — `--expect-loaded 49`** (not 57 — BD1).
+- [ ] Commit — `"feat(formula): rung 2c — extends, append and replace-in-place (49/100)"`
 
 ---
 
-## Task 7: Rung 2d — `type = "expansion"`, `template`, `expand`, `expand_vars`, `children`
+## Task 7: Rung 2d — expansion, and the SINGLE-BRACE grammar (F4)
 
-§9: *"`type = "expansion"` — the formula is **not directly runnable**; it supplies `template` steps
-for `expand`."* Measured: **14** formulas are `type = "expansion"` **and** carry a top-level
-`template` (the same 14, and **none has `steps`** — that is Task 1's S3); **15** steps carry
-`expand`; **14** carry `expand_vars`; **2** carry `children`.
+§9: *`type = "expansion"` — not directly runnable; it supplies `template` steps for `expand`.*
+Measured: **14** formulas are `type = "expansion"` with a top-level `template` (and **none has
+`steps`** — S3); **15** steps carry `expand`; **14** carry `expand_vars`; **`children` appears 16 times
+across 15 formulas** (rev 2 said "2" — it counted only the `steps` tree; **14 are on `template`**).
 
-gc (`internal/formula/expand.go`): an `expand` rule names a **target step** and a formula; the target
-is **replaced** by the expansion formula's `template` steps, with the expansion's own `[vars]` merged
-under the rule's overrides resolved against the parent's vars (`ApplyExpansionsWithVars` /
-`mergeVars` / `resolveOverrideVars`). **`DefaultMaxExpansionDepth = 5`** — exceeding it is a **hard
-error** (invariant 5), never a truncation.
+gc (`expand.go`): an `expand` rule names a **target step**; the target is **REPLACED** by the expansion
+formula's `template` steps, with the expansion's own `[vars]` merged under the rule's overrides
+(`ApplyExpansionsWithVars` / `mergeVars` / `resolveOverrideVars`). **`DefaultMaxExpansionDepth = 5`** —
+exceeding it is a **hard error**, never a truncation.
 
-`expand_vars` supplies a qualified route to the **4 route sites with no `[vars]` default** (measured)
-— so expansion (stage 3) must run **before** vars/substitution (stage 5), as pinned.
+### The single-brace grammar (F4) — rev 2 had none, and 8 routes corrupt without it
 
-**An expansion formula is `not_runnable`** (key `type`) — the same field the 21 use. It still
-**compiles** (it is inside the 95).
+Inside `expandStep` (`expand.go:255`), gc applies, in order:
+1. **`substituteTargetPlaceholders`** (`expand.go:446-464`) — a plain `strings.ReplaceAll` over a
+   **fixed 4-token vocabulary**: `{target}`, `{target.id}`, `{target.title}`, `{target.description}`.
+   **362 of the 435 corpus single-brace occurrences are this family.** It is **not** the var grammar.
+2. **`substituteVars`** (`range.go:94`, `rangeVarPattern = \{(\w+)\}`) — the general single-brace var
+   grammar, over ID, Title, Description, Notes, Assignee, Expand, Timeout, Labels[], Needs[],
+   **Metadata[]**, ExpandVars[], Gate.*, Loop.*, OnComplete.*, Ralph.Check.* (`expand.go:265-342`) —
+   **but NOT `DescriptionFile`**. An unknown token is **left verbatim** (`range.go:103`).
 
-- [ ] **Step 1: Write the failing tests**
+**Proof it is load-bearing:** `superpowers-code-review.formula.toml:63` authors
+`metadata = { "gc.run_target" = "{implementation_target}" }`, and gc's compiled Recipe carries
+`gc.run_target = "superpowers.implementer"` — **resolved**. All 8 single-brace routes live in
+`children.metadata.gc.run_target`. Get the stages backwards and **55 routes silently corrupt.**
+
 ```rust
-#[test] fn an_expansion_formula_compiles_and_is_not_runnable() {
-    let c = compile_named(&layers, &cfg, "exp").unwrap();   // it COMPILES — S3 amended (Task 1)
-    assert!(c.refusals.is_empty());
-    assert_eq!(c.not_runnable.expect("expansion is not directly runnable").key, "type");
-}
-#[test] fn expand_replaces_the_target_step_with_the_expansion_formulas_template() {
-    assert!(!ids.contains(&"placeholder") && ids.contains(&"tmpl-1"));
-}
-#[test] fn expand_vars_supply_a_qualified_route_where_no_vars_default_exists() {
-    assert_eq!(s.assignee.as_deref(), Some("bmad.story-implementer"));
-}
-#[test] fn children_are_flattened_preserving_position() {
-    assert_eq!(ids, vec!["parent","kid-a","kid-b","after"]);
-}
-#[test] fn expansion_deeper_than_five_is_a_hard_error_not_a_truncation() { }
-#[test] fn an_expand_target_that_does_not_exist_is_a_hard_error() { }
+/// gc's compile-stage grammar. The {target} family first (a fixed vocabulary), then
+/// `\{(\w+)\}` against the merged vars. Unknown tokens are LEFT VERBATIM. Never
+/// touches `description_file`. gc: expand.go:255, :446-464; range.go:94.
+/// APPLIED ONLY INSIDE EXPANSION — never as a global pass. See the warning below.
+pub(crate) fn resolve_single_brace(text: &str, target: Option<&Step>,
+                                   vars: &BTreeMap<String, String>) -> String;
 ```
-- [ ] **Step 2–3: Watch them fail; implement.** Remove `type`/`template`/`expand`/`expand_vars`/
-  `children` from `unimplemented`.
-- [ ] **Step 4: Gate** — `--expect-loaded 83`
-- [ ] **Step 5: Commit** — `"feat(formula): rung 2d — expansion, template, expand_vars, children (83/100)"`
+
+- [ ] Tests: `an_expansion_formula_compiles_and_is_not_runnable` (key `type`) ·
+  `expand_replaces_the_target_step_with_the_expansion_formulas_template` ·
+  **`a_single_brace_var_in_step_metadata_resolves_AT_COMPILE`**
+  (`assert_eq!(md["gc.run_target"], "superpowers.implementer")`) ·
+  **`the_target_family_is_a_fixed_vocabulary_not_the_var_grammar`** (`{target.title}` resolves with no
+  such var; `{target.bogus}` is left verbatim) ·
+  **`an_unknown_single_brace_token_is_left_verbatim`** (`{GC_PACK_DIR}` in prose survives) ·
+  **`a_single_brace_token_in_description_file_is_NOT_resolved`** ·
+  `children_are_flattened_preserving_position` · `expansion_deeper_than_five_is_a_hard_error` ·
+  `an_expand_target_that_does_not_exist_is_a_hard_error`.
+- [ ] Implement; remove `type`/`template`/`expand`/`expand_vars`/`children` from `UNIMPLEMENTED`.
+- [ ] **Gate — `--expect-loaded 76`** (not 83 — BD1).
+- [ ] Commit — `"feat(formula): rung 2d — expansion, and gc's compile-stage {name} grammar (76/100)"`
+
+**⚠️ What this fix could newly break — the single highest-risk line in the phase.** The regex
+`\{(\w+)\}` **matches `{x}` inside `{{x}}`** (at offset 1). A naive global single-brace pass would
+therefore **corrupt every one of the 55 surviving `{{}}` routes and 567 `{{}}` descriptions**. The
+reason gc does not corrupt them is that `substituteVars` **runs only inside `expandStep`**, on
+expansion templates — never over the whole formula. **Camp must do the same: `resolve_single_brace` is
+called ONLY from the expansion stage.** Pin it:
+```rust
+#[test]
+fn resolving_single_brace_leaves_double_brace_untouched() {
+    let vars = BTreeMap::from([("x".into(), "RESOLVED".into())]);
+    assert_eq!(resolve_single_brace("{{x}}", None, &vars), "{{x}}");   // byte-identical
+    assert_eq!(resolve_single_brace("{x}",   None, &vars), "RESOLVED");
+}
+#[test]
+fn a_double_brace_route_outside_an_expansion_survives_compile_byte_for_byte() { /* the corpus case */ }
+```
 
 ---
 
-## Task 8: Rung 2e (compile side) — `drain` and its refusals
+## Task 8: Rung 2e (compile side) — `drain`
 
-**Files:** create `formula/drain.rs` (with its `mod tests` — `parse_drain` is `pub(crate)`) · modify
-`parse.rs` (`walk_drain`, on the `walk_on_complete` mold at parse.rs:460), `ast.rs`, `keys.rs`
-(`Site::Drain`/`DrainItem` + the value-aware rules), `validate.rs` (S14–S16), `tests/compose.rs`
+**Files:** create `formula/drain.rs` · `parse.rs` (`walk_drain`, on `walk_on_complete`'s mold,
+parse.rs:460), `ast.rs`, `keys.rs`, `validate.rs` (S14–S17), `tests/compose.rs`
 
 ```rust
-/// gc's `DrainSpec` (gascity types.go:341), restricted to what camp implements.
+/// gc's DrainSpec (types.go:341), restricted to what camp implements.
+/// F2: gc's compiled Recipe has NO Drain struct — this becomes `gc.drain_*` METADATA
+/// on the step bead, which is where gc keeps it.
 pub struct Drain {
-    pub context: DrainContext,       // always Separate — Shared is REFUSED
-    pub formula: String,             // the per-member formula. NOT {{var}}-substituted (§9).
-    pub member_access: MemberAccess,
-    pub on_item_failure: OnItemFailure,
-    pub item: DrainItem,
+    pub context: DrainContext,          // always Separate — Shared is REFUSED
+    pub formula: String,                // rejected at validation if it contains "{{"  (gc's rule)
+    pub member_access: MemberAccess,    // default Read              (compile.go:590-598)
+    pub on_item_failure: OnItemFailure, // default Continue (separate) — PARSED, NOT ACTED ON (F6)
+    pub item: DrainItem,                // single_lane                — PARSED, NOT ACTED ON (F5)
 }
 pub enum DrainContext  { Separate }
-pub enum MemberAccess  { Read, Exclusive }         // as_str: "read" | "exclusive"
-pub enum OnItemFailure { Continue, SkipRemaining } // as_str: "continue" | "skip_remaining"
+pub enum MemberAccess  { Read, Exclusive }          // "read" | "exclusive"
+pub enum OnItemFailure { Continue, SkipRemaining }  // "continue" | "skip_remaining"
 pub struct DrainItem   { pub single_lane: bool }
 ```
+**gc's compiler defaulting** (`ApplyDrainControlMetadata`, `compile.go:584-614` — §9 cites `:579-608`;
+at `GASCITY_REF` it is **`:584-614`**): `member_access` → `"read"`; `on_item_failure` →
+`"skip_remaining"` (shared) / **`"continue"`** (else); `single_lane` written only when true.
+**Camp reproduces it exactly** — Task 11-B diffs the emitted `gc.drain_*` map against gc's.
 
-**gc's compiler defaulting, verbatim** — `ApplyDrainControlMetadata`, gascity
-`internal/formula/compile.go` (*"the single shape owner for drain control metadata"*).
-*(Provenance: compat §9 cites `compile.go:579-608`; the function at `GASCITY_REF` spans **:583-611**.
-Same function, same tree — §9's line numbers are off by 4. Recorded so the next reader does not think
-they read a different tree.)*
+**Refusals** (step-scoped — BD2): `context = "shared"`, `continuation_group`, `max_units`.
 
-| field | gc default | camp |
-|---|---|---|
-| `member_access` | **`"read"`** when unset | same. (All 25 corpus drains set `"exclusive"`.) |
-| `on_item_failure` | `"skip_remaining"` if `context == "shared"`, else **`"continue"`** | same. camp refuses `shared` ⇒ camp's effective default is **`continue`** — §9 exactly. |
-| `item.single_lane` | absent = false | same. |
+**S17 (new):** a `drain` step **must declare at least one `needs`** — *"a drain step must depend on the
+step that creates its members"*. Without it the anchor is claimed at cook time, before any member
+exists, scatters zero members and gathers `pass` immediately. Every corpus drain has `needs`.
 
-**Refusals (§4 rule 1, each naming its key):** `drain.context = "shared"` (13 corpus uses),
-`drain.continuation_group` (0), `drain.max_units` (0). The shared-drain message names **the formula,
-the step, and the `drain_policy = same-session` var that selects it** (§9, verbatim) — **except** for
-the one drain that has no condition, whose message says so.
-
-**`on_item_failure = "skip_remaining"` with `context = "separate"` is IMPLEMENTED, not refused** —
-gc's enum permits it and §9 lists both values; refusing an enumerated value would be camp inventing a
-restriction. **Zero corpus coverage** (all 13 uses sit on shared drains) ⇒ proven by the Task 9
-fixture. Same for **`single_lane`**. **The PR body must say this plainly.**
-
-- [ ] **Step 1: Write the failing tests**
-```rust
-#[test] fn drain_defaults_follow_gcs_compiler() {
-    let d = parse_drain(r#"formula = "item""#).unwrap();
-    assert_eq!(d.member_access, MemberAccess::Read);          // gc defaults to "read"
-    assert_eq!(d.on_item_failure, OnItemFailure::Continue);   // separate ⇒ continue
-    assert!(!d.item.single_lane);
-}
-#[test] fn a_conditional_shared_drain_is_refused_naming_formula_step_and_drain_policy() {
-    let r = c.refusals.iter().find(|r| r.key == "context").unwrap();
-    assert!(r.construct.contains("implement-same-session"));
-    assert!(r.reason.contains("build") && r.reason.contains("drain_policy")
-            && r.reason.contains("same-session"), "{}", r.reason);
-}
-#[test] fn the_corpus_build_formulas_compile_clean_because_the_shared_arm_IS_PRUNED() {
-    // THE load-bearing interaction. bmad-build/gstack-build/compound-build each
-    // carry TWO drain steps on mutually exclusive conditions; the default
-    // (drain_policy = "separate", from gascity's build-base) prunes the shared
-    // one BEFORE the refusal can fire. If the refusal fired at parse time, all
-    // three v1 build formulas would refuse and the ceiling would drop by 3.
-    // PRUNING (stage 6) RUNS BEFORE THE REFUSAL CHECK (stage 8).
-    let c = compile_named(&layers, &cfg, "build").unwrap();
-    assert!(c.refusals.is_empty(), "{:?}", c.refusals);
-    let d = c.formula.steps.iter().find(|s| s.id == "implement").unwrap().drain.as_ref().unwrap();
-    assert_eq!(d.member_access, MemberAccess::Exclusive);
-    assert_eq!(d.on_item_failure, OnItemFailure::Continue);
-}
-#[test] fn an_UNCONDITIONAL_shared_drain_is_refused_and_nothing_can_prune_it() {
-    // same-session-implement.formula.toml — the 13th shared drain, with NO
-    // `condition`. §9 and rev 1 both assumed all 13 were guarded. TWELVE are.
-    // This is one of the 5 formulas camp cannot load.
-    let c = compile_named(&layers, &cfg, "same-session-implement").unwrap();
-    assert!(c.refusals.iter().any(|r| r.key == "context"), "{:?}", c.refusals);
-}
-#[test] fn setting_drain_policy_to_same_session_refuses_instead_of_approximating() { }
-#[test] fn continuation_group_and_max_units_are_refused_by_name() { }
-#[test] fn drain_formula_is_never_var_substituted() { assert_eq!(d.formula, "{{item_formula}}"); }
-```
-- [ ] **Step 2: Run and watch them fail**
-- [ ] **Step 3: Implement.** `walk_drain` mirrors `walk_on_complete`, same key-whitelist discipline
-  and the same **presence-not-parse-success** rule (`RawStep.has_drain`, review finding 5). Add
-  `has_drain` to **S9**'s combination bans (`check`+`drain`, `retry`+`drain` — a drain step is
-  campd's, not a worker's) and to **S11**'s `uses_graph_only` predicate (validate.rs:182). Fill
-  `keys::classify` for `Site::Drain` / `Site::DrainItem` and the value-aware rules. **Remove `drain`
-  from `unimplemented`, then DELETE the `unimplemented` field and its violation — it is empty
-  forever.**
-- [ ] **Step 4: The gate, at the ceiling**
-```bash
-python3 ci/gc-compat/formula_gate.py /tmp/gcpacks target/debug/camp
-```
-Expected: **95 loaded · 62 runnable · 5 refused by name** (the table above), every rung count
-matching, the `rungs.py` cross-check green. **This is the phase's headline gate. If it reports
-anything else, STOP and report to the lead — `rungs.py` is the arbiter; do not adjust the
-expectation.**
-- [ ] **Step 5: Commit** —
-  `"feat(formula): rung 2e compile — drain, with shared/continuation_group/max_units refused (95/100, 62 runnable)"`
+- [ ] Tests: `drain_defaults_follow_gcs_compiler` (`Read`, `Continue`) ·
+  `a_conditional_shared_drain_is_refused_naming_formula_step_and_drain_policy` ·
+  **`the_corpus_build_formulas_compile_clean_because_the_shared_arm_IS_PRUNED`** — the load-bearing
+  one (BD2): `bmad-build`/`gstack-build`/`compound-build` each carry **two** drain steps on mutually
+  exclusive conditions, and the default `separate` prunes the shared one **and its refusal** before
+  stage 6 collects. *(gc corroborates: 13 authored shared drains → **1** compiled.)* ·
+  **`an_UNCONDITIONAL_shared_drain_is_refused_and_nothing_can_prune_it`** (`same-session-implement`) ·
+  `setting_drain_policy_to_same_session_refuses_instead_of_approximating` (via `vars_override`) ·
+  `continuation_group_and_max_units_are_refused_by_name` ·
+  **`the_metadata_key_gc_continuation_group_is_ACCEPTED_and_carried`** (29 uses — distinct from the
+  `drain.` key) · `a_templated_drain_formula_is_rejected_at_validation` (F8) ·
+  **`a_drain_step_compiles_to_gcs_gc_drain_metadata`** (F2/F3 — assert the exact 5-key map) ·
+  `a_drain_step_with_no_needs_is_a_violation` (S17).
+- [ ] Implement. `walk_drain` keeps the **presence-not-parse-success** rule (`RawStep.has_drain`). Add
+  `has_drain` to **S9**'s bans (`check`+`drain`, `retry`+`drain` — a drain step is campd's, not a
+  worker's) and to **S11**'s `uses_graph_only`. **Remove `drain` from `UNIMPLEMENTED`, then DELETE
+  `UNIMPLEMENTED` and its violation.**
+- [ ] **Gate — the ceiling.** `python3 ci/gc-compat/formula_gate.py /tmp/gcpacks target/debug/camp` ⇒
+  **95 loaded · 62 runnable · 5 refused by name**, every rung count matching, the set-vs-`rungs.py`
+  cross-check green. **If it reports anything else, STOP and report to the lead.**
+- [ ] Commit — `"feat(formula): rung 2e compile — drain (95/100 loadable, 62 runnable — the ceiling)"`
 
 ---
 
-## Task 9: The drain runtime — ONE lifecycle model, the reservation, and no leaks
+## Task 9: The drain runtime — gc's REAL semantics (RULING 4)
 
-**ADDITIVE ONLY** in `dispatch.rs`; `event_loop.rs` is **not touched**. `cp-1` owns those files.
+**ADDITIVE ONLY** in `dispatch.rs`; `event_loop.rs` untouched.
 
-**Files:** `formula/runtime.rs` (pure reads) · `readiness.rs` · `ledger/mod.rs` ·
-`camp/src/daemon/dispatch.rs` (**additive**) · `camp/src/cmd/doctor.rs` + `main.rs` (the operator
-escape) · `camp/tests/daemon_drain.rs`
+**Files:** `formula/runtime.rs`, `readiness.rs`, `ledger/mod.rs` · `daemon/dispatch.rs` (additive) ·
+`cmd/doctor.rs` + `main.rs` (the operator escape) · `camp/tests/daemon_drain.rs`
 
-### THE LIFECYCLE — one model, and it is campd-owned (B4)
+### The lifecycle — campd-owned, and **BD3's fix**
 
-Rev 1 specified the anchor three mutually-exclusive ways and hit a guaranteed `InvalidTransition`: it
-queued the drain when the anchor **closed pass**, then tried to **close** that already-closed anchor
-at gather (`fold.rs:369-373` rejects closing a closed bead), and its own tests closed the
-*predecessor*, never the anchor.
-
-**gc settles it:** *"Drain … materializes as a **controller-owned control bead**"* (types.go:318-319).
-
-> **The drain anchor is CAMPD-OWNED. It is never dispatched to a worker.**
-> campd **claims** it when its `needs` are satisfied → **scatters** the members → **gathers** →
-> **closes** it.
-
-This reuses machinery camp already has for check/retry anchors: `maybe_claim_looping`
-(dispatch.rs:1891) claims the anchor with `claimed_by = "campd"`, flipping it to `in_progress`, and
-`dispatchable_beads` requires `status = 'open'` (readiness.rs:137) — so **a campd-held anchor is
-never worker-dispatched.** The change is minimal and additive:
+gc: a drain *"materializes as a **controller-owned control bead**"* (types.go:318). campd **claims**
+the anchor when ready → **scatters** → **gathers** → **closes** it.
 
 ```rust
-// formula/runtime.rs — beside is_looping (runtime.rs:94). NOT a rename.
-/// campd holds this step's anchor itself: check/retry loops, and now drain —
-/// gc's "controller-owned control bead" (gascity types.go:318).
+// runtime.rs — beside is_looping (:94). NOT a rename.
 pub fn is_campd_held(step: &Step) -> bool { is_looping(step) || step.drain.is_some() }
 ```
-and switch **the one call site** (dispatch.rs:1909) from `is_looping` to `is_campd_held`. S9 (Task 8)
-bans `check`+`drain` and `retry`+`drain`, so a drain anchor never enters the check/attempt paths.
 
-**B5 falls out for free:** the anchor stays `in_progress` until gather, so `flow::finalization`
-(which iterates step anchors) **cannot** find the run quiescent, and every downstream step that
-`needs` the drain step stays blocked. *(Rev 1's justification — "the item roots hang off the anchor by
-`needs`" — was false: `finalization` iterates step anchors only, and bond children never block
-quiescence. The campd-held anchor is what actually blocks it.)* Pinned by
-`the_run_does_not_finalize_while_drain_items_are_open`.
-
-### THE MATERIALIZATION MATRIX (B6)
-
-Rev 1 claimed a `needs` edge on the item root would serialize items. **It is inert:**
-`dispatchable_beads` **excludes run roots outright** (readiness.rs:139,
-`AND NOT (b.run_id IS NOT NULL AND b.step_id IS NULL)`) — a root is never dispatchable, so a `needs`
-edge **on a root gates nothing**. And serializing purely by "materialize the next when the previous
-**passes**" silently imports `skip_remaining` semantics into `continue`. The real matrix:
-
-| `single_lane` | `on_item_failure` | materialization |
-|---|---|---|
-| false | `continue` (the corpus default) | **eager** — every member's item root in one pass |
-| **true** | `continue` | **lazy** — materialize item *i+1* when item *i*'s root is **CLOSED (any outcome)**. Concurrency 1; a failure does **not** halt the lane. |
-| any | `skip_remaining` | **lazy** — materialize item *i+1* only when item *i*'s root closed **`pass`**; on the first non-pass, materialize nothing further and gather. |
-
-The distinction between rows 2 and 3 — *closed* vs *closed pass* — **is** the difference between
-`continue` and `skip_remaining`, and it gets its own test
-(`single_lane_with_a_failing_item_still_runs_the_rest`).
-
-### THE RESERVATION, AND EVERY RELEASE PATH (B11)
-
-Reserve member *i* **before** materializing its item root: `bead.updated { metadata: {
-"gc.exclusive_drain_reservation": <anchor id> } }` — **gc's key verbatim** (beadmeta/keys.go:93,
-invariant 7). Task 3's fold makes it an atomic CAS. `member_access = "read"` reserves nothing.
-
-**Release on EVERY exit path** — rev 1 released only on a clean finalize, so a conflict, a dead-end, a
-`skip_remaining` trip, or a `kill -9` between reserve and cook leaked a reservation **forever**,
-blocking every future drain over that member with **no operator escape** (the metadata verb is
-compat-3's):
-
-| exit path | release |
-|---|---|
-| gather (all items closed) | release every member this drain holds, **in the finalizing `append_batch`** |
-| reserve **conflict** on member *k+1* | release members *1..k* **in the same batch as** the `dispatch.failed` |
-| `skip_remaining` trips | release every member this drain holds, at gather |
-| run dead-ends (`dead_end_run`) | release every member held by any anchor of that run |
-| **campd killed between reserve and cook** | **`reconcile` sweep**: any `bead_meta` row whose key is `gc.exclusive_drain_reservation` and whose value names an anchor that is **closed or absent** is **released** — an orphan by definition |
-| **operator escape** | **`camp doctor --drain-reservations [--release-orphans]`** — lists every held member and its holding anchor; `--release-orphans` releases those whose anchor is closed or absent. **Ships here**, not in compat-3. |
-
-**No new event type.** The reservation rides `bead.updated`; a drain that cannot proceed uses
-`dispatch.failed`, exactly as fan-out does (dispatch.rs:2258-2274 — *"`dispatch.failed` is the honest
-name: campd could not dispatch the declared follow-on work"*). Not laziness:
-`vocab.rs::no_reservation_vocabulary_exists` **forbids any event name containing `"reserv"`**.
-
-**Interfaces produced:**
+**BD3 — rev 2's "minimal and additive" one-line swap dispatched a real worker for every drain step.**
+`maybe_claim_looping` (dispatch.rs:1891-1934) **does not end at the claim**:
 ```rust
-// formula/runtime.rs — pure, write-free (the file's stated contract)
+Ledger::append_on(conn, now, EventInput { kind: EventType::BeadClaimed, /* campd */ … })?;
+let step = step_ref.step.clone();
+self.create_attempt(conn, now, &ctx, &step, &row, 1, None)?;   // <-- UNCONDITIONAL
+```
+`create_attempt` emits a `bead.created` with `run_id` + `step_id`, `type = task`, **open, no `needs`**
+— **exactly the shape `dispatchable_beads` picks up.** So every drain step got a worker **plus** the
+scatter (§13's money invariant, on the very path Task 4 protects); that phantom attempt's close then
+fell through `on_attempt_closed`'s branches to `Ok(())` **silently**, closing the anchor early, so the
+gather's `close_anchor` hit `InvalidTransition` — **B4, reintroduced through B4's own fix. And all four
+of rev 2's tests still passed**, because they only checked *the anchor*, and the attempt is a
+**different bead**.
 
-/// The drain's member set — gc's `convoycore.Members(parentConvoyID)`
-/// (gascity dispatch/drain.go:211) mapped onto camp's run (D3). Ordered by
-/// creation seq ⇒ a deterministic scatter.
+**Fix** — in `maybe_claim_looping`:
+```rust
+if flow::is_looping(step_ref.step) {                 // attempts ARE the check/retry mechanism
+    self.create_attempt(conn, now, &ctx, &step, &row, 1, None)?;
+} else {                                             // a drain anchor: campd scatters, never attempts
+    self.queue_drain(PendingDrain { … });
+}
+```
+**and the tests must be able to see it:**
+```rust
+#[test]
+fn a_drain_step_creates_NO_ATTEMPT_and_dispatches_NO_WORKER() {
+    // BD3: rev 2's four tests all passed against a broken implementation because
+    // they only checked THE ANCHOR. The attempt bead is a different bead id.
+    c.settle();
+    let anchor = c.step_bead(&run, "implement");
+    assert!(flow::attempts(&c.conn(), &run, "implement", &anchor).unwrap().is_empty(),
+            "a drain step has no attempts");
+    assert!(!c.dispatchable().iter().any(|b| b.step_id.as_deref() == Some("implement")),
+            "NOTHING carrying the drain step's step_id is dispatchable");
+}
+```
+**B5 (verified sound, kept):** `flow::finalization` (runtime.rs:392) returns `NotQuiescent` on any
+`in_progress` anchor, so the campd-held anchor blocks quiescence and every downstream `needs` stays
+blocked until gather.
+
+### Materialization — gc's REAL semantics (RULING 4; F5/F6/F7)
+
+**The 4-cell matrix is KILLED, with both synthetic fixtures.** They built behavior gc does not have.
+
+> **A separate drain is EAGER, ALL-MEMBERS, ALWAYS-`continue`, ALL-OR-NOTHING.**
+
+1. Read the member set (D3 — `type = 'task'`, **`status <> 'closed'`**).
+2. **If `len(members) > 100`** (gc's `defaultDrainMaxUnits`, `drain.go:24`): **close the anchor
+   `fail`/`hard_fail`, reason `limit_exceeded`; materialize nothing.**
+3. **Reserve EVERY member in ONE `append_batch`** (when `member_access = "exclusive"`).
+4. **Then** cook one item root per member, in the same execution.
+
+`single_lane` and `on_item_failure` are carried into `gc.drain_*` metadata and **never read** — exactly
+as in gc.
+
+### **BD4 — all-or-nothing, and why incremental was a correctness bug**
+
+Rev 2 reserved member *i* **before** materializing item *i*, and on a conflict at *k+1* "released
+1..k" — **while item-run 1 was already cooked and its workers dispatchable on m1.** m1 then carried
+**no** reservation, so a second drain could reserve it and cook its own item run over it: **two drains
+mutating one bead — the precise thing the reservation exists to prevent.** Rev 2's test asserted only
+that the metadata key was gone; it never asserted that item-run 1 was not cooked.
+
+**gc does not have this hole (F7):** `expandDrain` calls `reserveDrainMembers(store, bead, members,
+opts)` for the **whole set** (`drain.go:113-118`, `:1212-1219`) **before** the materialize loop; a
+conflict ⇒ `closeDrainReservationFailure` with **nothing materialized**.
+
+**Camp adopts that shape.** One `append_batch` holds every reservation: a CAS rejection **rolls the
+whole batch back for free** (ledger/mod.rs:982 — *"rejections appended nothing"*), so a partial
+reservation state is **unrepresentable** and the compensating-release path **disappears**.
+
+### **BD5 — a reserve conflict must CLOSE the anchor, or the run deadlocks forever**
+
+Rev 2 emitted `dispatch.failed` and stopped. That **only appends an event**; the campd-held anchor
+stays `in_progress` and `finalization` returns `NotQuiescent` **forever**. The reservation leak was
+fixed and replaced with a **run leak**.
+
+**On conflict, in one batch:** `dispatch.failed` (naming the member and the holding drain) **and the
+anchor close** (`fail` / `hard_fail`). The run then finalizes `fail`, and the operator sees a closed,
+named failure. Test: `a_reserve_conflict_closes_the_losing_anchor_and_the_run_FINALIZES`.
+
+### Release paths — now short, because BD4 removed the partial-state arm
+
+| exit | release |
+|---|---|
+| gather (all item roots closed) | release every member, **in the gather batch** |
+| reserve conflict | **nothing to release** — the batch rolled back |
+| `limit_exceeded` | nothing was reserved |
+| run dead-ends (`dead_end_run`) | release every member held by any anchor of that run |
+| **campd killed between the reserve batch and the cook** | **`reconcile` sweep**: a reservation naming an anchor that is **closed or absent** is an orphan ⇒ released |
+| **operator escape** | **`camp doctor --drain-reservations [--release-orphans]`** — ships **here**, not compat-3 |
+
+**No new event type.** The reservation rides `bead.updated`; failure uses `dispatch.failed` (the
+fan-out mold, :2258). `no_reservation_vocabulary_exists` **forbids any event name containing
+`"reserv"`**.
+
+### Interfaces
+
+```rust
+// runtime.rs — pure, write-free
 pub fn run_members(conn: &Connection, ctx: &RunContext) -> Result<Vec<BeadRow>, CoreError>;
-
-/// `drain:<anchor>:<index>` on each item ROOT — the exact mold of `bond_label`
-/// (runtime.rs:504). It is the IDEMPOTENCY LEDGER: what exists is materialized.
-pub fn drain_label(anchor: &str, index: usize) -> String;
+pub fn drain_label(anchor: &str, index: usize) -> String;          // "drain:<anchor>:<i>"
 pub fn parse_drain_label(label: &str) -> Option<(&str, usize)>;
 pub fn drain_children(conn: &Connection, anchor: &str) -> Result<BTreeMap<usize, BeadRow>, CoreError>;
-
-/// Members whose reservation names an anchor that is closed or absent.
 pub fn orphaned_reservations(conn: &Connection) -> Result<Vec<(String, String)>, CoreError>;
+pub const DRAIN_MAX_UNITS: usize = 100;      // gc's defaultDrainMaxUnits (drain.go:24)
 
-// camp/src/daemon/dispatch.rs — beside PendingFanout (dispatch.rs:1045)
+// dispatch.rs — beside PendingFanout (:1045)
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingDrain { pub run_id: String, pub step_id: String, pub anchor: String }
 ```
-
-`run_members` SQL — **note `b.type = 'task'` (B13):** compat-4 introduces dispatch-excluded
-`type = "mail"` beads and camp already has `memory` beads; without the filter, a mail bead landing in
-a run would be **scattered and reserved**.
 ```sql
+-- run_members. NOTE b.type='task' AND b.status<>'closed' (D3 — gc excludes closed members).
 SELECT {BEAD_COLS} FROM beads b
- WHERE b.run_id = ?1 AND b.step_id IS NULL AND b.type = 'task' AND b.id <> ?2   -- ?2 = the run root
+ WHERE b.run_id = ?1 AND b.step_id IS NULL AND b.type = 'task' AND b.status <> 'closed'
+   AND b.id <> ?2                                          -- ?2 = the run root
    AND b.labels NOT LIKE '%"bond:%' AND b.labels NOT LIKE '%"drain:%'
  ORDER BY (SELECT MIN(e.seq) FROM events e WHERE e.bead = b.id AND e.type = 'bead.created'), b.id
 ```
-The `LIKE`s are a **prefilter**; re-parse the labels Rust-side and drop decoys, exactly as
-`bond_children` (runtime.rs:514-549) does.
+The `LIKE`s are a **prefilter**; re-parse labels Rust-side and drop decoys (the `bond_children` mold,
+runtime.rs:514-549).
 
-### The test harness (B10)
+### The harness — **defined in full (BD11)**
 
-**There is no shared daemon-test harness in this repo — every file rolls its own.** Copy
-`struct Daemon`, `wait_until`, `scaffold` and `camp_ok` **from `crates/camp/tests/daemon_dispatch.rs`**
-into `daemon_drain.rs` (the established mold), plus these helpers, defined here:
+`daemon_dispatch.rs` (the named mold) has **free functions** (`camp`, `camp_ok`, `scaffold`,
+`wait_until`, `events_json`) and a `struct Daemon` with **one method and no accessors** — rev 2 wrote
+`c.method()` against a composite type that does not exist. Define it in `daemon_drain.rs`:
 
-| helper | definition |
-|---|---|
-| `c.settle()` | `wait_until(\|\| c.cursor_is_caught_up() && c.pending_drains_empty())`, 10 s deadline (the `daemon_dispatch.rs` mold). |
-| `c.create_member(&run, title)` | `camp_ok(&["create", title, "--run", run])` → the new bead id. |
-| `c.step_bead(&run, step_id)` | read the run manifest's `steps` map. |
-| `c.drain_children(anchor)` | the `drain:<anchor>:*` label query (`ledger.drain_children`). |
-| `c.close_pass(b)` / `c.close_fail(b)` / `c.close_pass_all(&[..])` | `camp_ok(&["close", b, "--outcome", "pass"\|"fail"])`. |
-| `c.dispatchable()` | `camp_core::readiness::dispatchable_beads(&conn)` — **there is no CLI for readiness**, so call the library directly. |
-| `c.restart_campd()` | drop the `Daemon` and re-spawn on the same camp root (the `daemon_lifecycle.rs` mold). |
-| `c.bead_metadata(b)` | `ledger.bead_metadata(b)`. |
+```rust
+struct Camp { root: TempDir, daemon: Daemon }
+impl Camp {
+    fn new(pack: &str) -> Self;                                  // scaffold + import the fixture pack + spawn
+    fn camp(&self, args: &[&str]) -> Output;
+    fn conn(&self) -> Connection;                                // camp.db, read-only
+    fn sling(&self, formula: &str) -> String;                    // -> run_id
+    fn create_member(&self, run: &str, title: &str) -> String;   // camp create <title> --run <run>
+    fn step_bead(&self, run: &str, step: &str) -> String;        // runs/<run>/manifest.json
+    fn get_bead(&self, id: &str) -> BeadRow;
+    fn bead_metadata(&self, id: &str) -> BTreeMap<String, String>;
+    fn drain_children(&self, anchor: &str) -> BTreeMap<usize, BeadRow>;
+    fn dispatchable(&self) -> Vec<BeadRow>;                      // readiness::dispatchable_beads — no CLI exists
+    fn events_of_type(&self, t: &str) -> Vec<serde_json::Value>;
+    fn close_item(&self, item_root: &str);                       // see below
+    fn settle(&self);          // wait_until(cursor caught up AND pending_drains empty), 10 s deadline
+    fn restart_campd(&mut self);
+}
+```
+**An item run root is NEVER closed directly** — every run root closes via `flow::finalization`, and
+`camp close` on a live root would hit the same `InvalidTransition` class as B4. **`close_item` closes
+the item run's `work` STEP bead** (read from that run's manifest); campd's finalization then closes the
+item root, and `settle()` observes it.
 
-### The two ZERO-COVERAGE fixtures — given in full (B10)
+### The fixtures — in full
 
-The corpus **provably cannot** exercise `single_lane` or `on_item_failure` on camp's path (all 13 uses
-sit on shared drains camp refuses). These fixtures are their **only** proof, so they are specified
-here rather than left to the implementer.
-
-`tests/fixtures/compose/drain-single-lane/formulas/sl-build.formula.toml`:
+`tests/fixtures/compose/drain/formulas/build.formula.toml`:
 ```toml
-formula = "sl-build"
+formula = "build"
 contract = "graph.v2"
 
 [[steps]]
@@ -1804,409 +1245,226 @@ title = "Decompose"
 [[steps]]
 id = "implement"
 title = "Implement each member"
-needs = ["decompose"]
+needs = ["decompose"]                    # S17 — a drain must depend on its member-producer
 [steps.implement.drain]
 context = "separate"
-formula = "sl-item"
+formula = "item"
 member_access = "exclusive"
-# on_item_failure OMITTED ⇒ gc's default for separate context = "continue"
-[steps.implement.drain.item]
-single_lane = true
 
 [[steps]]
 id = "publish"
 title = "Publish"
 needs = ["implement"]
 ```
-`.../formulas/sl-item.formula.toml`:
+`.../formulas/item.formula.toml`:
 ```toml
-formula = "sl-item"
+formula = "item"
 contract = "graph.v2"
 
 [[steps]]
 id = "work"
 title = "Work the member"
 ```
-`fixture_campd_with_single_lane_drain()` = this pack, **`max_workers = 8`**, **3 members** created
-with `camp create --run`.
-
-`.../drain-skip-remaining/formulas/sr-build.formula.toml` — identical to `sl-build` except:
+**The conflict fixture — the only constructible shape.** A bead has **one** `run_id` and `run_members`
+selects `WHERE b.run_id = ?1`, so two drains can contend **only as two drain steps of the SAME run**.
+`.../formulas/two-drains.formula.toml`:
 ```toml
-[steps.implement.drain]
+formula = "two-drains"
+contract = "graph.v2"
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "drain-a"
+title = "Drain A"
+needs = ["decompose"]
+[steps.drain-a.drain]
 context = "separate"
-formula = "sl-item"
+formula = "item"
 member_access = "exclusive"
-on_item_failure = "skip_remaining"
+
+[[steps]]
+id = "drain-b"
+title = "Drain B"
+needs = ["decompose"]                    # PARALLEL with drain-a — both ready at once
+[steps.drain-b.drain]
+context = "separate"
+formula = "item"
+member_access = "exclusive"
 ```
-(no `[steps.implement.drain.item]` — `skip_remaining` serializes on its own).
-`fixture_campd_with_skip_remaining_drain()` = this pack, **3 members**.
+Both anchors go ready when `decompose` closes; campd claims both; the first to execute reserves every
+member and the second's reserve batch **conflicts and rolls back**.
 
-- [ ] **Step 1: Write the failing tests** (`camp/tests/daemon_drain.rs`)
+**The orphan fixture** reuses `build.formula.toml` but points `drain.formula` at a name that does not
+resolve: `execute_drain` appends the reserve batch, then the cook fails ⇒ the anchor is left holding
+reservations ⇒ `restart_campd()` runs the sweep. *(That is also the honest test for "a drain whose item
+formula is missing": it must `dispatch.failed` **and close the anchor**, not leak.)*
 
-```rust
-#[test]
-fn the_drain_anchor_is_campd_held_and_never_worker_dispatched() {
-    // B4: ONE lifecycle. gc: "a controller-owned control bead" (types.go:318).
-    let mut c = fixture_campd_with_drain_formula();
-    let run = c.sling("build");
-    c.create_member(&run, "A");
-    c.close_pass(&c.step_bead(&run, "decompose"));      // the PREDECESSOR, never the anchor
-    c.settle();
-    let anchor = c.get_bead(&c.step_bead(&run, "implement"));
-    assert_eq!(anchor.status, "in_progress");
-    assert_eq!(anchor.claimed_by.as_deref(), Some("campd"));
-    assert!(!c.dispatchable().iter().any(|b| b.id == anchor.id), "never worker-dispatched");
-}
-
-#[test] fn a_drain_scatters_the_runs_members_one_item_root_each() { /* 2 members ⇒ 2 item roots */ }
-
-#[test]
-fn an_exclusive_drain_reserves_every_member_with_gcs_verbatim_key() {
-    assert_eq!(c.bead_metadata(&m)["gc.exclusive_drain_reservation"], c.step_bead(&run, "implement"));
-}
-
-#[test]
-fn a_second_drain_reserving_a_held_member_fails_loudly_and_never_mutates_it() {
-    let failures = c.events_of_type("dispatch.failed");
-    assert_eq!(failures.len(), 1, "the SECOND drain fails; the first is untouched");
-    assert!(failures[0]["data"]["reason"].as_str().unwrap().contains("gc.exclusive_drain_reservation"));
-    assert_eq!(c.bead_metadata(&c.member)["gc.exclusive_drain_reservation"], c.first_drain);
-}
-
-#[test]
-fn a_conflicting_drain_releases_the_members_it_had_already_reserved() {
-    // B11: it reserves 1..k, conflicts on k+1, and must NOT leak 1..k.
-    let mut c = fixture_campd_conflict_on_second_member();
-    c.settle();
-    assert!(!c.bead_metadata(&c.first_member).contains_key("gc.exclusive_drain_reservation"));
-}
-
-#[test] fn the_reservation_is_released_when_the_drain_gathers() { }
-
-#[test]
-fn the_run_does_not_finalize_while_drain_items_are_open() {
-    // B5: the campd-held anchor is what blocks quiescence.
-    c.settle();
-    assert!(c.events_of_type("run.finalized").is_empty());
-    assert!(!c.dispatchable().iter().any(|b| b.id == c.step_bead(&run, "publish")),
-            "a downstream step stays blocked on the open drain anchor");
-    c.close_pass_all(&c.drain_children(&anchor));
-    c.settle();
-    assert_eq!(c.get_bead(&anchor).outcome.as_deref(), Some("pass"));
-    assert!(c.dispatchable().iter().any(|b| b.id == c.step_bead(&run, "publish")));
-}
-
-#[test]
-fn single_lane_items_never_run_concurrently() {
-    let mut c = fixture_campd_with_single_lane_drain();   // 3 members, max_workers = 8
-    c.settle();
-    assert_eq!(c.drain_children(&anchor).len(), 1, "concurrency 1");
-    c.close_pass(&c.drain_children(&anchor)[&0]);
-    c.settle();
-    assert_eq!(c.drain_children(&anchor).len(), 2);
-}
-
-#[test]
-fn single_lane_with_a_failing_item_still_runs_the_rest() {
-    // B6: `continue` ≠ `skip_remaining`. Lazy materialization ALONE would
-    // silently import skip_remaining's semantics. THIS test separates them —
-    // rev 1 had no such test.
-    let mut c = fixture_campd_with_single_lane_drain();   // on_item_failure defaults to `continue`
-    c.settle();
-    c.close_fail(&c.drain_children(&anchor)[&0]);
-    c.settle();
-    assert_eq!(c.drain_children(&anchor).len(), 2, "the lane advances on CLOSED, not on PASSED");
-    c.close_pass(&c.drain_children(&anchor)[&1]);
-    c.settle();
-    assert_eq!(c.drain_children(&anchor).len(), 3, "all 3 members ran");
-    c.close_pass(&c.drain_children(&anchor)[&2]);
-    c.settle();
-    assert_eq!(c.get_bead(&anchor).outcome.as_deref(), Some("fail"),
-               "the drain's outcome reflects the failures at gather (§9)");
-}
-
-#[test]
-fn skip_remaining_materializes_nothing_after_the_first_failure() {
-    let mut c = fixture_campd_with_skip_remaining_drain();   // 3 members
-    c.settle();
-    assert_eq!(c.drain_children(&anchor).len(), 1);
-    c.close_fail(&c.drain_children(&anchor)[&0]);
-    c.settle();
-    assert_eq!(c.drain_children(&anchor).len(), 1, "nothing further");
-    assert_eq!(c.get_bead(&anchor).outcome.as_deref(), Some("fail"));
-    assert!(!c.bead_metadata(&c.members[1]).contains_key("gc.exclusive_drain_reservation"),
-            "and it leaks nothing");
-}
-
-#[test]
-fn a_drain_survives_a_campd_restart_without_double_materializing() {
-    let before = c.drain_children(&anchor);
-    c.restart_campd();                                  // reconcile re-queues
-    c.settle();
-    assert_eq!(c.drain_children(&anchor), before, "the drain: label is the idempotency ledger");
-}
-
-#[test]
-fn reconcile_releases_a_reservation_orphaned_by_a_kill_9() {
-    // B11: campd died between reserve and cook. The holder is closed/absent.
-    let mut c = fixture_with_orphaned_reservation();
-    c.restart_campd();
-    c.settle();
-    assert!(!c.bead_metadata(&c.member).contains_key("gc.exclusive_drain_reservation"));
-}
-
-#[test]
-fn doctor_lists_and_releases_orphaned_drain_reservations() {
-    // The operator escape. `bd update --set-metadata` is compat-3's; this ships HERE.
-    assert!(c.camp(&["doctor", "--drain-reservations"]).stdout.contains("gc.exclusive_drain_reservation"));
-    c.camp(&["doctor", "--drain-reservations", "--release-orphans"]);
-    assert!(!c.bead_metadata(&c.member).contains_key("gc.exclusive_drain_reservation"));
-}
-
-#[test]
-fn a_mail_bead_in_a_run_is_never_a_drain_member() {
-    // B13: compat-4 introduces dispatch-excluded `type = "mail"` beads.
-    c.create_mail_bead_in_run(&run);
-    c.settle();
-    assert_eq!(c.drain_children(&anchor).len(), 1, "only the task bead was scattered");
-}
-```
-
-- [ ] **Step 2: Run and watch them fail** — `cargo test -p camp --test daemon_drain 2>&1 | tail -20`
-
-- [ ] **Step 3: Implement the pure reads** in `runtime.rs`/`readiness.rs` (SQL above).
-
-- [ ] **Step 4: Implement the dispatch arms — SEVEN additive edits, no refactors**
-
-1. `PendingDrain` beside `PendingFanout` (dispatch.rs:1045).
-2. `pending_drains: Vec<PendingDrain>` on `GraphRuntime` (:1051-1063).
-3. `queue_drain` beside `queue_fanout` (:2180) — dedupe with `Vec::contains`.
-4. **`maybe_claim_looping` (:1891)** — switch its predicate to `is_campd_held` (:1909) and, after a
-   successful claim of a **drain** step, `queue_drain(...)`. *(This — not `on_bead_closed` — is the
-   trigger. The anchor is claimed when READY, not when closed.)*
-5. `execute_drain` loop in `execute` (:1154), after the fanout loop, with the same
-   **requeue-the-unexecuted-tail-on-error** shape (:1154-1162).
-6. `on_bead_closed` (:1813): when a closed bead is a **drain item root** (parse its `drain:` label),
-   re-queue that anchor's `PendingDrain` — the mold of `on_root_closed` (:1864) for bond children.
-7. `reconcile` (**dispatch.rs:1645**): for every `run.cooked`, for every step with `drain`, if the
-   anchor is campd-held-and-open, re-queue; **plus the orphaned-reservation sweep** (B11).
-
-`execute_drain` mirrors `execute_fanout` (:1174-1275): read members, read `drain_children` (the
-idempotency ledger), compute the due indices **per the matrix**, reserve, then `cook_with` with
-`extra_root_labels = vec![drain_label(anchor, i)]` and `vars` = the parent's merged vars plus
-`{member}` = the member bead id. **`drain.formula` resolves through `FormulaLayers`**, not
-`<camp>/formulas/<bond>.toml` (which `execute_fanout` hardcodes at :1230) — every corpus item formula
-(`bmad-story-development`, `gstack-work`, `compound-work`) lives in an **imported** pack. At gather,
-`close_anchor` (:2296) closes the campd-held anchor `pass` iff every item root closed `pass`, else
-`fail` / `hard_fail`, **and releases every reservation in the same `append_batch`**.
-
-- [ ] **Step 5: Run and watch them pass**
-```bash
-cargo test -p camp --test daemon_drain 2>&1 | tail -10
-cargo test --workspace 2>&1 | tail -10
-```
-- [ ] **Step 6: Full gates and commit** —
-  `"feat(dispatch): the drain runtime — campd-held anchors, exclusive reservations, single_lane, on_item_failure"`
+- [ ] **Step 1: Failing tests.** `a_drain_step_creates_NO_ATTEMPT_and_dispatches_NO_WORKER` (BD3) ·
+  `the_drain_anchor_is_campd_held_and_never_worker_dispatched` ·
+  **`a_drain_scatters_EVERY_member_in_one_pass`** (F7 — 3 members ⇒ 3 item roots after one `settle`) ·
+  `an_exclusive_drain_reserves_every_member_with_gcs_verbatim_key` ·
+  **`a_conflicting_drain_reserves_NOTHING_and_materializes_NOTHING`** (BD4 — the loser's
+  `drain_children` is **empty**; the winner still holds every member) ·
+  **`a_reserve_conflict_closes_the_losing_anchor_and_the_run_FINALIZES`** (BD5) ·
+  `the_reservation_is_released_when_the_drain_gathers` ·
+  `the_run_does_not_finalize_while_drain_items_are_open` (B5) ·
+  **`the_drains_outcome_reflects_a_failed_item_at_gather`** (one item fails ⇒ anchor `fail`, **and the
+  other items still ran** — `continue`, always, F6) ·
+  **`a_drain_over_100_members_fails_the_drain_and_scatters_nothing`** (gc's cap) ·
+  `a_drain_survives_a_campd_restart_without_double_materializing` ·
+  `reconcile_releases_a_reservation_orphaned_by_a_kill_9` ·
+  `doctor_lists_and_releases_orphaned_drain_reservations` ·
+  `a_mail_bead_in_a_run_is_never_a_drain_member` ·
+  **`a_CLOSED_member_is_never_scattered`** (D3 — gc excludes closed members) ·
+  **`execute_drain_refuses_a_not_runnable_item_formula`** (the third cook entry point).
+- [ ] **Step 2: Run; watch fail.**
+- [ ] **Step 3: The pure reads** (SQL above).
+- [ ] **Step 4: The dispatch arms — SEVEN additive edits, no refactors.**
+  (1) `PendingDrain` beside `PendingFanout` (:1045). (2) `pending_drains` on `GraphRuntime`
+  (:1051-1063). (3) `queue_drain` beside `queue_fanout` (:2180). (4) **`maybe_claim_looping` (:1891):
+  the `is_campd_held` predicate at :1909 AND the `create_attempt` gate (BD3).** (5) `execute_drain` in
+  `execute` (:1154), after the fanout loop, same requeue-tail-on-error shape. (6) `on_bead_closed`
+  (:1813): a closed **drain item root** (by its `drain:` label) re-queues its anchor — the
+  `on_root_closed` mold (:1864). (7) `reconcile` (**:1645**): re-queue open campd-held drain anchors,
+  **plus the orphan sweep**.
+  `execute_drain` mirrors `execute_fanout` (:1174-1275) but resolves `drain.formula` **through
+  `FormulaLayers`** (not `<camp>/formulas/<bond>.toml`, which `execute_fanout` hardcodes at :1230 —
+  every corpus item formula lives in an **imported** pack) and checks `not_runnable` before cooking.
+  **`close_anchor` (:2296) takes `&Connection`** and uses `append_on`, while `execute_drain` holds
+  `&mut Ledger` — so the gather **builds its `EventInput`s (the anchor close *and* every release) and
+  submits ONE `append_batch`**; it does **not** call `close_anchor`. *(Rev 2's "call `close_anchor` and
+  release in the same `append_batch`" does not typecheck.)*
+- [ ] **Steps 5–6: Run; pass; gates; commit** —
+  `"feat(dispatch): the drain runtime — campd-held anchors, all-or-nothing reservations, gc's real semantics"`
 
 ---
 
-## Task 10: Invariant 6 — camp ⊆ gc, with fixtures that actually reach the gate
+## Task 10: Invariant 6 — camp ⊆ gc fixtures
 
-**The trap:** the `gc-compat` CI job runs the **real gc compiler** over
-`crates/camp-core/tests/fixtures/formulas/valid` (`camp_corpus_validate.go`), and that shim globs
-`*.toml` and derives a formula's name as **`TrimSuffix(basename, ".toml")`**. So:
+The `gc-compat` job runs the **real gc compiler** over `tests/fixtures/formulas/valid`;
+`camp_corpus_validate.go` globs `*.toml` and derives the name as `TrimSuffix(basename, ".toml")`. So:
+**never name a fixture `*.formula.toml`** (gc would get `"x.formula"`); **no `expansion` fixture in
+`valid/`** (the shim compiles standalone, and §9 says an expansion formula is *"not directly
+runnable"*); and **`extends-child` needs a parent LAYER** the shim does not provide. ⇒ `expansion` and
+`extends-child` live in `tests/fixtures/compose/`; the **parent** goes in `valid/`.
 
-- **Do NOT name a fixture `*.formula.toml`** — gc would receive the name `"x.formula"` and fail its
-  own name check, turning the invariant-6 gate red for a reason unrelated to camp's rules.
-- **Do NOT put an `expansion` fixture in `valid/`** — the shim compiles each file **standalone**, and
-  §9 says an expansion formula is *"not directly runnable"*; gc may reject it.
-- **`extends-child` needs a parent LAYER**, which the shim does not provide.
-
-⇒ `expansion` and `extends-child` live in `tests/fixtures/compose/` (covered by `tests/compose.rs`,
-not by the gc gate). The **parent** goes in `valid/` — it is a complete, standalone, gc-valid formula.
-
-- [ ] **Step 1: Add gc-valid standalone fixtures** to `tests/fixtures/formulas/valid/`:
-  `vars-condition.toml`, `extends-parent.toml`, `drain-separate.toml` — each declaring
-  `contract = "graph.v2"`, each named `<name>.toml`. Update the hard-coded list in
-  `formula_corpus.rs::every_valid_fixture_is_accepted`.
-
-- [ ] **Step 2: Prove they pass the REAL gc compiler locally**
-```bash
-git clone -q --filter=blob:none https://github.com/gastownhall/gascity /tmp/gascity \
-  && git -C /tmp/gascity checkout -q "$(cat ci/gc-compat/GASCITY_REF)"
-mkdir -p /tmp/gascity/cmd/camp-corpus-validate
-cp ci/gc-compat/camp_corpus_validate.go /tmp/gascity/cmd/camp-corpus-validate/main.go
-(cd /tmp/gascity && go build -o /tmp/camp-corpus-validate ./cmd/camp-corpus-validate)
-/tmp/camp-corpus-validate crates/camp-core/tests/fixtures/formulas/valid
-```
-Expected: `OK <name>` for every fixture, exit 0. **A `FAIL` means camp accepts a formula gc rejects —
-invariant 6 is broken.**
-
-- [ ] **Step 3: Write the corpus-drift procedure** into a new `ci/gc-compat/README.md`: moving
-  `GCPACKS_REF` requires, in ONE PR — re-run `python3 ci/gc-compat/rungs.py <new corpus>`; update
-  `formula_gate.py`'s `CEILING`, `RUNNABLE`, `RUNG_COUNTS`, `NOT_LOADABLE`; re-run
-  `differential.py`; update the §9 addendum's numbers. **`rungs.py` is the arbiter** — it is derived
-  from §9's text, not from camp's `RUNGS` table, so it can tell you which of the two is wrong.
-
-- [ ] **Step 4: Commit** —
-  `"test(formula): gc-valid fixtures for the new key sets + the corpus-drift procedure"`
+- [ ] Add `vars-condition.toml`, `extends-parent.toml`, `drain-separate.toml` to `valid/`; update the
+  list in `every_valid_fixture_is_accepted`.
+- [ ] Prove them against the real gc compiler locally (`OK <name>`, exit 0). **A `FAIL` means camp
+  accepts what gc rejects — invariant 6 is broken.**
+- [ ] **`ci/gc-compat/README.md` — the corpus-drift procedure.** Moving `GCPACKS_REF` requires, in ONE
+  PR: re-run `factshim` (the gc baseline) and `rungs.py` (the arbiter); update `formula_gate.py`'s
+  `CEILING`/`RUNNABLE`/`RUNG_COUNTS`/`NOT_LOADABLE`; re-run `differential.py`; **and update the §9
+  addendum's numbers.** *(The addendum hard-codes 95/62/the rungs into the spec. Nothing can enforce
+  "spec == arbiter" mechanically; the written procedure is the enforcement.)*
+- [ ] Commit.
 
 ---
 
-## Task 11: The gc ORACLE — a differential gate, not a reading of gc's source (RULING 3)
+## Task 11: The differential gate — scoped to what is actually comparable
 
-`ci/gc-compat/camp_corpus_validate.go` **already links gc's real compiler**
-(`github.com/gastownhall/gascity/internal/formula`) and already runs in CI — and then **discards the
-compiled formula** (`if _, err := formula.Compile…`). Meanwhile **every fidelity claim in this phase
-is asserted from READING gc's source**: the >4096 pointer prompt "byte-for-byte", gc's drain
-defaulting, `extends` = append + replace-in-place, `expand` replaces the target, condition-pruning
-drops dangling `needs`, and **B15's inline-vs-substitute ordering**. Those claims carry rungs 2c (+26)
-and 2d (+26) — the most formulas in the phase. A mis-transcribed paragraph in the pointer prompt is a
-**silent divergence no camp-only test can detect**.
+**Rev 2's oracle could not have worked.** It diffed camp's **post**-substitution output against gc's
+**pre**-substitution Recipe (F1 ⇒ hundreds of false diffs), demanded a `"drain": {…}` object gc
+**cannot emit** (F2 ⇒ all 20 drain steps fail), and implied a step-list diff — but **gc expands
+check/retry loops at compile into namespaced `.iteration.N` steps and synthesizes `gc.kind: scope`
+bodies (1523 steps for 99 formulas), while camp keeps those as RUNTIME loops.** A full step-list diff
+is **structurally impossible**, and always will be.
 
-**Files:** create `ci/gc-compat/gc_compile_json.go`, `ci/gc-compat/differential.py` · modify
-`camp/src/cmd/doctor.rs` (`--compiled`), `.github/workflows/ci.yml`
+**So the oracle asserts the four things that ARE comparable**, each keyed by the **authored** step id
+(gc exposes it as `Metadata["gc.step_id"]`; top-level steps are `"<formula>.<authored-id>"`):
 
-- [ ] **Step 1: The gc side — a NEW shim** (leave `camp_corpus_validate.go` untouched so a green
-  invariant-6 gate cannot be broken by this work).
+| # | assertion | catches |
+|---|---|---|
+| **A** | **The compile set.** gc compiles 99/100 (`mol-polecat-work` fails); camp compiles 95. The delta is **exactly** the 4 camp deliberately refuses. | a silent over- or under-refusal |
+| **B** | **Drain metadata.** For every gc step with `gc.kind = "drain"` (**20**: 19 separate, 1 shared), camp emits an identical `gc.drain_*` map. Camp yields **19** — the shared one is its deliberate refusal. | gc's **defaulting** (F3), camp's **condition-pruning** (12 of 13 shared drains vanish in **both**), and **extends propagation** (12 authored → 19 compiled) |
+| **C** | **Routes.** For every gc step with `gc.run_target`, camp's value matches **byte-for-byte, pre-`{{}}`-substitution** — `{{implementation_target}}` must survive in **both**, and `{implementation_target}` must be **resolved** in both. | **F1 and F4 together** — the highest-risk pair in the phase |
+| **D** | **Descriptions.** `sha256(description)` per authored step id, for steps camp materializes. | the **>4096 pointer prompt byte-for-byte**, `description_file` layering, and **whether `{{var}}` was wrongly substituted at compile** |
 
-`ci/gc-compat/gc_compile_json.go`: `usage: gc-compile-json <layer-dir>[,<layer-dir>...] <formula-name>`.
-Calls the same `formula.CompileWithoutRuntimeVarValidation(ctx, name, layers, nil)` the existing shim
-calls, then marshals the **compiled** formula to JSON on stdout in this normalized shape:
+Excluded from every diff, and why: `FormulaSource` (an **absolute path** — environment-dependent),
+`ContentHash`, and every gc step camp has no counterpart for (the `.iteration.N` / scope bodies gc
+synthesizes).
 
-```jsonc
-{ "formula": "bmad-build",
-  "steps": [ { "id": "implement",
-               "title": "...",
-               "description_sha256": "…",     // a sha, so the diff stays readable
-               "needs": ["decompose"],
-               "metadata": { "gc.run_target": "gc.run-operator", "gc.kind": "drain", ... },
-               "drain": { "context": "separate", "formula": "bmad-story-development",
-                          "member_access": "exclusive", "on_item_failure": "continue",
-                          "single_lane": false } } ] }
-```
+**Files:** `ci/gc-compat/differential.py` (drives Task 0's `factshim` and `camp doctor --formula --json
+--compiled`) · `cmd/doctor.rs` (`--compiled` emits camp's compiled formula in the same normalized
+shape) · `ci.yml` (into the **`gc-compat`** job — it already has the gascity checkout and Go; add the
+corpus checkout and `cargo build --bin camp` there).
 
-- [ ] **Step 2: The camp side** — `camp doctor --formula <path> --json --compiled` emits **the same
-  schema** from `Compiled.formula`.
-
-- [ ] **Step 3: `ci/gc-compat/differential.py`** — compile all 100 in **both**, and diff.
-
-```python
-"""RULING 3: verify fidelity against the REAL gc compiler, not against a reading of it.
-
-usage: differential.py <corpus> <camp-binary> <gc-compile-json-binary>
-
-For each of the 100 formulas: compile in gc (layers = all 10 formula-bearing
-packs) and in camp (the formula_gate.py camp root), then diff the normalized
-JSON. ASSERT the ONLY differences are the KNOWN, EXPLAINED ones:
-
-  - the 5 camp refuses (NOT_LOADABLE): camp emits nothing.
-    (mol-polecat-work: gc ALSO fails — its parent lives in gc's embedded core
-     pack, which this shim does not load. ASSERT gc fails it too.)
-  - `assignee`: camp resolves metadata.gc.run_target INTO `assignee` (§4 trap 3);
-    gc leaves it in metadata. Compare camp.assignee == gc.metadata["gc.run_target"].
-
-EVERYTHING else — step id lists AND ORDER, titles, description_sha256, needs,
-metadata maps, drain specs — must match EXACTLY. A mismatch is a camp≠gc
-divergence and FAILS the gate.
-
-This settles, by RUNNING gc rather than reading it:
-  · the >4096 pointer prompt, byte-for-byte (via description_sha256)
-  · whether description_file contents are {{var}}-substituted        <- B15
-  · gc's drain defaulting (member_access→read, on_item_failure→continue)
-  · extends: append + replace-in-place, position preserved, no field-level merge
-  · expand: the target step is REPLACED by the template
-  · condition pruning, and that dangling `needs` are dropped
-"""
-```
-
-- [ ] **Step 4: Run it locally and FIX CAMP where it diverges.** This is the step that converts every
-  source-read in this plan into a verified fact. **If gc and camp disagree on the pointer prompt's
-  bytes, camp is wrong** — transcribe again. **If they disagree on whether `description_file`
-  contents are substituted, gc's behaviour wins and the Task 4 pipeline order changes to match.**
-
-- [ ] **Step 5: Wire CI.** The Go toolchain lives in the **`gc-compat`** job (it checks out gascity
-  and runs `setup-go`); the corpus and the camp binary live in **`gcpacks-compat`**. The differential
-  needs all four ⇒ add the corpus checkout (at `GCPACKS_REF`) and `cargo build --bin camp` to the
-  **`gc-compat`** job, which already has the gc source and Go:
-```yaml
-      - name: build the gc oracle
-        run: |
-          mkdir -p gascity-src/cmd/gc-compile-json
-          cp ci/gc-compat/gc_compile_json.go gascity-src/cmd/gc-compile-json/main.go
-          cd gascity-src && go build -o "$RUNNER_TEMP/gc-compile-json" ./cmd/gc-compile-json
-      - name: differential — camp's compiler vs the REAL gc compiler
-        run: python3 ci/gc-compat/differential.py gcpacks-src target/debug/camp "$RUNNER_TEMP/gc-compile-json"
-```
-
-- [ ] **Step 6: Commit** —
-  `"ci(gc-compat): the differential gate — camp's compiler diffed against the real gc compiler"`
+- [ ] Implement; **run locally; FIX CAMP where it diverges. gc's behaviour outranks this plan's
+  prose** — that is the entire point of building it.
+- [ ] Commit — `"ci(gc-compat): the differential gate — camp's compiler diffed against gc's"`
 
 ---
 
-## Task 12: Final gates and the PR
+## Task 12: The END-TO-END gate (BD8's proof), final gates, the PR
 
-- [ ] **Step 1: Every gate, in CI's order**
+**Nothing in rev 2 cooked an imported formula.** `formula_gate.py` compiles; `differential.py` diffs
+compilers; the drain fixtures were layer-free camp-local packs. That is exactly why the pinned-formula
+round-trip could be dead in every corpus run with no gate able to see it.
+
+- [ ] **Step 1: `ci/gc-compat/e2e_corpus.py`** — in the `formula_gate.py` camp root:
+  `camp sling --formula bmad-story-development` (an **imported** graph.v2 formula with `extends`,
+  `description_file` and a `{{}}` route), start campd with a **fake worker** (the
+  `crates/camp/tests/fake-agent.sh` mold), and assert:
+  1. the run **cooks** (`run.cooked`);
+  2. `runs/<id>/recipe.json` exists and its step ids equal the manifest's;
+  3. **campd does not dead-end the run** — *the exact failure BD8 names*: zero `dispatch.failed`
+     carrying a `load_run` reason, and a step bead reaches `in_progress`;
+  4. that bead's `assignee` is the **binding-resolved** route and its `metadata` carries
+     `gc.run_target`.
+  Wire it into the `gcpacks-compat` job.
+- [ ] **Step 2: Every gate, in CI's order**
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-python3 ci/gc-compat/rungs.py             /tmp/gcpacks                          # the arbiter
-python3 ci/gc-compat/load_corpus_packs.py /tmp/gcpacks target/debug/camp        # compat-1's gate, still green
-python3 ci/gc-compat/formula_gate.py      /tmp/gcpacks target/debug/camp        # 95 · 62 · 5 refused
-python3 ci/gc-compat/differential.py      /tmp/gcpacks target/debug/camp /tmp/gc-compile-json
-/tmp/camp-corpus-validate crates/camp-core/tests/fixtures/formulas/valid        # invariant 6
-ci/gc-compat/check_vocab.sh /tmp/gascity "$PWD"                                 # formula.refused must not collide
+cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace
+/tmp/factshim /tmp/gcpacks                                                   # the gc baseline
+python3 ci/gc-compat/rungs.py             /tmp/gcpacks                       # the arbiter
+python3 ci/gc-compat/load_corpus_packs.py /tmp/gcpacks target/debug/camp     # compat-1, still green
+python3 ci/gc-compat/formula_gate.py      /tmp/gcpacks target/debug/camp     # 95 · 62 · 5 refused
+python3 ci/gc-compat/differential.py      /tmp/gcpacks target/debug/camp /tmp/factshim
+python3 ci/gc-compat/e2e_corpus.py        /tmp/gcpacks target/debug/camp     # BD8
+/tmp/camp-corpus-validate crates/camp-core/tests/fixtures/formulas/valid     # invariant 6
+ci/gc-compat/check_vocab.sh /tmp/gascity "$PWD"
 ```
-- [ ] **Step 2: Push and open the PR**
-```bash
-git push -u origin compat-2-formulas
-gh pr create --title "compat: the formula key sets — rungs 2a–2e, 95/100 loadable, 62 runnable (compat-2)"
-gh pr checks --watch
-```
+- [ ] **Step 3: Push; PR; `gh pr checks --watch` green.**
 
-**The PR body MUST state, with evidence:**
-- **LOADABLE 95** and **RUNNABLE 62** — *both*. "95/100" alone is misleading; 62 is the number that
-  answers *"can camp run gc's packs?"*
-- The **5** formulas camp refuses and why — including the **two §9 did not anticipate**
-  (`same-session-implement`'s unconditional shared drain; `mol-polecat-work`'s parent, which ships in
-  gc's binary-embedded core pack).
-- The per-rung counts: **2 · 31 · 57 · 83 · 95**.
-- **`SCHEMA_VERSION` 2 → 3: an existing camp.db will NOT open and the operator must re-init** (the v1
-  no-auto-upgrade contract).
-- **`single_lane` and `on_item_failure` have ZERO corpus coverage** — the corpus provably cannot
-  exercise them on camp's path — and are proven by the two fixtures in Task 9.
-- The **three spec amendments**: master line 449 (S11); the §9 addendum (the ceiling, S2/S3, D2′, the
-  runnable count).
-- That fidelity is **verified against the real gc compiler** (Task 11), not asserted from its source.
-
-- [ ] **Step 3: CI green.** `gh pr checks --watch`. Not complete before.
+**The PR body MUST state:** LOADABLE **95** and RUNNABLE **62** (both — "95/100" alone misleads); the
+**5** camp refuses (incl. the two §9 did not anticipate) and that **gc itself fails one of them**; the
+rungs **2 · 31 · 49 · 76 · 95**; **`SCHEMA_VERSION` 2 → 3 — an existing camp.db will NOT open; the
+operator must re-init**; that **`single_lane` / `on_item_failure` have no runtime behavior in camp
+because they have none in gc** (measured); that `ready_task_count`'s new exclusion **changes `camp top`'s
+ready count**; the **accepted fidelity costs** (`gc.continuation_group`, `gc.build.*`, `gc.on_fail`
+carried but not honoured); and the **spec amendments** (master line 449; the §9 addendum's ceiling,
+S2/S3, D2′, **and §9's two corrected bullets — substitution and drain**).
 
 ---
 
-## Exit criteria — and how each is proven
+## Exit criteria
 
-| Exit criterion (phase block, verbatim) | Proof |
+| Criterion (phase block, verbatim) | Proof |
 |---|---|
-| *"every §9 rung's count pinned by a test at GCPACKS_REF"* | `ci/gc-compat/formula_gate.py` (CI, `gcpacks-compat`) drives **the real binary** over all 100 and asserts **2 · 31 · 57 · 83 · 95**, cross-checked against `rungs.py`, the **independent arbiter** derived from §9's text. The corpus is not vendored ⇒ a CI gate, not a `cargo test` — the mold compat-1 established, and what §10 asks for. |
-| *"refusals name their key and land as ledger events"* | `formula.refused` (Task 2), `deny_unknown_fields`-validated in the fold; appended by `camp sling`, **by the daemon's order-fire path** (B12), and by the drain refusals. Tests: `phase_is_refused_by_key_and_the_reason_names_the_value`, `a_scope_check_hiding_in_step_metadata_values_is_refused`, `sling_refuses_a_no_contract_formula_and_events_the_refusal`, `a_due_order_naming_a_no_contract_formula_fires_nothing_and_events_the_refusal`. |
-| *"camp ⊆ gc gate still green (invariant 6)"* | Task 10 (new standalone fixtures compiled by the **real gc compiler**) **and Task 11** (all 100 corpus formulas diffed against it — a far stronger form of the same invariant). |
-| *"Ceiling is 97–98 and the gate names which"* | **The measured ceiling is 95**, and §9 is amended to say so (Task 1). §9's 97–98 counted only vapor+scope; **two more formulas fail for reasons §9 did not anticipate.** The gate names all five. |
-| *"The 21 no-contract formulas are refused, not assumed"* | D1: they compile (inside the 95) and are `not_runnable`; **both** cook entry points refuse them with a `formula.refused` event naming `contract`. The 14 `type = "expansion"` formulas are refused the same way. **RUNNABLE = 62 is pinned by the gate.** |
-| *"exclusive reservations as member-bead metadata (`gc.exclusive_drain_reservation`, verbatim)"* | Task 3 (the store — refold-wired, schema 3, atomic CAS) + Task 9 (reserve/conflict/release on **every** exit path, the orphan sweep, the operator escape). |
-| *"same-session REFUSED"* | Task 8: the conditional case (12 drains, pruned on the default path — with the ordering test proving the three v1 build formulas still compile clean) **and the unconditional case** (`same-session-implement`, which nothing prunes and which §9 missed). |
-| *"on_item_failure/single_lane per gc's compiler defaulting"* | Task 8's defaulting table (from `ApplyDrainControlMetadata`) + Task 9's materialization matrix, including `single_lane_with_a_failing_item_still_runs_the_rest` — the test that separates `continue` from `skip_remaining`. |
+| *"every §9 rung's count pinned by a test at GCPACKS_REF"* | `formula_gate.py` drives the **real binary** over all 100: **2 · 31 · 49 · 76 · 95**, cross-checked **as a SET** against `rungs.py`. |
+| *"refusals name their key and land as ledger events"* | `formula.refused`, validated in the fold; emitted by **all three** cook entry points (`camp sling`, order-fire, `execute_drain`). |
+| *"camp ⊆ gc gate still green (invariant 6)"* | Task 10 (real gc compiler over `valid/`) **and Task 11** (all 100 diffed against gc). |
+| *"Ceiling is 97–98 and the gate names which"* | **Measured: 95.** §9 is amended. The gate names all five — and records that **gc itself fails one**. |
+| *"The 21 no-contract formulas are refused, not assumed"* | D1 — plus the 14 expansion formulas. **RUNNABLE = 62 pinned.** |
+| *"exclusive reservations as member-bead metadata (verbatim key)"* | Task 3 (store, refold-wired, schema 3, atomic CAS) + Task 9 (**all-or-nothing** reserve, conflict closes the anchor, orphan sweep, operator escape). |
+| *"same-session REFUSED"* | Task 8 — the 12 conditional (pruned, **with their refusals**) **and** the 1 unconditional. |
+| *"on_item_failure/single_lane per gc's compiler defaulting"* | Task 8's defaulting table, **diffed against gc's emitted `gc.drain_*`** (Task 11-B). Their **runtime** behavior is nil **because it is nil in gc** (F5/F6). |
 | *"CI green"* | Task 12. |
 
 ## Notes for the implementer
 
-- **`rungs.py` is the arbiter.** If a count moves, the pin moved or a rule is wrong. **Report to the
-  lead; never edit a seed to match the code.**
-- **Do not merge `cook::substitute` (`{name}`) with `compose::substitute` (`{{name}}`).** Two
-  grammars, two scopes. DRY does not mean conflating two languages.
-- **The `unimplemented` scaffold must be GONE by Task 8.** If it survives, an accepted key silently
-  compiles to nothing — the exact failure §4's trap 3 warns about.
-- **`dispatch.rs` is shared with `cp-1`.** Additive edits only (`event_loop.rs` is not touched at
-  all). Expect a rebase; re-run every gate after it.
-- **Task 11 outranks this plan's prose.** Where the differential gate says gc behaves differently from
-  what a task's comment claims, **gc wins** — that is the entire point of building it.
+- **`factshim` (Task 0) and `rungs.py` are the arbiters.** If a number moves, the pin moved or a rule
+  is wrong — **report to the lead; never edit a seed to match the code.**
+- **Three substitution functions, three grammars, three stages. Never merge them:**
+  `compose::resolve_single_brace` (`{name}`, **compile**, **inside expansion only**),
+  `cook::substitute_vars` (`{{name}}`, **instantiation**, every field), and the existing
+  `cook::substitute` (`{name}` over `CookOptions.vars`, for bond children).
+- **`UNIMPLEMENTED` must be GONE by Task 8.** If it survives, an accepted key silently compiles to
+  nothing.
+- **`dispatch.rs` is shared with `cp-1`.** Additive only; `event_loop.rs` is untouched. Expect a
+  rebase; re-run every gate after it.
+- **Before you build a mechanism, trace it on paper against a concrete input.** BD3, BD4 and BD8 each
+  took sixty seconds to falsify that way — and all three shipped in rev 2.
