@@ -31,14 +31,29 @@ fn toml_files(kind: &str) -> BTreeSet<String> {
 #[test]
 fn every_valid_fixture_is_accepted() {
     let files = toml_files("valid");
+    // INVARIANT 6 — every one of these is compiled by the REAL gc compiler in
+    // CI's `gc-compat` job (`camp_corpus_validate.go`). A FAIL there means camp
+    // accepts what gc rejects, and the subset property is broken.
+    //
+    // Naming rules the validator imposes, and they are not cosmetic:
+    //   * NEVER `*.formula.toml` here — it derives the gc name as
+    //     `TrimSuffix(basename, ".toml")`, so gc would look up `"x.formula"`.
+    //   * NO expansion fixture — the validator compiles each file STANDALONE,
+    //     and an expansion formula is not directly runnable (§9).
+    //   * An `extends` CHILD needs a parent LAYER the validator does not
+    //     provide, so the child lives in `tests/fixtures/compose/` and only the
+    //     PARENT is here.
     assert_eq!(
         files,
         [
             "diamond",
+            "drain-separate", // rung 2e
+            "extends-parent", // rung 2c (the child needs a layer; it lives in compose/)
             "fan-out",
             "guarded-change",
             "minimal",
-            "retry-fetch"
+            "retry-fetch",
+            "vars-condition", // rung 2b
         ]
         .into_iter()
         .map(String::from)
