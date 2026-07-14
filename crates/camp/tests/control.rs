@@ -650,3 +650,853 @@ fn sessions_list_reports_live_sessions_by_name() {
     );
     drop(campd);
 }
+
+// ===== Task 8: session.subscribe ==========================================
+
+/// A subscribe connection. `camp` is a BINARY crate, so there is no
+/// `socket::subscribe` to reuse — this is the harness's own idiom.
+#[derive(Debug)]
+struct SubClient {
+    reader: BufReader<UnixStream>,
+    stream: UnixStream,
+    #[allow(dead_code)]
+    subscription: String,
+    cursor: u64,
+}
+
+impl SubClient {
+    fn open(root: &Path, session: &str, cursor: Option<u64>) -> std::io::Result<SubClient> {
+        let stream = UnixStream::connect(root.join("campd.sock"))?;
+        // The HELLO is bounded by REQUEST_TIMEOUT (5 s) — a WEDGED campd fails
+        // HERE, which is the exit criterion.
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let req = serde_json::json!({
+            "op": "session.subscribe", "session": session, "cursor": cursor,
+        });
+        (&stream).write_all(format!("{req}\n").as_bytes())?;
+        // try_clone: the BufReader owns one handle; `stream` keeps the other so the
+        // read deadline can be CLEARED after the hello.
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut hello = String::new();
+        reader.read_line(&mut hello)?; // times out on a wedge
+        let v: serde_json::Value = serde_json::from_str(hello.trim_end())
+            .map_err(|e| std::io::Error::other(format!("bad hello {hello:?}: {e}")))?;
+        if v["ok"] != true {
+            return Err(std::io::Error::other(format!("subscribe refused: {v}")));
+        }
+        assert_eq!(v["v"], 1, "the hello carries the protocol version");
+        // §4.4: TIMEOUT-EXEMPT after the hello — a quiet stream is not a wedged
+        // daemon. THIS LINE is the exemption.
+        stream.set_read_timeout(None)?;
+        Ok(SubClient {
+            subscription: v["subscription"].as_str().unwrap_or_default().to_owned(),
+            cursor: v["cursor"].as_u64().unwrap_or(0),
+            reader,
+            stream,
+        })
+    }
+
+    /// The next frame, or None at EOF. `end` frames ARE returned — a test must be
+    /// able to SEE one.
+    ///
+    /// EVERY subscriber test carries a HARD DEADLINE, because the §4.4 timeout
+    /// exemption clears the read deadline: without one, a test that should FAIL
+    /// would HANG instead, and a hang that "passes by timing out the harness" is
+    /// exactly the failure mode these tests exist to make impossible.
+    fn next_frame_within(&mut self, dur: Duration) -> Option<serde_json::Value> {
+        self.stream.set_read_timeout(Some(dur)).ok()?;
+        let mut line = String::new();
+        let out = match self.reader.read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => serde_json::from_str(line.trim_end()).ok(),
+        };
+        let _ = self.stream.set_read_timeout(None);
+        out
+    }
+
+    fn next_frame(&mut self) -> Option<serde_json::Value> {
+        self.next_frame_within(Duration::from_secs(20))
+    }
+}
+
+/// THE EXIT CRITERION: a WEDGED campd fails the subscribe hello FAST.
+///
+/// A bare bound `UnixListener` is the wedge simulator: the kernel's listen backlog
+/// ACCEPTS the connection even though no event loop will ever answer. Liveness is
+/// an ANSWERED REQUEST, and `subscribe` must discover that at the hello — not hang
+/// forever waiting for a stream that will never start.
+#[test]
+fn a_wedged_campd_fails_the_subscribe_hello_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(".camp");
+    std::fs::create_dir_all(&root).unwrap();
+    // A socket that accepts and NEVER answers.
+    let _wedged = std::os::unix::net::UnixListener::bind(root.join("campd.sock")).unwrap();
+
+    let started = Instant::now();
+    let err = SubClient::open(&root, "t/dev/1", None)
+        .expect_err("a wedged campd must FAIL the hello, never hang on it");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "the hello must time out, not error some other way: {err:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the hello must fail INSIDE the request timeout — it took {elapsed:?}"
+    );
+}
+
+/// B13/§4.4: a subscription is TIMEOUT-EXEMPT after the hello. A quiet stream is
+/// not a wedged daemon, and a `camp watch` left open on an idle session must not
+/// be killed for being idle.
+#[test]
+fn a_subscription_survives_a_quiet_period_longer_than_request_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_CONTROL_LOOP", "1")]);
+    let mut stream = connect(&root);
+    let (_bead, session) = dispatch_one(&root);
+
+    // Subscribe at the TAIL: nothing to stream.
+    let mut sub = SubClient::open(&root, &session, None).unwrap();
+
+    // Quiet for LONGER than REQUEST_TIMEOUT (5 s).
+    std::thread::sleep(Duration::from_secs(6));
+
+    // The subscription is still alive: make the worker speak, and a frame arrives.
+    let resp = request(
+        &mut stream,
+        &format!(r#"{{"op":"session.interrupt","session":"{session}"}}"#),
+    );
+    assert_eq!(resp["ok"], true, "{resp}");
+    // Force the wake (the watch is latency-only — see wait_until).
+    wait_until(&root, "control.responded", |e| {
+        e.iter().any(|ev| ev["type"] == "control.responded")
+    });
+
+    let frame = sub
+        .next_frame()
+        .expect("the subscription must survive a quiet period longer than REQUEST_TIMEOUT");
+    assert_eq!(frame["frame"], "event");
+    drop(campd);
+}
+
+/// §9's RESUME PROMISE — and NOTHING tested it in five plan revisions.
+///
+/// Take frame K's `offset` OFF THE WIRE, reconnect with it as the `cursor`, and
+/// frame K+1 must arrive FIRST, byte-identical, with NO `skipped` frame.
+///
+/// THIS IS THE ONLY TEST THAT CLOSES THE LOOP ON WHAT AN OFFSET *MEANS*. Every
+/// other offset assertion is RELATIVE — and a drifting offset still INCREASES,
+/// which is exactly why a cumulative one-byte-per-line drift survived five
+/// revisions of "offsets are strictly increasing" assertions. A drifted cursor
+/// lands MID-LINE and yields a `skipped{not_a_json_object}`; that is what this
+/// test would catch.
+#[test]
+fn a_client_that_resubscribes_from_a_delivered_offset_resumes_exactly_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_SPAM_ON_TURN", "60"),
+            ("FAKE_AGENT_SPAM_LINGER", "60"),
+        ],
+    );
+    let mut stream = connect(&root);
+    let (_bead, session) = dispatch_one(&root);
+
+    // Make the worker produce a history.
+    request(
+        &mut stream,
+        &serde_json::json!({"op":"session.send_turn","session":session,"text":"go"}).to_string(),
+    );
+    wait_until(&root, "the spam to be drained", |_| {
+        std::fs::read_to_string(stdout_path(&root, &session))
+            .unwrap_or_default()
+            .matches("spam 59")
+            .count()
+            > 0
+    });
+
+    // FIRST subscription: read K frames and note frame K's offset AND the frame
+    // that follows it.
+    let mut first = SubClient::open(&root, &session, Some(0)).unwrap();
+    let mut frames = Vec::new();
+    for _ in 0..12 {
+        frames.push(first.next_frame().expect("a frame"));
+    }
+    let k = frames.len() - 1;
+    let resume_at = frames[k]["offset"].as_u64().unwrap();
+    let expected_next = first.next_frame().expect("frame K+1");
+    drop(first);
+
+    // SECOND subscription, resuming from the offset campd itself handed us.
+    let mut second = SubClient::open(&root, &session, Some(resume_at)).unwrap();
+    assert_eq!(
+        second.cursor, resume_at,
+        "the hello echoes the cursor it was given"
+    );
+    let got = second.next_frame().expect("a frame after resuming");
+
+    assert_eq!(
+        got, expected_next,
+        "resuming from a delivered offset must yield the NEXT frame, BYTE-IDENTICAL. \
+         A cursor that lands mid-line produces a `skipped` frame instead — which is \
+         precisely what a per-line offset drift causes, and what no 'offsets \
+         increase' assertion can ever see"
+    );
+    assert_ne!(
+        got["frame"], "skipped",
+        "a campd-issued offset must NEVER land mid-line"
+    );
+    drop(campd);
+}
+
+/// C6: a subscriber catching up across a LIVE BURST gets every line exactly once,
+/// in order. The history must exceed MAX_PUMP_BYTES_PER_WAKE (256 KiB) or catch-up
+/// finishes in ONE wake and the live-burst window never opens.
+#[test]
+fn a_subscriber_catching_up_across_a_live_burst_gets_every_line_exactly_once_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    // 6000 lines x ~70 bytes ~= 420 KiB — comfortably past MAX_PUMP_BYTES_PER_WAKE.
+    let campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_SPAM_ON_TURN", "6000"),
+            ("FAKE_AGENT_SPAM_LINGER", "60"),
+        ],
+    );
+    let mut stream = connect(&root);
+    let (_bead, session) = dispatch_one(&root);
+    request(
+        &mut stream,
+        &serde_json::json!({"op":"session.send_turn","session":session,"text":"go"}).to_string(),
+    );
+    wait_until(&root, "a history bigger than one pump budget", |_| {
+        std::fs::metadata(stdout_path(&root, &session))
+            .map(|m| m.len() > 300 * 1024)
+            .unwrap_or(false)
+    });
+
+    let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut offsets: Vec<u64> = Vec::new();
+    while seen.len() < 6000 {
+        assert!(Instant::now() < deadline, "catch-up never completed");
+        // Poke: any wake pumps (the watch is latency-only).
+        let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+        while let Some(f) = sub.next_frame_within(Duration::from_millis(400)) {
+            if f["frame"] != "event" {
+                continue;
+            }
+            let content = f["event"]["message"]["content"].as_str().unwrap_or("");
+            if let Some(n) = content.strip_prefix("spam ") {
+                seen.push(n.parse().unwrap());
+            }
+            offsets.push(f["offset"].as_u64().unwrap());
+            if seen.len() >= 6000 {
+                break;
+            }
+        }
+    }
+
+    // EXACTLY ONCE, IN ORDER.
+    let expected: Vec<u64> = (0..6000).collect();
+    assert_eq!(seen, expected, "every line exactly once, in FILE ORDER");
+    // ...with STRICTLY INCREASING offsets.
+    assert!(
+        offsets.windows(2).all(|w| w[1] > w[0]),
+        "offsets must be strictly increasing"
+    );
+    drop(campd);
+}
+
+/// R1'S TEST — AND THE HOLE THREE PLAN REVISIONS COULD NOT SEE.
+///
+/// At the DEFAULT 1 MiB cap, a client READING EVERY FRAME catches up across a
+/// history LARGER THAN THE CAP, and is NEVER dropped.
+///
+/// A cap that KILLS makes this impossible: during catch-up the producer is `pump`
+/// reading a FILE (256 KiB/wake) against a socket that accepts ~8 KiB — a file
+/// ALWAYS outruns a socket — so `out` hits the cap within a few wakes and the
+/// client is killed HOWEVER FAST IT READS. That breaks §9's late-joiner promise for
+/// any session with more than 1 MiB of stdout (which is ordinary), reports it as
+/// backpressure about a client that was reading perfectly, and is PERMANENT:
+/// re-subscribing re-fills and re-drops.
+///
+/// No earlier test could see it: a history under the cap never reaches it; a
+/// non-reading client's drop is CORRECT; and an over-cap LINE is skipped, so `out`
+/// stays tiny. The drop path was exercised only where dropping is right.
+#[test]
+fn a_reading_subscriber_survives_a_history_larger_than_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    // ~2.4 MiB of DELIVERABLE lines (short, valid JSON — never skipped).
+    let campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_SPAM_ON_TURN", "35000"),
+            ("FAKE_AGENT_SPAM_LINGER", "90"),
+        ],
+    );
+    let mut stream = connect(&root);
+    let (_bead, session) = dispatch_one(&root);
+    request(
+        &mut stream,
+        &serde_json::json!({"op":"session.send_turn","session":session,"text":"go"}).to_string(),
+    );
+    wait_until(&root, "a history LARGER THAN THE 1 MiB CAP", |_| {
+        std::fs::metadata(stdout_path(&root, &session))
+            .map(|m| m.len() > 2 * 1024 * 1024)
+            .unwrap_or(false)
+    });
+
+    // The DEFAULT cap (CAMP_SUBSCRIBER_BUFFER_BYTES is NOT set), cursor 0, and a
+    // client that reads every frame in a tight loop.
+    let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut seen = 0u64;
+    let mut last_offset = 0u64;
+    while seen < 35000 {
+        assert!(
+            Instant::now() < deadline,
+            "a READING client never caught up (saw {seen}/35000) — it was starved or dropped"
+        );
+        let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+        while let Some(f) = sub.next_frame_within(Duration::from_millis(400)) {
+            assert_ne!(
+                f["frame"], "skipped",
+                "these lines are all short and valid — none may be skipped: {f}"
+            );
+            if f["frame"] == "event" {
+                let off = f["offset"].as_u64().unwrap();
+                assert!(off > last_offset, "offsets strictly increase");
+                last_offset = off;
+                seen += 1;
+            }
+            if seen >= 35000 {
+                break;
+            }
+        }
+    }
+    assert_eq!(seen, 35000, "every line arrived, exactly once");
+
+    // THE POINT: the client was READING PERFECTLY, so it must NEVER be dropped.
+    assert!(
+        events_of(&root, "subscriber.dropped").is_empty(),
+        "a client that read every frame was DROPPED — the cap was treated as a KILL \
+         instead of a STOP, and every late joiner more than 1 MiB behind the tail is \
+         now killed however fast it reads: {:#?}",
+        events_of(&root, "subscriber.dropped")
+    );
+    drop(campd);
+}
+
+/// §8/B8/G3/R1: a subscriber that STOPS READING is dropped LOUDLY — and campd keeps
+/// serving. This is the local-DoS the cap exists to prevent: 8 such connections
+/// would permanently disable `subscribe` for everyone.
+///
+/// The drop now fires at the STALL TIMEOUT, because the peer accepted ZERO bytes —
+/// which is the TRUE cause, and the one the event names.
+#[test]
+fn a_subscriber_that_stops_reading_is_dropped_loudly_and_campd_keeps_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_SPAM_ON_TURN", "30000"),
+            ("FAKE_AGENT_SPAM_LINGER", "60"),
+            // Without this the test is a mandatory 30 s wall-clock wait, and its own
+            // deadline would have to exceed the hang it exists to detect.
+            ("CAMP_SUBSCRIBER_STALL_TIMEOUT_MS", "300"),
+        ],
+    );
+    let mut stream = connect(&root);
+    let (_bead, session) = dispatch_one(&root);
+
+    // Subscribe at the TAIL (a clean hello), then read NOTHING, ever.
+    let sub = SubClient::open(&root, &session, None).unwrap();
+    request(
+        &mut stream,
+        &serde_json::json!({"op":"session.send_turn","session":session,"text":"go"}).to_string(),
+    );
+
+    wait_until(&root, "subscriber.dropped", |e| {
+        e.iter().any(|ev| ev["type"] == "subscriber.dropped")
+    });
+    let dropped = events_of(&root, "subscriber.dropped");
+    assert_eq!(dropped.len(), 1, "{dropped:#?}");
+    assert_eq!(dropped[0]["data"]["session"], session.as_str());
+    assert_eq!(
+        dropped[0]["data"]["cap_bytes"], 1_048_576u64,
+        "the DEFAULT 1 MiB cap — the shipped configuration, not a toy"
+    );
+    assert!(
+        dropped[0]["data"]["buffered_bytes"].as_u64().unwrap() > 0,
+        "§4.4: the drop names the HIGH-WATER MARK"
+    );
+
+    // campd is unharmed — a fresh connection is answered promptly.
+    let started = Instant::now();
+    let status = request(&mut connect(&root), r#"{"op":"status"}"#);
+    assert_eq!(status["ok"], true);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "campd kept serving"
+    );
+    drop(sub);
+    drop(campd);
+}
+
+/// B7/§5.2: a NORMAL DETACH is not a fault. A client that hangs up is FORGOTTEN —
+/// never libeled as backpressure.
+#[test]
+fn a_hung_up_subscriber_is_forgotten_and_is_never_libeled_as_backpressure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_CONTROL_LOOP", "1")]);
+    let (_bead, session) = dispatch_one(&root);
+
+    let sub = SubClient::open(&root, &session, None).unwrap();
+    drop(sub); // a normal detach
+
+    // Drive three wakes.
+    for _ in 0..3 {
+        let status = request(&mut connect(&root), r#"{"op":"status"}"#);
+        assert_eq!(status["ok"], true, "campd still answers promptly");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        events_of(&root, "subscriber.dropped").is_empty(),
+        "a client that simply detached must NOT be recorded as dropped — that is \
+         libel, and §5.2 says a normal detach is not a fault"
+    );
+    drop(campd);
+}
+
+/// G1 — THE TEST THE SUITE STRUCTURALLY COULD NOT CONTAIN.
+///
+/// One genuinely huge line (2 MiB — over the 1 MiB cap) exercises the OVERSIZE
+/// SCAN and the `skipped` frame. The NEXT line must still arrive (the cursor
+/// advanced past a line campd refused to buffer), and campd must NOT LIVELOCK.
+///
+/// Bounded by a hard deadline: a livelock manifests as a HANG, and a hanging test
+/// that "passes by timing out the harness" is exactly the failure mode this test
+/// exists to make impossible.
+#[test]
+fn a_line_larger_than_the_cap_is_skipped_and_campd_does_not_livelock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_HUGE_LINE", "2097152"), // 2 MiB: over the 1 MiB cap
+            ("FAKE_AGENT_HUGE_LINE_LINGER", "60"),
+        ],
+    );
+    let (_bead, session) = dispatch_one(&root);
+    wait_until(&root, "the monster line to be written", |_| {
+        std::fs::read_to_string(stdout_path(&root, &session))
+            .unwrap_or_default()
+            .contains("after the monster")
+    });
+
+    let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut skipped: Option<serde_json::Value> = None;
+    let mut after: Option<serde_json::Value> = None;
+    while after.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "campd LIVELOCKED on a line bigger than one chunk — the ordinary case on \
+             any session that reads a file"
+        );
+        let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+        while let Some(f) = sub.next_frame_within(Duration::from_millis(500)) {
+            if f["frame"] == "skipped" && f["reason"] == "over_cap" {
+                skipped = Some(f);
+            } else if f["frame"] == "event"
+                && f["event"]["message"]["content"] == "after the monster"
+            {
+                after = Some(f);
+                break;
+            }
+        }
+    }
+
+    let skipped = skipped.expect("a skipped{over_cap} frame naming the monster");
+    assert!(
+        skipped["bytes"].as_u64().unwrap() > 2_000_000,
+        "the frame carries the line's TRUE byte count: {skipped}"
+    );
+    assert!(
+        after.is_some(),
+        "the NEXT line still arrived — the cursor advanced"
+    );
+
+    // campd did not livelock: a FRESH connection is answered in < 5 s.
+    let started = Instant::now();
+    assert_eq!(
+        request(&mut connect(&root), r#"{"op":"status"}"#)["ok"],
+        true
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // The client was reading perfectly — it must not be dropped.
+    assert!(events_of(&root, "subscriber.dropped").is_empty());
+    drop(campd);
+}
+
+/// §9: a cursor into a REAPED stream, or PAST the tail, is an EXPLICIT ERROR —
+/// never an empty stream that looks like a quiet one.
+#[test]
+fn a_cursor_into_a_reaped_stream_or_past_the_tail_is_an_explicit_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_CONTROL_LOOP", "1")]);
+    let (_bead, session) = dispatch_one(&root);
+
+    // PAST THE TAIL.
+    let err = SubClient::open(&root, &session, Some(999_999_999))
+        .expect_err("a cursor past what campd has consumed must be refused");
+    assert!(
+        err.to_string().contains("past"),
+        "the error must say WHY: {err}"
+    );
+
+    // A SESSION THAT WAS NEVER TAILED (a reaped stream's file is gone — §9: the
+    // bytes went with it).
+    let err = SubClient::open(&root, "t/dev/ghost", Some(0))
+        .expect_err("a session campd is not tailing must be refused");
+    assert!(
+        err.to_string().contains("not tailing"),
+        "the error must say WHY: {err}"
+    );
+    drop(campd);
+}
+
+/// B12/C7: a subscriber gets the FULL HISTORY, then an `end` frame, when its
+/// session ends. Not a truncated prefix — and EOF NEVER arrives without an `end`
+/// frame first.
+///
+/// PLUS THE ONE LINE THAT WOULD HAVE CAUGHT A PER-LINE OFFSET DRIFT:
+/// the last `event` frame's offset is the byte just past that line; the `end`
+/// frame's offset is `tail`. In a correct stream THEY ARE THE SAME NUMBER. Under a
+/// one-byte-per-line drift they differ BY THE LINE COUNT — while every "offsets
+/// strictly increase" assertion in the suite stays green.
+#[test]
+fn a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_EXIT_AFTER_CONTROL", "1")]);
+    let mut stream = connect(&root);
+    let (_bead, session) = dispatch_one(&root);
+
+    let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
+
+    // Interrupt: the worker answers and EXITS — so the session is reaped.
+    let resp = request(
+        &mut stream,
+        &format!(r#"{{"op":"session.interrupt","session":"{session}"}}"#),
+    );
+    assert_eq!(resp["ok"], true, "{resp}");
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    let mut end: Option<serde_json::Value> = None;
+    while end.is_none() {
+        assert!(Instant::now() < deadline, "the end frame never arrived");
+        let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+        while let Some(f) = sub.next_frame_within(Duration::from_millis(500)) {
+            match f["frame"].as_str() {
+                Some("end") => {
+                    end = Some(f);
+                    break;
+                }
+                Some("event") => events.push(f),
+                _ => {}
+            }
+        }
+    }
+    let end = end.unwrap();
+
+    // The whole history came FIRST — the worker's init line and its
+    // control_response are both in it.
+    assert!(
+        events.len() >= 2,
+        "the FULL history must precede the end frame, not a truncated prefix: {events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"]["type"] == "control_response"),
+        "the worker's LAST line (its answer) is part of the history"
+    );
+
+    // ── THE OFFSET-FIDELITY ASSERTION ────────────────────────────────────────
+    let last_event = events.last().unwrap();
+    assert_eq!(
+        last_event["offset"], end["offset"],
+        "the last event frame's offset and the end frame's offset MUST BE THE SAME \
+         NUMBER. If they differ by the line count, `cursor` is drifting one byte per \
+         line — and §9 makes these offsets the DURABLE RESUME CURSORS, so a client \
+         reconnecting with one would land mid-file at the wrong byte"
+    );
+    // ─────────────────────────────────────────────────────────────────────────
+
+    assert!(["stopped", "crashed"].contains(&end["reason"].as_str().unwrap()));
+
+    // EOF FOLLOWS the end frame — and never precedes it.
+    assert!(
+        sub.next_frame_within(Duration::from_secs(5)).is_none(),
+        "EOF must follow the end frame"
+    );
+    drop(campd);
+}
+
+/// The steady state of every long-lived watch: a subscriber CAUGHT UP AT THE TAIL,
+/// with nothing buffered and nothing to pump. It must still get its `end` frame
+/// when the session is reaped.
+///
+/// ⚠ WHAT THIS TEST DOES *NOT* PROVE — stated honestly, because an earlier plan
+/// revision claimed it did: it does NOT gate the disposal ORDERING, and no
+/// black-box test can. `on_watch_event` signals on EVERY arm and `unregister`'s
+/// `remove_file` fires a notify, so campd always gets another wake — under a broken
+/// ordering the disposed list simply persists and the NEXT wake emits the end frame
+/// ONE WAKE LATE. This test is GREEN on the broken ordering. What it proves is that
+/// the end frame ARRIVES for a caught-up subscriber. That is worth having, and it is
+/// all it is. The ordering guarantee is STRUCTURAL (one caller, right after
+/// `dispose_pending`).
+#[test]
+fn a_subscriber_caught_up_at_the_tail_gets_an_end_frame_when_its_session_is_reaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_EXIT_AFTER_CONTROL", "1")]);
+    let mut stream = connect(&root);
+    let (_bead, session) = dispatch_one(&root);
+
+    // Subscribe at cursor 0 and DRAIN EVERYTHING until fully caught up.
+    let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
+    let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+    while sub.next_frame_within(Duration::from_millis(400)).is_some() {}
+    // Now the subscriber is caught up: out is empty, cursor == tail.
+
+    // Let the worker answer and exit.
+    let resp = request(
+        &mut stream,
+        &format!(r#"{{"op":"session.interrupt","session":"{session}"}}"#),
+    );
+    assert_eq!(resp["ok"], true, "{resp}");
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut end: Option<serde_json::Value> = None;
+    while end.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "a CAUGHT-UP subscriber never got its end frame — the steady state of \
+             every long-lived watch"
+        );
+        let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+        while let Some(f) = sub.next_frame_within(Duration::from_millis(500)) {
+            if f["frame"] == "end" {
+                end = Some(f);
+                break;
+            }
+        }
+    }
+    assert_eq!(end.unwrap()["frame"], "end");
+    // EOF follows.
+    assert!(sub.next_frame_within(Duration::from_secs(5)).is_none());
+    drop(campd);
+}
+
+/// The `HashSet<(session, offset)>` dedupe's ENTIRE REASON TO EXIST — and nothing
+/// exercised it. TWO subscribers on ONE session hit the SAME over-cap line: BOTH
+/// get a `skipped` frame, and EXACTLY ONE `patrol.degraded` is appended.
+///
+/// cp-2 inherits this dedupe.
+#[test]
+fn two_subscribers_on_one_session_share_an_over_cap_line_and_one_degraded_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_HUGE_LINE", "2097152"),
+            ("FAKE_AGENT_HUGE_LINE_LINGER", "60"),
+        ],
+    );
+    let (_bead, session) = dispatch_one(&root);
+    wait_until(&root, "the monster line", |_| {
+        std::fs::read_to_string(stdout_path(&root, &session))
+            .unwrap_or_default()
+            .contains("after the monster")
+    });
+
+    let mut a = SubClient::open(&root, &session, Some(0)).unwrap();
+    let mut b = SubClient::open(&root, &session, Some(0)).unwrap();
+
+    let mut got_a = false;
+    let mut got_b = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !(got_a && got_b) {
+        assert!(Instant::now() < deadline, "both subscribers must be told");
+        let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+        while let Some(f) = a.next_frame_within(Duration::from_millis(300)) {
+            if f["frame"] == "skipped" && f["reason"] == "over_cap" {
+                got_a = true;
+            }
+        }
+        while let Some(f) = b.next_frame_within(Duration::from_millis(300)) {
+            if f["frame"] == "skipped" && f["reason"] == "over_cap" {
+                got_b = true;
+            }
+        }
+    }
+    assert!(got_a && got_b, "BOTH subscribers get the skipped frame");
+
+    // ...and EXACTLY ONE durable event, not one per subscriber.
+    let degraded: Vec<_> = events_of(&root, "patrol.degraded")
+        .into_iter()
+        .filter(|e| {
+            e["data"]["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("exceeds the subscriber buffer cap"))
+        })
+        .collect();
+    assert_eq!(
+        degraded.len(),
+        1,
+        "N subscribers hitting the SAME over-cap line must append ONE event, not N: \
+         {degraded:#?}"
+    );
+    drop(campd);
+}
+
+/// §9: "durable across a campd restart for free". The subscription DIES with campd,
+/// but the client's BYTE CURSOR stays valid and it resumes exactly there — no loss,
+/// no duplication.
+///
+/// NOTE, HONESTLY: the client receives a bare EOF with NO `end` frame when campd
+/// dies. That is a KNOWN GAP (recorded in the PR body); this test PINS the
+/// client-visible behaviour so cp-2's `camp watch` inherits a documented contract
+/// rather than a surprise.
+#[test]
+fn a_subscription_dies_with_campd_and_the_client_resumes_from_its_own_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_CONTROL_LOOP", "1"),
+            ("FAKE_AGENT_LINGER_ON_EOF", "60"),
+        ],
+    );
+    let (_bead, session) = dispatch_one(&root);
+    let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+
+    let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
+    let first = sub
+        .next_frame_within(Duration::from_secs(20))
+        .expect("the init line");
+    assert_eq!(first["frame"], "event");
+    let resume_at = first["offset"].as_u64().unwrap();
+
+    // kill -9. Crash-only.
+    campd.kill9();
+    // The client sees a BARE EOF — no end frame. A known gap, pinned here.
+    let tail = sub.next_frame_within(Duration::from_secs(5));
+    assert!(
+        tail.is_none(),
+        "campd died: the client gets EOF (and, today, NO end frame): {tail:?}"
+    );
+
+    // A fresh campd. The client's cursor is still valid — it is the CLIENT's,
+    // and the stream file is still on disk.
+    let campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_CONTROL_LOOP", "1"),
+            ("FAKE_AGENT_LINGER_ON_EOF", "60"),
+        ],
+    );
+    let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+
+    let mut resumed = SubClient::open(&root, &session, Some(resume_at)).unwrap();
+    assert_eq!(resumed.cursor, resume_at);
+    // Everything from that byte on is still there — no loss, no duplication.
+    let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+    if let Some(f) = resumed.next_frame_within(Duration::from_secs(10)) {
+        assert_ne!(
+            f["frame"], "skipped",
+            "the client's own cursor must still land on a line boundary after a \
+             campd restart: {f}"
+        );
+        assert!(f["offset"].as_u64().unwrap() > resume_at);
+    }
+    drop(campd);
+}
+
+/// G11: cp-0 ALREADY reports a non-JSON line as `patrol.degraded` from its drain.
+/// campd must NOT report it a SECOND time from the file side — the subscriber gets
+/// a `skipped{not_a_json_object}` frame and NO extra event.
+#[test]
+fn a_non_json_line_yields_a_skipped_frame_and_no_second_patrol_degraded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_CONTROL_LOOP", "1")]);
+    let (_bead, session) = dispatch_one(&root);
+    let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+
+    let mut sub = SubClient::open(&root, &session, None).unwrap();
+
+    // Append a NON-JSON line directly to the stream file.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(stdout_path(&root, &session))
+        .unwrap()
+        .write_all(b"this is not json at all\n")
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut skipped: Option<serde_json::Value> = None;
+    while skipped.is_none() {
+        assert!(Instant::now() < deadline, "the skipped frame never arrived");
+        let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+        while let Some(f) = sub.next_frame_within(Duration::from_millis(400)) {
+            if f["frame"] == "skipped" {
+                skipped = Some(f);
+                break;
+            }
+        }
+    }
+    assert_eq!(skipped.unwrap()["reason"], "not_a_json_object");
+
+    // cp-0 reports it ONCE (from its own drain). The file side must NOT report it
+    // again — that is the double-report the design forbids.
+    let non_json: Vec<_> = events_of(&root, "patrol.degraded")
+        .into_iter()
+        .filter(|e| {
+            e["data"]["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("non-JSON"))
+        })
+        .collect();
+    assert_eq!(
+        non_json.len(),
+        1,
+        "cp-0 already owns this fault; the subscriber path must not re-report it: \
+         {non_json:#?}"
+    );
+    drop(campd);
+}

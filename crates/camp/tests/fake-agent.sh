@@ -36,6 +36,22 @@
 #                              IMMEDIATELY — the reap-races-the-drain shape.
 #                              The answer is the worker's LAST stdout bytes, so
 #                              a reap-before-drain bug destroys it unread.
+#   FAKE_AGENT_SPAM_ON_TURN=N  cp-1 (§4.4 backpressure): on a USER TURN, emit N
+#                              stream-json lines. The spam must come AFTER the
+#                              subscriber is registered, or the backpressure gate
+#                              tests nothing.
+#   FAKE_AGENT_HUGE_LINE=N     cp-1 (G1): emit ONE stream-json line whose payload
+#                              is N bytes — a SINGLE line far larger than
+#                              HISTORY_CHUNK_BYTES (64 KiB) and, at N >= 1 MiB,
+#                              larger than the whole subscriber cap.
+#
+#     WHY HUGE_LINE EXISTS: **every other fixture in this repo emits SHORT lines**
+#     — `emit_stream` is `printf '%s\n'` and nothing anywhere produces a line
+#     bigger than a few hundred bytes. That is precisely WHY a pump that livelocks
+#     on any line > 64 KiB was invisible to the entire suite, and why a real
+#     Read/Bash/Grep tool-result line — which routinely exceeds 64 KiB — would have
+#     hung campd in production while CI stayed green. Without this mode no gate in
+#     this phase can see the phase's worst bug.
 #   FAKE_AGENT_DELIVERY   Phase 3 delivery modes (obligations i/ii/vi):
 #                         "ship" = commit on the dispatched branch, close
 #                         pass+shipped with the real commit/branch facts;
@@ -196,6 +212,35 @@ if [[ -n "${FAKE_AGENT_CONTROL_LOOP:-}" ]]; then
     sleep "$FAKE_AGENT_LINGER_ON_EOF"
     exit 0
   fi
+fi
+
+# cp-1: ONE genuinely huge line, on one line, valid stream-json.
+huge_line() {
+  local n="$1" pad
+  pad="$(head -c "$n" /dev/zero | tr '\0' 'x')"
+  printf '{"type":"assistant","message":{"role":"assistant","content":"%s"}}\n' "$pad"
+}
+
+if [[ -n "${FAKE_AGENT_HUGE_LINE:-}" ]]; then
+  huge_line "$FAKE_AGENT_HUGE_LINE"
+  emit_stream '{"type":"assistant","message":{"role":"assistant","content":"after the monster"}}'
+  # Stay alive so the session keeps being tailed while the subscriber catches up.
+  sleep "${FAKE_AGENT_HUGE_LINE_LINGER:-30}"
+  exit 0
+fi
+
+if [[ -n "${FAKE_AGENT_SPAM_ON_TURN:-}" ]]; then
+  # cp-1 (§4.4): the spam lands AFTER a user turn, so a test can register its
+  # subscriber first and THEN make the worker produce a backlog.
+  read -r _task_line
+  read -r _turn_line
+  i=0
+  while [ "$i" -lt "$FAKE_AGENT_SPAM_ON_TURN" ]; do
+    printf '{"type":"assistant","message":{"role":"assistant","content":"spam %d"}}\n' "$i"
+    i=$((i + 1))
+  done
+  sleep "${FAKE_AGENT_SPAM_LINGER:-30}"
+  exit 0
 fi
 
 if [[ -n "${FAKE_AGENT_CLOSE_STDIN:-}" ]]; then
