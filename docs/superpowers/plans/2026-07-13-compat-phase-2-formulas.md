@@ -1,5 +1,31 @@
 # Compat Phase 2 — the formula key sets (rungs 2a–2e) Implementation Plan
 
+## Plan-gate approval
+
+APPROVED 2026-07-13 (rev 5, 96a35da) after FIVE adversarial review rounds
+(4-panelist panels: contract-completeness / interface-regression /
+execution-readiness + a completeness critic, each defaulting to BLOCK).
+
+Rounds 1-4 found and closed, among others: a FABRICATED measurement
+(`gc.scope_kind`, named three times as fact, exists nowhere in the corpus);
+a PHASE-KILLER where every cooked corpus run would `dead_end_run`, invisible
+to every gate in the plan; its sequel, where the pinned recipe was
+pre-substitution so all 36 check/retry formulas would dispatch UNROUTED
+workers and `spawn_check` would exec a literal `{{kind}}.sh`; a ceiling
+number (97) that was wrong and was about to be written into the spec as
+measured fact; and a differential oracle whose join key was INVERTED, so its
+drain assertion had ZERO rows and could never fail.
+
+Rulings 1-6 (operator) are recorded in the plan. §9 is amended to measured
+truth (ceiling 95, RUNNABLE 62, rungs 2/31/49/76/95). D1, D2', the
+CAS-in-fold, the S11+S3 amendments and gc's eager all-or-nothing reserve are
+all ratified.
+
+RULING 6: camp DELIBERATELY DIVERGES from gc's `{{var}}` corruption bug (52
+occurrences / 49 steps / 20 formulas — gc's mutator lacks the double-brace
+guard its own residual checker carries). Camp is correct where gc is buggy.
+Assertion D excludes those 49 steps; the cost is stated in the PR body.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (or
 > superpowers:subagent-driven-development) to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
