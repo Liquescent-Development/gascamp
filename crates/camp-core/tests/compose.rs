@@ -437,3 +437,146 @@ fn a_formula_that_inherits_drain_ONLY_from_its_parent_is_blocked_until_rung_2e()
         "blocked as UNIMPLEMENTED, not refused: {err}"
     );
 }
+
+// ---- rung 2d: expansion, and the compile-stage {name} grammar --------------
+
+#[test]
+fn expand_replaces_the_target_step_with_the_expansion_formulas_template() {
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "expansion-host", &no_vars()).unwrap();
+    // `review` is GONE — REPLACED, in position, by the expansion's template.
+    // `{target}` resolved to the target step's id.
+    assert_eq!(
+        ids(&compiled),
+        vec!["prepare", "review.gather", "publish"],
+        "the target is replaced in position; the guarded child is pruned"
+    );
+}
+
+#[test]
+fn a_single_brace_var_in_step_metadata_resolves_AT_COMPILE() {
+    // F4 — rev 2 had NO single-brace grammar at all and claimed "0 bare route
+    // values". There are 8, all in `children.metadata.gc.run_target`, and
+    // `superpowers-code-review.formula.toml:63` proves it: authored
+    // `{implementation_target}`, and gc's compiled Recipe carries
+    // `superpowers.implementer` — RESOLVED. Get the stages backwards and 55
+    // routes silently corrupt.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "expansion-host", &no_vars()).unwrap();
+    let gather = &compiled.formula.steps[1];
+    assert_eq!(
+        gather.metadata.get("gc.run_target").map(String::as_str),
+        Some("gc.implementer"),
+        "a SINGLE-brace route resolves at COMPILE"
+    );
+}
+
+#[test]
+fn a_BOUND_double_brace_var_inside_an_expansion_template_survives_expansion() {
+    // ⭐ THE UNEXERCISED PATH, three revisions running: `{{x}}` inside an
+    // expansion template where x IS BOUND. Every earlier fixture was a bare `{x}`
+    // (resolves) or a `{{x}}` with x UNBOUND (survives for the WRONG REASON —
+    // binding was doing the protecting, not staging). 52 real corpus instances,
+    // and gc CORRUPTS every one of them.
+    //
+    // `implementation_target` HAS a default here, and the token must still come
+    // out byte-identical.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "expansion-host", &no_vars()).unwrap();
+    let gather = &compiled.formula.steps[1];
+    assert!(
+        gather
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("{{implementation_target}}"),
+        "a BOUND {{{{var}}}} inside an expansion template must survive byte-for-byte \
+         (gc would have written `{{gc.implementer}}` here): {:?}",
+        gather.description
+    );
+}
+
+#[test]
+fn a_double_brace_condition_inside_an_expansion_template_survives_expansion() {
+    // gc EXEMPTS Condition from substituteVars (expand.go:272) with a source
+    // comment naming this exact bug. All four `{{review_mode}} != report`
+    // conditions live on the template/children tree — inside expandStep's reach.
+    // Substitute them and `{{review_mode}} != report` becomes `{report} != report`,
+    // which eval_condition REJECTS ⇒ the four code-review formulas stop loading
+    // ⇒ THE CEILING IS NO LONGER 95.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "expansion-host", &no_vars())
+        .expect("the condition must survive expansion intact and then PRUNE, not error");
+    // review_mode defaults to "report" ⇒ the guarded child is PRUNED, and that is
+    // a pruning, not a violation.
+    assert!(!ids(&compiled).contains(&"review.apply-review-findings"));
+    assert!(compiled.refusals.is_empty());
+    assert!(
+        compiled.formula.steps.iter().all(|s| !s.id.contains('{')),
+        "no step id may still carry a brace: {:?}",
+        ids(&compiled)
+    );
+}
+
+#[test]
+fn children_are_flattened_preserving_position() {
+    // camp's step list has no nesting, where gc keeps children on the Step. With
+    // review_mode flipped, the guarded child SURVIVES and must land right after
+    // its parent.
+    let c = camp();
+    let overrides = BTreeMap::from([("review_mode".to_owned(), "agent".to_owned())]);
+    let compiled = compile_named(&c.layers, &c.cfg, "expansion-host", &overrides).unwrap();
+    assert_eq!(
+        ids(&compiled),
+        vec![
+            "prepare",
+            "review.gather",
+            "review.apply-review-findings",
+            "publish"
+        ]
+    );
+}
+
+#[test]
+fn a_single_brace_token_in_description_file_is_NOT_resolved() {
+    // 121 corpus asset files are named, ON DISK, literally `{target}.*.md`, and
+    // 130 `description_file` values carry the braces. gc never substitutes there,
+    // so it opens the LITERAL path. An implementer who "helpfully" applies the
+    // {target} family to every field breaks 130 asset resolutions — each a hard
+    // error in a graph.v2 formula ⇒ mass refusal ⇒ the ceiling collapses.
+    //
+    // The fixture asset is literally named `{target}.note.md`.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "brace-asset", &no_vars()).unwrap();
+    assert_eq!(
+        compiled.formula.steps[0].description.as_deref(),
+        Some("Literal brace asset.\n"),
+        "description_file opened the LITERAL `{{target}}.note.md` path"
+    );
+}
+
+#[test]
+fn an_expansion_formula_compiles_and_is_not_runnable() {
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "review-flow", &no_vars()).unwrap();
+    assert!(!compiled.is_runnable());
+    assert!(
+        compiled.not_runnable.unwrap().reason.contains("expansion"),
+        "an expansion formula supplies template steps; it is not directly runnable"
+    );
+}
+
+#[test]
+fn an_expansion_formula_with_no_template_is_a_violation() {
+    let c = camp();
+    let err = compile_named(&c.layers, &c.cfg, "empty-expansion", &no_vars()).unwrap_err();
+    assert!(err.names("template"), "{err}");
+}
+
+#[test]
+fn an_expand_target_that_does_not_exist_is_a_hard_error() {
+    let c = camp();
+    let err = compile_named(&c.layers, &c.cfg, "bad-expand", &no_vars()).unwrap_err();
+    assert!(err.names("expand"), "{err}");
+    assert!(err.to_string().contains("no-such-expansion"), "{err}");
+}

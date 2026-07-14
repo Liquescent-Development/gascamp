@@ -114,13 +114,8 @@ pub const RUNGS: &[Rung] = &[
 /// compile to nothing, silently, and every intermediate rung count would be a
 /// lie.
 pub const UNIMPLEMENTED: &[&str] = &[
-    // rungs 2b (`vars`, `condition`) and 2c (`extends`) — LANDED.
-    "type",
-    "template",
-    "expand",
-    "expand_vars",
-    "children", // rung 2d
-    "drain",    // rung 2e
+    // rungs 2b, 2c and 2d — LANDED.
+    "drain", // rung 2e
 ];
 
 // ---- the tables ------------------------------------------------------------
@@ -488,15 +483,12 @@ mod tests {
         // The rule itself: a rung key is unimplemented only AT ITS OWN SITE.
         assert!(is_unimplemented(Site::Step, "drain"));
         assert!(!is_unimplemented(Site::Top, "drain"), "drain is a STEP key");
-        assert!(is_unimplemented(Site::Top, "template"));
-        assert!(
-            !is_unimplemented(Site::Step, "template"),
-            "template is a TOP key"
-        );
         // Landed rungs are not unimplemented.
         assert!(!is_unimplemented(Site::Top, "vars"));
         assert!(!is_unimplemented(Site::Step, "condition"));
         assert!(!is_unimplemented(Site::Top, "extends"));
+        assert!(!is_unimplemented(Site::Top, "template"));
+        assert!(!is_unimplemented(Site::Step, "children"));
         assert!(!is_unimplemented(Site::Top, "contract"));
         // Nothing on the base sets may ever be unimplemented.
         assert!(!is_unimplemented(Site::Step, "check"));

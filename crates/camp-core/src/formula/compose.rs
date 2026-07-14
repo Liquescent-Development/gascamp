@@ -100,18 +100,33 @@ pub fn compile(
         }
     };
 
-    // ---- stage 3: expansion + {name} (rung 2d). Identity until Task 7.
-    //
-    // Until that rung lands, `keys::UNIMPLEMENTED` makes any formula that USES it
-    // a hard violation, so an identity stub here can never silently drop a
-    // construct (§4 trap 3). That is the whole reason UNIMPLEMENTED exists, and it
-    // is deleted the moment the last rung lands.
     let _ = cfg;
 
     // The merged var VALUES: the chain's declared defaults, with the caller's
     // overrides on top. Conditions are evaluated over these — never by text
     // substitution (that is `{{var}}`, and it happens at COOK).
     let vars = merge_vars(&walked.raw.vars, vars_override);
+
+    // ---- stage 3: expansion, and the single-brace `{name}` grammar (rung 2d).
+    let defined: BTreeMap<String, String> = vars
+        .iter()
+        .filter_map(|(k, v)| v.clone().map(|v| (k.clone(), v)))
+        .collect();
+    match expand_steps(
+        layers,
+        std::mem::take(&mut walked.raw.steps),
+        &defined,
+        1,
+        &mut walked.violations,
+        &mut walked.refusals,
+        &mut walked.ignored,
+    ) {
+        Ok(steps) => walked.raw.steps = steps,
+        Err(e) => walked.violations.push(Violation {
+            construct: "expand".to_owned(),
+            message: e.to_string(),
+        }),
+    }
 
     // ---- stage 4: description_file (rung 2a).
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -285,6 +300,14 @@ fn overlay(parent: parse::Walked, child: parse::Walked) -> parse::Walked {
     let mut vars = parent.raw.vars;
     vars.extend(child.raw.vars);
 
+    // `template` inherits like `steps` do — an expansion formula can extend
+    // another one.
+    let template = if child.raw.template.is_empty() {
+        parent.raw.template
+    } else {
+        child.raw.template
+    };
+
     let mut violations = parent.violations;
     violations.extend(child.violations);
     let mut ignored = parent.ignored;
@@ -300,12 +323,296 @@ fn overlay(parent: parse::Walked, child: parse::Walked) -> parse::Walked {
             kind: child.raw.kind.or(parent.raw.kind),
             vars,
             extends: Vec::new(),
+            template,
             steps,
         },
         violations,
         refusals,
         ignored,
     }
+}
+
+/// gc's `DefaultMaxExpansionDepth`. Exceeding it is a HARD ERROR, never a
+/// truncation.
+const MAX_EXPANSION_DEPTH: usize = 5;
+
+/// gc's COMPILE-STAGE grammar, and the second of camp's three substitution
+/// functions. **Applied ONLY inside expansion — never as a global pass.**
+///
+/// Two passes, in gc's order (`expandStep`, `expand.go:255`):
+/// 1. the `{target}` FAMILY — a fixed 4-token vocabulary (`{target}`,
+///    `{target.id}`, `{target.title}`, `{target.description}`), a plain
+///    `ReplaceAll` (`substituteTargetPlaceholders`, `expand.go:446-464`). 362 of
+///    the corpus's 435 single-brace occurrences are this family. It is NOT the
+///    var grammar: `{target.title}` resolves with no such var, and
+///    `{target.bogus}` is left verbatim.
+/// 2. the general single-brace var grammar (`\{(\w+)\}`, `range.go:32`). An
+///    unknown token is LEFT VERBATIM (`range.go:103`).
+///
+/// # ⚠️ THE DOUBLE-BRACE GUARD — a DELIBERATE DIVERGENCE FROM gc (D7)
+///
+/// `\{(\w+)\}` matches the INNER `{x}` of an authored `{{x}}` at offset 1. gc's
+/// `substituteVars` is a bare `ReplaceAllStringFunc` with no guard, so inside
+/// `expandStep` it really does corrupt them: **52 measured sites across 49 steps
+/// in 20 formulas** — `{{implementation_target}}` becomes
+/// `{superpowers.implementer}`, an outer brace pair wrapped around a substituted
+/// VALUE. There is no var named `superpowers.implementer`.
+///
+/// **gc's own residual CHECKER carries this guard** (`parser.go:664-672`:
+/// `if start > 0 && s[start-1] == '{' { continue }`). Its authors knew about the
+/// ambiguity, guarded the checker, and did not guard the mutator. It is a bug,
+/// not a semantic, and **camp does not reproduce it.**
+///
+/// **What protects the other 55 routes is SCOPE, not binding.** `bmad-build`'s
+/// `implementation_target` HAS a default, and its `{{implementation_target}}`
+/// route survives compile anyway — because that step is not inside an expansion
+/// template, so `expandStep` never reaches it. An implementer who believed
+/// "binding protects" could reasonably apply this function GLOBALLY (the guard
+/// makes it feel safe) and would then resolve `{ISSUE_NUM}` and
+/// `{artifact_path_keys}` outside expansion, where gc leaves them verbatim.
+/// **This function is called ONLY from the expansion stage.**
+pub(crate) fn resolve_single_brace(
+    text: &str,
+    target: Option<&parse::RawStep>,
+    vars: &BTreeMap<String, String>,
+) -> String {
+    let staged = match target {
+        Some(t) => substitute_target_placeholders(text, t),
+        None => text.to_owned(),
+    };
+    substitute_single_brace_vars(&staged, vars)
+}
+
+/// gc's `substituteTargetPlaceholders` — a FIXED vocabulary, a plain replace.
+fn substitute_target_placeholders(text: &str, target: &parse::RawStep) -> String {
+    let id = target.id.as_deref().unwrap_or_default();
+    text.replace("{target.id}", id)
+        .replace(
+            "{target.title}",
+            target.title.as_deref().unwrap_or_default(),
+        )
+        .replace(
+            "{target.description}",
+            target.description.as_deref().unwrap_or_default(),
+        )
+        .replace("{target}", id)
+}
+
+/// gc's `substituteVars` (`range.go:94`) — PLUS the double-brace guard its
+/// mutator lacks. See [`resolve_single_brace`].
+fn substitute_single_brace_vars(text: &str, vars: &BTreeMap<String, String>) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            let ch = text[i..].chars().next().unwrap_or('{');
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        // ⚠️ THE GUARD (D7). `{{` opens a DOUBLE-brace token: it belongs to the
+        // COOK grammar and must survive compile byte-for-byte. Copy it through
+        // whole — never let the var regex see the inner `{x}`.
+        if bytes.get(i + 1) == Some(&b'{') {
+            match text[i + 2..].find("}}") {
+                Some(end) => {
+                    out.push_str(&text[i..i + 2 + end + 2]);
+                    i += 2 + end + 2;
+                }
+                None => {
+                    out.push_str(&text[i..]);
+                    return out;
+                }
+            }
+            continue;
+        }
+        // A single-brace `{word}`: `\w+` only, exactly gc's class.
+        let rest = &text[i + 1..];
+        let end = rest.find('}');
+        match end {
+            Some(end) => {
+                let token = &rest[..end];
+                let is_word =
+                    !token.is_empty() && token.chars().all(|c| c.is_alphanumeric() || c == '_');
+                match vars.get(token).filter(|_| is_word) {
+                    Some(value) => out.push_str(value),
+                    // Unknown, or not `\w+` (e.g. `{target.bogus}`): VERBATIM.
+                    None if is_word => {
+                        out.push('{');
+                        out.push_str(token);
+                        out.push('}');
+                    }
+                    None => {
+                        out.push('{');
+                        i += 1;
+                        continue;
+                    }
+                }
+                i += 1 + end + 1;
+            }
+            None => {
+                out.push_str(&text[i..]);
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Stage 3 — EXPANSION (rung 2d).
+///
+/// An `expand` rule names an EXPANSION FORMULA; the step carrying it is the
+/// TARGET, and it is REPLACED by that formula's `template` steps, with the
+/// expansion's own `[vars]` merged UNDER the rule's `expand_vars` overrides
+/// (gc `ApplyExpansionsWithVars` / `mergeVars` / `resolveOverrideVars`).
+fn expand_steps(
+    layers: &FormulaLayers,
+    steps: Vec<parse::RawStep>,
+    parent_vars: &BTreeMap<String, String>,
+    depth: usize,
+    violations: &mut Vec<Violation>,
+    refusals: &mut Vec<Refusal>,
+    ignored: &mut Vec<String>,
+) -> Result<Vec<parse::RawStep>, CoreError> {
+    let mut out = Vec::with_capacity(steps.len());
+    for step in steps {
+        let Some(expansion) = step.expand.clone() else {
+            // Not a target. FLATTEN its children in place — camp's step list has
+            // no nesting, where gc keeps children on the Step. The step comes
+            // first, then its children, in order.
+            flatten_into(step, &mut out);
+            continue;
+        };
+        if depth > MAX_EXPANSION_DEPTH {
+            return Err(CoreError::Formula(format!(
+                "expansion depth limit exceeded: max {MAX_EXPANSION_DEPTH} levels (step {:?})",
+                step.id.as_deref().unwrap_or("<unnamed>")
+            )));
+        }
+
+        // Load the expansion formula THROUGH THE LAYERS (it merges its own
+        // `extends` on the way).
+        let path = layers
+            .formula_path(&expansion)
+            .map_err(|e| CoreError::Formula(format!("expand {expansion:?}: {e}")))?;
+        let source = std::fs::read_to_string(&path).map_err(|e| {
+            CoreError::Formula(format!(
+                "expand {expansion:?}: cannot read {}: {e}",
+                path.display()
+            ))
+        })?;
+        let mut visiting = vec![expansion.clone()];
+        let mut walked = chain(layers, &path, &source, &mut visiting)?;
+        if walked.raw.template.is_empty() {
+            return Err(CoreError::Formula(format!(
+                "expand {expansion:?}: that formula declares no `[[template]]` steps — an \
+                 expansion formula supplies template steps for an `expand` rule"
+            )));
+        }
+        violations.append(&mut walked.violations);
+        refusals.append(&mut walked.refusals);
+        ignored.append(&mut walked.ignored);
+
+        // vars = the expansion's OWN defaults, with the rule's overrides on top.
+        // The override VALUES are themselves resolved against the PARENT's vars
+        // first (gc `resolveOverrideVars`, expand.go:210-223).
+        let mut vars: BTreeMap<String, String> = walked
+            .raw
+            .vars
+            .iter()
+            .filter_map(|(k, v)| v.clone().map(|v| (k.clone(), v)))
+            .collect();
+        for (k, v) in &step.expand_vars {
+            let resolved = crate::formula::cook::substitute_vars(v, parent_vars);
+            vars.insert(
+                k.clone(),
+                substitute_single_brace_vars(&resolved, parent_vars),
+            );
+        }
+
+        // Substitute the template against the TARGET (this step) and those vars.
+        let mut expanded = Vec::new();
+        for tmpl in walked.raw.template {
+            expanded.push(substitute_template_step(tmpl, &step, &vars));
+        }
+        // A template step may itself carry an `expand` — recurse, bounded.
+        let expanded = expand_steps(
+            layers,
+            expanded,
+            &vars,
+            depth + 1,
+            violations,
+            refusals,
+            ignored,
+        )?;
+        // The TARGET is REPLACED, in position, by the expansion.
+        out.extend(expanded);
+    }
+    Ok(out)
+}
+
+/// Flatten a step's `children` into the flat list, PRESERVING POSITION: the step
+/// first, then its children in order, recursively. camp's step list has no
+/// nesting, where gc keeps children on the Step.
+fn flatten_into(mut step: parse::RawStep, out: &mut Vec<parse::RawStep>) {
+    let children = std::mem::take(&mut step.children);
+    out.push(step);
+    for child in children {
+        flatten_into(child, out);
+    }
+}
+
+/// Apply gc's `expandStep` field list to one template step.
+///
+/// **`description_file` is NOT in it, and neither is `condition`** — the two
+/// exemptions, both load-bearing (D5):
+/// * 121 corpus asset files are named, on disk, literally `{target}.*.md`, and
+///   130 `description_file` values carry the braces. Substituting there breaks
+///   every one of them.
+/// * gc exempts `Condition` explicitly (`expand.go:272`) with a comment naming
+///   this exact bug. All four `{{review_mode}} != report` conditions live on the
+///   `template/children` tree — inside `expandStep`'s reach. Substitute them and
+///   `{{review_mode}} != report` becomes `{report} != report`, which
+///   `eval_condition` REJECTS, and the four code-review formulas stop loading:
+///   the ceiling is no longer 95.
+fn substitute_template_step(
+    mut tmpl: parse::RawStep,
+    target: &parse::RawStep,
+    vars: &BTreeMap<String, String>,
+) -> parse::RawStep {
+    let sub = |s: &str| resolve_single_brace(s, Some(target), vars);
+    tmpl.id = tmpl.id.as_deref().map(&sub);
+    tmpl.title = tmpl.title.as_deref().map(&sub);
+    tmpl.description = tmpl.description.as_deref().map(&sub);
+    tmpl.assignee = tmpl
+        .assignee
+        .as_deref()
+        // gc: Assignee gets the VAR pass only, no target family.
+        .map(|s| substitute_single_brace_vars(s, vars));
+    tmpl.needs = tmpl.needs.iter().map(|n| sub(n)).collect();
+    for value in tmpl.metadata.values_mut() {
+        *value = sub(value);
+    }
+    for value in tmpl.expand_vars.values_mut() {
+        *value = sub(value);
+    }
+    tmpl.expand = tmpl.expand.as_deref().map(&sub);
+    if let Some(check) = &mut tmpl.check {
+        check.path = std::path::PathBuf::from(sub(&check.path.to_string_lossy()));
+    }
+    // EXEMPT: `condition` gets the target family and NOTHING else.
+    tmpl.condition = tmpl
+        .condition
+        .as_deref()
+        .map(|c| substitute_target_placeholders(c, target));
+    // EXEMPT ENTIRELY: `description_file` is never substituted.
+    tmpl.children = tmpl
+        .children
+        .into_iter()
+        .map(|c| substitute_template_step(c, target, vars))
+        .collect();
+    tmpl
 }
 
 /// The merged var VALUES. Declared defaults first, the caller's overrides on
@@ -560,5 +867,102 @@ mod tests {
         assert!(!text.contains("## Formula Variables"), "{text}");
         // gc's builder ends on the "Follow the section" line.
         assert!(text.ends_with("in that file.\n"), "{text}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(non_snake_case)]
+mod single_brace_tests {
+    use super::*;
+
+    fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn resolving_single_brace_leaves_double_brace_untouched() {
+        // ⭐ D7 — camp is CORRECT where gc is BUGGY. This is the guard gc's own
+        // residual CHECKER carries (parser.go:664-672) and its MUTATOR lacks.
+        //
+        // DO NOT DELETE. gc corrupts 52 sites across 20 formulas exactly here, and
+        // `differential.py` excludes those sites so they cannot be "fixed" back
+        // into a bug.
+        let v = vars(&[("x", "RESOLVED")]);
+        // x IS BOUND — and the double-brace token still survives BYTE-IDENTICAL.
+        // Binding is not what protects it; the GUARD is.
+        assert_eq!(resolve_single_brace("{{x}}", None, &v), "{{x}}");
+        assert_eq!(resolve_single_brace("{x}", None, &v), "RESOLVED");
+        // gc would produce "{RESOLVED}" for the first. Camp does not.
+        assert_eq!(
+            resolve_single_brace("route: {{x}} and {x}", None, &v),
+            "route: {{x}} and RESOLVED"
+        );
+    }
+
+    #[test]
+    fn the_target_family_is_a_fixed_vocabulary_not_the_var_grammar() {
+        let target = parse::RawStep {
+            index: 0,
+            id: Some("review".into()),
+            title: Some("Review it".into()),
+            description: Some("body".into()),
+            description_file: None,
+            metadata: BTreeMap::new(),
+            condition: None,
+            base_dir: None,
+            expand: None,
+            expand_vars: BTreeMap::new(),
+            children: Vec::new(),
+            needs: Vec::new(),
+            assignee: None,
+            timeout: None,
+            check: None,
+            retry: None,
+            on_complete: None,
+            has_check: false,
+            has_retry: false,
+            has_on_complete: false,
+        };
+        let empty = BTreeMap::new();
+        // Resolves with NO such var — it is a plain ReplaceAll over a fixed
+        // 4-token vocabulary, not the var grammar. 362 of the corpus's 435
+        // single-brace occurrences are this family.
+        assert_eq!(
+            resolve_single_brace("{target}.blind-hunter", Some(&target), &empty),
+            "review.blind-hunter"
+        );
+        assert_eq!(
+            resolve_single_brace("{target.title}", Some(&target), &empty),
+            "Review it"
+        );
+        // Not in the vocabulary ⇒ LEFT VERBATIM (and `target.bogus` is not `\w+`
+        // either, so the var pass cannot touch it).
+        assert_eq!(
+            resolve_single_brace("{target.bogus}", Some(&target), &empty),
+            "{target.bogus}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_single_brace_token_is_left_verbatim() {
+        // gc range.go:103. `{GC_PACK_DIR}` in prose survives.
+        let v = vars(&[("x", "X")]);
+        assert_eq!(
+            resolve_single_brace("see {GC_PACK_DIR}/x", None, &v),
+            "see {GC_PACK_DIR}/x"
+        );
+        assert_eq!(resolve_single_brace("{ISSUE_NUM}", None, &v), "{ISSUE_NUM}");
+    }
+
+    #[test]
+    fn a_lone_or_unterminated_brace_is_carried_through() {
+        let v = vars(&[("x", "X")]);
+        assert_eq!(resolve_single_brace("a { b", None, &v), "a { b");
+        assert_eq!(resolve_single_brace("{{x", None, &v), "{{x");
+        assert_eq!(resolve_single_brace("100% {", None, &v), "100% {");
     }
 }

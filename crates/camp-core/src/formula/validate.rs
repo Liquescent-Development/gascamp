@@ -109,6 +109,15 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
             "a camp formula must declare at least one step",
         );
     }
+    // …and an expansion formula must declare at least one `[[template]]` step:
+    // template steps are the whole of what it supplies.
+    if is_expansion(raw) && raw.template.is_empty() {
+        violation(
+            out,
+            "template",
+            "an `type = \"expansion\"` formula must declare at least one `[[template]]` step",
+        );
+    }
 
     // S4 — ids: required, non-empty, unique.
     let mut seen: BTreeSet<&str> = BTreeSet::new();

@@ -1,0 +1,1 @@
+Literal brace asset.

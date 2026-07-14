@@ -1,0 +1,21 @@
+formula = "expansion-host"
+contract = "graph.v2"
+
+[vars]
+implementation_target = { default = "gc.implementer" }
+review_mode = { default = "report" }
+
+[[steps]]
+id = "prepare"
+title = "Prepare"
+
+[[steps]]
+id = "review"
+title = "Review it"
+needs = ["prepare"]
+expand = "review-flow"
+expand_vars = { review_mode = "{{review_mode}}" }
+
+[[steps]]
+id = "publish"
+title = "Publish"

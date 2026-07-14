@@ -35,6 +35,10 @@ pub(crate) struct RawFormula {
     /// 48 corpus formulas extend; none extends more than one parent, but gc's
     /// shape is a list and camp implements the list.
     pub extends: Vec<String>,
+    /// `[[template]]` — rung 2d. The steps an `type = "expansion"` formula
+    /// supplies to another formula's `expand` rule. 14 corpus formulas are
+    /// expansions, and NONE of them has `steps` (S3).
+    pub template: Vec<RawStep>,
     pub steps: Vec<RawStep>,
 }
 
@@ -59,6 +63,15 @@ pub(crate) struct RawStep {
     /// `description_file` resolves against it (gc resolves each formula's
     /// description files against its own base dir). Set by `compose::chain`.
     pub base_dir: Option<PathBuf>,
+    /// `expand` — rung 2d. Names an EXPANSION FORMULA; this step is the TARGET
+    /// and is REPLACED by that formula's `template` steps. 15 corpus steps.
+    pub expand: Option<String>,
+    /// `expand_vars` — rung 2d. The rule's var overrides, laid over the
+    /// expansion formula's own `[vars]` defaults. 14 corpus steps.
+    pub expand_vars: BTreeMap<String, String>,
+    /// `children` — rung 2d. 16 occurrences across 15 formulas, and 14 of them
+    /// are on the `template` tree (rev 2 counted only `steps` and said "2").
+    pub children: Vec<RawStep>,
     pub needs: Vec<String>,
     pub assignee: Option<String>,
     pub timeout: Option<Duration>,
@@ -324,6 +337,7 @@ pub(crate) fn walk(text: &str, origin: Origin) -> Walked {
         kind: None,
         vars: BTreeMap::new(),
         extends: Vec::new(),
+        template: Vec::new(),
         steps: Vec::new(),
     };
     let table: toml::Table = match text.parse() {
@@ -351,6 +365,7 @@ pub(crate) fn walk(text: &str, origin: Origin) -> Walked {
     let formula_compiler = walk_requires(&table, &mut ctx.violations);
     let vars = walk_vars(&table, &mut ctx.violations);
     let extends = walk_extends(&table, &mut ctx.violations);
+    let template = walk_step_array(&table, "template", "", &mut ctx);
     let steps = walk_steps(&table, &mut ctx);
 
     Walked {
@@ -362,6 +377,7 @@ pub(crate) fn walk(text: &str, origin: Origin) -> Walked {
             kind,
             vars,
             extends,
+            template,
             steps,
         },
         violations: ctx.violations,
@@ -453,6 +469,34 @@ fn walk_vars(table: &toml::Table, out: &mut Vec<Violation>) -> BTreeMap<String, 
     vars
 }
 
+/// An array of step tables at `key` (`children`, `template`). Same walk, same
+/// key table, same site — a template step is a step.
+fn walk_step_array(table: &toml::Table, key: &str, loc: &str, ctx: &mut Ctx) -> Vec<RawStep> {
+    let items = match table.get(key) {
+        None => return Vec::new(),
+        Some(Value::Array(items)) => items,
+        Some(_) => {
+            let at = if loc.is_empty() {
+                key.to_owned()
+            } else {
+                format!("{loc}.{key}")
+            };
+            ctx.violations.push(wrong_type(&at, "an array of tables"));
+            return Vec::new();
+        }
+    };
+    let mut steps = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Value::Table(step) = item else {
+            ctx.violations
+                .push(wrong_type(&format!("{loc}.{key}[{index}]"), "a table"));
+            continue;
+        };
+        steps.push(walk_step(index, step, ctx));
+    }
+    steps
+}
+
 fn walk_steps(table: &toml::Table, ctx: &mut Ctx) -> Vec<RawStep> {
     let raw_steps = match table.get("steps") {
         None => return Vec::new(),
@@ -493,6 +537,9 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
     let at = |field: &str| format!("{loc}.{field}");
 
     ctx.keys(Site::Step, step, &loc, id.as_deref());
+    // Children first: they need `ctx`, and the value-getters below borrow
+    // `ctx.violations` for the rest of the function.
+    let children = walk_step_array(step, "children", &loc, ctx);
 
     let out = &mut ctx.violations;
     let title = get_string(step, "title", &at("title"), out);
@@ -500,6 +547,8 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
     let description_file = get_string(step, "description_file", &at("description_file"), out);
     let metadata = get_string_map(step, "metadata", &at("metadata"), out);
     let condition = get_string(step, "condition", &at("condition"), out);
+    let expand = get_string(step, "expand", &at("expand"), out);
+    let expand_vars = get_string_map(step, "expand_vars", &at("expand_vars"), out);
     let needs = get_string_array(step, "needs", &at("needs"), out);
     let assignee = get_string(step, "assignee", &at("assignee"), out);
     let timeout = get_duration(step, "timeout", &at("timeout"), out);
@@ -516,6 +565,9 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
         metadata,
         condition,
         base_dir: None,
+        expand,
+        expand_vars,
+        children,
         needs,
         assignee,
         timeout,
