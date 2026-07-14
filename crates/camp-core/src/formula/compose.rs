@@ -89,24 +89,34 @@ pub fn compile(
 
     // ---- stage 2: extends (rung 2c). Identity until Task 6.
     // ---- stage 3: expansion + {name} (rung 2d). Identity until Task 7.
-    // ---- stage 5: condition pruning (rung 2b). Identity until Task 5.
     //
     // Until those rungs land, `keys::UNIMPLEMENTED` makes any formula that USES
     // them a hard violation, so an identity stub here can never silently drop a
     // construct (§4 trap 3). That is the whole reason UNIMPLEMENTED exists, and
     // it is deleted the moment the last rung lands.
-    let _ = vars_override;
     let _ = cfg;
+
+    // The merged var VALUES: the formula's declared defaults, with the caller's
+    // overrides on top. Conditions are evaluated over these — never by text
+    // substitution (that is `{{var}}`, and it happens at COOK).
+    let vars = merge_vars(&walked.raw.vars, vars_override);
 
     // ---- stage 4: description_file (rung 2a).
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let vars: BTreeMap<String, String> = BTreeMap::new();
     if let Err(e) = inline_description_files(layers, &mut walked.raw, base_dir, &vars) {
         walked.violations.push(Violation {
             construct: "description_file".to_owned(),
             message: e.to_string(),
         });
     }
+
+    // ---- stage 5: condition pruning (rung 2b).
+    prune_conditions(
+        &mut walked.raw,
+        &vars,
+        &mut walked.violations,
+        &mut walked.refusals,
+    );
 
     // ---- stage 6: validate, collect surviving refusals, decide runnability.
     let stem = validate::formula_stem(path);
@@ -127,7 +137,7 @@ pub fn compile(
         step: None,
     });
     Ok(Compiled {
-        formula: validate::assemble(walked.raw, source),
+        formula: validate::assemble(walked.raw, source, vars),
         ignored_keys: walked.ignored,
         refusals: Vec::new(),
         not_runnable,
@@ -152,6 +162,129 @@ pub fn compile_named(
     compile(layers, cfg, &path, vars_override)
 }
 
+/// The merged var VALUES. Declared defaults first, the caller's overrides on
+/// top. A var declared with no default is DECLARED BUT UNDEFINED: it keeps its
+/// name (gc's oversize prompt lists every declared name) and contributes no
+/// value, so its `{{placeholder}}` survives to the worker verbatim.
+pub(crate) fn merge_vars(
+    declared: &BTreeMap<String, Option<String>>,
+    overrides: &BTreeMap<String, String>,
+) -> BTreeMap<String, Option<String>> {
+    let mut out: BTreeMap<String, Option<String>> = declared.clone();
+    for (k, v) in overrides {
+        out.insert(k.clone(), Some(v.clone()));
+    }
+    out
+}
+
+/// §9's condition grammar: `==` and `!=` ONLY, LHS a single `{{var}}`.
+///
+/// **Evaluated over the merged var VALUES, never by text substitution.** That
+/// distinction is the whole of D5: `{{var}}` is not substituted at compile, so a
+/// condition can only be decided by LOOKING UP the var — and an undefined var
+/// equals nothing.
+///
+/// The RHS is an unquoted bare word in every corpus use; a quoted one is accepted
+/// too. Measured: 4 distinct conditions, 29 uses.
+pub(crate) fn eval_condition(
+    expr: &str,
+    vars: &BTreeMap<String, Option<String>>,
+) -> Result<bool, String> {
+    let (lhs, op, rhs) = match expr.split_once("==") {
+        Some((l, r)) => (l, Op::Eq, r),
+        None => match expr.split_once("!=") {
+            Some((l, r)) => (l, Op::Ne, r),
+            None => {
+                return Err(format!(
+                    "condition {expr:?} is outside camp's subset: only `{{{{var}}}} == value` \
+                     and `{{{{var}}}} != value` are supported (compat §9)"
+                ));
+            }
+        },
+    };
+    let lhs = lhs.trim();
+    let name = lhs
+        .strip_prefix("{{")
+        .and_then(|s| s.strip_suffix("}}"))
+        .map(str::trim)
+        .ok_or_else(|| {
+            format!(
+                "condition {expr:?}: the left-hand side must be a single `{{{{var}}}}`, not {lhs:?}"
+            )
+        })?;
+    let rhs = rhs.trim().trim_matches('"').trim_matches('\'');
+
+    // An UNDEFINED var equals nothing. `==` is therefore false (the step prunes)
+    // and `!=` is true (it stays).
+    let actual = vars.get(name).and_then(Option::as_deref);
+    let equal = actual == Some(rhs);
+    Ok(match op {
+        Op::Eq => equal,
+        Op::Ne => !equal,
+    })
+}
+
+enum Op {
+    Eq,
+    Ne,
+}
+
+/// Stage 5 — condition pruning.
+///
+/// **A pruned step takes its REFUSALS with it (BD2), and that is what separates a
+/// ceiling of 95 from one of 76.** 19 corpus formulas carry a CONDITIONAL
+/// shared-drain arm — `context = "shared"`, which camp refuses. gc prunes those
+/// arms under the default `drain_policy = "separate"` (13 authored shared drains
+/// compile to 1). If camp collected the refusal at parse and never re-filtered
+/// it, all 19 would refuse — taking `bmad-build`, `gstack-build` and
+/// `compound-build` with them.
+fn prune_conditions(
+    raw: &mut parse::RawFormula,
+    vars: &BTreeMap<String, Option<String>>,
+    violations: &mut Vec<Violation>,
+    refusals: &mut Vec<Refusal>,
+) {
+    let mut kept: Vec<parse::RawStep> = Vec::new();
+    let mut pruned: BTreeSet<String> = BTreeSet::new();
+    for step in std::mem::take(&mut raw.steps) {
+        let Some(expr) = step.condition.clone() else {
+            kept.push(step);
+            continue;
+        };
+        match eval_condition(&expr, vars) {
+            Ok(true) => kept.push(step),
+            Ok(false) => {
+                if let Some(id) = &step.id {
+                    pruned.insert(id.clone());
+                }
+            }
+            Err(message) => {
+                violations.push(Violation {
+                    construct: match &step.id {
+                        Some(id) => format!("steps.{id}.condition"),
+                        None => format!("steps[{}].condition", step.index),
+                    },
+                    message,
+                });
+                kept.push(step);
+            }
+        }
+    }
+    raw.steps = kept;
+
+    // The refusals of a pruned step die WITH it.
+    refusals.retain(|r| match &r.step {
+        Some(step) => !pruned.contains(step),
+        None => true,
+    });
+
+    // Dangling `needs` are DROPPED, silently — a surviving step that still needed
+    // a pruned one would never dispatch and the run would dead-end (§9).
+    for step in &mut raw.steps {
+        step.needs.retain(|n| !pruned.contains(n));
+    }
+}
+
 /// Stage 4 — `description_file`: the file's CONTENTS REPLACE the step's
 /// description, and the key is consumed (gc `parser.go:808-828`).
 ///
@@ -162,7 +295,7 @@ fn inline_description_files(
     layers: &FormulaLayers,
     raw: &mut parse::RawFormula,
     base_dir: &Path,
-    vars: &BTreeMap<String, String>,
+    vars: &BTreeMap<String, Option<String>>,
 ) -> Result<(), CoreError> {
     for step in &mut raw.steps {
         let Some(rel) = step.description_file.clone() else {
@@ -204,7 +337,7 @@ fn pointer_prompt(
     raw_path: &str,
     resolved: &Path,
     size: usize,
-    vars: &BTreeMap<String, String>,
+    vars: &BTreeMap<String, Option<String>>,
 ) -> String {
     let mut b = String::new();
     b.push_str("# External Prompt Required\n\n");
@@ -222,7 +355,9 @@ fn pointer_prompt(
     b.push_str("Treat the file contents as the authoritative task prompt for this bead. It augments the startup/runtime protocol; it does not replace the startup prompt, the current agent prompt, or any bead lifecycle/result-contract instructions already given to you.\n");
     b.push_str("Follow the section matching this bead's `gc.step_id` metadata and title, plus any result, closure, lifecycle, or post-close contract sections in that file.\n");
 
-    // gc sorts the var names (`slices.Sort`); a BTreeMap already is.
+    // gc sorts the var names (`slices.Sort`); a BTreeMap already is. It lists
+    // EVERY DECLARED name — including the ones with no default, whose
+    // `{{placeholder}}` will still be unresolved when the worker reads it.
     let keys: BTreeSet<&String> = vars.keys().collect();
     if !keys.is_empty() {
         b.push_str("\n## Formula Variables\n\n");
@@ -244,8 +379,9 @@ mod tests {
     #[test]
     fn the_pointer_prompt_is_gcs_text_byte_for_byte() {
         let vars = BTreeMap::from([
-            ("kind".to_owned(), "build".to_owned()),
-            ("agent".to_owned(), "dev".to_owned()),
+            ("kind".to_owned(), Some("build".to_owned())),
+            // Declared with NO default: it still appears in the block.
+            ("agent".to_owned(), None),
         ]);
         let text = pointer_prompt("../assets/x.md", Path::new("/p/assets/x.md"), 5000, &vars);
         assert!(text.starts_with("# External Prompt Required\n\n"), "{text}");

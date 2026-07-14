@@ -33,10 +33,11 @@ pub(crate) fn not_runnable(raw: &RawFormula) -> Option<String> {
              formula's `expand` rule and is not directly runnable (compat §9)"
                 .to_owned(),
         )
-    } else if raw.contract.as_deref() != Some("graph.v2") {
+    } else if !declares_compiler(raw) {
         Some(
-            "this formula declares no `contract = \"graph.v2\"`: camp compiles it, but only \
-             graph.v2 formulas can be run (compat §9)"
+            "this formula declares no graph compiler — neither `contract = \"graph.v2\"` nor \
+             `[requires] formula_compiler`: camp compiles it, but only graph formulas can be run \
+             (compat §9)"
                 .to_owned(),
         )
     } else {
@@ -407,13 +408,18 @@ fn check_cycles(raw: &RawFormula, out: &mut Vec<Violation>) {
 
 /// Convert a violation-free RawFormula into the public Formula. Only call
 /// after `check` reported no violations (parse_and_validate enforces this).
-pub(crate) fn assemble(raw: RawFormula, source: String) -> Formula {
+pub(crate) fn assemble(
+    raw: RawFormula,
+    source: String,
+    vars: BTreeMap<String, Option<String>>,
+) -> Formula {
     Formula {
         name: raw.name.unwrap_or_default(),
         description: raw.description,
         requires: raw
             .formula_compiler
             .map(|formula_compiler| crate::formula::ast::Requires { formula_compiler }),
+        vars,
         steps: raw
             .steps
             .into_iter()
@@ -689,7 +695,8 @@ mod tests {
         );
         super::check(&w.raw, Some("f"), &mut w.violations);
         assert!(w.violations.is_empty(), "{:?}", w.violations);
-        let formula = super::assemble(w.raw, String::new());
+        let vars = w.raw.vars.clone();
+        let formula = super::assemble(w.raw, String::new(), vars);
         assert_eq!(
             formula.steps[0].retry.as_ref().unwrap().on_exhausted,
             crate::formula::ast::Disposition::HardFail

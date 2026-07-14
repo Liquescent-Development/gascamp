@@ -1,0 +1,36 @@
+formula = "guarded"
+contract = "graph.v2"
+
+[vars]
+drain_policy = "separate"
+review_mode = { default = "report" }
+implementation_target = { description = "who implements", required = true }
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "impl-separate"
+title = "Separate arm"
+condition = "{{drain_policy}} == separate"
+needs = ["decompose"]
+
+[[steps]]
+id = "impl-shared"
+title = "Shared arm"
+condition = "{{drain_policy}} == same-session"
+needs = ["decompose"]
+gate = { path = "x" }
+
+[[steps]]
+id = "apply-review-findings"
+title = "Apply review findings"
+condition = "{{review_mode}} != report"
+needs = ["impl-separate"]
+
+[[steps]]
+id = "publish"
+title = "Publish {{drain_policy}}"
+needs = ["apply-review-findings", "impl-separate"]
+description = "Target is {{implementation_target}} and {{unknown_var}}"

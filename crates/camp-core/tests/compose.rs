@@ -49,7 +49,7 @@ fn camp() -> Camp {
     std::fs::write(
         root.join("camp.toml"),
         format!(
-            "[camp]\nname = \"t\"\n\n[imports.gc]\nsource = {:?}\n",
+            "[camp]\nname = \"t\"\n\n[agent_defaults]\ntools = [\"Read\"]\n\n[imports.gc]\nsource = {:?}\n",
             parent.display().to_string()
         ),
     )
@@ -230,4 +230,114 @@ fn compile_by_path_and_by_name_agree() {
     )
     .unwrap();
     assert_eq!(by_name.formula, by_path.formula);
+}
+
+// ---- rung 2b: vars, condition pruning, and the {{var}} STAGE ---------------
+
+fn ids(c: &camp_core::formula::Compiled) -> Vec<&str> {
+    c.formula.steps.iter().map(|s| s.id.as_str()).collect()
+}
+
+#[test]
+fn a_false_condition_prunes_the_step_its_children_AND_its_refusals() {
+    // ⭐ BD2, and it is what separates a ceiling of 95 from one of 76.
+    //
+    // `impl-shared` carries a `gate` — a §4 rule-1 REFUSAL. Its condition is
+    // false under the default `drain_policy = "separate"`, so the step prunes and
+    // ITS REFUSAL MUST DIE WITH IT. Collect refusals at parse and never re-filter
+    // them, and 19 corpus formulas with a conditional shared-drain arm refuse —
+    // taking bmad-build, gstack-build and compound-build with them.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "guarded", &no_vars())
+        .expect("the shared arm's refusal must die with the pruned step");
+    assert!(
+        !ids(&compiled).contains(&"impl-shared"),
+        "{:?}",
+        ids(&compiled)
+    );
+    assert!(ids(&compiled).contains(&"impl-separate"));
+    assert!(compiled.refusals.is_empty(), "{:?}", compiled.refusals);
+}
+
+#[test]
+fn a_true_condition_keeps_the_step_and_an_override_flips_which_arm_survives() {
+    // gc's `Compile` takes vars, and conditions resolve at COMPILE — so a
+    // sling-time override must change what is pruned. And when the SHARED arm
+    // survives, its refusal survives with it: camp refuses rather than
+    // approximate.
+    let c = camp();
+    let overrides = BTreeMap::from([("drain_policy".to_owned(), "same-session".to_owned())]);
+    let err = compile_named(&c.layers, &c.cfg, "guarded", &overrides)
+        .expect_err("the shared arm now survives, and it is refused");
+    assert!(err.names("gate"), "{err}");
+}
+
+#[test]
+fn review_mode_defaults_to_report_so_the_guarded_child_prunes() {
+    // The 4 `{{review_mode}} != report` conditions. `review_mode`'s default
+    // VARIES BY PACK, so the merged chain decides — here it is `report`, so the
+    // guarded step prunes and is NOT a violation.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "guarded", &no_vars()).unwrap();
+    assert!(!ids(&compiled).contains(&"apply-review-findings"));
+    // And the dangling `needs` on it is DROPPED — a step still needing a pruned
+    // step would never dispatch and the run would dead-end.
+    let publish = compiled
+        .formula
+        .steps
+        .iter()
+        .find(|s| s.id == "publish")
+        .unwrap();
+    assert_eq!(
+        publish.needs,
+        vec!["impl-separate"],
+        "the dangling need on the pruned step is dropped"
+    );
+}
+
+#[test]
+fn compile_does_NOT_substitute_double_brace_vars_anywhere() {
+    // F1 — the fact rev 2 got backwards. `{{var}}` survives COMPILE, even where
+    // the var HAS a default. 561 corpus steps still carry one afterwards.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "guarded", &no_vars()).unwrap();
+    let publish = compiled
+        .formula
+        .steps
+        .iter()
+        .find(|s| s.id == "publish")
+        .unwrap();
+    assert_eq!(
+        publish.title, "Publish {{drain_policy}}",
+        "drain_policy HAS a default and the placeholder still survives compile"
+    );
+    assert!(
+        publish
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("{{implementation_target}}")
+    );
+}
+
+#[test]
+fn a_condition_outside_the_subset_is_a_violation_naming_the_step() {
+    let c = camp();
+    let err = compile_named(&c.layers, &c.cfg, "bad-condition", &no_vars()).unwrap_err();
+    assert!(err.names("steps.a.condition"), "{err}");
+    assert!(err.to_string().contains("outside camp's subset"), "{err}");
+}
+
+#[test]
+fn vars_with_no_default_are_declared_but_undefined() {
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "guarded", &no_vars()).unwrap();
+    // The name EXISTS (gc's oversize prompt lists every declared name) …
+    assert!(compiled.formula.vars.contains_key("implementation_target"));
+    // … and it resolves to nothing, so its placeholder survives to the worker.
+    assert_eq!(compiled.formula.vars["implementation_target"], None);
+    assert_eq!(
+        compiled.formula.vars["drain_policy"],
+        Some("separate".to_owned())
+    );
 }

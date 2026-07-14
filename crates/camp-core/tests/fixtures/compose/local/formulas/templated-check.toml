@@ -1,0 +1,19 @@
+formula = "templated-check"
+contract = "graph.v2"
+
+[vars]
+kind = "build"
+
+[[steps]]
+id = "impl"
+title = "Implement"
+
+# NOTE the spelling: `[steps.check]` attaches to the LAST `[[steps]]` entry.
+# `[steps.impl.check]` would declare a TABLE named `impl` under a `steps` table —
+# a different thing entirely, and an unknown key.
+[steps.check]
+max_attempts = 2
+
+[steps.check.check]
+mode = "exec"
+path = ".gc/scripts/checks/{{kind}}.sh"

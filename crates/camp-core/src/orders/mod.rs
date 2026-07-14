@@ -432,20 +432,34 @@ pub fn execute_fire(
         })?;
         Ok(())
     };
-    let path = match resolve_formula(config, &order.formula) {
-        Ok(p) => p,
+    // compat §9: compile through the LAYER STACK. `parse_and_validate` is the
+    // no-layer camp-local entry and cannot resolve an imported formula's
+    // `extends`, `description_file`, or routes.
+    let layers = match crate::formula::FormulaLayers::from_config(config, camp_root) {
+        Ok(l) => l,
         Err(e) => {
             fail(ledger, format!("formula {:?}: {e}", order.formula))?;
             return Ok(None);
         }
     };
-    let formula = match crate::formula::parse_and_validate(&path) {
-        Ok(formula) => formula,
+    let compiled = match crate::formula::compile_named(
+        &layers,
+        config,
+        &order.formula,
+        &std::collections::BTreeMap::new(),
+    ) {
+        Ok(c) => c,
         Err(e) => {
             fail(ledger, format!("formula {:?}: {e}", order.formula))?;
             return Ok(None);
         }
     };
+    // D1 + §13's money invariant: a formula camp cannot honour must never reach a
+    // worker. The refusal is NOT wired here yet — the plan's D1 predicate refuses
+    // camp's own shipped formulas (`one-step` declares no compiler at all), and
+    // every candidate rule moves the pinned RUNNABLE count. REPORTED TO THE LEAD;
+    // awaiting a ruling. `compiled.not_runnable` is computed and unit-tested.
+    let formula = compiled.formula;
     let rig = match resolve_rig(config, order) {
         Ok(rig) => rig.clone(),
         Err(reason) => {
@@ -453,12 +467,18 @@ pub fn execute_fire(
             return Ok(None);
         }
     };
-    match crate::formula::cook(
+    let opts = crate::formula::CookOptions {
+        // Routes resolve through the binding namespace, like every other cook.
+        config: Some(config.clone()),
+        ..Default::default()
+    };
+    match crate::formula::cook_with(
         ledger,
         &formula,
         &crate::formula::runtime::runs_dir(camp_root),
         &rig,
         &cook_actor(&order.name, fired_seq),
+        &opts,
     ) {
         Ok(run) => Ok(Some(run)),
         Err(e) => {

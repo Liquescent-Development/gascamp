@@ -27,6 +27,10 @@ pub(crate) struct RawFormula {
     /// formula supplies `template` steps for an `expand` rule and has no
     /// `steps` of its own (S3), and is never directly runnable (D1).
     pub kind: Option<String>,
+    /// `[vars]` — rung 2b. name -> DEFAULT. `None` means DECLARED BUT UNDEFINED:
+    /// the name still exists (gc's pointer prompt lists it) but no value
+    /// resolves, so a `{{name}}` placeholder survives verbatim.
+    pub vars: BTreeMap<String, Option<String>>,
     pub steps: Vec<RawStep>,
 }
 
@@ -43,6 +47,9 @@ pub(crate) struct RawStep {
     /// Rung 2a. gc's step metadata, carried VERBATIM onto the bead. This is
     /// where routing lives (`gc.run_target`, 327 uses) — it is not annotation.
     pub metadata: BTreeMap<String, String>,
+    /// Rung 2b. CONSUMED at compile (stage 5): a false condition PRUNES the
+    /// step, its children, and its REFUSALS (BD2).
+    pub condition: Option<String>,
     pub needs: Vec<String>,
     pub assignee: Option<String>,
     pub timeout: Option<Duration>,
@@ -306,6 +313,7 @@ pub(crate) fn walk(text: &str, origin: Origin) -> Walked {
         formula_compiler: None,
         contract: None,
         kind: None,
+        vars: BTreeMap::new(),
         steps: Vec::new(),
     };
     let table: toml::Table = match text.parse() {
@@ -331,6 +339,7 @@ pub(crate) fn walk(text: &str, origin: Origin) -> Walked {
     let contract = get_string(&table, "contract", "contract", &mut ctx.violations);
     let kind = get_string(&table, "type", "type", &mut ctx.violations);
     let formula_compiler = walk_requires(&table, &mut ctx.violations);
+    let vars = walk_vars(&table, &mut ctx.violations);
     let steps = walk_steps(&table, &mut ctx);
 
     Walked {
@@ -340,6 +349,7 @@ pub(crate) fn walk(text: &str, origin: Origin) -> Walked {
             formula_compiler,
             contract,
             kind,
+            vars,
             steps,
         },
         violations: ctx.violations,
@@ -375,6 +385,47 @@ fn walk_requires(table: &toml::Table, out: &mut Vec<Violation>) -> Option<String
         "requires.formula_compiler",
         out,
     )
+}
+
+/// `[vars]` (rung 2b). An entry is either a BARE STRING (the default) or a
+/// TABLE that may carry a `default`. A var with NO default is DECLARED BUT
+/// UNDEFINED: its name still exists — gc's oversize-prompt `## Formula Variables`
+/// block lists every declared name — but no value resolves, so a `{{name}}`
+/// placeholder survives verbatim all the way to the worker.
+///
+/// gc's var tables also carry `description` and `required`; camp reads neither.
+/// `required` is gc's own sling-time prompt, and camp has no interactive sling.
+fn walk_vars(table: &toml::Table, out: &mut Vec<Violation>) -> BTreeMap<String, Option<String>> {
+    let mut vars = BTreeMap::new();
+    match table.get("vars") {
+        None => {}
+        Some(Value::Table(t)) => {
+            for (name, value) in t {
+                match value {
+                    Value::String(s) => {
+                        vars.insert(name.clone(), Some(s.clone()));
+                    }
+                    Value::Table(def) => {
+                        let default = match def.get("default") {
+                            None => None,
+                            Some(Value::String(s)) => Some(s.clone()),
+                            Some(_) => {
+                                out.push(wrong_type(&format!("vars.{name}.default"), "a string"));
+                                None
+                            }
+                        };
+                        vars.insert(name.clone(), default);
+                    }
+                    _ => out.push(wrong_type(
+                        &format!("vars.{name}"),
+                        "a string or a table with a `default`",
+                    )),
+                }
+            }
+        }
+        Some(_) => out.push(wrong_type("vars", "a table")),
+    }
+    vars
 }
 
 fn walk_steps(table: &toml::Table, ctx: &mut Ctx) -> Vec<RawStep> {
@@ -423,6 +474,7 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
     let description = get_string(step, "description", &at("description"), out);
     let description_file = get_string(step, "description_file", &at("description_file"), out);
     let metadata = get_string_map(step, "metadata", &at("metadata"), out);
+    let condition = get_string(step, "condition", &at("condition"), out);
     let needs = get_string_array(step, "needs", &at("needs"), out);
     let assignee = get_string(step, "assignee", &at("assignee"), out);
     let timeout = get_duration(step, "timeout", &at("timeout"), out);
@@ -437,6 +489,7 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
         description,
         description_file,
         metadata,
+        condition,
         needs,
         assignee,
         timeout,
@@ -957,15 +1010,15 @@ mode = "fanout"
     #[test]
     fn walk_collects_every_finding_and_sorts_them_into_the_right_bucket() {
         // One file, three verdicts — and the buckets are the point. `pour` is a
-        // REFUSAL (§4 rule 1, permanent). `vars` is a VIOLATION only because its
-        // rung has not landed (temporary — UNIMPLEMENTED). `tags` is an
+        // REFUSAL (§4 rule 1, permanent). `extends` is a VIOLATION only because
+        // its rung has not landed (temporary — UNIMPLEMENTED). `tags` is an
         // ANNOTATION and is SILENT. Conflating any two of these is how the old
         // table refused 95 of the 100 corpus formulas.
-        let text = "formula = \"x\"\nvars = {}\npour = true\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ntags = [\"x\"]\n";
+        let text = "formula = \"x\"\nextends = \"p\"\npour = true\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ntags = [\"x\"]\n";
         let w = walk(text, Origin::CampLocal);
 
         let c: Vec<&str> = w.violations.iter().map(|v| v.construct.as_str()).collect();
-        assert_eq!(c, vec!["vars"], "only the unimplemented rung key: {c:?}");
+        assert_eq!(c, vec!["extends"], "only the unimplemented rung key: {c:?}");
 
         let r: Vec<&str> = w.refusals.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(r, vec!["pour"], "{r:?}");

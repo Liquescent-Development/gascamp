@@ -258,6 +258,7 @@ fn cook_rejects_unknown_needs_ids_in_hand_built_formulas() {
     };
     let formula = Formula {
         name: "hand".into(),
+        vars: Default::default(),
         description: None,
         requires: None,
         steps: vec![step("a", &[]), step("b", &["ghost"])],
@@ -382,6 +383,7 @@ fn cook_with_substitutes_vars_and_links_the_root() {
     vars.insert("name".to_owned(), "alpha".to_owned());
     vars.insert("position".to_owned(), "0".to_owned());
     let opts = CookOptions {
+        config: None,
         vars,
         extra_root_needs: vec!["gc-1".to_owned()],
         extra_root_labels: vec!["bond:gc-1:0".to_owned()],
@@ -458,6 +460,7 @@ fn substitution_never_reinterprets_inserted_values_as_templates() {
     vars.insert("name".to_owned(), "literal {position} inside".to_owned());
     vars.insert("position".to_owned(), "0".to_owned());
     let opts = CookOptions {
+        config: None,
         vars,
         ..Default::default()
     };
@@ -512,7 +515,7 @@ fn layered_camp() -> (
     std::fs::write(
         root.join("camp.toml"),
         format!(
-            "[camp]\nname = \"t\"\n\n[imports.gc]\nsource = {:?}\n",
+            "[camp]\nname = \"t\"\n\n[agent_defaults]\ntools = [\"Read\"]\n\n[imports.gc]\nsource = {:?}\n",
             fixtures.join("parent").display().to_string()
         ),
     )
@@ -589,20 +592,35 @@ fn load_run_reconstitutes_a_run_cooked_from_an_IMPORTED_formula_with_extends_and
     .unwrap();
 
     let runs = root.join("runs");
-    let cooked = cook(&mut ledger, &compiled.formula, &runs, &rig(), "cli").unwrap();
+    let opts = camp_core::formula::CookOptions {
+        config: Some(cfg.clone()),
+        ..Default::default()
+    };
+    let cooked =
+        camp_core::formula::cook_with(&mut ledger, &compiled.formula, &runs, &rig(), "cli", &opts)
+            .unwrap();
 
-    // The whole point: this must be Ok, with no layers and no config in hand.
+    // The whole point: this must be Ok, with NO layers and NO config in hand —
+    // exactly the position campd is in when it reloads a run.
     let ctx = camp_core::formula::runtime::load_run(&runs, &cooked.run_id)
         .expect("a cooked run must reload from its pinned recipe alone");
     assert_eq!(ctx.formula.name, "base");
     let step = ctx
         .step_ref("impl")
         .expect("the step survives the round trip");
-    // And its metadata — the ROUTE — survives with it.
-    assert!(
-        step.step.metadata.contains_key("gc.run_target"),
-        "the route must survive the pin: {:?}",
-        step.step.metadata
+    // The ROUTE survives the pin — and it is RESOLVED (BD-A):
+    // `{{implementation_target}}` was substituted at cook and bound through the
+    // binding namespace, so the bead campd dispatches carries a real agent, not a
+    // placeholder.
+    assert_eq!(
+        step.step.metadata.get("gc.run_target").map(String::as_str),
+        Some("gc.implementer"),
+        "the route is SUBSTITUTED in the pinned recipe"
+    );
+    assert_eq!(
+        step.step.assignee.as_deref(),
+        Some("gc.implementer"),
+        "and binding-resolved into the assignee campd dispatches on"
     );
     // The description came from an asset that no re-parse could have resolved.
     assert!(step.step.description.is_some());
@@ -654,5 +672,131 @@ fn load_run_rejects_a_recipe_with_an_unknown_recipe_version() {
     assert!(
         text.contains("re-sling"),
         "the remedy must be NAMED: {text}"
+    );
+}
+
+// ---- rung 2b at COOK: {{var}} substitution and the route -------------------
+
+#[test]
+fn the_PINNED_RECIPE_carries_the_substituted_check_path_that_campd_will_EXEC() {
+    // F8 + BD-A. §9 claimed `check.path` was EXEMPT from substitution. It is not:
+    // gc substitutes it (→ `gc.check_path`, ralph.go:76).
+    //
+    // AND THE ASSERTION IS ON THE RECIPE, NOT A BEAD. `spawn_check`
+    // (dispatch.rs:1288) does `rig_path.join(&check.path)` and EXECs it, reading
+    // the step out of `load_run`. NOTHING in merged camp reads a check path off a
+    // bead — rev 3's version of this test asserted on a bead, went green, and the
+    // runtime was dead: campd would have spawned a literal `{{kind}}.sh`.
+    let (_d, root, cfg) = layered_camp();
+    let (_l, mut ledger) = temp_ledger();
+    let layers = camp_core::formula::FormulaLayers::from_config(&cfg, &root).unwrap();
+    let compiled = camp_core::formula::compile_named(
+        &layers,
+        &cfg,
+        "templated-check",
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    // It survives COMPILE templated …
+    assert_eq!(
+        compiled.formula.steps[0]
+            .check
+            .as_ref()
+            .unwrap()
+            .path
+            .to_str()
+            .unwrap(),
+        ".gc/scripts/checks/{{kind}}.sh"
+    );
+
+    let runs = root.join("runs");
+    let cooked =
+        camp_core::formula::cook(&mut ledger, &compiled.formula, &runs, &rig(), "cli").unwrap();
+
+    // … and is SUBSTITUTED in the recipe campd reloads and execs.
+    let ctx = camp_core::formula::runtime::load_run(&runs, &cooked.run_id).unwrap();
+    assert_eq!(
+        ctx.step_ref("impl")
+            .unwrap()
+            .step
+            .check
+            .as_ref()
+            .unwrap()
+            .path,
+        std::path::PathBuf::from(".gc/scripts/checks/build.sh"),
+        "campd EXECs this path; a residual {{kind}} would ENOENT and hard-fail the step"
+    );
+}
+
+#[test]
+fn cook_substitutes_every_metadata_value_with_no_exemption_list() {
+    let vars = std::collections::BTreeMap::from([
+        ("a".to_owned(), Some("A".to_owned())),
+        ("undefined".to_owned(), None),
+    ]);
+    let f = camp_core::formula::Formula {
+        name: "f".into(),
+        description: Some("d {{a}}".into()),
+        requires: None,
+        vars,
+        steps: vec![camp_core::formula::Step {
+            id: "s".into(),
+            title: "t {{a}}".into(),
+            description: Some("body {{a}} and {{undefined}}".into()),
+            needs: vec![],
+            assignee: None,
+            metadata: std::collections::BTreeMap::from([
+                ("gc.continuation_group".to_owned(), "g-{{a}}".to_owned()),
+                ("gc.build.artifact_schema".to_owned(), "{{a}}".to_owned()),
+            ]),
+            timeout: None,
+            check: None,
+            retry: None,
+            on_complete: None,
+        }],
+        source: String::new(),
+    };
+    let out = camp_core::formula::instantiate(&f, None).unwrap();
+    assert_eq!(out.steps[0].title, "t A");
+    assert_eq!(out.steps[0].metadata["gc.continuation_group"], "g-A");
+    assert_eq!(out.steps[0].metadata["gc.build.artifact_schema"], "A");
+    // An UNDEFINED var keeps its literal placeholder …
+    assert!(
+        out.steps[0]
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("{{undefined}}")
+    );
+}
+
+#[test]
+fn an_undefined_var_in_a_TITLE_is_a_loud_cook_failure() {
+    // §9's residual check is TITLE-ONLY, and it runs after substitution. A
+    // residual `{{var}}` in a description is NORMAL (561 corpus steps carry one);
+    // in a title it is a bug the operator must see.
+    let f = camp_core::formula::Formula {
+        name: "f".into(),
+        description: None,
+        requires: None,
+        vars: Default::default(),
+        steps: vec![camp_core::formula::Step {
+            id: "s".into(),
+            title: "t {{nope}}".into(),
+            description: None,
+            needs: vec![],
+            assignee: None,
+            metadata: Default::default(),
+            timeout: None,
+            check: None,
+            retry: None,
+            on_complete: None,
+        }],
+        source: String::new(),
+    };
+    let err = camp_core::formula::instantiate(&f, None).unwrap_err();
+    assert!(
+        err.to_string().contains("title still has an unresolved"),
+        "{err}"
     );
 }

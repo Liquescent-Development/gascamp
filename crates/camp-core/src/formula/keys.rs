@@ -114,9 +114,8 @@ pub const RUNGS: &[Rung] = &[
 /// compile to nothing, silently, and every intermediate rung count would be a
 /// lie.
 pub const UNIMPLEMENTED: &[&str] = &[
-    "vars",
-    "condition", // rung 2b
-    "extends",   // rung 2c
+    // rung 2b (`vars`, `condition`) — LANDED.
+    "extends", // rung 2c
     "type",
     "template",
     "expand",
@@ -474,20 +473,31 @@ mod tests {
 
     #[test]
     fn unimplemented_is_site_aware_because_on_complete_vars_is_not_top_level_vars() {
-        // The regression this exists for, and it is §4 trap 1 exactly: matching
-        // UNIMPLEMENTED by NAME fires on `steps.<id>.on_complete.vars` — an
-        // implemented, load-bearing key — because top-level `vars` (rung 2b)
-        // happens to share its spelling. That rejects every fan-out formula.
-        assert!(is_unimplemented(Site::Top, "vars"), "the rung-2b key");
+        // §4 trap 1, and it really bit: matching UNIMPLEMENTED by NAME fired on
+        // `steps.<id>.on_complete.vars` — an implemented, load-bearing key —
+        // because top-level `vars` (rung 2b) happened to share its spelling. That
+        // rejected every fan-out formula in the corpus.
+        //
+        // Rung 2b has since landed, so `vars` is no longer on the list and this
+        // pair can no longer collide. The guard STAYS as a regression fence: a
+        // future rung key that shares a nested key's name must not resurrect the
+        // bug, and `on_complete.vars` must never be "unimplemented" at any point.
         assert!(
             !is_unimplemented(Site::OnComplete, "vars"),
-            "on_complete.vars is a DIFFERENT key that merely shares the name"
+            "on_complete.vars is a DIFFERENT key that merely shares a name"
         );
-        // A rung key at the wrong site is not "unimplemented" — it is unknown.
+        // The rule itself: a rung key is unimplemented only AT ITS OWN SITE.
         assert!(is_unimplemented(Site::Step, "drain"));
-        assert!(!is_unimplemented(Site::Top, "drain"));
-        assert!(is_unimplemented(Site::Step, "condition"));
-        assert!(!is_unimplemented(Site::Step, "contract"));
+        assert!(!is_unimplemented(Site::Top, "drain"), "drain is a STEP key");
+        assert!(is_unimplemented(Site::Top, "extends"));
+        assert!(
+            !is_unimplemented(Site::Step, "extends"),
+            "extends is a TOP key"
+        );
+        // Landed rungs are not unimplemented.
+        assert!(!is_unimplemented(Site::Top, "vars"));
+        assert!(!is_unimplemented(Site::Step, "condition"));
+        assert!(!is_unimplemented(Site::Top, "contract"));
         // Nothing on the base sets may ever be unimplemented.
         assert!(!is_unimplemented(Site::Step, "check"));
         assert!(!is_unimplemented(Site::Top, "steps"));

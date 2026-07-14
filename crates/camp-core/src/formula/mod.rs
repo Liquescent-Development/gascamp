@@ -34,7 +34,7 @@ pub use ast::{
     Violation,
 };
 pub use compose::{Compiled, compile, compile_named};
-pub use cook::{CookOptions, CookedRun, RECIPE_VERSION, cook, cook_with};
+pub use cook::{CookOptions, CookedRun, RECIPE_VERSION, RUN_TARGET, cook, cook_with, instantiate};
 pub use keys::{Class, Origin, Site};
 pub use layers::FormulaLayers;
 pub use validate::{FORMULA_COMPILER_CAPABILITY, formula_stem};
@@ -63,7 +63,8 @@ pub fn parse_and_validate(path: &Path) -> Result<Formula, FormulaError> {
     // and `camp doctor --formula` prints it.
     let _dead_gc_keys = walked.ignored;
     if walked.violations.is_empty() && walked.refusals.is_empty() {
-        Ok(validate::assemble(walked.raw, source))
+        let vars = walked.raw.vars.clone();
+        Ok(validate::assemble(walked.raw, source, vars))
     } else {
         Err(FormulaError {
             path: path.to_path_buf(),

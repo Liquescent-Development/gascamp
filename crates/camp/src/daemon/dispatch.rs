@@ -1254,6 +1254,13 @@ impl GraphRuntime {
                 vars,
                 extra_root_needs,
                 extra_root_labels: vec![flow::bond_label(&fanout.anchor, index)],
+                // The bond path resolves its formula at `<camp>/formulas/<bond>.toml`
+                // — camp-local, no layers (:1230). `on_complete` has ZERO corpus
+                // uses, so this path is not corpus-reachable and needs no binding
+                // namespace. A bond formula that DOES carry a `gc.run_target` fails
+                // loudly in `instantiate` rather than dispatching an unrouted
+                // worker.
+                config: None,
             };
             if let Err(e) = camp_core::formula::cook_with(
                 ledger,

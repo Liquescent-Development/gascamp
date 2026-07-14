@@ -15,6 +15,12 @@ pub struct Formula {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires: Option<Requires>,
+    /// The RESOLVED vars: declared defaults with the caller's overrides on top.
+    /// `None` = declared but UNDEFINED — the name exists (gc's oversize prompt
+    /// lists it) but no value resolves, so its `{{placeholder}}` survives to the
+    /// worker verbatim.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vars: BTreeMap<String, Option<String>>,
     pub steps: Vec<Step>,
     /// Verbatim bytes of the authored file.
     ///

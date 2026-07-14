@@ -1,6 +1,9 @@
 formula = "base"
 contract = "graph.v2"
 
+[vars]
+implementation_target = { default = "gc.implementer" }
+
 [[steps]]
 id = "impl"
 title = "Implement"

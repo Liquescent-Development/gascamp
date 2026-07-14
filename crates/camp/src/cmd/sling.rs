@@ -45,18 +45,43 @@ pub fn run(
 /// running campd. Prints "<run_id> root <root-bead>".
 fn sling_formula(camp: &CampDir, name: &str, rig: Option<String>) -> Result<()> {
     let config = CampConfig::load(&camp.config_path())?;
-    let rig_cfg = resolve_rig(&config, rig.as_deref())?;
-    // compat §6/§7.1: resolve through the import + local layers, so an
-    // imported formula is reachable via `camp sling --formula`. (Running an
-    // imported formula via sling remains phase 2 — §12; phase 1 fixes the
-    // RESOLUTION path only.)
-    let path = camp_core::orders::resolve_formula(&config, name)
-        .map_err(|e| anyhow::anyhow!("formula {name:?}: {e}"))?;
-    let formula = camp_core::formula::parse_and_validate(&path)
-        .map_err(|e| anyhow::anyhow!("formula {name:?} is invalid:\n{e}"))?;
+    let rig_cfg = resolve_rig(&config, rig.as_deref())?.clone();
+    // compat §9: compile through the LAYER STACK. `parse_and_validate` (the
+    // no-layer, camp-local entry) cannot resolve an imported formula's `extends`,
+    // its `description_file`, or its routes — and every corpus formula needs all
+    // three.
+    let layers = camp_core::formula::FormulaLayers::from_config(&config, &camp.root)?;
+    let compiled = camp_core::formula::compile_named(
+        &layers,
+        &config,
+        name,
+        &std::collections::BTreeMap::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("formula {name:?} did not compile:\n{e}"))?;
+
+    // D1 — LOADABLE ≠ RUNNABLE. The compiler COMPUTES runnability
+    // (`compiled.not_runnable`, unit-tested in tests/compose.rs), but this entry
+    // point does not yet ENFORCE it: the plan's D1 predicate
+    // (`contract == "graph.v2"`) refuses camp's OWN shipped formulas, which
+    // declare the compiler the other legal way or not at all
+    // (packs/starter/formulas/guarded-change.toml declares `[requires]`;
+    // daemon_orders' `one-step` declares neither). Enforcing it as written is a
+    // regression of merged behavior, and every candidate rule moves the pinned
+    // RUNNABLE count (62 / 65 / 81). REPORTED TO THE LEAD; awaiting a ruling.
+
+    let opts = camp_core::formula::CookOptions {
+        config: Some(config.clone()),
+        ..Default::default()
+    };
     let mut ledger = Ledger::open(&camp.db_path())?;
-    let cooked =
-        camp_core::formula::cook(&mut ledger, &formula, &camp.runs_path(), rig_cfg, "cli")?;
+    let cooked = camp_core::formula::cook_with(
+        &mut ledger,
+        &compiled.formula,
+        &camp.runs_path(),
+        &rig_cfg,
+        "cli",
+        &opts,
+    )?;
     // the root's run.cooked is the batch's last event — the poke seq
     // (advisory; the settle reads past the cursor regardless)
     let head = ledger
