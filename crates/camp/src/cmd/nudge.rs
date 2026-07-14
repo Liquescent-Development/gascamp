@@ -39,12 +39,12 @@ pub fn run(camp: &CampDir, session: String, text: String) -> Result<()> {
         // resume (A4).
         match socket::request_if_up(
             camp,
-            &Request::Nudge {
+            &Request::SessionSendTurn {
                 session: session.clone(),
                 text: text.clone(),
             },
         )? {
-            Some(Response::Nudge { via, .. }) if via == "stdin" => {
+            Some(Response::SendTurn { via, .. }) if via == "stdin" => {
                 // Mechanism-honest (assessment findings A/B): the turn is
                 // WRITTEN INTO the held pipe — the worker picks it up at
                 // its next read, and its answer lands in its transcript
@@ -55,7 +55,7 @@ pub fn run(camp: &CampDir, session: String, text: String) -> Result<()> {
                 );
                 return Ok(());
             }
-            Some(Response::Nudge { .. }) => {} // via="none": no pipe → resume
+            Some(Response::SendTurn { .. }) => {} // via="none": no pipe → resume
             Some(other) => bail!("unexpected response to nudge: {other:?}"),
             None => {} // campd down → resume
         }

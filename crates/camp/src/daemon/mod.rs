@@ -258,6 +258,21 @@ pub fn run(camp: &CampDir) -> Result<()> {
         }
     }
 
+    // cp-1 (control-plane spec §2.1): the control runtime — the pending-request
+    // table, the subscriber registry, and every socket-verb handler body.
+    //
+    // B6: REHYDRATE from the ledger, after adoption. A campd restart with an
+    // interrupt in flight must neither LIE (invent a fault for a request the
+    // worker actually answered) nor FORGET (drop one it never did). The ledger
+    // is the only thing that survives a kill -9, so it is the only honest source.
+    let mut control = control::ControlRuntime::new(control::subscriber_buffer_bytes_from_env(
+        control::SUBSCRIBER_BUFFER_BYTES_DEFAULT,
+    )?);
+    let restored = control.rehydrate(&ledger, jiff::Timestamp::now())?;
+    if restored > 0 {
+        eprintln!("campd: restored {restored} in-flight control request(s) from the ledger");
+    }
+
     let mut stdout = std::io::stdout();
     writeln!(stdout, "{READY_PREFIX}{}", socket_path.display()).context("announcing readiness")?;
     stdout.flush().context("flushing the readiness line")?;
@@ -280,6 +295,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &mut patrol_receiver,
         &mut read_channel,
         &mut read_receiver,
+        &mut control,
     );
     drop(watcher);
     // The stream watcher lives inside `read_channel` (set_watcher) and is

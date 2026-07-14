@@ -24,15 +24,19 @@
 //! so a future `control_notify` camp does not know becomes a LOUD fault
 //! rather than content forwarded to a subscriber as if it were the worker's
 //! own words. Everything that is not `control*` passes through verbatim.
-#![allow(dead_code)] // cp-1: first read in Task 6 — DELETE this attribute there
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use camp_core::event::{EventInput, EventType};
 use camp_core::ledger::Ledger;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
+
+use super::dispatch::{ControlWrite, Dispatcher, NudgeOutcome};
+use super::read_channel::StreamLine;
+use super::socket::Response;
 
 /// Every request id camp mints carries this prefix. It is what lets campd
 /// tell its OWN request apart from one the CLI minted for itself (a
@@ -709,6 +713,7 @@ impl ControlRuntime {
     ///
     /// A late answer cannot arrive after disposal: the session is no longer
     /// tailed, so there is nothing left to re-read.
+    #[allow(dead_code)] // cp-1: first read in Task 8 (close_disposed)
     pub fn forget_session(&mut self, session: &str, _now: Timestamp) -> Vec<EventInput> {
         let doomed: Vec<String> = self
             .pending
@@ -775,6 +780,460 @@ fn duration_until(deadline: Timestamp, now: Timestamp) -> Duration {
         return Duration::ZERO;
     }
     Duration::try_from(delta).unwrap_or(Duration::ZERO)
+}
+
+// ---------------------------------------------------------------------------
+// cp-1 (§4.1/§4.4): the socket-verb handlers, and the inbound ingest.
+//
+// Every handler body lives HERE, so `event_loop.rs`'s new arms are one-line
+// delegations. The event loop is the most contended file in the tree; a phase
+// that puts its logic there makes the next phase's rebase a merge conflict.
+// ---------------------------------------------------------------------------
+
+/// §4.4's number. The per-subscriber outbound buffer cap.
+pub const SUBSCRIBER_BUFFER_BYTES_DEFAULT: usize = 1024 * 1024;
+
+/// Test-only override, the `CAMP_MAX_STREAM_BYTES` twin (read_channel.rs).
+/// Production uses the default until `config.rs` gains a `[control]` field in a
+/// phase that owns it. Fail fast: a malformed override is an error, never
+/// silently ignored.
+pub fn subscriber_buffer_bytes_from_env(default: usize) -> anyhow::Result<usize> {
+    match std::env::var("CAMP_SUBSCRIBER_BUFFER_BYTES") {
+        Ok(raw) => {
+            let n: usize = raw
+                .parse()
+                .with_context(|| format!("CAMP_SUBSCRIBER_BUFFER_BYTES={raw:?} is not a usize"))?;
+            if n == 0 {
+                anyhow::bail!("CAMP_SUBSCRIBER_BUFFER_BYTES must be > 0");
+            }
+            Ok(n)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(v)) => {
+            anyhow::bail!("CAMP_SUBSCRIBER_BUFFER_BYTES={v:?} is not valid UTF-8")
+        }
+    }
+}
+
+/// Loud is right; UNBOUNDED-loud is a self-DoS. A worker spraying malformed
+/// control lines would otherwise drive one synchronous SQLite append per line,
+/// on the event loop. This bounds the fault events ONE `ingest` call may emit
+/// for ONE session.
+///
+/// It is a PER-CALL counter (a local map, reset at the top of every `ingest`),
+/// not runtime state — hence "per wake". Past the cap, further faults for that
+/// session are suppressed and the LAST event's `reason` names the suppressed
+/// count. The count rides `reason` precisely so no new payload field is needed:
+/// `ControlFailed` is `deny_unknown_fields`, and adding a field later would
+/// break every event already in every ledger.
+pub const MAX_FAULTS_PER_SESSION_PER_WAKE: usize = 8;
+
+impl ControlRuntime {
+    /// §4.1 `session.interrupt`. D1 (ACK-then-ASYNC) + D2 (deliver -> record ->
+    /// respond). campd does NOT wait for the `control_response`: its loop is
+    /// single-threaded, and blocking a handler on a filesystem-latency line is
+    /// issue #55's wedge class. The answer returns on the read channel
+    /// (`ingest`), survives a restart (`rehydrate`, B6), and a late answer
+    /// appends a correction (C11).
+    ///
+    /// ORDERING, and what camp does NOT promise: an interrupt and a `send_turn`
+    /// are both LINES IN THE SAME held stdin pipe, written in socket-arrival
+    /// order. camp makes NO guarantee that an interrupt "cancels" a turn already
+    /// queued ahead of it — a caller assuming that is assuming something camp
+    /// does not promise. Two concurrent interrupts mint DISTINCT request_ids and
+    /// produce two independent pending rows and two `control.responded`s; that
+    /// is correct and needs no coordination.
+    pub fn serve_interrupt(
+        &mut self,
+        session: &str,
+        ledger: &mut Ledger,
+        dispatcher: &mut Dispatcher,
+        now: Timestamp,
+    ) -> Response {
+        // Bound the table AND the ledger: neither an overseer loop nor a hostile
+        // local client may grow `pending` or append `session.interrupted`
+        // without limit.
+        if self.pending.len() >= MAX_PENDING_CONTROL_REQUESTS {
+            return Response::Error {
+                ok: false,
+                error: format!(
+                    "campd already has {} unanswered control requests outstanding (the \
+                     MAX_PENDING_CONTROL_REQUESTS cap) — something is issuing interrupts \
+                     faster than workers answer them",
+                    self.pending.len()
+                ),
+            };
+        }
+        let request_id = new_request_id();
+        let line = match (ParentMessage::Interrupt {
+            request_id: request_id.clone(),
+        })
+        .to_line()
+        {
+            Ok(line) => line,
+            Err(e) => {
+                return Response::Error {
+                    ok: false,
+                    error: format!("building the interrupt: {e}"),
+                };
+            }
+        };
+        let (rig, bead) = dispatcher
+            .child_info(session)
+            .map(|(r, b)| (Some(r), Some(b)))
+            .unwrap_or((None, None));
+
+        match dispatcher.write_control(session, &line) {
+            // D2: DELIVER -> RECORD. The ledger must not claim what was not
+            // delivered, and the caller must not believe what the ledger lacks.
+            ControlWrite::Delivered => match ledger.append(EventInput {
+                kind: EventType::SessionInterrupted,
+                rig: rig.clone(),
+                actor: "campd".into(),
+                bead: bead.clone(),
+                data: serde_json::json!({"session": session, "request_id": request_id}),
+            }) {
+                Ok(_) => {
+                    // G7: the rig/bead go INTO the pending row, so every fault
+                    // this request may later produce (silence_timeout,
+                    // ceiling_timeout, session_ended) carries the SAME
+                    // provenance as the `session.interrupted` it answers.
+                    self.track_pending(
+                        request_id.clone(),
+                        session.to_owned(),
+                        "session.interrupt",
+                        rig,
+                        bead,
+                        now,
+                    );
+                    Response::Interrupt {
+                        ok: true,
+                        request_id,
+                    }
+                }
+                Err(e) => Response::Error {
+                    ok: false,
+                    error: format!(
+                        "interrupt delivered into {session} but recording session.interrupted \
+                         failed: {e}"
+                    ),
+                },
+            },
+            // There is NO resume path for an interrupt (unlike a turn): a worker
+            // campd holds no pipe to CANNOT be interrupted, and pretending
+            // otherwise would be a silent no-op. Loud — and NOT evented:
+            // nothing happened, so there is no campd action to record
+            // (invariant 3 records ACTIONS; a refused verb is the caller's error).
+            ControlWrite::NoPipe => Response::Error {
+                ok: false,
+                error: format!(
+                    "campd holds no stdin pipe for {session} — it is not a live campd-spawned \
+                     worker (exited, released, attended, or adopted from a previous campd \
+                     life), and there is no other way to interrupt a turn (control-plane \
+                     spec §2.3)"
+                ),
+            },
+            // C12 — the write was ATTEMPTED and FAILED, so bytes may already
+            // have reached the pipe and `write_control` has torn it down. That
+            // IS a campd action with a consequence — the worker just lost its
+            // write channel — so it is BOTH an error to the caller AND a durable
+            // fault (§2.1 loudness; invariant 3). Bounded: one socket request =>
+            // one event, and the request_id is fresh, so a retrying caller
+            // cannot dedupe-collide.
+            ControlWrite::Failed(e) => {
+                let reason = format!(
+                    "writing an interrupt into {session}'s held stdin failed: {e}. The pipe may \
+                     hold a torn partial line, so campd dropped it — this worker can no longer \
+                     be sent turns or control messages, and patrol's stall ladder now owns it"
+                );
+                match ledger.append(EventInput {
+                    kind: EventType::ControlFailed,
+                    rig,
+                    actor: "campd".into(),
+                    bead,
+                    data: serde_json::json!({
+                        "session": session,
+                        "request_id": request_id,
+                        "verb": "session.interrupt",
+                        // G5: the machine-readable cause. TERMINAL — the request
+                        // never reached the worker, so no answer can ever arrive,
+                        // and `rehydrate` must route this id to `answered`.
+                        "cause": "write_failed",
+                        "reason": reason,
+                    }),
+                }) {
+                    Ok(_) => Response::Error {
+                        ok: false,
+                        error: reason,
+                    },
+                    // A failing append must not MASK the write failure being
+                    // reported — carry both.
+                    Err(append_err) => Response::Error {
+                        ok: false,
+                        error: format!(
+                            "{reason} (and recording control.failed ALSO failed: {append_err})"
+                        ),
+                    },
+                }
+            }
+        }
+    }
+
+    /// §4.1 `session.send_turn` (D4 — the `nudge` socket verb's replacement).
+    /// Deliver -> record (`session.nudged`) -> respond. `NoPipe` is NOT an error
+    /// here — unlike an interrupt, a turn HAS a resume path, and `via:"none"`
+    /// is what routes the caller to it.
+    pub fn serve_send_turn(
+        &mut self,
+        session: &str,
+        text: &str,
+        ledger: &mut Ledger,
+        dispatcher: &mut Dispatcher,
+    ) -> Response {
+        match dispatcher.nudge_via_stdin(session, text) {
+            NudgeOutcome::Delivered => {
+                let (rig, bead) = dispatcher
+                    .child_info(session)
+                    .map(|(r, b)| (Some(r), Some(b)))
+                    .unwrap_or((None, None));
+                match ledger.append(EventInput {
+                    kind: EventType::SessionNudged,
+                    rig,
+                    actor: "campd".into(),
+                    bead,
+                    data: serde_json::json!({
+                        "session": session, "via": "stdin", "text": text,
+                    }),
+                }) {
+                    Ok(_) => Response::SendTurn {
+                        ok: true,
+                        via: "stdin".into(),
+                    },
+                    // A post-delivery append failure surfaces to the caller: the
+                    // ledger must not claim what was not delivered, and the
+                    // caller must not believe what the ledger does not hold.
+                    Err(e) => Response::Error {
+                        ok: false,
+                        error: format!(
+                            "turn delivered into {session} but recording session.nudged \
+                             failed: {e}"
+                        ),
+                    },
+                }
+            }
+            NudgeOutcome::NoPipe => Response::SendTurn {
+                ok: true,
+                via: "none".into(),
+            },
+            NudgeOutcome::Failed(e) => Response::Error {
+                ok: false,
+                error: format!("stdin turn delivery to {session} failed: {e}"),
+            },
+        }
+    }
+
+    /// The INBOUND half: everything the read channel drained this wake.
+    ///
+    /// This is where a worker's answer to an interrupt actually lands — and
+    /// where every other control message it can send is met with a decision
+    /// rather than a shrug.
+    pub fn ingest(
+        &mut self,
+        lines: &[StreamLine],
+        dispatcher: &mut Dispatcher,
+        now: Timestamp,
+    ) -> Vec<EventInput> {
+        let mut events: Vec<EventInput> = Vec::new();
+        // Per-CALL, hence per-wake. Not runtime state.
+        let mut faults: HashMap<String, usize> = HashMap::new();
+        let mut refused_dialogs: HashSet<String> = HashSet::new();
+
+        for sl in lines {
+            // D7/C11 FIRST, for EVERY line: the session is producing output, so
+            // its SILENCE deadline resets. (The G6 ceiling does not — nothing
+            // resets that, which is the whole point of having it.)
+            self.note_activity(&sl.session, now);
+
+            match parse_worker_line(&sl.line) {
+                Ok(WorkerMessage::ControlResponse {
+                    request_id,
+                    ok,
+                    detail,
+                }) => {
+                    // B6/C11: `resolve` decides whether this is the answer, a
+                    // correction, a true duplicate, or a fault.
+                    if let Some(input) = self.resolve(&request_id, ok, detail) {
+                        events.push(input);
+                    }
+                }
+                Ok(WorkerMessage::RequestUserDialog { request_id }) => {
+                    // §9: camp is not a human. Refuse — DETERMINISTICALLY — or
+                    // the worker blocks forever holding a dispatch slot.
+                    // Deduped per request_id: a worker re-asking the same id
+                    // must not append an event per line.
+                    if !refused_dialogs.insert(request_id.clone()) {
+                        continue;
+                    }
+                    let outcome = match (ParentMessage::DialogRefusal {
+                        request_id: request_id.clone(),
+                    })
+                    .to_line()
+                    {
+                        Ok(line) => match dispatcher.write_control(&sl.session, &line) {
+                            ControlWrite::Delivered => "the refusal was delivered".to_owned(),
+                            ControlWrite::NoPipe => {
+                                "campd holds no stdin pipe for it, so the refusal could NOT be \
+                                 delivered and the worker is now blocked forever — kill it"
+                                    .to_owned()
+                            }
+                            ControlWrite::Failed(e) => {
+                                format!(
+                                    "delivering the refusal FAILED ({e}) — the worker is now \
+                                         blocked forever; kill it"
+                                )
+                            }
+                        },
+                        Err(e) => format!("building the refusal failed: {e}"),
+                    };
+                    let input = EventInput {
+                        kind: EventType::ControlFailed,
+                        rig: None,
+                        actor: "campd".into(),
+                        bead: None,
+                        data: serde_json::json!({
+                            "session": sl.session,
+                            "request_id": request_id,
+                            "cause": "dialog_refused",
+                            "reason": format!(
+                                "the worker asked for an interactive dialog (§9). camp is not a \
+                                 human and has no dialog to show, so it answers every one with a \
+                                 deterministic refusal: {outcome}"
+                            ),
+                        }),
+                    };
+                    push_fault(&mut events, &mut faults, &sl.session, input);
+                }
+                Ok(WorkerMessage::CanUseTool {
+                    request_id,
+                    tool_name,
+                }) => {
+                    // §5.3.1: STRUCTURALLY UNREACHABLE in cp-1 — camp does not
+                    // pass `--permission-prompt-tool`. If it arrives anyway,
+                    // something is badly wrong, and camp says so plainly rather
+                    // than quietly flipping a `blocked` bit. cp-1 takes NO
+                    // automatic action: phase 3 owns both the answer and §5.3.2's
+                    // slot rule.
+                    let input = EventInput {
+                        kind: EventType::ControlFailed,
+                        rig: None,
+                        actor: "campd".into(),
+                        bead: None,
+                        data: serde_json::json!({
+                            "session": sl.session,
+                            "request_id": request_id,
+                            "cause": "permission_unanswerable",
+                            "reason": format!(
+                                "the worker asked permission to use {tool_name:?}, and cp-1 \
+                                 CANNOT answer a can_use_tool (the permission plane is phase 3). \
+                                 This flow should be structurally unreachable — camp does not \
+                                 pass --permission-prompt-tool — so its arrival is itself the \
+                                 fault. The worker is now BLOCKED FOREVER waiting for an answer \
+                                 that will never come, holding a dispatch slot: stop it with \
+                                 `camp stop {}`",
+                                sl.session
+                            ),
+                        }),
+                    };
+                    push_fault(&mut events, &mut faults, &sl.session, input);
+                }
+                // D6": subscribers are fed from the FILE by `pump`, never from
+                // here. A stream line has no control-plane effect beyond the
+                // activity stamp above.
+                Ok(WorkerMessage::Stream(_)) => {}
+                Err(e) => {
+                    // §2.1: an unrecognized control message is a loud fault.
+                    //
+                    // cp-0's `drain_one` hands over only lines it ALREADY
+                    // parsed as JSON (the `Ok(_v)` arm) and surfaces non-JSON
+                    // lines separately as `patrol.degraded` — so `ingest` never
+                    // double-reports. Do not add a guard.
+                    let input = EventInput {
+                        kind: EventType::ControlFailed,
+                        rig: None,
+                        actor: "campd".into(),
+                        bead: None,
+                        data: serde_json::json!({
+                            "session": sl.session,
+                            "cause": "unparsable",
+                            "reason": format!(
+                                "camp could not understand a control message from {}: {}. The \
+                                 line was: {}",
+                                sl.session,
+                                e.reason,
+                                truncate(&e.line, 400),
+                            ),
+                        }),
+                    };
+                    push_fault(&mut events, &mut faults, &sl.session, input);
+                }
+            }
+        }
+
+        // The suppressed count is known only once every line is seen, so it is
+        // appended to the LAST fault this wake produced for each capped session
+        // rather than guessed at the 8th.
+        for (session, n) in faults {
+            if n <= MAX_FAULTS_PER_SESSION_PER_WAKE {
+                continue;
+            }
+            let suppressed = n - MAX_FAULTS_PER_SESSION_PER_WAKE;
+            if let Some(last) = events
+                .iter_mut()
+                .rev()
+                .find(|e| e.data["session"] == session && e.kind == EventType::ControlFailed)
+                && let Some(reason) = last.data["reason"].as_str()
+            {
+                let amended = format!(
+                    "{reason} — and {suppressed} further control-message fault(s) for this \
+                     session this wake were SUPPRESSED (the MAX_FAULTS_PER_SESSION_PER_WAKE cap: \
+                     loud is right, unbounded-loud is a self-DoS)"
+                );
+                last.data["reason"] = serde_json::Value::String(amended);
+            }
+        }
+
+        events
+    }
+}
+
+/// Count a fault against its session's per-wake budget, and emit it only while
+/// the budget lasts. Loud is right; UNBOUNDED-loud is a self-DoS — a worker
+/// spraying malformed control lines would otherwise drive one synchronous
+/// SQLite append per line, on the event loop.
+fn push_fault(
+    events: &mut Vec<EventInput>,
+    faults: &mut HashMap<String, usize>,
+    session: &str,
+    input: EventInput,
+) {
+    let n = faults.entry(session.to_owned()).or_insert(0);
+    *n += 1;
+    if *n <= MAX_FAULTS_PER_SESSION_PER_WAKE {
+        events.push(input);
+    }
+}
+
+/// Bound a line quoted into a fault's `reason`: a worker can write a 256 MiB
+/// line, and the ledger is not the place to store it.
+fn truncate(line: &str, max: usize) -> String {
+    if line.len() <= max {
+        return line.to_owned();
+    }
+    let mut end = max;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes total)", &line[..end], line.len())
 }
 
 #[cfg(test)]

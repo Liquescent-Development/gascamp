@@ -36,11 +36,30 @@ pub enum Request {
     /// Reconcile the session registry against reality (spec §8.5) — the
     /// same routine campd runs at startup, on demand (Phase 11).
     Adopt,
-    /// Deliver one user turn into a live worker's campd-held stdin pipe
-    /// (dispatch-lifecycle Phase 1, #29 — the converse verb's live path).
-    Nudge {
+    /// cp-1 (§4.1): deliver one user turn into a live worker's campd-held
+    /// stdin pipe.
+    ///
+    /// D4: this REPLACES the `nudge` socket verb. It keeps emitting
+    /// `session.nudged` — the merged vocabulary for "a turn was injected";
+    /// renaming that event would churn vocab/fold/`cli_nudge.rs` for nothing.
+    /// The `camp nudge` CLI verb is unchanged, and `patrol.rs` calls
+    /// `Dispatcher::nudge_via_stdin` DIRECTLY, so that method survives with no
+    /// orphaned caller. Only the socket op moves.
+    #[serde(rename = "session.send_turn")]
+    SessionSendTurn {
         session: String,
         text: String,
+    },
+    /// cp-1 (§4.1): interrupt a live worker's turn.
+    ///
+    /// D1 — ACK-then-ASYNC. campd answers with the `request_id` as soon as the
+    /// control line is IN THE PIPE; it does NOT wait for the worker's
+    /// `control_response`, because campd's loop is single-threaded and blocking
+    /// a handler on a filesystem-latency line is issue #55's wedge class. The
+    /// answer comes back on the read channel and lands in the ledger.
+    #[serde(rename = "session.interrupt")]
+    SessionInterrupt {
+        session: String,
     },
 }
 
@@ -67,14 +86,22 @@ pub enum Response {
         swept: usize,
         kept: usize,
     },
-    /// Nudge disposition (dispatch-lifecycle Phase 1): via="stdin" means
-    /// the turn is in the held pipe; via="none" means no held pipe for the
-    /// session (released, Null-mode, exited, or not campd's child) — the
-    /// caller converses over the resume path instead. Must precede Ok in
-    /// this untagged enum so {"ok":..,"via":..} resolves here.
-    Nudge {
+    /// cp-1 (§4.1) `session.send_turn`: via="stdin" means the turn is in the
+    /// held pipe; via="none" means no held pipe for the session (released,
+    /// Null-mode, exited, or not campd's child) — the caller converses over the
+    /// resume path instead. Must precede Ok in this untagged enum so
+    /// {"ok":..,"via":..} resolves here.
+    SendTurn {
         ok: bool,
         via: String,
+    },
+    /// cp-1 (§4.1) `session.interrupt`: D1's ACK. The interrupt is IN THE PIPE;
+    /// the worker's answer lands in the ledger as `control.responded`, keyed by
+    /// this `request_id`. Must precede Ok so {"ok":..,"request_id":..} resolves
+    /// here.
+    Interrupt {
+        ok: bool,
+        request_id: String,
     },
     Error {
         ok: bool,
@@ -667,36 +694,80 @@ mod tests {
         assert!(serde_json::from_str::<Request>(r#"{"op":"dance"}"#).is_err());
     }
 
-    /// The converse verb's wire op (dispatch-lifecycle Phase 1, #29).
+    /// cp-1 (§4.1): the control-plane verbs' wire, pinned in BOTH directions.
+    ///
+    /// D4: `session.send_turn` REPLACES the `nudge` SOCKET VERB — so
+    /// `{"op":"nudge"}` is now REJECTED. (The `camp nudge` CLI verb is
+    /// unchanged, and `patrol.rs` calls `Dispatcher::nudge_via_stdin` directly,
+    /// so that method survives with no orphaned caller. Only the socket op moves.)
     #[test]
-    fn nudge_wire_format_is_pinned() {
+    fn control_plane_verbs_wire_format_is_pinned() {
+        // ---- requests, outbound
         assert_eq!(
-            serde_json::to_string(&Request::Nudge {
+            serde_json::to_string(&Request::SessionInterrupt {
                 session: "camp/dev/1".into(),
-                text: "status?".into()
             })
             .unwrap(),
-            r#"{"op":"nudge","session":"camp/dev/1","text":"status?"}"#
+            r#"{"op":"session.interrupt","session":"camp/dev/1"}"#
         );
         assert_eq!(
-            serde_json::from_str::<Request>(r#"{"op":"nudge","session":"s","text":"t"}"#).unwrap(),
-            Request::Nudge {
-                session: "s".into(),
-                text: "t".into()
+            serde_json::to_string(&Request::SessionSendTurn {
+                session: "camp/dev/1".into(),
+                text: "status?".into(),
+            })
+            .unwrap(),
+            r#"{"op":"session.send_turn","session":"camp/dev/1","text":"status?"}"#
+        );
+
+        // ---- requests, inbound
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"op":"session.interrupt","session":"s"}"#).unwrap(),
+            Request::SessionInterrupt {
+                session: "s".into()
             }
         );
-        // Response: untagged — the Nudge variant must win for {"ok":..,"via":..}
         assert_eq!(
-            serde_json::to_string(&Response::Nudge {
+            serde_json::from_str::<Request>(
+                r#"{"op":"session.send_turn","session":"s","text":"t"}"#
+            )
+            .unwrap(),
+            Request::SessionSendTurn {
+                session: "s".into(),
+                text: "t".into(),
+            }
+        );
+
+        // D4: the OLD socket verb is GONE. A client still speaking it gets a
+        // loud parse error, never a silent no-op.
+        assert!(
+            serde_json::from_str::<Request>(r#"{"op":"nudge","session":"s","text":"t"}"#).is_err(),
+            "D4: the `nudge` socket verb is REPLACED by session.send_turn"
+        );
+
+        // ---- responses (untagged: variant ORDER is what resolves them)
+        assert_eq!(
+            serde_json::to_string(&Response::Interrupt {
                 ok: true,
-                via: "stdin".into()
+                request_id: "camp-1".into(),
+            })
+            .unwrap(),
+            r#"{"ok":true,"request_id":"camp-1"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::SendTurn {
+                ok: true,
+                via: "stdin".into(),
             })
             .unwrap(),
             r#"{"ok":true,"via":"stdin"}"#
         );
         assert!(matches!(
+            serde_json::from_str::<Response>(r#"{"ok":true,"request_id":"camp-1"}"#).unwrap(),
+            Response::Interrupt { request_id, .. } if request_id == "camp-1"
+        ));
+        assert!(matches!(
             serde_json::from_str::<Response>(r#"{"ok":true,"via":"none"}"#).unwrap(),
-            Response::Nudge { via, .. } if via == "none"
+            Response::SendTurn { via, .. } if via == "none"
         ));
     }
 

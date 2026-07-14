@@ -108,6 +108,7 @@ pub fn run(
     patrol_rx: &mut mio::unix::pipe::Receiver,
     read_channel: &mut super::read_channel::ReadChannelRuntime,
     read_rx: &mut mio::unix::pipe::Receiver,
+    control: &mut super::control::ControlRuntime,
 ) -> Result<()> {
     let mut poll = Poll::new().context("creating the poller")?;
     let mut events = Events::with_capacity(64);
@@ -152,10 +153,17 @@ pub fn run(
         let poll_now = Timestamp::now();
         let timeout = min_deadline(
             min_deadline(
-                runtime.poll_timeout(poll_now),
-                graph.poll_timeout(Instant::now()),
+                min_deadline(
+                    runtime.poll_timeout(poll_now),
+                    graph.poll_timeout(Instant::now()),
+                ),
+                patrol.poll_timeout(poll_now),
             ),
-            patrol.poll_timeout(poll_now),
+            // cp-1: the control plane's deadlines — a pending control request's
+            // silence/ceiling bound, and (Task 8) the subscriber continuation
+            // and stall timer. `None` when nothing is pending, so an idle campd
+            // still blocks forever (invariant 1).
+            control.poll_timeout(poll_now),
         );
         let wall_before = Timestamp::now();
         let mono_before = Instant::now();
@@ -359,6 +367,7 @@ pub fn run(
                         graph,
                         patrol,
                         read_channel,
+                        control,
                         MAX_REQUEST_BYTES,
                     ) {
                         Ok(ConnState::Open) => {
@@ -428,6 +437,15 @@ pub fn run(
         if let Err(e) = read_channel.drain_all(ledger) {
             eprintln!("campd: read-channel drain_all failed: {e:#}");
         }
+        // cp-1 — HARVEST 1: the lines `drain_all` just consumed.
+        //
+        // Under MERGED LAW this is the harvest that gets an answer-and-exit
+        // worker's `control_response`: the reap appends
+        // session.stopped/session.crashed BEFORE settle, so the unregister is
+        // queued before `drain_all`, and `drain_all` reads the worker's final
+        // bytes while the session is still in `tailed` (read_channel.rs's fix-1
+        // ordering, and the merged test that pins it).
+        let mut appended_control_events = control_step(ledger, control, dispatcher, read_channel)?;
         // cp-0 (§2.3): a max_stream_bytes breach is a loud session failure —
         // append the named cause event FIRST (the agent.stalled → kill →
         // session.crashed mold), then kill the worker. The reap appends
@@ -554,6 +572,14 @@ pub fn run(
         // event. It returns `true` when it appended anything, so the campd
         // cursor is advanced past those events in this same wake rather than
         // waiting for a wake that an idle campd may never take.
+        //
+        // ═══ cp-1: WHAT LANDS IN TASK 6 vs TASK 8 ═══════════════════════════
+        // TASK 6 keeps the MERGED wrapper call below, exactly as main does
+        // today. TASK 8 REPLACES this one line with the split
+        // (`final_drain_pending` → harvest 2 → `dispose_pending` →
+        // `close_disposed`), because `close_disposed` and `take_disposed` do
+        // not exist yet. Nothing else in this block moves.
+        // ════════════════════════════════════════════════════════════════════
         if read_channel.apply_pending_unregisters(ledger)?
             && let Err(e) = settle(
                 ledger,
@@ -568,7 +594,72 @@ pub fn run(
         {
             eprintln!("campd: read-channel disposal settle failed: {e:#}");
         }
+        // cp-1 — HARVEST 2: the lines the DISPOSAL-TIME final drain consumed.
+        //
+        // DEFENSE IN DEPTH, honestly labelled. Under merged law the final drain
+        // yields ZERO lines (harvest 1 already read them), so this is normally a
+        // no-op. It exists because `drain_one` has two callers and a future phase
+        // could append session.stopped from INSIDE settle, which would move a
+        // worker's last bytes onto this path. It is idempotent (the hand-over is
+        // `mem::take`-drained): no double-ingest, no double-append.
+        //
+        // DO NOT claim that deleting it turns a test red — it does not.
+        //
+        // (The lines themselves are already SAFE at this point: the final drain
+        // read them into memory BEFORE `dispose_pending` unlinked the file. What
+        // this harvest does is INGEST them — which must happen before
+        // `expire_pending` below, or campd could declare an interrupt unanswered
+        // while its answer sat un-ingested in a Vec.)
+        appended_control_events |= control_step(ledger, control, dispatcher, read_channel)?;
+
+        // cp-1 (B5): ONLY NOW may a control deadline expire — AFTER every
+        // ingest this wake. A `control_response` sitting in the stream file
+        // because its notify was coalesced must be READ and INGESTED before
+        // campd may declare that it never arrived. That is cp-0's law, in the
+        // very block above: correctness never depends on a delivered event.
+        for input in control.expire_pending(Timestamp::now()) {
+            ledger.append(input)?;
+            appended_control_events = true;
+        }
+        if appended_control_events
+            && let Err(e) = settle(
+                ledger,
+                processor,
+                runtime,
+                clock,
+                dispatcher,
+                graph,
+                patrol,
+                read_channel,
+            )
+        {
+            eprintln!("campd: control settle failed: {e:#}");
+        }
     }
+}
+
+/// cp-1: ingest whatever the read channel just handed over, and append what it
+/// produced. ONE helper, called at every harvest point, so a line's control
+/// effect can never depend on WHICH drain path read it.
+///
+/// Returns whether it appended anything (the caller settles to advance the campd
+/// cursor past those events).
+fn control_step(
+    ledger: &mut Ledger,
+    control: &mut super::control::ControlRuntime,
+    dispatcher: &mut Dispatcher,
+    read_channel: &mut super::read_channel::ReadChannelRuntime,
+) -> Result<bool> {
+    let lines = read_channel.take_stream_lines();
+    if lines.is_empty() {
+        return Ok(false);
+    }
+    let mut appended = false;
+    for input in control.ingest(&lines, dispatcher, Timestamp::now()) {
+        ledger.append(input)?;
+        appended = true;
+    }
+    Ok(appended)
 }
 
 /// Drain the watch pipe (the byte content is meaningless — the signal
@@ -617,6 +708,7 @@ fn serve_connection(
     graph: &mut GraphRuntime,
     patrol: &mut PatrolRuntime,
     read_channel: &mut super::read_channel::ReadChannelRuntime,
+    control: &mut super::control::ControlRuntime,
     max_request_bytes: usize,
 ) -> Result<ConnState> {
     let mut chunk = [0u8; 4096];
@@ -647,6 +739,7 @@ fn serve_connection(
             graph,
             patrol,
             read_channel,
+            control,
         )?;
         if let Some(terminal) = drained {
             return Ok(terminal);
@@ -691,6 +784,7 @@ fn drain_lines(
     graph: &mut GraphRuntime,
     patrol: &mut PatrolRuntime,
     read_channel: &mut super::read_channel::ReadChannelRuntime,
+    control: &mut super::control::ControlRuntime,
 ) -> Result<Option<ConnState>> {
     while let Some(newline) = conn.buf.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = conn.buf.drain(..=newline).collect();
@@ -793,53 +887,15 @@ fn drain_lines(
                     eprintln!("campd: adopt settle failed: {e:#}");
                 }
             }
-            Ok(Request::Nudge { session, text }) => {
-                // The converse verb's live path (dispatch-lifecycle Phase 1,
-                // #29). Deliver → record → respond: the injected turn is a
-                // ledger fact (invariant 3), and a post-delivery append
-                // failure surfaces to the caller (invariant 5) — the ledger
-                // must not claim what was not delivered, and the caller must
-                // not believe what the ledger does not hold. No held pipe is
-                // NOT an error: via="none" routes the caller to the resume
-                // path (A4).
-                use super::dispatch::NudgeOutcome;
-                let response = match dispatcher.nudge_via_stdin(&session, &text) {
-                    NudgeOutcome::Delivered => {
-                        let (rig, bead) = dispatcher
-                            .child_info(&session)
-                            .map(|(r, b)| (Some(r), Some(b)))
-                            .unwrap_or((None, None));
-                        match ledger.append(EventInput {
-                            kind: EventType::SessionNudged,
-                            rig,
-                            actor: "campd".into(),
-                            bead,
-                            data: serde_json::json!({
-                                "session": session, "via": "stdin", "text": text,
-                            }),
-                        }) {
-                            Ok(_) => Response::Nudge {
-                                ok: true,
-                                via: "stdin".into(),
-                            },
-                            Err(e) => Response::Error {
-                                ok: false,
-                                error: format!(
-                                    "turn delivered into {session} but recording \
-                                     session.nudged failed: {e}"
-                                ),
-                            },
-                        }
-                    }
-                    NudgeOutcome::NoPipe => Response::Nudge {
-                        ok: true,
-                        via: "none".into(),
-                    },
-                    NudgeOutcome::Failed(e) => Response::Error {
-                        ok: false,
-                        error: format!("stdin nudge of {session} failed: {e}"),
-                    },
-                };
+            // cp-1 (§4.1). Both bodies live in `control.rs` — the ONE module
+            // that owns the control plane — so these arms are delegations.
+            Ok(Request::SessionSendTurn { session, text }) => {
+                let response = control.serve_send_turn(&session, &text, ledger, dispatcher);
+                respond(&mut conn.stream, &response)?;
+            }
+            Ok(Request::SessionInterrupt { session }) => {
+                let response =
+                    control.serve_interrupt(&session, ledger, dispatcher, Timestamp::now());
                 respond(&mut conn.stream, &response)?;
             }
             Err(e) => {
@@ -1249,6 +1305,7 @@ mod tests {
             &mut graph,
             &mut test_patrol(),
             &mut read_channel,
+            &mut crate::daemon::control::ControlRuntime::new(1024),
             1024,
         )
         .expect("a dead poker must not error the connection loop");
@@ -1459,6 +1516,7 @@ mod tests {
             &mut graph,
             &mut test_patrol(),
             &mut read_channel,
+            &mut crate::daemon::control::ControlRuntime::new(1024),
             TEST_CAP,
         )
         .unwrap();

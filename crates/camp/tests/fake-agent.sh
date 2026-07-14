@@ -27,6 +27,15 @@
 #   FAKE_AGENT_TOUCH_TRANSCRIPT_LOOP  Phase 11: N iterations of appending
 #                              to $CAMP_TRANSCRIPT every 250 ms after the
 #                              claim — a working agent's heartbeat
+#   FAKE_AGENT_CONTROL_LOOP    cp-1 (§2.1): read stdin forever; ANSWER every
+#                              control_request with the pinned control_response
+#                              (request_id echoed back); a plain user turn ends
+#                              the loop and closes the bead. The interrupt
+#                              round-trip's worker half.
+#   FAKE_AGENT_EXIT_AFTER_CONTROL  cp-1: answer ONE control_request and EXIT
+#                              IMMEDIATELY — the reap-races-the-drain shape.
+#                              The answer is the worker's LAST stdout bytes, so
+#                              a reap-before-drain bug destroys it unread.
 #   FAKE_AGENT_DELIVERY   Phase 3 delivery modes (obligations i/ii/vi):
 #                         "ship" = commit on the dispatched branch, close
 #                         pass+shipped with the real commit/branch facts;
@@ -148,6 +157,71 @@ if [[ -n "${FAKE_AGENT_NUDGE_CLOSE:-}" ]]; then
   # fall through to the close — the revival the master plan demands.
   read -r _task_line
   read -r _nudge_line
+fi
+
+# cp-1: answer camp's control_requests, exactly as the real CLI does. The
+# request_id is echoed back verbatim — that correlation IS the protocol, and
+# the response shape is the one pinned in tests/fixtures/control/.
+answer_control() {
+  local line="$1"
+  local id
+  id="$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')"
+  [[ -n "$id" ]] || return 0
+  printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"still_queued":[]}}}\n' "$id"
+}
+
+if [[ -n "${FAKE_AGENT_CONTROL_LOOP:-}" ]]; then
+  # cp-1: campd wrote the TASK as the first stdin line at spawn (the HeldStream
+  # contract) — consume it, exactly as FAKE_AGENT_NUDGE_CLOSE does. THEN read
+  # forever: a control_request is ANSWERED; a plain user turn ends the loop and
+  # falls through to the close.
+  #
+  # This is the shape every interrupt round-trip test drives: campd writes a
+  # control line into the held stdin, and the answer comes back out on stdout —
+  # which IS campd's read channel (spec §2.3). The whole cp-1 loop, in a worker.
+  read -r _task_line
+  while IFS= read -r _control_line; do
+    case "$_control_line" in
+      *'"type":"control_request"'*) answer_control "$_control_line" ;;
+      *) break ;;  # a user turn: stop listening and close the bead
+    esac
+  done
+  # stdin hit EOF (campd released the pipe — or DIED). FAKE_AGENT_LINGER_ON_EOF
+  # makes the worker OUTLIVE campd instead of exiting, which is what B6's restart
+  # proof needs: the session must still be LIVE when the new campd starts, or
+  # adoption crashes it, it is never re-tailed, and the worker's answer — already
+  # sitting in its stdout file — is never read. (A worker that exits with campd is
+  # B6's NAMED residual, not its happy path.)
+  if [[ -n "${FAKE_AGENT_LINGER_ON_EOF:-}" ]]; then
+    sleep "$FAKE_AGENT_LINGER_ON_EOF"
+    exit 0
+  fi
+fi
+
+if [[ -n "${FAKE_AGENT_CLOSE_STDIN:-}" ]]; then
+  # cp-1 (C12): the worker CLOSES its stdin read end and stays alive. campd still
+  # holds the WRITE end, so its next write into that pipe gets EPIPE — a write
+  # that is ATTEMPTED and FAILS, which is a different thing from "no pipe" and
+  # must be loud in BOTH channels (an error to the caller AND a durable fault).
+  #
+  # This is the deterministic way to drive ControlWrite::Failed: a FULL pipe
+  # cannot be used, because the first write that fails TEARS the pipe down, so
+  # any later interrupt would report NoPipe instead.
+  exec 0<&-
+  sleep "${FAKE_AGENT_CLOSE_STDIN}"
+  exit 0
+fi
+
+if [[ -n "${FAKE_AGENT_EXIT_AFTER_CONTROL:-}" ]]; then
+  # cp-1: consume the task line, answer exactly ONE control_request, and EXIT
+  # IMMEDIATELY — the reap-races-the-drain shape. The answer is the worker's LAST
+  # stdout bytes, written a breath before the process dies, so it is precisely
+  # the line a reap-before-drain bug destroys. If campd's harvest ordering is
+  # wrong, this answer is unlinked unread and the interrupt looks unanswered
+  # forever.
+  read -r _task_line
+  IFS= read -r _control_line || true
+  answer_control "$_control_line"
 fi
 
 # Phase 3 delivery modes (dispatch-lifecycle §9 obligations i/ii/vi).
