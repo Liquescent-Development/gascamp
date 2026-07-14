@@ -1,0 +1,7 @@
+formula = "oversize"
+contract = "graph.v2"
+
+[[steps]]
+id = "big"
+title = "Big"
+description_file = "../assets/workflows/big.md"

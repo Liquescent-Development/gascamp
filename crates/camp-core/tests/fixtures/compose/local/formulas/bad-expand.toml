@@ -1,0 +1,7 @@
+formula = "bad-expand"
+contract = "graph.v2"
+
+[[steps]]
+id = "a"
+title = "A"
+expand = "no-such-expansion"

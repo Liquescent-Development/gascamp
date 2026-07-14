@@ -1,0 +1,7 @@
+formula = "missing-asset"
+contract = "graph.v2"
+
+[[steps]]
+id = "a"
+title = "A"
+description_file = "../assets/workflows/nope.md"

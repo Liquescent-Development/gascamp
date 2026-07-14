@@ -1,6 +1,0 @@
-formula = "notes"
-
-[[steps]]
-id = "a"
-title = "t"
-notes = true

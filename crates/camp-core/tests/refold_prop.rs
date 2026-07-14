@@ -11,13 +11,49 @@ use proptest::prelude::*;
 
 #[derive(Debug, Clone)]
 enum Op {
-    Create { id: u8, with_needs: bool },
-    Claim { id: u8, session: u8 },
-    Update { id: u8 },
-    Close { id: u8, pass: bool },
-    Woke { session: u8 },
-    Stop { session: u8 },
-    Crash { session: u8 },
+    Create {
+        id: u8,
+        with_needs: bool,
+    },
+    Claim {
+        id: u8,
+        session: u8,
+    },
+    Update {
+        id: u8,
+    },
+    Close {
+        id: u8,
+        pass: bool,
+    },
+    Woke {
+        session: u8,
+    },
+    Stop {
+        session: u8,
+    },
+    Crash {
+        session: u8,
+    },
+    /// compat §6.1 — plain metadata on a bead.
+    SetMeta {
+        id: u8,
+        key: u8,
+    },
+    /// The exclusive drain reservation. `drain` is drawn from a SMALL range on
+    /// purpose: two different drains WILL contend for one member, so the
+    /// generator really produces the CAS conflict the fold must reject. A
+    /// rejected append must append NOTHING, and the replay must land on an
+    /// identical state — that is the property, and without a conflicting op it
+    /// is never exercised.
+    Reserve {
+        id: u8,
+        drain: u8,
+    },
+    /// Release — an UNSET (null), including of a key that is not held.
+    Release {
+        id: u8,
+    },
 }
 
 fn bead_id(i: u8) -> String {
@@ -74,6 +110,27 @@ fn to_input(op: &Op) -> EventInput {
             None,
             serde_json::json!({"name": session_name(*session)}),
         ),
+        Op::SetMeta { id, key } => (
+            EventType::BeadUpdated,
+            Some(bead_id(*id)),
+            serde_json::json!({"metadata": {format!("gc.k{key}"): format!("v{key}")}}),
+        ),
+        Op::Reserve { id, drain } => (
+            EventType::BeadUpdated,
+            Some(bead_id(*id)),
+            serde_json::json!({
+                "metadata": {
+                    camp_core::readiness::EXCLUSIVE_DRAIN_RESERVATION: format!("drain-{drain}"),
+                }
+            }),
+        ),
+        Op::Release { id } => (
+            EventType::BeadUpdated,
+            Some(bead_id(*id)),
+            serde_json::json!({
+                "metadata": { camp_core::readiness::EXCLUSIVE_DRAIN_RESERVATION: serde_json::Value::Null }
+            }),
+        ),
     };
     EventInput {
         kind,
@@ -93,6 +150,10 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         (0u8..4).prop_map(|session| Op::Woke { session }),
         (0u8..4).prop_map(|session| Op::Stop { session }),
         (0u8..4).prop_map(|session| Op::Crash { session }),
+        (0u8..8, 0u8..3).prop_map(|(id, key)| Op::SetMeta { id, key }),
+        // 2 drains over 8 beads: conflicts are frequent, not incidental.
+        (0u8..8, 0u8..2).prop_map(|(id, drain)| Op::Reserve { id, drain }),
+        (0u8..8).prop_map(|id| Op::Release { id }),
     ]
 }
 
@@ -114,6 +175,7 @@ const DUMPS: &[(&str, &str)] = &[
         "beads",
         "id, rig, type, title, description, status, assignee, claimed_by, outcome, close_reason, labels, run_id, step_id, created_ts, updated_ts, closed_ts",
     ),
+    ("bead_meta", "bead_id, key, value"),
     ("deps", "bead_id, needs_id"),
     (
         "sessions",

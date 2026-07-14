@@ -1,0 +1,16 @@
+formula = "not-runnable-drain"
+contract = "graph.v2"
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+needs = ["decompose"]
+
+[steps.drain]
+context = "separate"
+formula = "no-contract-item"
+member_access = "exclusive"

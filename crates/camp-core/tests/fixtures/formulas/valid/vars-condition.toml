@@ -1,0 +1,23 @@
+# Rung 2b under the REAL gc compiler (invariant 6): vars + condition pruning.
+formula = "vars-condition"
+contract = "graph.v2"
+
+[vars]
+drain_policy = "separate"
+review_mode = { default = "report" }
+
+[[steps]]
+id = "decompose"
+title = "Decompose the work"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+condition = "{{drain_policy}} == separate"
+needs = ["decompose"]
+
+[[steps]]
+id = "apply-review-findings"
+title = "Apply review findings"
+condition = "{{review_mode}} != report"
+needs = ["implement"]

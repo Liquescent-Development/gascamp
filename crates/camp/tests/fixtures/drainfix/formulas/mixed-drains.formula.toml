@@ -1,0 +1,26 @@
+formula = "mixed-drains"
+contract = "graph.v2"
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "drain-bad"
+title = "Drain with a bogus item formula"
+needs = ["decompose"]
+
+[steps.drain]
+context = "separate"
+formula = "no-such-item-formula"
+member_access = "exclusive"
+
+[[steps]]
+id = "drain-good"
+title = "Drain with a good item formula"
+needs = ["decompose"]
+
+[steps.drain]
+context = "separate"
+formula = "item"
+member_access = "exclusive"

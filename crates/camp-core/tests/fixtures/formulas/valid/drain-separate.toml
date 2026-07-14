@@ -1,0 +1,23 @@
+# Rung 2e under the REAL gc compiler (invariant 6): a separate drain, with the
+# `needs` S17 requires (it depends on the step that creates its members).
+formula = "drain-separate"
+contract = "graph.v2"
+
+[[steps]]
+id = "decompose"
+title = "Decompose into members"
+
+[[steps]]
+id = "implement"
+title = "Implement each member"
+needs = ["decompose"]
+
+[steps.drain]
+context = "separate"
+formula = "vars-condition"
+member_access = "exclusive"
+
+[[steps]]
+id = "publish"
+title = "Publish"
+needs = ["implement"]

@@ -1,0 +1,6 @@
+formula = "contract-parent"
+contract = "graph.v2"
+
+[[steps]]
+id = "only"
+title = "Only"

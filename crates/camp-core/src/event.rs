@@ -85,6 +85,12 @@ pub enum EventType {
     ImportAdded,
     /// compat §5.4: a pack/agent key was refused (audit-only — no state fold).
     ImportRefused,
+    /// compat §4 rule 1: a formula named a Gas City construct camp does not
+    /// implement, so camp refused to load it rather than approximate its
+    /// semantics. Audit-only — no state fold. The event NAMES the key
+    /// (invariant 3: the ledger tells the whole story), because "the formula
+    /// did not load" is not an answer an operator can act on.
+    FormulaRefused,
 }
 
 impl EventType {
@@ -124,6 +130,7 @@ impl EventType {
         EventType::SubscriberDropped,
         EventType::ImportAdded,
         EventType::ImportRefused,
+        EventType::FormulaRefused,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -163,6 +170,7 @@ impl EventType {
             EventType::SubscriberDropped => "subscriber.dropped",
             EventType::ImportAdded => "import.added",
             EventType::ImportRefused => "import.refused",
+            EventType::FormulaRefused => "formula.refused",
         }
     }
 
@@ -306,6 +314,19 @@ mod tests {
         );
         assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&"import.added"));
         assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&"import.refused"));
+    }
+
+    #[test]
+    fn formula_refused_roundtrips_and_is_camp_specific() {
+        // compat §4 rule 1. gc's 71-event vocabulary has NO `formula.*` event,
+        // so this is additive, never a redefinition (invariant 7).
+        assert_eq!(EventType::FormulaRefused.as_str(), "formula.refused");
+        assert_eq!(
+            EventType::parse("formula.refused").unwrap(),
+            EventType::FormulaRefused
+        );
+        assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&"formula.refused"));
+        assert!(!crate::vocab::GC_MIRRORED_EVENTS.contains(&"formula.refused"));
         assert!(!crate::vocab::GC_MIRRORED_EVENTS.contains(&"import.added"));
     }
 }

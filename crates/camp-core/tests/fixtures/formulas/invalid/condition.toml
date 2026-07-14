@@ -1,6 +1,0 @@
-formula = "condition"
-
-[[steps]]
-id = "a"
-title = "t"
-condition = true

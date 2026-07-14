@@ -201,6 +201,60 @@ impl Ledger {
         crate::formula::runtime::run_step_beads(&self.conn, run_id, step_id)
     }
 
+    /// Does any bead carry this `run_id`? (`camp create --run` fails fast on an
+    /// unknown run: a member silently attached to a run that does not exist
+    /// would simply never be scattered, and nothing would say why.)
+    pub fn run_exists(&self, run_id: &str) -> Result<bool, CoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM beads WHERE run_id = ?1)",
+            [run_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// A bead's metadata, with the dedicated columns projected over it
+    /// (compat §6.1; `readiness::PROJECTED_METADATA`).
+    pub fn bead_metadata(
+        &self,
+        bead: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, CoreError> {
+        crate::readiness::bead_metadata(&self.conn, bead)
+    }
+
+    /// The run MEMBERS a drain scatters over (D3).
+    pub fn run_members(
+        &self,
+        ctx: &crate::formula::runtime::RunContext,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::run_members(&self.conn, ctx)
+    }
+
+    /// The item runs already scattered for a drain anchor, by index.
+    pub fn drain_children(
+        &self,
+        anchor: &str,
+    ) -> Result<std::collections::BTreeMap<usize, crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::drain_children(&self.conn, anchor)
+    }
+
+    /// Every member this anchor holds a reservation on (status-agnostic — V-4).
+    pub fn reservations_held_by(
+        &self,
+        anchor: &str,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::reservations_held_by(&self.conn, anchor)
+    }
+
+    /// Reservations whose holding anchor is closed or gone (the orphan sweep).
+    pub fn orphaned_reservations(&self) -> Result<Vec<(String, String)>, CoreError> {
+        crate::formula::runtime::orphaned_reservations(&self.conn)
+    }
+
+    /// A bead row by id.
+    pub fn bead_row(&self, bead: &str) -> Result<Option<crate::readiness::BeadRow>, CoreError> {
+        crate::readiness::get_bead(&self.conn, bead)
+    }
+
     /// The attempts of a looping step (its beads minus the anchor),
     /// creation order.
     pub fn step_attempts(
@@ -761,10 +815,13 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
     use crate::event::{EventInput, EventType};
+    use crate::ledger::schema::SCHEMA_VERSION;
+    use crate::readiness::{EXCLUSIVE_DRAIN_RESERVATION, PROJECTED_METADATA};
 
     pub(crate) fn temp_ledger() -> (tempfile::TempDir, Ledger) {
         let dir = tempfile::tempdir().unwrap();
@@ -1617,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn open_applies_pragmas_and_creates_schema_v1() {
+    fn open_applies_pragmas_and_creates_the_current_schema() {
         let (_dir, ledger) = temp_ledger();
         let conn = &ledger.conn;
 
@@ -1654,7 +1711,12 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "2");
+        // Bound to the CONST, never a literal (BD9): `init_schema` writes the
+        // version as a LITERAL inside FULL_DDL_PREFIX and returns early without
+        // verifying, while every later open compares `SCHEMA_VERSION`. Asserting
+        // a literal here lets the two drift apart — which is a camp that inits
+        // fine and then cannot open itself.
+        assert_eq!(version, SCHEMA_VERSION.to_string());
     }
 
     fn input(
@@ -3430,10 +3492,263 @@ mod tests {
         match Ledger::open(&path) {
             Err(CoreError::UnsupportedSchema { found, supported }) => {
                 assert_eq!(found, 999);
-                assert_eq!(supported, 2);
+                assert_eq!(supported, SCHEMA_VERSION);
             }
             Err(other) => panic!("expected UnsupportedSchema, got {other:?}"),
             Ok(_) => panic!("open must fail on schema_version 999"),
+        }
+    }
+
+    // ---- compat §6.1: bead metadata, the reservation CAS, schema 3 ----------
+
+    fn mk_bead(l: &mut Ledger, id: &str, data: serde_json::Value) {
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some(id.into()),
+            data,
+        })
+        .unwrap();
+    }
+
+    fn update(l: &mut Ledger, id: &str, data: serde_json::Value) -> Result<Seq, CoreError> {
+        l.append(EventInput {
+            kind: EventType::BeadUpdated,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some(id.into()),
+            data,
+        })
+    }
+
+    #[test]
+    fn a_fresh_camp_reopens() {
+        // BD9. `SCHEMA_VERSION` lives in TWO places: the const, and a LITERAL
+        // inside FULL_DDL_PREFIX that `init_schema` writes before returning
+        // early WITHOUT verifying. Every later open compares the CONST. Bump one
+        // and not the other and every freshly-initialized camp writes the old
+        // version and then fails to open on its very next process — and no test
+        // that only ever inits would notice.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("camp.db");
+        {
+            let _l = Ledger::open(&path).unwrap();
+        }
+        let reopened = Ledger::open(&path);
+        assert!(
+            reopened.is_ok(),
+            "a camp initialized by this binary must reopen with it: {:?}",
+            reopened.err()
+        );
+    }
+
+    #[test]
+    fn bead_created_carries_metadata_and_bead_updated_sets_and_unsets_it() {
+        let (_d, mut l) = temp_ledger();
+        mk_bead(
+            &mut l,
+            "gc-1",
+            serde_json::json!({
+                "title": "t",
+                "metadata": {"gc.run_target": "superpowers.implementer", "gc.kind": "drain"},
+            }),
+        );
+        let md = l.bead_metadata("gc-1").unwrap();
+        assert_eq!(md.get("gc.kind").map(String::as_str), Some("drain"));
+        assert_eq!(
+            md.get("gc.run_target").map(String::as_str),
+            Some("superpowers.implementer")
+        );
+
+        // Set a new key and overwrite an existing one.
+        update(
+            &mut l,
+            "gc-1",
+            serde_json::json!({"metadata": {"gc.kind": "cleanup", "gc.on_fail": "abort"}}),
+        )
+        .unwrap();
+        let md = l.bead_metadata("gc-1").unwrap();
+        assert_eq!(md.get("gc.kind").map(String::as_str), Some("cleanup"));
+        assert_eq!(md.get("gc.on_fail").map(String::as_str), Some("abort"));
+
+        // null UNSETS.
+        update(
+            &mut l,
+            "gc-1",
+            serde_json::json!({"metadata": {"gc.on_fail": null}}),
+        )
+        .unwrap();
+        let md = l.bead_metadata("gc-1").unwrap();
+        assert!(!md.contains_key("gc.on_fail"), "{md:?}");
+        assert!(md.contains_key("gc.kind"), "only the named key is unset");
+    }
+
+    #[test]
+    fn bead_updated_still_requires_at_least_one_field() {
+        let (_d, mut l) = temp_ledger();
+        mk_bead(&mut l, "gc-1", serde_json::json!({"title": "t"}));
+        let err = update(&mut l, "gc-1", serde_json::json!({})).unwrap_err();
+        assert!(
+            matches!(&err, CoreError::InvalidEventData { reason, .. }
+                     if reason.contains("title and/or description and/or metadata")),
+            "{err:?}"
+        );
+        // But metadata ALONE is now enough — the reservation rides this event.
+        update(
+            &mut l,
+            "gc-1",
+            serde_json::json!({"metadata": {"gc.k": "v"}}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_second_drain_cannot_reserve_a_held_member() {
+        let (_d, mut l) = temp_ledger();
+        mk_bead(&mut l, "gc-1", serde_json::json!({"title": "member"}));
+        let reserve =
+            |drain: &str| serde_json::json!({"metadata": {EXCLUSIVE_DRAIN_RESERVATION: drain}});
+
+        update(&mut l, "gc-1", reserve("drain-a")).unwrap();
+        assert_eq!(
+            l.bead_metadata("gc-1")
+                .unwrap()
+                .get(EXCLUSIVE_DRAIN_RESERVATION)
+                .map(String::as_str),
+            Some("drain-a")
+        );
+
+        // A DIFFERENT drain conflicts, and the error NAMES the holder.
+        let err = update(&mut l, "gc-1", reserve("drain-b")).unwrap_err();
+        assert!(
+            matches!(&err, CoreError::InvalidEventData { reason, .. }
+                     if reason.contains("drain-a") && reason.contains("drain-b")),
+            "the conflict must name both drains: {err:?}"
+        );
+        // The rejected append appended NOTHING — the reservation is untouched.
+        assert_eq!(
+            l.bead_metadata("gc-1")
+                .unwrap()
+                .get(EXCLUSIVE_DRAIN_RESERVATION)
+                .map(String::as_str),
+            Some("drain-a"),
+            "a rejected CAS must not have mutated the holder"
+        );
+
+        // The SAME holder re-reserving is idempotent (campd may replay its own
+        // queued drain after a restart).
+        update(&mut l, "gc-1", reserve("drain-a")).unwrap();
+
+        // Release, then a different drain CAN take it.
+        update(
+            &mut l,
+            "gc-1",
+            serde_json::json!({"metadata": {EXCLUSIVE_DRAIN_RESERVATION: null}}),
+        )
+        .unwrap();
+        update(&mut l, "gc-1", reserve("drain-b")).unwrap();
+        assert_eq!(
+            l.bead_metadata("gc-1")
+                .unwrap()
+                .get(EXCLUSIVE_DRAIN_RESERVATION)
+                .map(String::as_str),
+            Some("drain-b")
+        );
+    }
+
+    #[test]
+    fn a_reserve_BATCH_with_one_conflict_appends_ZERO_ROWS() {
+        // ⭐ V-1 — the assertion BD4's all-or-nothing reserve actually rests on, and
+        // the one the daemon suite CANNOT make.
+        //
+        // At the daemon level a losing drain always conflicts on member[0] (both
+        // drains enumerate through the same `run_members` ordering and campd runs
+        // them serially), so a single-event batch and rev-2's incremental
+        // per-event loop are INDISTINGUISHABLE — the BD4 mutant survives the whole
+        // daemon suite even with two members. The property is a LEDGER property, so
+        // it is asserted at the ledger.
+        //
+        // A batch that reserves m1 and then conflicts on m2 must append NOTHING —
+        // not "m1 and then stop". Under the incremental shape m1 stays reserved,
+        // item-run 1 is already cooked and dispatchable on it, and releasing it
+        // later would let a SECOND drain cook its own item run over the same bead:
+        // two drains mutating one bead, the exact thing the reservation prevents.
+        let (_d, mut l) = temp_ledger();
+        mk_bead(&mut l, "gc-1", serde_json::json!({"title": "m1"}));
+        mk_bead(&mut l, "gc-2", serde_json::json!({"title": "m2"}));
+        // m2 is already held by another drain.
+        update(
+            &mut l,
+            "gc-2",
+            serde_json::json!({"metadata": {EXCLUSIVE_DRAIN_RESERVATION: "drain-other"}}),
+        )
+        .unwrap();
+
+        let reserve = |bead: &str| EventInput {
+            kind: EventType::BeadUpdated,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some(bead.to_owned()),
+            data: serde_json::json!({
+                "metadata": {EXCLUSIVE_DRAIN_RESERVATION: "drain-mine"}
+            }),
+        };
+        let err = l
+            .append_batch(vec![reserve("gc-1"), reserve("gc-2")])
+            .unwrap_err();
+        assert!(
+            matches!(&err, CoreError::InvalidEventData { reason, .. }
+                     if reason.contains("drain-other")),
+            "the conflict names the holder: {err:?}"
+        );
+
+        // ⭐ ZERO ROWS. m1 — which the batch reserved BEFORE it hit the conflict —
+        // must carry NO reservation. "Rejections appended nothing."
+        assert!(
+            !l.bead_metadata("gc-1")
+                .unwrap()
+                .contains_key(EXCLUSIVE_DRAIN_RESERVATION),
+            "a rejected batch must append NOTHING — m1 was reserved before the conflict"
+        );
+        // …and the prior holder is untouched.
+        assert_eq!(
+            l.bead_metadata("gc-2")
+                .unwrap()
+                .get(EXCLUSIVE_DRAIN_RESERVATION)
+                .map(String::as_str),
+            Some("drain-other")
+        );
+    }
+
+    #[test]
+    fn a_metadata_key_with_a_dedicated_column_is_projected_at_read_and_refused_at_write() {
+        let (_d, mut l) = temp_ledger();
+        mk_bead(
+            &mut l,
+            "gc-1",
+            serde_json::json!({"title": "t", "assignee": "superpowers.implementer"}),
+        );
+
+        // PROJECTED at read: the column shows up as its gc metadata key, so a
+        // reader sees one complete map and never has to know where a fact lives.
+        let md = l.bead_metadata("gc-1").unwrap();
+        assert_eq!(
+            md.get("gc.routed_to").map(String::as_str),
+            Some("superpowers.implementer")
+        );
+
+        // REFUSED at write, NAMING the column. compat-3 stamps `gc.routed_to`
+        // when it dispatches; if metadata could also hold it, a bead could carry
+        // two different routes and nothing would be wrong enough to fail.
+        for (key, column) in PROJECTED_METADATA {
+            let err =
+                update(&mut l, "gc-1", serde_json::json!({"metadata": {*key: "x"}})).unwrap_err();
+            assert!(
+                matches!(&err, CoreError::InvalidEventData { reason, .. }
+                         if reason.contains(column)),
+                "{key} must be refused naming `beads.{column}`: {err:?}"
+            );
         }
     }
 }

@@ -1,0 +1,14 @@
+formula = "drain-parent"
+contract = "graph.v2"
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "implement"
+title = "Implement each"
+needs = ["decompose"]
+[steps.drain]
+context = "separate"
+formula = "item"

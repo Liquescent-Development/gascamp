@@ -432,20 +432,53 @@ pub fn execute_fire(
         })?;
         Ok(())
     };
-    let path = match resolve_formula(config, &order.formula) {
-        Ok(p) => p,
+    // compat §9: compile through the LAYER STACK. `parse_and_validate` is the
+    // no-layer camp-local entry and cannot resolve an imported formula's
+    // `extends`, `description_file`, or routes.
+    let layers = match crate::formula::FormulaLayers::from_config(config, camp_root) {
+        Ok(l) => l,
         Err(e) => {
             fail(ledger, format!("formula {:?}: {e}", order.formula))?;
             return Ok(None);
         }
     };
-    let formula = match crate::formula::parse_and_validate(&path) {
-        Ok(formula) => formula,
+    let compiled = match crate::formula::compile_named(
+        &layers,
+        config,
+        &order.formula,
+        &std::collections::BTreeMap::new(),
+    ) {
+        Ok(c) => c,
         Err(e) => {
             fail(ledger, format!("formula {:?}: {e}", order.formula))?;
             return Ok(None);
         }
     };
+    // D1 (ruling E) + §13's MONEY INVARIANT: a formula camp cannot honour must
+    // NEVER reach a worker. The order-fire path is a cook entry point like any
+    // other, and it refuses HERE — loudly, as a ledger event — rather than firing
+    // a run under semantics the formula never claimed.
+    if let Some(why) = &compiled.not_runnable {
+        let mut data = serde_json::json!({
+            "formula": order.formula, "key": why.key, "reason": why.reason,
+        });
+        if let Some(step) = &why.step {
+            data["step"] = serde_json::json!(step);
+        }
+        ledger.append(EventInput {
+            kind: EventType::FormulaRefused,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data,
+        })?;
+        fail(
+            ledger,
+            format!("formula {:?} cannot be run: {}", order.formula, why.reason),
+        )?;
+        return Ok(None);
+    }
+    let formula = compiled.formula;
     let rig = match resolve_rig(config, order) {
         Ok(rig) => rig.clone(),
         Err(reason) => {
@@ -453,12 +486,18 @@ pub fn execute_fire(
             return Ok(None);
         }
     };
-    match crate::formula::cook(
+    let opts = crate::formula::CookOptions {
+        // Routes resolve through the binding namespace, like every other cook.
+        config: Some(config.clone()),
+        ..Default::default()
+    };
+    match crate::formula::cook_with(
         ledger,
         &formula,
         &crate::formula::runtime::runs_dir(camp_root),
         &rig,
         &cook_actor(&order.name, fired_seq),
+        &opts,
     ) {
         Ok(run) => Ok(Some(run)),
         Err(e) => {

@@ -1,6 +1,0 @@
-formula = "expand"
-
-[[steps]]
-id = "a"
-title = "t"
-expand = true

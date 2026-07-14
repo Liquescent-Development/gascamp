@@ -41,9 +41,21 @@ struct Manifest {
     rig: String,
     root: String,
     steps: BTreeMap<String, String>,
-    // actor / cooked_ts / vars: audit content, not needed here
+    // actor / cooked_ts: audit content, not needed here.
+    //
+    // `vars` too, and DELIBERATELY: the recipe is already INSTANTIATED (BD-A),
+    // so there is nothing left to substitute at load. The vars are pinned in the
+    // manifest for audit — so an operator can see what the run was cooked with —
+    // not for re-derivation.
     #[serde(flatten)]
     _rest: BTreeMap<String, serde_json::Value>,
+}
+
+/// `runs/<id>/recipe.json` — the INSTANTIATED formula (D6/BD-A).
+#[derive(Deserialize)]
+struct PinnedRecipe {
+    recipe_version: u32,
+    formula: Formula,
 }
 
 /// Load a run's context from `<runs_dir>/<run_id>/`. A missing dir,
@@ -64,9 +76,56 @@ pub fn load_run(runs_dir: &Path, run_id: &str) -> Result<RunContext, CoreError> 
             manifest.run_id
         )));
     }
-    let formula_path = dir.join(format!("{}.toml", manifest.formula));
-    let formula = crate::formula::parse_and_validate(&formula_path)
-        .map_err(|e| corrupt(format!("pinned formula invalid: {e}")))?;
+    // BD8 — deserialize the PINNED RECIPE. This used to re-parse the authored
+    // `<formula>.toml` with `parse_and_validate` (no layers, no config), which
+    // for any imported formula could not possibly succeed: `ctx()` turned the
+    // error into `None` and every caller then DEAD-ENDED the run. Every one of
+    // the 65 runnable corpus formulas would have hit it.
+    //
+    // Nothing here re-parses, resolves layers, or reads config. The recipe is
+    // already instantiated: `{{var}}` substituted, routes resolved.
+    let recipe_path = dir.join("recipe.json");
+    let raw = std::fs::read_to_string(&recipe_path).map_err(|_| {
+        corrupt(format!(
+            "no recipe.json at {} — this run was cooked by an older camp; re-sling it",
+            recipe_path.display()
+        ))
+    })?;
+    let pinned: PinnedRecipe =
+        serde_json::from_str(&raw).map_err(|e| corrupt(format!("bad recipe.json: {e}")))?;
+    // STRICT equality, and it kills in-flight runs LOUDLY rather than
+    // deserializing a recipe that means something else (BD-C).
+    if pinned.recipe_version != crate::formula::cook::RECIPE_VERSION {
+        return Err(corrupt(format!(
+            "was cooked by a different camp (recipe v{}, this camp reads v{}) — re-sling it",
+            pinned.recipe_version,
+            crate::formula::cook::RECIPE_VERSION
+        )));
+    }
+    let formula = pinned.formula;
+    // `Formula::source` is `#[serde(skip)]` (BD-C: the authored bytes are already
+    // pinned verbatim next to the recipe, and duplicating them here would double the
+    // run dir). So a formula reconstituted from `recipe.json` carries an EMPTY
+    // source — by design, and NOTHING reads it today.
+    //
+    // It is asserted rather than merely commented, because a future caller reaching
+    // for `.source` off a reloaded formula would silently get `""` and behave as if
+    // the file were empty. Make that structural: if the invariant ever changes, this
+    // fires in dev before it ships.
+    debug_assert!(
+        formula.source.is_empty(),
+        "a formula reloaded from recipe.json has no authored source (serde skip); \
+         read <run>/<formula>.toml if you need the bytes"
+    );
+    // The two pinned artifacts must agree about what was cooked. They are written
+    // in the same transaction, so a mismatch means the run dir was edited or
+    // corrupted — never a thing to shrug at.
+    if formula.name != manifest.formula {
+        return Err(corrupt(format!(
+            "manifest names formula {:?} but recipe.json holds {:?}",
+            manifest.formula, formula.name
+        )));
+    }
     let formula_steps: Vec<&str> = formula.steps.iter().map(|s| s.id.as_str()).collect();
     let manifest_steps: Vec<&str> = manifest.steps.keys().map(String::as_str).collect();
     if formula_steps
@@ -93,6 +152,23 @@ pub fn load_run(runs_dir: &Path, run_id: &str) -> Result<RunContext, CoreError> 
 /// (gc rule S9 forbids combining them).
 pub fn is_looping(step: &Step) -> bool {
     step.check.is_some() || step.retry.is_some()
+}
+
+/// A CAMPD-HELD step: campd claims its anchor and drives it, and NO WORKER is
+/// ever dispatched for the anchor itself.
+///
+/// gc calls a drain's anchor a *"controller-owned control bead"* (`types.go:318`),
+/// and that is exactly what this is. Two shapes hold an anchor, and they hold it
+/// for DIFFERENT reasons — which is why `is_campd_held` is not a rename of
+/// [`is_looping`]:
+///
+/// * **looping** (`check`/`retry`) — campd claims the anchor and dispatches
+///   worker ATTEMPTS against it. The attempts are the mechanism.
+/// * **drain** — campd claims the anchor and SCATTERS one item run per run
+///   member. There are no attempts, and a worker for the anchor would be a
+///   worker for a step that has no work (§13's money invariant).
+pub fn is_campd_held(step: &Step) -> bool {
+    is_looping(step) || step.drain.is_some()
 }
 
 /// A step reference resolved from a step id: the formula step and its
@@ -498,6 +574,164 @@ pub fn substitute_vars(
         out.insert(key.clone(), result);
     }
     Ok(out)
+}
+
+/// gc's `defaultDrainMaxUnits` (`drain.go:24`). The authored KEY `drain.max_units`
+/// is refused by name (0 corpus uses); this is gc's RUNTIME cap, and camp honours
+/// it: a drain whose member set exceeds it CLOSES `fail` and scatters NOTHING
+/// (`drain.go:244-255`, reason `limit_exceeded`).
+pub const DRAIN_MAX_UNITS: usize = crate::formula::drain::DEFAULT_MAX_UNITS;
+
+/// A run MEMBER (D3): a bead with this run's `run_id`, **no `step_id`**,
+/// `type = 'task'`, and **not closed**.
+///
+/// gc: `convoycore.Members(store, id, includeClosed=false, …)`
+/// (`membership.go:96-144` — *"if !includeClosed && IsTerminalStatus(b.Status)
+/// { return }"*). A CLOSED member is not a member: it is finished work, and
+/// scattering an item run over it would redo it.
+///
+/// Members are added by `camp create --run <run_id>`. The run ROOT is excluded
+/// (it also has `step_id IS NULL`), and so is anything wearing a `bond:` or
+/// `drain:` label — those are cooked run roots, not work the operator handed the
+/// run.
+pub fn run_members(conn: &Connection, ctx: &RunContext) -> Result<Vec<BeadRow>, CoreError> {
+    let sql = format!(
+        "SELECT {cols} FROM beads b
+         WHERE b.run_id = ?1 AND b.step_id IS NULL AND b.type = 'task' AND b.status <> 'closed'
+           AND b.id <> ?2
+           AND b.labels NOT LIKE '%\"bond:%' AND b.labels NOT LIKE '%\"drain:%'
+         ORDER BY (SELECT MIN(e.seq) FROM events e WHERE e.bead = b.id AND e.type = 'bead.created'), b.id",
+        cols = crate::readiness::BEAD_COLS,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<BeadRow> = stmt
+        .query_map(rusqlite::params![ctx.run_id, ctx.root], |r| {
+            crate::readiness::row_to_bead(r)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    // The `NOT LIKE`s above are NOT a prefilter — they are the OPERATIVE exclusion, and
+    // they are BROADER than this re-parse. That is the opposite of `bond_children` /
+    // `drain_children`, where a POSITIVE `LIKE` selects candidates and the re-parse
+    // narrows them; inverting the LIKE inverts the relationship, and this comment used
+    // to claim the `bond_children` shape here. It was wrong, and expensively so — a test
+    // harness read it, reproduced the label rule as "call the two parsers", and shipped
+    // a hole (see `close_member_REFUSES_a_MALFORMED_LABELLED_nonroot` in
+    // `camp/tests/daemon_drain.rs`).
+    //
+    // Concretely: a MALFORMED label like `drain:gc-999` (no index) is EXCLUDED by the
+    // SQL — labels serialize as a JSON array, so it appears as `"drain:` — while
+    // `parse_drain_label` returns `None` for it and would ADMIT it. The SQL drops beads
+    // the parsers accept as members.
+    //
+    // So this filter cannot drop a row the SQL kept: every label a parser accepts starts
+    // with `bond:`/`drain:`, hence appears as `"bond:`/`"drain:` in the column, hence was
+    // already excluded. Verified by deleting it — the workspace suite stays green. It is
+    // kept as belt-and-braces: if the SQL exclusion is ever narrowed, correctness must
+    // not silently depend on the LIKE alone.
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            !row.labels
+                .iter()
+                .any(|l| parse_bond_label(l).is_some() || parse_drain_label(l).is_some())
+        })
+        .collect())
+}
+
+/// The label linking a drain item run's ROOT to the anchor that scattered it.
+pub fn drain_label(anchor: &str, index: usize) -> String {
+    format!("drain:{anchor}:{index}")
+}
+
+pub fn parse_drain_label(label: &str) -> Option<(&str, usize)> {
+    let rest = label.strip_prefix("drain:")?;
+    let (anchor, index) = rest.rsplit_once(':')?;
+    if anchor.is_empty() {
+        return None;
+    }
+    Some((anchor, index.parse().ok()?))
+}
+
+/// The item runs already scattered for a drain anchor, by index. The
+/// `bond_children` mold exactly — a LIKE prefilter, then a real label re-parse.
+pub fn drain_children(
+    conn: &Connection,
+    anchor: &str,
+) -> Result<std::collections::BTreeMap<usize, BeadRow>, CoreError> {
+    let escaped = anchor
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%\"drain:{escaped}:%");
+    let mut stmt = conn.prepare(
+        "SELECT id, labels FROM beads
+         WHERE run_id IS NOT NULL AND step_id IS NULL
+           AND labels LIKE ?1 ESCAPE '\\'",
+    )?;
+    let candidates: Vec<(String, String)> = stmt
+        .query_map([pattern], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut children = std::collections::BTreeMap::new();
+    for (id, labels_json) in candidates {
+        let labels: Vec<String> = serde_json::from_str(&labels_json)
+            .map_err(|e| CoreError::Corrupt(format!("bead {id} labels are not JSON: {e}")))?;
+        for label in &labels {
+            if let Some((parent, index)) = parse_drain_label(label)
+                && parent == anchor
+            {
+                let row = crate::readiness::get_bead(conn, &id)?
+                    .ok_or_else(|| CoreError::Corrupt(format!("bead {id} vanished mid-query")))?;
+                children.insert(index, row);
+                break;
+            }
+        }
+    }
+    Ok(children)
+}
+
+/// Every member THIS anchor currently holds a reservation on.
+///
+/// **Status-agnostic, and that is the point (V-4).** `run_members` filters
+/// `status <> 'closed'`, so a member that CLOSED while its item run was in flight
+/// is invisible to it — and a release loop built on `run_members` would skip that
+/// member and leave its reservation held FOREVER. A reservation is a fact about
+/// `bead_meta`, so it is released by asking `bead_meta`.
+pub fn reservations_held_by(conn: &Connection, anchor: &str) -> Result<Vec<BeadRow>, CoreError> {
+    let sql = format!(
+        "SELECT {cols} FROM beads b
+           JOIN bead_meta m ON m.bead_id = b.id
+          WHERE m.key = ?1 AND m.value = ?2
+          ORDER BY b.id",
+        cols = crate::readiness::BEAD_COLS,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params![crate::readiness::EXCLUSIVE_DRAIN_RESERVATION, anchor],
+        crate::readiness::row_to_bead,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Reservations whose holding anchor is CLOSED or GONE — orphans.
+///
+/// A `kill -9` between the reserve batch and the cook leaves members held by an
+/// anchor that will never gather them. Without a sweep they are held FOREVER and
+/// no other drain can ever take them. Returns `(member_bead, holding_anchor)`.
+pub fn orphaned_reservations(conn: &Connection) -> Result<Vec<(String, String)>, CoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT m.bead_id, m.value
+           FROM bead_meta m
+           LEFT JOIN beads a ON a.id = m.value
+          WHERE m.key = ?1
+            AND (a.id IS NULL OR a.status = 'closed')
+          ORDER BY m.bead_id",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([crate::readiness::EXCLUSIVE_DRAIN_RESERVATION], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 /// The label linking a bond child's root to the anchor that fanned it out.

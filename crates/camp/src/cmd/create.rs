@@ -19,11 +19,42 @@ pub fn run(
     labels: Vec<String>,
     bead_type: Option<String>,
     assignee: Option<String>,
+    run: Option<String>,
 ) -> Result<()> {
     let config = CampConfig::load(&camp.config_path())?;
     let rig_cfg = resolve_rig(&config, rig.as_deref())?;
 
     let mut ledger = Ledger::open(&camp.db_path())?;
+
+    // Fail fast on an unknown run: a member bead silently attached to a run
+    // that does not exist would simply never be scattered, and nothing would
+    // say why.
+    if let Some(run_id) = &run {
+        if !ledger.run_exists(run_id)? {
+            bail!("unknown run {run_id:?} — `camp sling` cooks a run before it can have members");
+        }
+        // …and the run's formula must actually HAVE a drain.
+        //
+        // INVARIANT 3 (nothing hidden). A member is deliberately excluded from
+        // `dispatchable_beads` AND from `ready_task_count` — campd never dispatches
+        // one; a DRAIN scatters over it. So a member on a DRAINLESS run is SILENT
+        // DEAD WORK: it never runs, it never appears in `camp top`'s ready count, and
+        // nothing anywhere says why. Refuse it at creation, where the operator can
+        // still see the mistake.
+        let ctx = camp_core::formula::runtime::load_run(&camp.runs_path(), run_id)
+            .map_err(|e| anyhow::anyhow!("run {run_id:?}: {e}"))?;
+        if !ctx.formula.steps.iter().any(|s| s.drain.is_some()) {
+            bail!(
+                "run {run_id:?} was cooked from formula {:?}, which has NO drain step — \
+                 a run member is only ever consumed by a drain (campd never dispatches \
+                 one), so this bead would never run and would never appear in \
+                 `camp top`. Sling a formula with a `[steps.<id>.drain]`, or create \
+                 the bead without --run.",
+                ctx.formula.name
+            );
+        }
+    }
+
     let id = ledger.next_bead_id(&rig_cfg.prefix)?;
 
     let mut data = serde_json::json!({ "title": title });
@@ -41,6 +72,11 @@ pub fn run(
     }
     if let Some(a) = assignee {
         data["assignee"] = serde_json::json!(a);
+    }
+    // D3 — a run MEMBER: run_id set, step_id NULL, type task. That triple is
+    // exactly what `run_members` selects and what a drain scatters over.
+    if let Some(r) = run {
+        data["run_id"] = serde_json::json!(r);
     }
 
     let seq = ledger.append(EventInput {

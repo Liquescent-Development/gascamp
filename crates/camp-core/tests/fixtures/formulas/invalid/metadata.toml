@@ -1,6 +1,0 @@
-formula = "metadata"
-
-[[steps]]
-id = "a"
-title = "t"
-metadata = true

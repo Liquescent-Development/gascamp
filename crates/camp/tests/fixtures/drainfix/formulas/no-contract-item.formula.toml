@@ -1,0 +1,9 @@
+# Compiles fine. Declares NO graph compiler — neither `contract` nor `[requires]`.
+# It is IMPORTED, so D1 (ruling E) refuses it at RUN time. This is the fixture for
+# `execute_drain`'s not_runnable arm — the THIRD cook entry point, and §13's money
+# invariant.
+formula = "no-contract-item"
+
+[[steps]]
+id = "work"
+title = "Work the member"

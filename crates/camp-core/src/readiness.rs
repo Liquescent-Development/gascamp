@@ -3,6 +3,8 @@
 //! missing dependency never unblocks its dependents. Also the read surface
 //! `camp ls` uses. Pure queries over the state tables — no writes.
 
+use std::collections::BTreeMap;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
@@ -45,10 +47,33 @@ pub struct ListFilter<'a> {
     pub mine: Option<&'a str>,
 }
 
-const BEAD_COLS: &str = "id, rig, type, title, status, assignee, claimed_by, outcome, \
+// `pub(crate)`: `formula::runtime::run_members` selects the same projection.
+pub(crate) const BEAD_COLS: &str = "id, rig, type, title, status, assignee, claimed_by, outcome, \
                          labels, created_ts, updated_ts, work_outcome, dispatch_failure";
 
-fn row_to_bead(row: &rusqlite::Row<'_>) -> rusqlite::Result<BeadRow> {
+/// gc's key, VERBATIM (`beadmeta/keys.go:93`; invariant 7 — camp mirrors the
+/// vocabulary where the concept exists). The value is the reserving drain's
+/// anchor bead id, so a conflict can NAME the holder.
+///
+/// It is METADATA, not an event name. No event may ever be called
+/// `drain.reserved` — `vocab::no_reservation_vocabulary_exists` forbids any
+/// event name containing "reserv", and that guard scans event names only.
+pub const EXCLUSIVE_DRAIN_RESERVATION: &str = "gc.exclusive_drain_reservation";
+
+/// Metadata keys that have a DEDICATED COLUMN on `beads`: PROJECTED at read,
+/// REFUSED at write, and the refusal NAMES the column.
+///
+/// Two sources of truth for one fact is how state rots. compat-3 stamps
+/// `gc.routed_to` / `gc.work_branch` when it dispatches; if metadata could also
+/// hold them, a bead could say it was routed to one agent in its column and
+/// another in its metadata, and nothing would be wrong enough to fail. The
+/// storage rule is fixed HERE, before compat-3 can inherit the ambiguity.
+pub const PROJECTED_METADATA: &[(&str, &str)] = &[
+    ("gc.routed_to", "assignee"),
+    ("gc.work_branch", "work_branch"),
+];
+
+pub(crate) fn row_to_bead(row: &rusqlite::Row<'_>) -> rusqlite::Result<BeadRow> {
     let labels_json: String = row.get(8)?;
     let labels: Vec<String> = serde_json::from_str(&labels_json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
@@ -162,11 +187,49 @@ pub fn ready_task_count(conn: &Connection) -> Result<u64, CoreError> {
         "SELECT count(*) FROM beads b
          WHERE b.status = 'open' AND {TASK}
            AND b.dispatch_failure IS NULL
+           AND NOT (b.run_id IS NOT NULL AND b.step_id IS NULL)
            AND NOT EXISTS (
              SELECT 1 FROM deps d LEFT JOIN beads t ON t.id = d.needs_id
              WHERE d.bead_id = b.id AND {UNMET_DEP})"
     );
     count_nonneg(conn, &sql, "ready-task")
+}
+
+/// A bead's metadata: the `bead_meta` rows, with the dedicated columns
+/// PROJECTED over them ([`PROJECTED_METADATA`]) so a reader sees one complete
+/// map and never has to know which facts live in a column.
+pub fn bead_metadata(conn: &Connection, bead: &str) -> Result<BTreeMap<String, String>, CoreError> {
+    let mut out = BTreeMap::new();
+    let mut stmt = conn.prepare("SELECT key, value FROM bead_meta WHERE bead_id = ?1")?;
+    let rows = stmt.query_map([bead], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (k, v) = row?;
+        out.insert(k, v);
+    }
+    // The projections. A NULL column contributes no key — absent, not empty.
+    let mut stmt = conn.prepare("SELECT assignee, work_branch FROM beads WHERE id = ?1")?;
+    let cols: Option<(Option<String>, Option<String>)> = stmt
+        .query_row([bead], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    if let Some((assignee, work_branch)) = cols {
+        for (key, column) in PROJECTED_METADATA {
+            let value = match *column {
+                "assignee" => assignee.clone(),
+                "work_branch" => work_branch.clone(),
+                other => {
+                    return Err(CoreError::Corrupt(format!(
+                        "PROJECTED_METADATA names column {other:?}, which bead_metadata does not read"
+                    )));
+                }
+            };
+            if let Some(value) = value {
+                out.insert((*key).to_owned(), value);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The reason prefix campd stamps on a `dispatch.failed` that is a worker-cap
@@ -676,5 +739,113 @@ mod tests {
         assert_eq!(dispatchable[0].assignee.as_deref(), Some("dev"));
         assert_eq!(dispatchable[0].status, "open");
         assert_eq!(dispatchable[0].claimed_by, None);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(non_snake_case)]
+mod ready_count_tests {
+    use crate::clock::FixedClock;
+    use crate::event::{EventInput, EventType};
+    use crate::ledger::Ledger;
+
+    fn ledger() -> (tempfile::TempDir, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Ledger::open_with_clock(
+            &dir.path().join("camp.db"),
+            Box::new(FixedClock::new("2026-07-05T21:14:03Z")),
+        )
+        .unwrap();
+        (dir, l)
+    }
+
+    fn bead(l: &mut Ledger, id: &str, data: serde_json::Value) {
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some(id.into()),
+            data,
+        })
+        .unwrap();
+    }
+
+    fn close(l: &mut Ledger, id: &str) {
+        l.append(EventInput {
+            kind: EventType::BeadClaimed,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some(id.into()),
+            data: serde_json::json!({"session": "s"}),
+        })
+        .unwrap();
+        l.append(EventInput {
+            kind: EventType::BeadClosed,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some(id.into()),
+            data: serde_json::json!({"outcome": "pass"}),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn ready_excludes_a_RUN_MEMBER_and_a_COMPLETED_RUN_ROOT() {
+        // ⭐ B1 — the ONLY production line this change adds to `readiness.rs`, and
+        // NOTHING defended it: deleting the run-root exclusion left the entire
+        // workspace green.
+        //
+        // It was not merely untested — it was UNTESTABLE by the fixtures that
+        // existed, because a run ROOT is always blocked by its own step deps, so the
+        // predicate is a NO-OP for it. The exclusion only bites on the two shapes no
+        // fixture had:
+        //
+        //   (a) a run MEMBER — `camp create --run <id>`: run_id set, step_id NULL,
+        //       NO deps. NEW in this change. campd never dispatches it (a drain
+        //       scatters over it), so counting it as `ready` is a lie.
+        //   (b) a run ROOT whose steps have ALL CLOSED — no longer blocked, and
+        //       campd never dispatches a root either.
+        //
+        // This test constructs both, and it FAILS if the exclusion is removed.
+        let (_d, mut l) = ledger();
+
+        // A run: root + one step. The root `needs` the step, as cook writes it.
+        bead(
+            &mut l,
+            "gc-1",
+            serde_json::json!({"title": "root", "run_id": "r1", "needs": ["gc-2"]}),
+        );
+        bead(
+            &mut l,
+            "gc-2",
+            serde_json::json!({"title": "step", "run_id": "r1", "step_id": "s1"}),
+        );
+        // A run MEMBER (`camp create --run r1`): no step_id, NO needs.
+        bead(
+            &mut l,
+            "gc-3",
+            serde_json::json!({"title": "member", "run_id": "r1"}),
+        );
+        // …and one ordinary bead, which IS ready.
+        bead(&mut l, "gc-4", serde_json::json!({"title": "plain"}));
+
+        // Only the step and the plain bead are ready. The MEMBER is not: campd will
+        // never dispatch it. (Without the exclusion it would be counted — it is open,
+        // a task, and has no unmet deps.)
+        assert_eq!(
+            l.status_summary().unwrap().ready,
+            2,
+            "a run MEMBER is never dispatched and must not be counted ready"
+        );
+
+        // Close the step. The root is now UNBLOCKED — and still must not be ready,
+        // because campd never dispatches a run root either.
+        close(&mut l, "gc-2");
+        assert_eq!(
+            l.status_summary().unwrap().ready,
+            1,
+            "a COMPLETED run root is unblocked but is still never dispatched"
+        );
     }
 }

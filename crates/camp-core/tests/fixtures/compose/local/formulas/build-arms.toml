@@ -1,0 +1,29 @@
+formula = "build-arms"
+contract = "graph.v2"
+
+[vars]
+drain_policy = "separate"
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "implement"
+title = "Implement each member"
+condition = "{{drain_policy}} == separate"
+needs = ["decompose"]
+[steps.drain]
+context = "separate"
+formula = "item"
+member_access = "exclusive"
+
+# the SHARED arm — refused, but PRUNED before the refusal is ever collected
+[[steps]]
+id = "implement-shared"
+title = "Implement in one session"
+condition = "{{drain_policy}} == same-session"
+needs = ["decompose"]
+[steps.drain]
+context = "shared"
+formula = "item"

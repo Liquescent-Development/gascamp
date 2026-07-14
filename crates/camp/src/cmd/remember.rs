@@ -16,5 +16,7 @@ pub fn run(camp: &CampDir, fact: String, rig: Option<String>) -> Result<()> {
         Vec::new(),
         Some("memory".to_owned()),
         None,
+        // A memory is never a run member.
+        None,
     )
 }

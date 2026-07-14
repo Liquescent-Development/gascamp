@@ -1,9 +1,12 @@
+# BD6: this fixture used to carry `tags = ["x"]` — which is now an ACCEPTED
+# annotation, so the fixture stopped producing the violation its own test
+# asserted. `gate` is a §4 rule-1 refusal (0 corpus uses) and stays refused.
 formula = "wrong-name"
 pour = true
 
 [[steps]]
 id = "a"
 title = "t"
-tags = ["x"]
+gate = { path = "x" }
 needs = ["ghost"]
 timeout = "5m"

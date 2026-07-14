@@ -3,6 +3,8 @@
 //! `refold` replays it against a shadow database — it must stay a pure
 //! function of (state, event).
 
+use std::collections::BTreeMap;
+
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -58,6 +60,7 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         // state fold (the materialized tree under <root>/imports/ is the
         // state, owned by `camp import`).
         EventType::ImportAdded | EventType::ImportRefused => Ok(()),
+        EventType::FormulaRefused => formula_refused(event),
     }
 }
 
@@ -112,6 +115,9 @@ struct BeadCreated {
     run_id: Option<String>,
     #[serde(default)]
     step_id: Option<String>,
+    /// compat §6.1 — gc's step metadata, carried onto the bead verbatim.
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
 }
 
 fn default_bead_type() -> String {
@@ -179,11 +185,80 @@ fn bead_created(conn: &Connection, event: &Event) -> Result<(), CoreError> {
             });
         }
     }
+    for (key, value) in &p.metadata {
+        write_meta(conn, event, id, key, value)?;
+    }
     conn.execute(
         "INSERT INTO search (bead_id, kind, content) VALUES (?1, 'body', ?2)",
         params![id, format!("{}\n{}", p.title, p.description)],
     )?;
     crate::id::bump_counter(conn, id)?;
+    Ok(())
+}
+
+/// Set one metadata key, applying the two rules that make `bead_meta` a single
+/// source of truth.
+///
+/// **1. A key with a dedicated column is REFUSED**, naming the column
+/// ([`PROJECTED_METADATA`]). Otherwise a bead could carry a routing target in
+/// its `assignee` column AND a different one in its metadata, and nothing would
+/// be wrong enough to fail.
+///
+/// **2. The reservation is a COMPARE-AND-SET, and it lives HERE, in the fold.**
+/// A read-then-append in the caller would be a real TOCTOU race: two drains
+/// could both read "unheld" and both append. The fold is the only place where
+/// the check and the write are the same transaction — `append` rolls back
+/// entirely on `Err` ("rejections appended nothing"), and `build_shadow`
+/// replays the ACCEPTED log through this same function, so the CAS is a pure
+/// function of the accepted prefix and the refold reproduces it exactly.
+fn write_meta(
+    conn: &Connection,
+    event: &Event,
+    bead: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), CoreError> {
+    if let Some((_, column)) = crate::readiness::PROJECTED_METADATA
+        .iter()
+        .find(|(k, _)| *k == key)
+    {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: format!(
+                "metadata key {key:?} has a dedicated column (`beads.{column}`) and is projected \
+                 from it at read; write the column, not the metadata — two sources of truth for \
+                 one fact is not a thing camp keeps"
+            ),
+        });
+    }
+    if key == crate::readiness::EXCLUSIVE_DRAIN_RESERVATION {
+        use rusqlite::OptionalExtension;
+        let held: Option<String> = conn
+            .query_row(
+                "SELECT value FROM bead_meta WHERE bead_id = ?1 AND key = ?2",
+                params![bead, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // Same holder re-reserving is idempotent; a DIFFERENT holder is the
+        // conflict the reservation exists to prevent, and it NAMES the holder.
+        if let Some(holder) = held
+            && holder != value
+        {
+            return Err(CoreError::InvalidEventData {
+                event_type: event.kind.as_str().to_owned(),
+                reason: format!(
+                    "bead {bead} is already reserved by drain {holder}; drain {value} cannot take \
+                     it — two drains must never mutate one bead"
+                ),
+            });
+        }
+    }
+    conn.execute(
+        "INSERT INTO bead_meta (bead_id, key, value) VALUES (?1, ?2, ?3)
+         ON CONFLICT (bead_id, key) DO UPDATE SET value = excluded.value",
+        params![bead, key, value],
+    )?;
     Ok(())
 }
 
@@ -228,15 +303,20 @@ struct BeadUpdated {
     title: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    /// compat §6.1/§9: `Some(v)` sets, `None` UNSETS. The drain reservation
+    /// rides this event — there is no `drain.reserved` event and there never
+    /// will be (`vocab::no_reservation_vocabulary_exists`).
+    #[serde(default)]
+    metadata: BTreeMap<String, Option<String>>,
 }
 
 fn bead_updated(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     let id = required_bead(event)?;
     let p: BeadUpdated = payload(event)?;
-    if p.title.is_none() && p.description.is_none() {
+    if p.title.is_none() && p.description.is_none() && p.metadata.is_empty() {
         return Err(CoreError::InvalidEventData {
             event_type: event.kind.as_str().to_owned(),
-            reason: "update must set title and/or description".to_owned(),
+            reason: "update must set title and/or description and/or metadata".to_owned(),
         });
     }
     // Same rule as creation (PR #18 review finding 1): a patch must not
@@ -251,6 +331,20 @@ fn bead_updated(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     }
     if bead_status(conn, id)?.is_none() {
         return Err(CoreError::UnknownBead(id.to_owned()));
+    }
+    for (key, value) in &p.metadata {
+        match value {
+            Some(value) => write_meta(conn, event, id, key, value)?,
+            // Unset. The release path — and it must be able to release a key
+            // that is not held (an orphan sweep runs against beads it has not
+            // checked), so a no-op DELETE is success, not an error.
+            None => {
+                conn.execute(
+                    "DELETE FROM bead_meta WHERE bead_id = ?1 AND key = ?2",
+                    params![id, key],
+                )?;
+            }
+        }
     }
     conn.execute(
         "UPDATE beads SET title = COALESCE(?1, title),
@@ -494,6 +588,40 @@ fn non_empty(event: &Event, field: &str, value: &str) -> Result<(), CoreError> {
             event_type: event.kind.as_str().to_owned(),
             reason: format!("empty {field}"),
         });
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FormulaRefused {
+    formula: String,
+    /// The KEY camp refused — not always the key that carried it: a
+    /// `gc.kind = "scope"` inside an accepted `metadata` map refuses as
+    /// `gc.kind` (compat §4 trap 2).
+    key: String,
+    reason: String,
+    /// The step the refusal belongs to, when it belongs to one.
+    #[serde(default)]
+    step: Option<String>,
+}
+
+/// `formula.refused` is log-only (compat §4 rule 1): a formula named a Gas City
+/// construct camp does not implement, and camp declined to load it rather than
+/// approximate its semantics. No state fold — the formula never became a run.
+///
+/// It has no bead: the refusal happens BEFORE anything is cooked. That is the
+/// whole point — §13's money invariant says a formula camp cannot honour must
+/// never reach a worker.
+fn formula_refused(event: &Event) -> Result<(), CoreError> {
+    let p: FormulaRefused = payload(event)?;
+    non_empty(event, "formula", &p.formula)?;
+    non_empty(event, "key", &p.key)?;
+    non_empty(event, "reason", &p.reason)?;
+    // Present-but-empty is a bug in the producer, not a step-less refusal:
+    // a formula-scoped refusal omits the field entirely.
+    if let Some(step) = &p.step {
+        non_empty(event, "step", step)?;
     }
     Ok(())
 }

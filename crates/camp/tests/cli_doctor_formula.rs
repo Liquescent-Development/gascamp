@@ -44,10 +44,14 @@ fn doctor_formula_exits_1_listing_every_violation() {
         .args(["init", "--no-service"])
         .assert()
         .success();
+    // `tags` is an accepted ANNOTATION now (compat §4) — it is deliberately not
+    // asserted here. `gate` is a §4 rule-1 REFUSAL, and the point of this test
+    // is that human mode prints refusals as well as violations: `pour` and
+    // `gate` reach stdout only because `run_formula` walks BOTH buckets.
     let f = write(
         dir.path(),
         "broken.toml",
-        "formula = \"wrong-name\"\npour = true\n\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ntags = [\"x\"]\nneeds = [\"ghost\"]\n",
+        "formula = \"wrong-name\"\npour = true\n\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ngate = { path = \"x\" }\nneeds = [\"ghost\"]\n",
     );
     camp()
         .current_dir(dir.path())
@@ -57,10 +61,11 @@ fn doctor_formula_exits_1_listing_every_violation() {
         .failure()
         .code(1)
         .stdout(predicates::str::contains("pour"))
-        .stdout(predicates::str::contains("tags"))
+        .stdout(predicates::str::contains("gate"))
         .stdout(predicates::str::contains("file stem"))
         .stdout(predicates::str::contains("ghost"))
-        .stderr(predicates::str::contains("violation"));
+        .stderr(predicates::str::contains("violation"))
+        .stderr(predicates::str::contains("refusal"));
 }
 
 #[test]

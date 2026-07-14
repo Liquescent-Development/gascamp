@@ -1,0 +1,7 @@
+formula = "bad-condition"
+contract = "graph.v2"
+
+[[steps]]
+id = "a"
+title = "A"
+condition = "drain_policy ~= separate"

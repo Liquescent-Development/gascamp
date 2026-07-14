@@ -45,18 +45,45 @@ pub fn run(
 /// running campd. Prints "<run_id> root <root-bead>".
 fn sling_formula(camp: &CampDir, name: &str, rig: Option<String>) -> Result<()> {
     let config = CampConfig::load(&camp.config_path())?;
-    let rig_cfg = resolve_rig(&config, rig.as_deref())?;
-    // compat §6/§7.1: resolve through the import + local layers, so an
-    // imported formula is reachable via `camp sling --formula`. (Running an
-    // imported formula via sling remains phase 2 — §12; phase 1 fixes the
-    // RESOLUTION path only.)
-    let path = camp_core::orders::resolve_formula(&config, name)
-        .map_err(|e| anyhow::anyhow!("formula {name:?}: {e}"))?;
-    let formula = camp_core::formula::parse_and_validate(&path)
-        .map_err(|e| anyhow::anyhow!("formula {name:?} is invalid:\n{e}"))?;
+    let rig_cfg = resolve_rig(&config, rig.as_deref())?.clone();
+    // compat §9: compile through the LAYER STACK. `parse_and_validate` (the
+    // no-layer, camp-local entry) cannot resolve an imported formula's `extends`,
+    // its `description_file`, or its routes — and every corpus formula needs all
+    // three.
+    let layers = camp_core::formula::FormulaLayers::from_config(&config, &camp.root)?;
+    let compiled = camp_core::formula::compile_named(
+        &layers,
+        &config,
+        name,
+        &std::collections::BTreeMap::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("formula {name:?} did not compile:\n{e}"))?;
+
+    // D1 (ruling E) — LOADABLE ≠ RUNNABLE. Of the 95 corpus formulas camp
+    // compiles, 16 declare no graph compiler at all and 14 are expansions: 30
+    // that camp refuses at RUN time rather than run under semantics they never
+    // claimed. Camp-LOCAL formulas are exempt from the gate (the operator's own
+    // formula is not a gc pack making a contract claim), so this refuses only
+    // imported ones.
+    if let Some(why) = &compiled.not_runnable {
+        let mut ledger = Ledger::open(&camp.db_path())?;
+        refuse_formula(&mut ledger, name, why)?;
+        bail!("formula {name:?} cannot be run: {}", why.reason);
+    }
+
+    let opts = camp_core::formula::CookOptions {
+        config: Some(config.clone()),
+        ..Default::default()
+    };
     let mut ledger = Ledger::open(&camp.db_path())?;
-    let cooked =
-        camp_core::formula::cook(&mut ledger, &formula, &camp.runs_path(), rig_cfg, "cli")?;
+    let cooked = camp_core::formula::cook_with(
+        &mut ledger,
+        &compiled.formula,
+        &camp.runs_path(),
+        &rig_cfg,
+        "cli",
+        &opts,
+    )?;
     // the root's run.cooked is the batch's last event — the poke seq
     // (advisory; the settle reads past the cursor regardless)
     let head = ledger
@@ -127,6 +154,35 @@ fn sling_bead(
              only a healthy, running campd dispatches; it runs as soon as one is (campd \
              catches up from its cursor on start)"
         ))
+    })?;
+    Ok(())
+}
+
+/// A refusal LANDS IN THE LEDGER (compat §4 rule 1; exit criterion: "refusals
+/// name their key and land as ledger events").
+///
+/// "The formula did not run" is not an answer an operator can act on. The event
+/// NAMES THE KEY — which, for a scope-check hiding in step metadata, is not even
+/// the key that carried it (§4 trap 2).
+pub(crate) fn refuse_formula(
+    ledger: &mut Ledger,
+    name: &str,
+    refusal: &camp_core::formula::Refusal,
+) -> Result<()> {
+    let mut data = serde_json::json!({
+        "formula": name,
+        "key": refusal.key,
+        "reason": refusal.reason,
+    });
+    if let Some(step) = &refusal.step {
+        data["step"] = serde_json::json!(step);
+    }
+    ledger.append(EventInput {
+        kind: EventType::FormulaRefused,
+        rig: None,
+        actor: "cli".into(),
+        bead: None,
+        data,
     })?;
     Ok(())
 }

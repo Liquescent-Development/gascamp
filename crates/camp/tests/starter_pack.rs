@@ -32,7 +32,17 @@ fn starter_formula_is_the_corpus_file_and_doctor_accepts_it() {
         "the symlink must resolve to the corpus file"
     );
 
+    // `doctor --formula` COMPILES THROUGH THE LAYERS now (compat §9): an imported
+    // formula's `extends`, `description_file` and routes only resolve against a
+    // real camp, so the verb needs one — as every other verb already does.
+    let dir = tempfile::tempdir().unwrap();
+    Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["init", "--no-service"])
+        .status()
+        .unwrap();
     let out = Command::new(BIN)
+        .current_dir(dir.path())
         .args(["doctor", "--formula"])
         .arg(&pack_formula)
         .output()

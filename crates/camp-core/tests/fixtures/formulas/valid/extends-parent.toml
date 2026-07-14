@@ -1,0 +1,17 @@
+# Rung 2c's PARENT. The CHILD lives in tests/fixtures/compose/ — an `extends`
+# child needs a parent LAYER, and the gc validator compiles each file standalone
+# against one search path.
+formula = "extends-parent"
+contract = "graph.v2"
+
+[vars]
+drain_policy = "separate"
+
+[[steps]]
+id = "first"
+title = "First"
+
+[[steps]]
+id = "second"
+title = "Second"
+needs = ["first"]

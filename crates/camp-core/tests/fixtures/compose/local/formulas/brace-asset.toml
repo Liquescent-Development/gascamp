@@ -1,0 +1,9 @@
+formula = "brace-asset"
+contract = "graph.v2"
+
+# The asset is named, ON DISK, literally `{target}.note.md` — with the braces.
+# 121 corpus assets are named this way. `description_file` is NEVER substituted.
+[[steps]]
+id = "a"
+title = "A"
+description_file = "../assets/workflows/{target}.note.md"

@@ -1097,8 +1097,22 @@ pub struct PendingFanout {
     pub anchor: String,
 }
 
+/// A drain the settle loop owes: campd has CLAIMED the anchor and must now
+/// scatter one item run per run member.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingDrain {
+    pub run_id: String,
+    pub step_id: String,
+    pub anchor: String,
+}
+
 pub struct GraphRuntime {
     camp_root: PathBuf,
+    /// The config, for resolving a drain's ITEM FORMULA through the layer stack
+    /// and cooking it with its routes bound. `execute_fanout`'s bond path
+    /// hardcodes `<camp>/formulas/<bond>.toml`, which cannot reach an imported
+    /// formula — and EVERY corpus item formula is imported.
+    config: camp_core::config::CampConfig,
     /// rig snapshot (check-script cwd, bond-cook prefix) — same
     /// campd-start freshness as the Dispatcher's config.
     rigs: HashMap<String, camp_core::config::RigConfig>,
@@ -1107,6 +1121,7 @@ pub struct GraphRuntime {
     runs: HashMap<String, Option<Arc<RunContext>>>,
     pending_checks: Vec<PendingCheck>,
     pending_fanouts: Vec<PendingFanout>,
+    pending_drains: Vec<PendingDrain>,
     /// Live check-script children by pid, reaped on SIGCHLD like workers.
     check_children: HashMap<u32, CheckChild>,
 }
@@ -1143,10 +1158,12 @@ impl GraphRuntime {
     pub fn new(camp_root: PathBuf, config: &camp_core::config::CampConfig) -> GraphRuntime {
         GraphRuntime {
             camp_root,
+            config: config.clone(),
             rigs: rig_snapshot(config),
             runs: HashMap::new(),
             pending_checks: Vec::new(),
             pending_fanouts: Vec::new(),
+            pending_drains: Vec::new(),
             check_children: HashMap::new(),
         }
     }
@@ -1205,6 +1222,15 @@ impl GraphRuntime {
             if let Err(error) = self.execute_fanout(ledger, fanout) {
                 for survivor in &fanouts[i..] {
                     self.pending_fanouts.push(survivor.clone());
+                }
+                return Err(error);
+            }
+        }
+        let drains = std::mem::take(&mut self.pending_drains);
+        for (i, drain) in drains.iter().enumerate() {
+            if let Err(error) = self.execute_drain(ledger, drain) {
+                for survivor in &drains[i..] {
+                    self.pending_drains.push(survivor.clone());
                 }
                 return Err(error);
             }
@@ -1303,6 +1329,14 @@ impl GraphRuntime {
                 vars,
                 extra_root_needs,
                 extra_root_labels: vec![flow::bond_label(&fanout.anchor, index)],
+                root_metadata: Default::default(),
+                // The bond path resolves its formula at `<camp>/formulas/<bond>.toml`
+                // — camp-local, no layers (:1230). `on_complete` has ZERO corpus
+                // uses, so this path is not corpus-reachable and needs no binding
+                // namespace. A bond formula that DOES carry a `gc.run_target` fails
+                // loudly in `instantiate` rather than dispatching an unrouted
+                // worker.
+                config: None,
             };
             if let Err(e) = camp_core::formula::cook_with(
                 ledger,
@@ -1719,6 +1753,18 @@ impl GraphRuntime {
             if step_ref.anchor != anchor_row.id {
                 continue;
             }
+            // A campd-held DRAIN anchor: its scatter (or gather) died with the
+            // process. Re-queue it — `execute_drain` is idempotent, gathering
+            // instead of re-scattering when children already exist, so a restart
+            // never double-materializes.
+            if step_ref.step.drain.is_some() {
+                self.queue_drain(PendingDrain {
+                    run_id: membership.run_id.clone(),
+                    step_id: step_id.clone(),
+                    anchor: anchor_row.id.clone(),
+                });
+                continue;
+            }
             let attempts = ledger.step_attempts(&membership.run_id, &step_id, &anchor_row.id)?;
             let Some(latest) = attempts.last() else {
                 continue; // claim landed, attempt creation is cursor-atomic
@@ -1813,6 +1859,15 @@ impl GraphRuntime {
                 }
             }
         }
+
+        // (4) THE ORPHAN SWEEP. A `kill -9` between the reserve batch and the
+        // cook leaves members held by an anchor that will never gather them.
+        // Without this they are held FOREVER and no other drain can ever take
+        // them — a reservation leak that outlives the process that made it.
+        //
+        // A reservation naming an anchor that is CLOSED or ABSENT is an orphan,
+        // by definition: a live anchor is `in_progress` and was re-queued above.
+        release_orphaned_reservations(ledger)?;
         Ok(())
     }
 
@@ -1914,6 +1969,20 @@ impl GraphRuntime {
         let Some(row) = camp_core::readiness::get_bead(conn, root)? else {
             return Ok(());
         };
+        // A closed DRAIN ITEM ROOT re-queues its anchor, so the gather can see
+        // whether every item is in.
+        for label in &row.labels {
+            if let Some((anchor, _index)) = flow::parse_drain_label(label)
+                && let Some(pm) = flow::run_membership(conn, anchor)?
+                && let Some(step_id) = pm.step_id
+            {
+                self.queue_drain(PendingDrain {
+                    run_id: pm.run_id,
+                    step_id,
+                    anchor: anchor.to_owned(),
+                });
+            }
+        }
         for label in &row.labels {
             let Some((parent_anchor, _index)) = flow::parse_bond_label(label) else {
                 continue;
@@ -1955,7 +2024,10 @@ impl GraphRuntime {
         let Some(step_ref) = ctx.step_ref(&step_id) else {
             return Ok(());
         };
-        if step_ref.anchor != bead || !flow::is_looping(step_ref.step) {
+        // CAMPD-HELD, not merely looping: a drain anchor is campd's too (gc's
+        // "controller-owned control bead"). Without this a drain anchor stays
+        // `open` and `dispatchable_beads` hands it to a WORKER.
+        if step_ref.anchor != bead || !flow::is_campd_held(step_ref.step) {
             return Ok(());
         }
         let Some(row) = camp_core::readiness::get_bead(conn, bead)? else {
@@ -1976,7 +2048,29 @@ impl GraphRuntime {
             },
         )?;
         let step = step_ref.step.clone();
-        self.create_attempt(conn, now, &ctx, &step, &row, 1, None)?;
+        // ⭐ BD3. `create_attempt` used to run UNCONDITIONALLY here, and a drain
+        // anchor would have got one: `create_attempt` emits a `bead.created` with
+        // run_id + step_id, `type = task`, OPEN, NO needs — EXACTLY the shape
+        // `dispatchable_beads` picks up. So every drain step would spawn a real
+        // worker (§13's money invariant, on the very path this phase protects)
+        // AND that phantom attempt's close would fall through `on_attempt_closed`
+        // to `Ok(())` silently, closing the anchor early, so the gather's
+        // `close_anchor` hit `InvalidTransition` — B4, reintroduced through B4's
+        // own fix.
+        //
+        // Rev 2's four tests ALL PASSED against that, because they only ever
+        // checked THE ANCHOR — and the phantom attempt is a DIFFERENT BEAD ID.
+        if flow::is_looping(&step) {
+            // Attempts ARE the check/retry mechanism.
+            self.create_attempt(conn, now, &ctx, &step, &row, 1, None)?;
+        } else {
+            // A drain anchor: campd SCATTERS. It never attempts.
+            self.queue_drain(PendingDrain {
+                run_id: membership.run_id.clone(),
+                step_id: step_id.clone(),
+                anchor: bead.to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -2217,6 +2311,33 @@ impl GraphRuntime {
         )? {
             Ledger::append_on(conn, now, input)?;
         }
+        // BD-1, same class: a dead-ended run's drain anchors will never gather, so
+        // every member they hold would be held FOREVER. The release table promised
+        // "release every member held by any anchor of that run"; `dead_end_inputs`
+        // emits no releases, so it is done here — status-agnostic, like every other
+        // release path (V-4).
+        for (member, anchor) in flow::orphaned_reservations(conn)? {
+            let Some(row) = camp_core::readiness::get_bead(conn, &member)? else {
+                continue;
+            };
+            Ledger::append_on(
+                conn,
+                now,
+                EventInput {
+                    kind: EventType::BeadUpdated,
+                    rig: Some(row.rig.clone()),
+                    actor: "campd".into(),
+                    bead: Some(member),
+                    data: serde_json::json!({
+                        "metadata": {
+                            camp_core::readiness::EXCLUSIVE_DRAIN_RESERVATION:
+                                serde_json::Value::Null,
+                        }
+                    }),
+                },
+            )?;
+            let _ = anchor;
+        }
         Ok(())
     }
 
@@ -2230,6 +2351,391 @@ impl GraphRuntime {
         if !self.pending_fanouts.contains(&pending) {
             self.pending_fanouts.push(pending);
         }
+    }
+
+    fn queue_drain(&mut self, pending: PendingDrain) {
+        if !self.pending_drains.contains(&pending) {
+            self.pending_drains.push(pending);
+        }
+    }
+
+    /// SCATTER, then GATHER — gc's real separate-drain semantics (RULING 4).
+    ///
+    /// > **A separate drain is EAGER, ALL-MEMBERS, ALWAYS-`continue`,
+    /// > ALL-OR-NOTHING.**
+    ///
+    /// `single_lane` and `on_item_failure` are carried in `gc.drain_*` metadata
+    /// and **never read** — because gc never reads them either for a separate
+    /// drain (F5/F6). There is no materialization matrix; it was killed for
+    /// inventing behavior gc does not have.
+    fn execute_drain(&mut self, ledger: &mut Ledger, drain: &PendingDrain) -> Result<()> {
+        // A dead-ended run is the ONE arm that legitimately drops the pending drain:
+        // `ctx()` already evented the dead-end, and `dead_end_run` releases what this
+        // anchor held.
+        let Some(ctx) = self.ctx(&drain.run_id) else {
+            return Ok(());
+        };
+        // The rest are structurally impossible — the anchor was claimed from this
+        // very step a moment ago. They are LOUD anyway: the `PendingDrain` has been
+        // `mem::take`n, so a silent return DROPS it and leaves the campd-held anchor
+        // `in_progress` FOREVER. That is the swallowed-fault shape §2.1 names, and it
+        // is what bit PR #97.
+        let Some(step_ref) = ctx.step_ref(&drain.step_id) else {
+            return Err(CoreError::Corrupt(format!(
+                "drain {}: step {:?} is not in the pinned recipe — the anchor would hang \
+                 in_progress forever",
+                drain.anchor, drain.step_id
+            ))
+            .into());
+        };
+        let Some(spec) = step_ref.step.drain.clone() else {
+            return Err(CoreError::Corrupt(format!(
+                "drain {}: step {:?} carries no drain in the pinned recipe — the anchor \
+                 would hang in_progress forever",
+                drain.anchor, drain.step_id
+            ))
+            .into());
+        };
+        let Some(anchor_row) = ledger.bead_row(&drain.anchor)? else {
+            return Err(CoreError::Corrupt(format!(
+                "drain anchor {} does not exist — it would hang in_progress forever",
+                drain.anchor
+            ))
+            .into());
+        };
+        if anchor_row.status == "closed" {
+            return Ok(());
+        }
+
+        let children = ledger.drain_children(&drain.anchor)?;
+        if !children.is_empty() {
+            // Already scattered — GATHER instead (a campd restart re-queues the
+            // anchor, and it must not double-materialize).
+            return self.gather_drain(ledger, drain, &ctx, &spec, &anchor_row, &children);
+        }
+
+        let members = ledger.run_members(&ctx)?;
+
+        // gc's RUNTIME cap (drain.go:24, :244-255). The authored `max_units` key
+        // is refused by name; the cap is honoured anyway, because gc hard-closes
+        // a drain over it and camp will not scatter 200 workers where gc fails.
+        if members.len() > flow::DRAIN_MAX_UNITS {
+            return self.close_drain(
+                ledger,
+                drain,
+                &ctx,
+                &anchor_row,
+                "fail",
+                Some("hard_fail"),
+                &format!(
+                    "limit_exceeded: {} members exceeds the drain cap of {}",
+                    members.len(),
+                    flow::DRAIN_MAX_UNITS
+                ),
+                Vec::new(),
+            );
+        }
+        if members.is_empty() {
+            // Nothing to scatter: the drain passes trivially. (S17 makes this
+            // rare — a drain must `needs` the step that creates its members.)
+            return self.close_drain(
+                ledger,
+                drain,
+                &ctx,
+                &anchor_row,
+                "pass",
+                None,
+                "drain gathered: 0 members",
+                Vec::new(),
+            );
+        }
+
+        // ⭐ BD4 — RESERVE THE WHOLE MEMBER SET IN ONE BATCH, BEFORE MATERIALIZING
+        // ANYTHING. gc does the same (`reserveDrainMembers` takes the whole set
+        // before the materialize loop, drain.go:113-118).
+        //
+        // Reserving incrementally and "releasing 1..k" on a conflict at k+1 is a
+        // CORRECTNESS BUG, not a tidiness one: item-run 1 is already cooked and
+        // its workers are dispatchable on m1, so releasing m1 lets a SECOND drain
+        // reserve it and cook its own item run over it — two drains mutating one
+        // bead, the exact thing the reservation exists to prevent.
+        //
+        // In one `append_batch`, a CAS rejection rolls the WHOLE batch back for
+        // free (ledger/mod.rs:982 — "rejections appended nothing"), so a partial
+        // reservation state is UNREPRESENTABLE and the compensating-release path
+        // does not exist.
+        if spec.member_access == camp_core::formula::MemberAccess::Exclusive {
+            let reservations: Vec<EventInput> = members
+                .iter()
+                .map(|m| EventInput {
+                    kind: EventType::BeadUpdated,
+                    rig: Some(m.rig.clone()),
+                    actor: "campd".into(),
+                    bead: Some(m.id.clone()),
+                    data: serde_json::json!({
+                        "metadata": {
+                            camp_core::readiness::EXCLUSIVE_DRAIN_RESERVATION: drain.anchor,
+                        }
+                    }),
+                })
+                .collect();
+            if let Err(e) = ledger.append_batch(reservations) {
+                // ⭐ BD5 — a conflict must CLOSE THE LOSING ANCHOR. Emitting
+                // `dispatch.failed` alone only appends an event: the campd-held
+                // anchor stays `in_progress`, `flow::finalization` returns
+                // `NotQuiescent` FOREVER, and the run never finalizes. The
+                // reservation leak would have been traded for a RUN leak.
+                return self.close_drain(
+                    ledger,
+                    drain,
+                    &ctx,
+                    &anchor_row,
+                    "fail",
+                    Some("hard_fail"),
+                    &format!("drain reservation conflict: {e}"),
+                    vec![EventInput {
+                        kind: EventType::DispatchFailed,
+                        rig: Some(ctx.rig.clone()),
+                        actor: "campd".into(),
+                        bead: Some(drain.anchor.clone()),
+                        data: serde_json::json!({
+                            "reason": format!("drain reservation conflict: {e}"),
+                        }),
+                    }],
+                );
+            }
+        }
+
+        // …and THEN materialize, in the same execution. Eager, all members.
+        let Some(rig) = self.rigs.get(&ctx.rig).cloned() else {
+            return self.drain_failure(ledger, drain, &ctx, "rig is not configured");
+        };
+        let layers = camp_core::formula::FormulaLayers::from_config(&self.config, &self.camp_root)?;
+        let count = members.len();
+
+        for (index, member) in members.iter().enumerate() {
+            // ⭐ BD-3 — THE MEMBER↔ITEM LINK.
+            //
+            // Without this the drain scatters BYTE-IDENTICAL CLONES: nothing on the
+            // item run named its member, so the worker could not know WHICH member it
+            // was meant to work. The correspondence existed only as a positional index
+            // into `run_members` — never persisted, and not even stable (it filters
+            // `status <> 'closed'`, so a member closing renumbers the rest).
+            //
+            // gc answers it precisely, and camp reproduces gc rather than inventing a
+            // scheme: `ensureDrainItemRoot` (drain.go:984-998) BINDS the member into
+            // the item formula's vars, and `stampDrainItemRecipe` (drain.go:1110-1128)
+            // STAMPS the member's id onto the item root. gc's keys, verbatim
+            // (invariant 7).
+            let vars = std::collections::BTreeMap::from([(
+                camp_core::formula::drain::MEMBER_VAR.to_owned(),
+                member.id.clone(),
+            )]);
+            let compiled = match camp_core::formula::compile_named(
+                &layers,
+                &self.config,
+                &spec.formula,
+                &vars,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    return self.drain_failure(
+                        ledger,
+                        drain,
+                        &ctx,
+                        &format!("item formula {:?} is unusable: {e}", spec.formula),
+                    );
+                }
+            };
+            // The THIRD cook entry point (D1, §13's MONEY INVARIANT): an item formula
+            // camp cannot honour must never reach a worker either.
+            if let Some(why) = &compiled.not_runnable {
+                return self.drain_failure(
+                    ledger,
+                    drain,
+                    &ctx,
+                    &format!(
+                        "item formula {:?} cannot be run: {}",
+                        spec.formula, why.reason
+                    ),
+                );
+            }
+
+            let root_metadata = std::collections::BTreeMap::from([
+                (
+                    camp_core::formula::drain::CONTROL_ID.to_owned(),
+                    drain.anchor.clone(),
+                ),
+                (
+                    camp_core::formula::drain::MEMBER_ID.to_owned(),
+                    member.id.clone(),
+                ),
+                (
+                    camp_core::formula::drain::INDEX.to_owned(),
+                    index.to_string(),
+                ),
+                (
+                    camp_core::formula::drain::COUNT.to_owned(),
+                    count.to_string(),
+                ),
+                (
+                    camp_core::formula::drain::MEMBER_ACCESS.to_owned(),
+                    spec.member_access.as_str().to_owned(),
+                ),
+            ]);
+            let opts = camp_core::formula::CookOptions {
+                extra_root_labels: vec![flow::drain_label(&drain.anchor, index)],
+                root_metadata,
+                config: Some(self.config.clone()),
+                ..Default::default()
+            };
+            if let Err(e) = camp_core::formula::cook_with(
+                ledger,
+                &compiled.formula,
+                &flow::runs_dir(&self.camp_root),
+                &rig,
+                "campd",
+                &opts,
+            ) {
+                return self.drain_failure(
+                    ledger,
+                    drain,
+                    &ctx,
+                    &format!("cooking item {index} for member {} failed: {e}", member.id),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// GATHER: every item run closed ⇒ close the anchor and RELEASE every
+    /// member, in ONE batch.
+    ///
+    /// `close_anchor` takes `&Connection` and uses `append_on`, while we hold
+    /// `&mut Ledger` — so the gather BUILDS its `EventInput`s (the anchor close
+    /// AND every release) and submits one `append_batch`. It does not call
+    /// `close_anchor`.
+    fn gather_drain(
+        &mut self,
+        ledger: &mut Ledger,
+        drain: &PendingDrain,
+        ctx: &RunContext,
+        spec: &camp_core::formula::Drain,
+        anchor: &BeadRow,
+        children: &std::collections::BTreeMap<usize, BeadRow>,
+    ) -> Result<()> {
+        if children.values().any(|c| c.status != "closed") {
+            return Ok(()); // still running — B5 keeps the run non-quiescent
+        }
+        // ALWAYS `continue` (F6): an item's failure does not stop the others —
+        // they have all already run. The DRAIN's own outcome reflects them.
+        let failed = children
+            .values()
+            .filter(|c| c.outcome.as_deref() != Some("pass"))
+            .count();
+        let (outcome, disposition, reason) = if failed == 0 {
+            (
+                "pass",
+                None,
+                format!("drain gathered: {} item(s) passed", children.len()),
+            )
+        } else {
+            (
+                "fail",
+                Some("hard_fail"),
+                format!(
+                    "drain gathered: {failed} of {} item(s) failed",
+                    children.len()
+                ),
+            )
+        };
+
+        let _ = spec;
+        // Every exit that can be holding reservations releases through the SAME
+        // loop (BD-1) — and it is status-agnostic (V-4).
+        let extra = release_inputs(ledger, &drain.anchor)?;
+        self.close_drain(
+            ledger,
+            drain,
+            ctx,
+            anchor,
+            outcome,
+            disposition,
+            &reason,
+            extra,
+        )
+    }
+
+    /// Close a drain anchor (and anything else the exit owes) in ONE batch.
+    #[allow(clippy::too_many_arguments)]
+    fn close_drain(
+        &mut self,
+        ledger: &mut Ledger,
+        _drain: &PendingDrain,
+        ctx: &RunContext,
+        anchor: &BeadRow,
+        outcome: &str,
+        final_disposition: Option<&str>,
+        reason: &str,
+        mut extra: Vec<EventInput>,
+    ) -> Result<()> {
+        let mut data = serde_json::json!({ "outcome": outcome, "reason": reason });
+        if let Some(d) = final_disposition {
+            data["final_disposition"] = serde_json::json!(d);
+        }
+        extra.push(EventInput {
+            kind: EventType::BeadClosed,
+            rig: Some(ctx.rig.clone()),
+            actor: "campd".into(),
+            bead: Some(anchor.id.clone()),
+            data,
+        });
+        ledger.append_batch(extra)?;
+        Ok(())
+    }
+
+    /// A drain that cannot proceed: `dispatch.failed` AND the anchor close, so
+    /// the run FINALIZES instead of hanging `NotQuiescent` forever (BD5).
+    fn drain_failure(
+        &mut self,
+        ledger: &mut Ledger,
+        drain: &PendingDrain,
+        ctx: &RunContext,
+        reason: &str,
+    ) -> Result<()> {
+        let Some(anchor) = ledger.bead_row(&drain.anchor)? else {
+            return Ok(());
+        };
+        // ⭐ BD-1 — RELEASE ON THE FAILURE PATH TOO. `execute_drain` reserves the
+        // WHOLE member set and only THEN resolves the rig, compiles the item
+        // formula, checks runnability, and cooks. Every one of those failures used
+        // to close the anchor and release NOTHING — so a plain MISSING ITEM FORMULA
+        // leaked the reservation with campd ALIVE AND HEALTHY, and `reconcile` (the
+        // only automatic sweep) runs ONCE, AT STARTUP.
+        //
+        // ⭐ BD-2 — the leak then poisoned a HEALTHY SIBLING drain: its member was
+        // "held" by a CLOSED anchor that would never gather anything, so the sibling
+        // hard-failed with a `dispatch.failed` asserting "two drains must never
+        // mutate one bead" WHEN ONLY ONE DRAIN WAS LIVE. Invariant 3 — the event
+        // named a cause that was not true. Fixing BD-1 fixes BD-2.
+        let mut inputs = release_inputs(ledger, &drain.anchor)?;
+        inputs.push(EventInput {
+            kind: EventType::DispatchFailed,
+            rig: Some(ctx.rig.clone()),
+            actor: "campd".into(),
+            bead: Some(drain.anchor.clone()),
+            data: serde_json::json!({ "reason": format!("drain: {reason}") }),
+        });
+        self.close_drain(
+            ledger,
+            drain,
+            ctx,
+            &anchor,
+            "fail",
+            Some("hard_fail"),
+            &format!("drain: {reason}"),
+            inputs,
+        )
     }
 
     /// Test observability (production drains via the Task 6/7 executors).
@@ -2304,6 +2810,65 @@ fn existing_bond_children(
 /// A fan-out-level failure: evented on the anchor (invariant 5 — campd
 /// has no caller), fan-out dropped. dispatch.failed is the honest name:
 /// campd could not dispatch the declared follow-on work.
+/// The `bead.updated` events that RELEASE every member this anchor holds.
+///
+/// **Status-agnostic, and that is the point (V-4).** It asks `bead_meta`, not
+/// `run_members` — which filters `status <> 'closed'` and would therefore SKIP a
+/// member that closed while its item run was in flight, leaving its reservation
+/// held forever.
+///
+/// ONE loop, used by EVERY exit that can be holding reservations: the gather, and
+/// every post-reserve failure (BD-1).
+fn release_inputs(ledger: &Ledger, anchor: &str) -> Result<Vec<EventInput>, CoreError> {
+    Ok(ledger
+        .reservations_held_by(anchor)?
+        .into_iter()
+        .map(|member| EventInput {
+            kind: EventType::BeadUpdated,
+            rig: Some(member.rig.clone()),
+            actor: "campd".into(),
+            bead: Some(member.id),
+            data: serde_json::json!({
+                "metadata": {
+                    camp_core::readiness::EXCLUSIVE_DRAIN_RESERVATION: serde_json::Value::Null,
+                }
+            }),
+        })
+        .collect())
+}
+
+/// Release every reservation whose holding anchor is closed or gone. Returns the
+/// released `(member, anchor)` pairs so `camp doctor` can report them.
+pub(crate) fn release_orphaned_reservations(
+    ledger: &mut Ledger,
+) -> Result<Vec<(String, String)>, CoreError> {
+    let orphans = ledger.orphaned_reservations()?;
+    if orphans.is_empty() {
+        return Ok(orphans);
+    }
+    let mut inputs = Vec::with_capacity(orphans.len());
+    for (member, _anchor) in &orphans {
+        let Some(row) = ledger.bead_row(member)? else {
+            continue;
+        };
+        inputs.push(EventInput {
+            kind: EventType::BeadUpdated,
+            rig: Some(row.rig.clone()),
+            actor: "campd".into(),
+            bead: Some(member.clone()),
+            data: serde_json::json!({
+                "metadata": {
+                    camp_core::readiness::EXCLUSIVE_DRAIN_RESERVATION: serde_json::Value::Null,
+                }
+            }),
+        });
+    }
+    if !inputs.is_empty() {
+        ledger.append_batch(inputs)?;
+    }
+    Ok(orphans)
+}
+
 fn fanout_failure(
     ledger: &mut Ledger,
     fanout: &PendingFanout,

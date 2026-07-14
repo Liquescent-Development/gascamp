@@ -1,17 +1,45 @@
-//! Raw TOML walk for the camp formula subset (acceptance/rejection key
-//! tables) and the duration grammar shared by `timeout` fields.
+//! Raw TOML walk for camp formulas: the key table (compat §4, [`crate::formula::keys`])
+//! applied at every nesting site, plus the duration grammar shared by
+//! `timeout` fields.
+//!
+//! The walk is ORIGIN-SCOPED (D2′). It reports three kinds of finding and it
+//! never conflates them: **violations** (malformed), **refusals** (well-formed
+//! Gas City that camp declines — §4 rule 1), and **ignored keys** (gc's dead
+//! config, and unrecognised keys in an imported layer).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use toml::Value;
 
-use crate::formula::ast::{Check, CheckMode, OnComplete, Violation};
+use crate::formula::ast::{Check, CheckMode, OnComplete, Refusal, Violation};
+use crate::formula::drain::{Drain, DrainContext, DrainItem, MemberAccess, OnItemFailure};
+use crate::formula::keys::{self, Class, Origin, Site};
 
 pub(crate) struct RawFormula {
     pub name: Option<String>,
     pub description: Option<String>,
     pub formula_compiler: Option<String>,
+    /// `contract = "graph.v2"` — rung 2a. Satisfies S11's compiler
+    /// declaration (master spec line 449) and gates RUNNABLE (D1).
+    pub contract: Option<String>,
+    /// The top-level `type` key — rung 2d. `Some("expansion")` means the
+    /// formula supplies `template` steps for an `expand` rule and has no
+    /// `steps` of its own (S3), and is never directly runnable (D1).
+    pub kind: Option<String>,
+    /// `[vars]` — rung 2b. name -> DEFAULT. `None` means DECLARED BUT UNDEFINED:
+    /// the name still exists (gc's pointer prompt lists it) but no value
+    /// resolves, so a `{{name}}` placeholder survives verbatim.
+    pub vars: BTreeMap<String, Option<String>>,
+    /// `extends` — rung 2c. Parents resolve by BARE NAME through the layers.
+    /// 48 corpus formulas extend; none extends more than one parent, but gc's
+    /// shape is a list and camp implements the list.
+    pub extends: Vec<String>,
+    /// `[[template]]` — rung 2d. The steps an `type = "expansion"` formula
+    /// supplies to another formula's `expand` rule. 14 corpus formulas are
+    /// expansions, and NONE of them has `steps` (S3).
+    pub template: Vec<RawStep>,
     pub steps: Vec<RawStep>,
 }
 
@@ -20,6 +48,34 @@ pub(crate) struct RawStep {
     pub id: Option<String>,
     pub title: Option<String>,
     pub description: Option<String>,
+    /// Rung 2a. CONSUMED at compile (stage 4): the file's contents REPLACE
+    /// `description`. 328 corpus uses, and the steps that carry one typically
+    /// have no inline description at all — ignore it and the worker gets zero
+    /// instructions.
+    pub description_file: Option<String>,
+    /// Rung 2a. gc's step metadata, carried VERBATIM onto the bead. This is
+    /// where routing lives (`gc.run_target`, 327 uses) — it is not annotation.
+    pub metadata: BTreeMap<String, String>,
+    /// Rung 2b. CONSUMED at compile (stage 5): a false condition PRUNES the
+    /// step, its children, and its REFUSALS (BD2).
+    pub condition: Option<String>,
+    /// The directory of the formula file this step was AUTHORED in — which,
+    /// after an `extends` merge, is not the child's. A non-asset
+    /// `description_file` resolves against it (gc resolves each formula's
+    /// description files against its own base dir). Set by `compose::chain`.
+    pub base_dir: Option<PathBuf>,
+    /// `expand` — rung 2d. Names an EXPANSION FORMULA; this step is the TARGET
+    /// and is REPLACED by that formula's `template` steps. 15 corpus steps.
+    pub expand: Option<String>,
+    /// `expand_vars` — rung 2d. The rule's var overrides, laid over the
+    /// expansion formula's own `[vars]` defaults. 14 corpus steps.
+    pub expand_vars: BTreeMap<String, String>,
+    /// `children` — rung 2d. 16 occurrences across 15 formulas, and 14 of them
+    /// are on the `template` tree (rev 2 counted only `steps` and said "2").
+    pub children: Vec<RawStep>,
+    /// `drain` — rung 2e. campd owns this step's anchor: it scatters one item run
+    /// per run MEMBER, gathers them, and closes.
+    pub drain: Option<Drain>,
     pub needs: Vec<String>,
     pub assignee: Option<String>,
     pub timeout: Option<Duration>,
@@ -32,6 +88,9 @@ pub(crate) struct RawStep {
     pub has_check: bool,
     pub has_retry: bool,
     pub has_on_complete: bool,
+    /// PRESENCE, not parse success — a malformed drain table is still a drain,
+    /// and S9/S11/S17 must not be muted by it.
+    pub has_drain: bool,
 }
 
 pub(crate) struct RawRetry {
@@ -39,60 +98,80 @@ pub(crate) struct RawRetry {
     pub on_exhausted: Option<String>,
 }
 
-/// Keys that exist in Gas City formula v2 but are outside camp's subset
-/// (spec §8.2 "City-only in v1"; gc formula-spec-v2 §1.2/§1.3).
-const CITY_ONLY_TOP: &[&str] = &[
-    "advice",
-    "catalog",
-    "compose",
-    "contract",
-    "extends",
-    "phase",
-    "pointcuts",
-    "pour",
-    "template",
-    "type",
-    "vars",
-];
-const CITY_ONLY_STEP: &[&str] = &[
-    "children",
-    "condition",
-    "depends_on",
-    "description_file",
-    "drain",
-    "expand",
-    "expand_vars",
-    "gate",
-    "loop",
-    "metadata",
-    "notes",
-    "priority",
-    "tags",
-    "tally",
-    "type",
-    "waits_for",
-];
+/// Everything one walk found. Refusals and ignored keys are NOT violations and
+/// are carried separately: a refusal is well-formed gc camp declines, and an
+/// ignored key is a warning the operator sees but the formula survives.
+pub(crate) struct Walked {
+    pub raw: RawFormula,
+    pub violations: Vec<Violation>,
+    pub refusals: Vec<Refusal>,
+    pub ignored: Vec<String>,
+}
 
-const ACCEPTED_TOP: &[&str] = &["description", "formula", "requires", "steps"];
-const ACCEPTED_STEP: &[&str] = &[
-    "assignee",
-    "check",
-    "description",
-    "id",
-    "needs",
-    "on_complete",
-    "retry",
-    "timeout",
-    "title",
-];
+/// The walk's mutable accumulator. Bundled so the per-site key loop does not
+/// take eight parameters.
+struct Ctx {
+    origin: Origin,
+    violations: Vec<Violation>,
+    refusals: Vec<Refusal>,
+    ignored: Vec<String>,
+}
 
-fn city_only(key: &str) -> Violation {
-    Violation {
-        construct: key.to_owned(),
-        message: format!(
-            "`{key}` is a Gas City-only construct; camp does not accept it — \
-             run this formula in a Gas City (spec §8.2)"
-        ),
+impl Ctx {
+    /// Classify every key of one table at one SITE (§4 trap 1 — the site, never
+    /// the name, decides). `prefix` is the dotted location of the table itself
+    /// (`""` at top level); `step_id` stamps step-scoped refusals so BD2 can
+    /// discard them with their step.
+    fn keys(&mut self, site: Site, table: &toml::Table, prefix: &str, step_id: Option<&str>) {
+        for key in sorted_keys(table) {
+            // The dotted location. Refusals always carry it, so a step-scoped
+            // refusal can be read back to its step.
+            let at = if prefix.is_empty() {
+                key.to_owned()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            // Violations keep review finding 3's convention: the BARE key at top
+            // and step level, the dotted location inside a nested table.
+            let violation_at = match site {
+                Site::Top | Site::Step => key.to_owned(),
+                _ => at.clone(),
+            };
+            // The value-aware layer runs FIRST: it can refuse a key `classify`
+            // calls Accepted (a `gc.kind = "scope"` inside a step's metadata).
+            let value = &table[key];
+            if let Some(mut refusal) = keys::refuse(site, key, value, &at) {
+                refusal.step = step_id.map(str::to_owned);
+                self.refusals.push(refusal);
+                continue;
+            }
+            match keys::classify(site, key) {
+                Class::Accepted => {}
+                // `refuse` handles every Refused key; reaching here means the
+                // two tables disagree, which is a bug in `keys`, not in the
+                // formula.
+                Class::Refused => self.violations.push(Violation {
+                    construct: violation_at,
+                    message: format!(
+                        "internal: `{key}` classifies as Refused but produced no refusal"
+                    ),
+                }),
+                // gc's own dead config: ignored + warned in BOTH tiers. Refusing
+                // a formula over a key that does nothing even in gc would cost
+                // real coverage for nothing.
+                Class::DeadInGc => self.ignored.push(format!(
+                    "{at}: `{key}` is dead in Gas City (no runtime behavior there either) — ignored"
+                )),
+                Class::Annotation => {}
+                // D2′ — the whole permissiveness rule, in one match arm.
+                Class::Unknown => match self.origin {
+                    Origin::Imported => self.ignored.push(format!(
+                        "{at}: unknown key `{key}` in an imported pack — ignored"
+                    )),
+                    Origin::CampLocal => self.violations.push(unknown(&violation_at, key)),
+                },
+            }
+        }
     }
 }
 
@@ -101,7 +180,10 @@ fn city_only(key: &str) -> Violation {
 fn unknown(construct: &str, key: &str) -> Violation {
     Violation {
         construct: construct.to_owned(),
-        message: format!("unknown key `{key}`: camp formulas accept no unknown keys (spec §8.2)"),
+        message: format!(
+            "unknown key `{key}`: camp's own formulas accept no unknown keys (compat §4, D2′ — \
+             an imported pack would only be warned)"
+        ),
     }
 }
 
@@ -163,6 +245,32 @@ fn get_string_array(
     }
 }
 
+/// A flat map of string values — `steps.<id>.metadata`. gc's metadata values
+/// are strings; a non-string is a violation, never a silent drop.
+fn get_string_map(
+    table: &toml::Table,
+    key: &str,
+    construct: &str,
+    out: &mut Vec<Violation>,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    match table.get(key) {
+        None => {}
+        Some(Value::Table(t)) => {
+            for (k, v) in t {
+                match v {
+                    Value::String(s) => {
+                        map.insert(k.clone(), s.clone());
+                    }
+                    _ => out.push(wrong_type(&format!("{construct}.{k}"), "a string")),
+                }
+            }
+        }
+        Some(_) => out.push(wrong_type(construct, "a table of strings")),
+    }
+    map
+}
+
 fn get_duration(
     table: &toml::Table,
     key: &str,
@@ -202,53 +310,73 @@ fn get_max_attempts(table: &toml::Table, construct: &str, out: &mut Vec<Violatio
     }
 }
 
-/// Walk raw TOML text against camp's acceptance/rejection tables, collecting
-/// every violation. Returns whatever structure could be extracted so the
-/// semantic checks can still run and report *their* violations too. Every
-/// salvage records its violation first — nothing is silenced.
-pub(crate) fn walk(text: &str) -> (RawFormula, Vec<Violation>) {
-    let mut out = Vec::new();
+/// Walk raw TOML text against camp's key table at `origin`'s strictness (D2′),
+/// collecting every violation, refusal and ignored key. Returns whatever
+/// structure could be extracted so the semantic checks can still run and report
+/// *their* findings too. Every salvage records its violation first — nothing is
+/// silenced.
+pub(crate) fn walk(text: &str, origin: Origin) -> Walked {
+    let mut ctx = Ctx {
+        origin,
+        violations: Vec::new(),
+        refusals: Vec::new(),
+        ignored: Vec::new(),
+    };
     let empty = RawFormula {
         name: None,
         description: None,
         formula_compiler: None,
+        contract: None,
+        kind: None,
+        vars: BTreeMap::new(),
+        extends: Vec::new(),
+        template: Vec::new(),
         steps: Vec::new(),
     };
     let table: toml::Table = match text.parse() {
         Ok(t) => t,
         Err(e) => {
-            out.push(Violation {
+            ctx.violations.push(Violation {
                 construct: "toml".to_owned(),
                 message: e.to_string(),
             });
-            return (empty, out);
+            return Walked {
+                raw: empty,
+                violations: ctx.violations,
+                refusals: ctx.refusals,
+                ignored: ctx.ignored,
+            };
         }
     };
 
-    for key in sorted_keys(&table) {
-        if ACCEPTED_TOP.contains(&key) {
-            continue;
-        } else if CITY_ONLY_TOP.contains(&key) {
-            out.push(city_only(key));
-        } else {
-            out.push(unknown(key, key));
-        }
-    }
+    ctx.keys(Site::Top, &table, "", None);
 
-    let name = get_string(&table, "formula", "formula", &mut out);
-    let description = get_string(&table, "description", "description", &mut out);
-    let formula_compiler = walk_requires(&table, &mut out);
-    let steps = walk_steps(&table, &mut out);
+    let name = get_string(&table, "formula", "formula", &mut ctx.violations);
+    let description = get_string(&table, "description", "description", &mut ctx.violations);
+    let contract = get_string(&table, "contract", "contract", &mut ctx.violations);
+    let kind = get_string(&table, "type", "type", &mut ctx.violations);
+    let formula_compiler = walk_requires(&table, &mut ctx.violations);
+    let vars = walk_vars(&table, &mut ctx.violations);
+    let extends = walk_extends(&table, &mut ctx.violations);
+    let template = walk_step_array(&table, "template", "", &mut ctx);
+    let steps = walk_steps(&table, &mut ctx);
 
-    (
-        RawFormula {
+    Walked {
+        raw: RawFormula {
             name,
             description,
             formula_compiler,
+            contract,
+            kind,
+            vars,
+            extends,
+            template,
             steps,
         },
-        out,
-    )
+        violations: ctx.violations,
+        refusals: ctx.refusals,
+        ignored: ctx.ignored,
+    }
 }
 
 fn walk_requires(table: &toml::Table, out: &mut Vec<Violation>) -> Option<String> {
@@ -280,74 +408,161 @@ fn walk_requires(table: &toml::Table, out: &mut Vec<Violation>) -> Option<String
     )
 }
 
-fn walk_steps(table: &toml::Table, out: &mut Vec<Violation>) -> Vec<RawStep> {
+/// `[vars]` (rung 2b). An entry is either a BARE STRING (the default) or a
+/// TABLE that may carry a `default`. A var with NO default is DECLARED BUT
+/// UNDEFINED: its name still exists — gc's oversize-prompt `## Formula Variables`
+/// block lists every declared name — but no value resolves, so a `{{name}}`
+/// placeholder survives verbatim all the way to the worker.
+///
+/// gc's var tables also carry `description` and `required`; camp reads neither.
+/// `required` is gc's own sling-time prompt, and camp has no interactive sling.
+/// `extends` (rung 2c): a bare name, or a list of them. gc's shape is a list.
+fn walk_extends(table: &toml::Table, out: &mut Vec<Violation>) -> Vec<String> {
+    match table.get("extends") {
+        None => Vec::new(),
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(_)) => get_string_array(table, "extends", "extends", out),
+        Some(_) => {
+            out.push(wrong_type("extends", "a formula name or a list of them"));
+            Vec::new()
+        }
+    }
+}
+
+fn walk_vars(table: &toml::Table, out: &mut Vec<Violation>) -> BTreeMap<String, Option<String>> {
+    let mut vars = BTreeMap::new();
+    match table.get("vars") {
+        None => {}
+        Some(Value::Table(t)) => {
+            for (name, value) in t {
+                match value {
+                    Value::String(s) => {
+                        vars.insert(name.clone(), Some(s.clone()));
+                    }
+                    Value::Table(def) => {
+                        let default = match def.get("default") {
+                            None => None,
+                            Some(Value::String(s)) => Some(s.clone()),
+                            Some(_) => {
+                                out.push(wrong_type(&format!("vars.{name}.default"), "a string"));
+                                None
+                            }
+                        };
+                        vars.insert(name.clone(), default);
+                    }
+                    _ => out.push(wrong_type(
+                        &format!("vars.{name}"),
+                        "a string or a table with a `default`",
+                    )),
+                }
+            }
+        }
+        Some(_) => out.push(wrong_type("vars", "a table")),
+    }
+    vars
+}
+
+/// An array of step tables at `key` (`children`, `template`). Same walk, same
+/// key table, same site — a template step is a step.
+fn walk_step_array(table: &toml::Table, key: &str, loc: &str, ctx: &mut Ctx) -> Vec<RawStep> {
+    let items = match table.get(key) {
+        None => return Vec::new(),
+        Some(Value::Array(items)) => items,
+        Some(_) => {
+            let at = if loc.is_empty() {
+                key.to_owned()
+            } else {
+                format!("{loc}.{key}")
+            };
+            ctx.violations.push(wrong_type(&at, "an array of tables"));
+            return Vec::new();
+        }
+    };
+    let mut steps = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Value::Table(step) = item else {
+            ctx.violations
+                .push(wrong_type(&format!("{loc}.{key}[{index}]"), "a table"));
+            continue;
+        };
+        steps.push(walk_step(index, step, ctx));
+    }
+    steps
+}
+
+fn walk_steps(table: &toml::Table, ctx: &mut Ctx) -> Vec<RawStep> {
     let raw_steps = match table.get("steps") {
         None => return Vec::new(),
         Some(Value::Array(items)) => items,
         Some(_) => {
-            out.push(wrong_type("steps", "an array of tables"));
+            ctx.violations
+                .push(wrong_type("steps", "an array of tables"));
             return Vec::new();
         }
     };
     let mut steps = Vec::new();
     for (index, item) in raw_steps.iter().enumerate() {
         let Value::Table(step) = item else {
-            out.push(wrong_type(&format!("steps[{index}]"), "a table"));
+            ctx.violations
+                .push(wrong_type(&format!("steps[{index}]"), "a table"));
             continue;
         };
-        steps.push(walk_step(index, step, out));
+        steps.push(walk_step(index, step, ctx));
     }
     steps
 }
 
-fn walk_step(index: usize, step: &toml::Table, out: &mut Vec<Violation>) -> RawStep {
+fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
     let id = match step.get("id") {
         Some(Value::String(s)) => Some(s.clone()),
         Some(_) => {
-            out.push(wrong_type(&format!("steps[{index}].id"), "a string"));
+            ctx.violations
+                .push(wrong_type(&format!("steps[{index}].id"), "a string"));
             None
         }
         None => None,
     };
     // Location prefix: the id when we have one, else the index.
-    let at = |field: &str| match &id {
-        Some(id) => format!("steps.{id}.{field}"),
-        None => format!("steps[{index}].{field}"),
+    let loc = match &id {
+        Some(id) => format!("steps.{id}"),
+        None => format!("steps[{index}]"),
     };
+    let at = |field: &str| format!("{loc}.{field}");
 
-    for key in sorted_keys(step) {
-        if ACCEPTED_STEP.contains(&key) {
-            continue;
-        } else if key == "tally" {
-            // Not a pointer to the city: gc formula-v2 hard-removed
-            // [steps.tally] too (review finding 8).
-            out.push(Violation {
-                construct: "tally".to_owned(),
-                message: "`tally` was removed from Gas City formula v2; neither camp \
-                          nor current gc accepts it (spec §8.2)"
-                    .to_owned(),
-            });
-        } else if CITY_ONLY_STEP.contains(&key) {
-            out.push(city_only(key));
-        } else {
-            out.push(unknown(key, key));
-        }
-    }
+    ctx.keys(Site::Step, step, &loc, id.as_deref());
+    // Children first: they need `ctx`, and the value-getters below borrow
+    // `ctx.violations` for the rest of the function.
+    let children = walk_step_array(step, "children", &loc, ctx);
 
+    let out = &mut ctx.violations;
     let title = get_string(step, "title", &at("title"), out);
     let description = get_string(step, "description", &at("description"), out);
+    let description_file = get_string(step, "description_file", &at("description_file"), out);
+    let metadata = get_string_map(step, "metadata", &at("metadata"), out);
+    let condition = get_string(step, "condition", &at("condition"), out);
+    let expand = get_string(step, "expand", &at("expand"), out);
+    let expand_vars = get_string_map(step, "expand_vars", &at("expand_vars"), out);
     let needs = get_string_array(step, "needs", &at("needs"), out);
     let assignee = get_string(step, "assignee", &at("assignee"), out);
     let timeout = get_duration(step, "timeout", &at("timeout"), out);
-    let check = walk_check(step, &at("check"), out);
-    let retry = walk_retry(step, &at("retry"), out);
-    let on_complete = walk_on_complete(step, &at("on_complete"), out);
+    let check = walk_check(step, &at("check"), ctx);
+    let retry = walk_retry(step, &at("retry"), ctx);
+    let on_complete = walk_on_complete(step, &at("on_complete"), ctx);
+    let drain = walk_drain(step, &at("drain"), id.as_deref(), ctx);
 
     RawStep {
         index,
         id,
         title,
         description,
+        description_file,
+        metadata,
+        condition,
+        base_dir: None,
+        expand,
+        expand_vars,
+        children,
+        drain,
         needs,
         assignee,
         timeout,
@@ -357,23 +572,144 @@ fn walk_step(index: usize, step: &toml::Table, out: &mut Vec<Violation>) -> RawS
         has_check: step.contains_key("check"),
         has_retry: step.contains_key("retry"),
         has_on_complete: step.contains_key("on_complete"),
+        has_drain: step.contains_key("drain"),
     }
 }
 
-fn walk_check(step: &toml::Table, construct: &str, out: &mut Vec<Violation>) -> Option<Check> {
+/// `[steps.<id>.drain]` (rung 2e), on `walk_on_complete`'s mold.
+///
+/// `context = "shared"`, `continuation_group` and `max_units` never reach here —
+/// `Ctx::keys` refuses them first (step-scoped, so a pruned arm's refusal dies
+/// with it). What is left is the shape camp implements.
+fn walk_drain(
+    step: &toml::Table,
+    construct: &str,
+    step_id: Option<&str>,
+    ctx: &mut Ctx,
+) -> Option<Drain> {
+    let drain = match step.get("drain") {
+        None => return None,
+        Some(Value::Table(t)) => t,
+        Some(_) => {
+            ctx.violations.push(wrong_type(construct, "a table"));
+            return None;
+        }
+    };
+    ctx.keys(Site::Drain, drain, construct, step_id);
+    // `item` is a nested table with its own site (§4 trap 1: `single_lane` is
+    // DEAD at the top level and real here).
+    let mut single_lane = false;
+    match drain.get("item") {
+        None => {}
+        Some(Value::Table(item)) => {
+            ctx.keys(Site::DrainItem, item, &format!("{construct}.item"), step_id);
+            match item.get("single_lane") {
+                None => {}
+                Some(Value::Boolean(b)) => single_lane = *b,
+                Some(_) => ctx.violations.push(wrong_type(
+                    &format!("{construct}.item.single_lane"),
+                    "a boolean",
+                )),
+            }
+        }
+        Some(_) => ctx
+            .violations
+            .push(wrong_type(&format!("{construct}.item"), "a table")),
+    }
+
+    let out = &mut ctx.violations;
+    // `context` defaults to "separate" (the only shape camp implements; "shared"
+    // was already refused).
+    let context = match get_string(drain, "context", &format!("{construct}.context"), out) {
+        None | Some(_) => DrainContext::Separate,
+    };
+    let formula = match get_string(drain, "formula", &format!("{construct}.formula"), out) {
+        Some(f) if !f.is_empty() => f,
+        Some(_) | None => {
+            out.push(Violation {
+                construct: format!("{construct}.formula"),
+                message: "a drain must name the `formula` it instantiates per member".to_owned(),
+            });
+            return None;
+        }
+    };
+    // gc's OWN rule (`graphv2_validation.go:417-419`) — a VALIDATION reject, not a
+    // substitution exemption. §9's asymmetry list said `drain.formula` was exempt
+    // from `{{var}}` substitution; it is not (gc substitutes it into
+    // `gc.drain_formula`). It is blocked HERE instead, exactly as gc blocks it.
+    if formula.contains("{{") {
+        out.push(Violation {
+            construct: format!("{construct}.formula"),
+            message: format!(
+                "templated item formula names are not supported: {formula:?} (gc rejects this                  too — the drain's formula must be a literal name)"
+            ),
+        });
+        return None;
+    }
+
+    let member_access = match get_string(
+        drain,
+        "member_access",
+        &format!("{construct}.member_access"),
+        out,
+    ) {
+        None => MemberAccess::Read, // gc's compiler default (compile.go:590-598)
+        Some(s) => match MemberAccess::parse(&s) {
+            Some(m) => m,
+            None => {
+                out.push(Violation {
+                    construct: format!("{construct}.member_access"),
+                    message: format!(
+                        "member_access {s:?} is not legal; use \"read\" or \"exclusive\""
+                    ),
+                });
+                return None;
+            }
+        },
+    };
+    let on_item_failure = match get_string(
+        drain,
+        "on_item_failure",
+        &format!("{construct}.on_item_failure"),
+        out,
+    ) {
+        // gc: "skip_remaining" for shared, "continue" otherwise — and camp only
+        // has separate.
+        None => OnItemFailure::Continue,
+        Some(s) => match OnItemFailure::parse(&s) {
+            Some(v) => v,
+            None => {
+                out.push(Violation {
+                    construct: format!("{construct}.on_item_failure"),
+                    message: format!(
+                        "on_item_failure {s:?} is not legal; use \"continue\" or \"skip_remaining\""
+                    ),
+                });
+                return None;
+            }
+        },
+    };
+
+    Some(Drain {
+        context,
+        formula,
+        member_access,
+        on_item_failure,
+        item: DrainItem { single_lane },
+    })
+}
+
+fn walk_check(step: &toml::Table, construct: &str, ctx: &mut Ctx) -> Option<Check> {
     let check = match step.get("check") {
         None => return None,
         Some(Value::Table(t)) => t,
         Some(_) => {
-            out.push(wrong_type(construct, "a table"));
+            ctx.violations.push(wrong_type(construct, "a table"));
             return None;
         }
     };
-    for key in sorted_keys(check) {
-        if !["check", "max_attempts"].contains(&key) {
-            out.push(unknown(&format!("{construct}.{key}"), key));
-        }
-    }
+    ctx.keys(Site::Check, check, construct, None);
+    let out = &mut ctx.violations;
     let max_attempts = get_max_attempts(check, &format!("{construct}.max_attempts"), out);
     let inner = match check.get("check") {
         Some(Value::Table(t)) => t,
@@ -387,11 +723,10 @@ fn walk_check(step: &toml::Table, construct: &str, out: &mut Vec<Violation>) -> 
             return None;
         }
     };
-    for key in sorted_keys(inner) {
-        if !["mode", "path", "timeout"].contains(&key) {
-            out.push(unknown(&format!("{construct}.check.{key}"), key));
-        }
-    }
+    // §4 trap 1: `mode` here is the load-bearing exec mode, not gc's dead
+    // top-level `mode`.
+    ctx.keys(Site::CheckInner, inner, &format!("{construct}.check"), None);
+    let out = &mut ctx.violations;
     let mode_construct = format!("{construct}.check.mode");
     let mode = match get_string(inner, "mode", &mode_construct, out) {
         Some(m) if m == "exec" => CheckMode::Exec,
@@ -430,20 +765,17 @@ fn walk_check(step: &toml::Table, construct: &str, out: &mut Vec<Violation>) -> 
     })
 }
 
-fn walk_retry(step: &toml::Table, construct: &str, out: &mut Vec<Violation>) -> Option<RawRetry> {
+fn walk_retry(step: &toml::Table, construct: &str, ctx: &mut Ctx) -> Option<RawRetry> {
     let retry = match step.get("retry") {
         None => return None,
         Some(Value::Table(t)) => t,
         Some(_) => {
-            out.push(wrong_type(construct, "a table"));
+            ctx.violations.push(wrong_type(construct, "a table"));
             return None;
         }
     };
-    for key in sorted_keys(retry) {
-        if !["max_attempts", "on_exhausted"].contains(&key) {
-            out.push(unknown(&format!("{construct}.{key}"), key));
-        }
-    }
+    ctx.keys(Site::Retry, retry, construct, None);
+    let out = &mut ctx.violations;
     let max_attempts = get_max_attempts(retry, &format!("{construct}.max_attempts"), out);
     let on_exhausted = get_string(
         retry,
@@ -457,24 +789,17 @@ fn walk_retry(step: &toml::Table, construct: &str, out: &mut Vec<Violation>) -> 
     })
 }
 
-fn walk_on_complete(
-    step: &toml::Table,
-    construct: &str,
-    out: &mut Vec<Violation>,
-) -> Option<OnComplete> {
+fn walk_on_complete(step: &toml::Table, construct: &str, ctx: &mut Ctx) -> Option<OnComplete> {
     let oc = match step.get("on_complete") {
         None => return None,
         Some(Value::Table(t)) => t,
         Some(_) => {
-            out.push(wrong_type(construct, "a table"));
+            ctx.violations.push(wrong_type(construct, "a table"));
             return None;
         }
     };
-    for key in sorted_keys(oc) {
-        if !["bond", "for_each", "parallel", "sequential", "vars"].contains(&key) {
-            out.push(unknown(&format!("{construct}.{key}"), key));
-        }
-    }
+    ctx.keys(Site::OnComplete, oc, construct, None);
+    let out = &mut ctx.violations;
     let for_each = get_string(oc, "for_each", &format!("{construct}.for_each"), out);
     let bond = get_string(oc, "bond", &format!("{construct}.bond"), out);
     let parallel_key = match oc.get("parallel") {
@@ -603,22 +928,27 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// The plan's test names shout the load-bearing word (IMPORTED vs CAMP_LOCAL,
+// BOTH tiers). Keeping them is worth one lint allow.
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
     #[test]
-    fn tally_rejection_notes_that_gc_also_rejects_it() {
-        // Review finding 8: pointing tally authors at a Gas City would be
-        // wrong advice — gc formula-v2 hard-rejects [steps.tally] too.
+    fn tally_refusal_notes_that_gc_also_rejects_it() {
+        // Review finding 8: pointing tally authors at a Gas City would be wrong
+        // advice — gc formula-v2 hard-rejects [steps.tally] too. It is a
+        // REFUSAL now, not a violation, and it carries its step (BD2).
         let text = "formula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ntally = true\n";
-        let v = violations(text);
-        let tally = v
-            .iter()
-            .find(|v| v.construct == "tally")
-            .expect("tally violation");
-        assert!(tally.message.contains("removed"), "{}", tally.message);
-        assert!(tally.message.contains("Gas City"), "{}", tally.message);
+        let tally = refusals(text)
+            .into_iter()
+            .find(|r| r.key == "tally")
+            .expect("tally refusal");
+        assert_eq!(tally.construct, "steps.a.tally");
+        assert_eq!(tally.step.as_deref(), Some("a"));
+        assert!(tally.reason.contains("removed"), "{}", tally.reason);
+        assert!(tally.reason.contains("Gas City"), "{}", tally.reason);
     }
 
     #[test]
@@ -696,11 +1026,20 @@ mode = "fanout"
     }
 
     fn violations(text: &str) -> Vec<crate::formula::ast::Violation> {
-        walk(text).1
+        walk(text, Origin::CampLocal).violations
+    }
+
+    fn refusals(text: &str) -> Vec<Refusal> {
+        walk(text, Origin::CampLocal).refusals
     }
 
     fn constructs(text: &str) -> Vec<String> {
         violations(text).into_iter().map(|v| v.construct).collect()
+    }
+
+    /// A step carrying one key, at the camp-local (strict) tier.
+    fn step_key(key: &str) -> String {
+        format!("formula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n{key} = 1\n")
     }
 
     const MINIMAL: &str =
@@ -708,86 +1047,189 @@ mode = "fanout"
 
     #[test]
     fn minimal_formula_walks_clean() {
-        let (raw, v) = walk(MINIMAL);
-        assert!(v.is_empty(), "{v:?}");
-        assert_eq!(raw.name.as_deref(), Some("minimal"));
-        assert_eq!(raw.steps.len(), 1);
-        assert_eq!(raw.steps[0].id.as_deref(), Some("only"));
-        assert_eq!(raw.steps[0].title.as_deref(), Some("Do the thing"));
+        let w = walk(MINIMAL, Origin::CampLocal);
+        assert!(w.violations.is_empty(), "{:?}", w.violations);
+        assert!(w.refusals.is_empty(), "{:?}", w.refusals);
+        assert_eq!(w.raw.name.as_deref(), Some("minimal"));
+        assert_eq!(w.raw.steps.len(), 1);
+        assert_eq!(w.raw.steps[0].id.as_deref(), Some("only"));
+        assert_eq!(w.raw.steps[0].title.as_deref(), Some("Do the thing"));
     }
 
     #[test]
-    fn every_city_only_key_is_rejected_by_name_with_a_city_pointer() {
-        for key in [
-            "extends",
-            "vars",
-            "type",
-            "phase",
-            "pour",
-            "contract",
-            "catalog",
-            "template",
-            "compose",
-            "advice",
-            "pointcuts",
-        ] {
+    fn every_section_4_rule_1_key_is_refused_by_name() {
+        // What camp REFUSES — real gc semantics camp does not implement. This
+        // list used to hold `extends`, `vars`, `contract`, `drain`, `condition`,
+        // `metadata` … — the constructs the corpus is BUILT from. Refusing them
+        // is what cost 95 of 100 formulas; the ones left here are refused on
+        // purpose (§4 rule 1) and carry 0 corpus uses each.
+        for key in ["advice", "compose", "phase", "pointcuts", "pour"] {
             let text =
                 format!("{key} = 1\nformula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n");
-            let v = violations(&text);
+            let r = refusals(&text);
             assert!(
-                v.iter()
-                    .any(|v| v.construct == key && v.message.contains("Gas City")),
-                "{key}: {v:?}"
+                r.iter().any(|r| r.key == key && r.step.is_none()),
+                "top {key} must refuse, formula-scoped: {r:?}"
             );
         }
+        for key in ["depends_on", "gate", "loop", "tally", "waits_for"] {
+            let r = refusals(&step_key(key));
+            assert!(
+                r.iter()
+                    .any(|r| r.key == key && r.step.as_deref() == Some("a")),
+                "step {key} must refuse, STEP-scoped: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_keys_the_corpus_is_built_from_are_no_longer_refused() {
+        // The inverse of the rule-1 list, and the whole point of the phase: these
+        // now compile (or, until their rung lands, fail as UNIMPLEMENTED — never
+        // as a refusal, which would be permanent).
+        for key in ["contract", "vars", "extends", "type", "template"] {
+            let text =
+                format!("{key} = 1\nformula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n");
+            assert!(refusals(&text).is_empty(), "top {key} must not refuse");
+        }
         for key in [
-            "drain",
-            "gate",
-            "loop",
+            "description_file",
+            "metadata",
+            "condition",
             "expand",
             "expand_vars",
             "children",
-            "waits_for",
-            "condition",
-            "tally",
-            "metadata",
-            "depends_on",
-            "type",
-            "priority",
-            "tags",
-            "description_file",
-            "notes",
+            "drain",
         ] {
-            let text =
-                format!("formula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n{key} = 1\n");
-            let v = violations(&text);
             assert!(
-                v.iter()
-                    .any(|v| v.construct == key && v.message.contains("Gas City")),
-                "step {key}: {v:?}"
+                refusals(&step_key(key)).is_empty(),
+                "step {key} must not refuse"
             );
         }
     }
 
     #[test]
-    fn unknown_keys_are_rejected_everywhere_gc_would_silently_ignore_them() {
-        // gc silently drops a `dependson` typo (formula-spec-v2 §1.3 note);
-        // camp names it.
+    fn an_unknown_key_is_ignored_in_an_IMPORTED_layer_and_fatal_in_the_CAMP_LOCAL_one() {
+        // D2′, the whole rule. gc silently drops a `dependson` typo
+        // (formula-spec-v2 §1.3 note). Camp names it in the operator's OWN
+        // formulas — where a typo is a bug — and merely warns about it in a
+        // third-party pack it happens to import, where refusing would fail the
+        // load over a key camp has never heard of.
         let text = "formula = \"x\"\nbogus = 1\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ndependson = [\"b\"]\n";
-        let c = constructs(text);
+
+        let local = walk(text, Origin::CampLocal);
+        let c: Vec<String> = local
+            .violations
+            .iter()
+            .map(|v| v.construct.clone())
+            .collect();
         assert!(c.contains(&"bogus".to_owned()), "{c:?}");
         assert!(c.contains(&"dependson".to_owned()), "{c:?}");
+
+        let imported = walk(text, Origin::Imported);
+        assert!(
+            imported.violations.is_empty(),
+            "an imported pack must not fail over an unknown key: {:?}",
+            imported.violations
+        );
+        assert_eq!(imported.ignored.len(), 2, "{:?}", imported.ignored);
+        assert!(
+            imported.ignored.iter().any(|w| w.contains("bogus"))
+                && imported.ignored.iter().any(|w| w.contains("dependson")),
+            "the warning must NAME the key: {:?}",
+            imported.ignored
+        );
     }
 
     #[test]
-    fn walk_collects_all_violations_not_just_the_first() {
-        let text = "formula = \"x\"\nvars = {}\npour = true\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ntags = [\"x\"]\n";
-        let c = constructs(text);
-        assert_eq!(
-            c,
-            vec!["pour", "vars", "tags"],
-            "sorted top keys then steps: {c:?}"
+    fn a_key_dead_in_gc_is_ignored_in_BOTH_tiers() {
+        // gc's own dead config. Refusing a formula over a key that does nothing
+        // even in gc would cost real corpus coverage for nothing. Note `mode`
+        // and `single_lane` — DEAD here, LOAD-BEARING nested (§4 trap 1).
+        for key in [
+            "version",
+            "target_required",
+            "internal",
+            "mode",
+            "single_lane",
+            "sling_container_mode",
+        ] {
+            let text =
+                format!("{key} = 1\nformula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\n");
+            for origin in [Origin::CampLocal, Origin::Imported] {
+                let w = walk(&text, origin);
+                assert!(w.violations.is_empty(), "{key} @ {origin:?}: not fatal");
+                assert!(w.refusals.is_empty(), "{key} @ {origin:?}: not a refusal");
+                assert!(
+                    w.ignored.iter().any(|s| s.contains(key)),
+                    "{key} @ {origin:?} must WARN: {:?}",
+                    w.ignored
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn annotations_are_silent_in_both_tiers() {
+        for (text, what) in [
+            (
+                "notes = \"x\"\ncatalog = \"c\"\nmetadata = { a = \"b\" }\nformula = \"x\"\n\
+                 [[steps]]\nid = \"a\"\ntitle = \"t\"\n",
+                "top",
+            ),
+            (
+                "formula = \"x\"\n[[steps]]\nid = \"a\"\ntitle = \"t\"\nnotes = \"n\"\n\
+                 tags = [\"x\"]\npriority = 2\n",
+                "step",
+            ),
+        ] {
+            for origin in [Origin::CampLocal, Origin::Imported] {
+                let w = walk(text, origin);
+                assert!(
+                    w.violations.is_empty(),
+                    "{what} @ {origin:?}: {:?}",
+                    w.violations
+                );
+                assert!(
+                    w.refusals.is_empty(),
+                    "{what} @ {origin:?}: {:?}",
+                    w.refusals
+                );
+                assert!(
+                    w.ignored.is_empty(),
+                    "{what} @ {origin:?}: annotations are SILENT, not warned: {:?}",
+                    w.ignored
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn walk_collects_every_finding_and_sorts_them_into_the_right_bucket() {
+        // One file, FOUR verdicts, and the buckets are the whole point. `pour` is
+        // a REFUSAL (§4 rule 1, permanent). `bogus` is a VIOLATION (D2′: an
+        // unrecognised key is fatal in the operator's OWN formulas). `tags` is an
+        // ANNOTATION and is SILENT. `internal` is DEAD IN GC and is merely WARNED.
+        // Conflating any two of these is how the old table refused 95 of the 100
+        // corpus formulas.
+        let text = "formula = \"x\"\npour = true\nbogus = 1\ninternal = true\n\
+                    [[steps]]\nid = \"a\"\ntitle = \"t\"\ntags = [\"x\"]\n";
+        let w = walk(text, Origin::CampLocal);
+
+        let c: Vec<&str> = w.violations.iter().map(|v| v.construct.as_str()).collect();
+        assert_eq!(c, vec!["bogus"], "only the unrecognised key: {c:?}");
+        assert!(
+            w.ignored.iter().any(|s| s.contains("internal")),
+            "gc's dead config is warned, not fatal: {:?}",
+            w.ignored
         );
+
+        let r: Vec<&str> = w.refusals.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(r, vec!["pour"], "{r:?}");
+
+        // `tags` is an ANNOTATION: SILENT — not a violation, not a refusal, and
+        // not even a warning. The only warning here is `internal`.
+        assert_eq!(w.ignored.len(), 1, "tags must be silent: {:?}", w.ignored);
     }
 
     #[test]
@@ -830,8 +1272,9 @@ sequential = true
 [steps.on_complete.vars]
 name = "{item.name}"
 "#;
-        let (raw, v) = walk(text);
-        assert!(v.is_empty(), "{v:?}");
+        let w = walk(text, Origin::CampLocal);
+        assert!(w.violations.is_empty(), "{:?}", w.violations);
+        let raw = w.raw;
         let check = raw.steps[0].check.as_ref().unwrap();
         assert_eq!(check.max_attempts, 3);
         assert_eq!(check.path, std::path::PathBuf::from("scripts/verify.sh"));
@@ -871,7 +1314,7 @@ name = "{item.name}"
 
     #[test]
     fn toml_syntax_error_is_a_single_violation() {
-        let (_, v) = walk("formula = \"x\"\n[[steps\n");
+        let v = walk("formula = \"x\"\n[[steps\n", Origin::CampLocal).violations;
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].construct, "toml");
     }

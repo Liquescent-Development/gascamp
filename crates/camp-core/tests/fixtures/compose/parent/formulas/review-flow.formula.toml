@@ -1,0 +1,19 @@
+formula = "review-flow"
+type = "expansion"
+contract = "graph.v2"
+
+[vars]
+implementation_target = { default = "gc.implementer" }
+review_mode = { default = "report" }
+
+[[template]]
+id = "{target}.gather"
+title = "Gather context for {target.title}"
+description = "Route stays {{implementation_target}} until cook."
+metadata = { "gc.run_target" = "{implementation_target}" }
+
+[[template.children]]
+id = "{target}.apply-review-findings"
+title = "Apply review findings"
+condition = "{{review_mode}} != report"
+metadata = { "gc.run_target" = "{implementation_target}" }

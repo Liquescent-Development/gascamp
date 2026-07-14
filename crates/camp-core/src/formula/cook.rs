@@ -23,6 +23,17 @@ use crate::event::{EventInput, EventType};
 use crate::formula::ast::Formula;
 use crate::ledger::Ledger;
 
+/// The schema of `runs/<id>/recipe.json`.
+///
+/// **STRICT EQUALITY** (BD-C). `recipe.json` is the reload path for every live
+/// run. compat-3 touches the worker contract; compat-4 adds `type = "mail"`. If
+/// either adds a field to `Formula`/`Step`, this MUST be bumped — and bumping it
+/// kills in-flight runs LOUDLY, with a named remedy ("re-sling it"), which is
+/// invariant 5. The alternative — deserializing a recipe that means something
+/// else — is the failure mode BD8 already shipped once, and no compat-2 gate can
+/// see it, because every fixture cooks and loads with the SAME binary.
+pub const RECIPE_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CookedRun {
     pub run_id: String,
@@ -42,12 +53,72 @@ pub struct CookOptions {
     pub extra_root_needs: Vec<String>,
     /// Labels on the root bead (`bond:<anchor>:<index>` linkage).
     pub extra_root_labels: Vec<String>,
+    /// Metadata stamped on the run's ROOT bead. A drain uses it to carry gc's
+    /// `gc.drain_member_id` / `_index` / `_count` / `_control_id` onto each item
+    /// run — the link that tells the item worker WHICH MEMBER it is working.
+    /// Without it a drain scatters byte-identical clones.
+    pub root_metadata: BTreeMap<String, String>,
+    /// The camp config, for RESOLVING ROUTES through the binding namespace
+    /// (compat §7.1). `None` cooks a formula with no `gc.run_target` — every
+    /// camp-local fixture — and fails loudly on one that has a route, rather
+    /// than silently dispatching an unrouted worker.
+    pub config: Option<crate::config::CampConfig>,
+}
+
+/// gc's `Substitute` (`parser.go:617`); `varPattern` is
+/// `\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}` (`parser.go:557`).
+///
+/// **This is the INSTANTIATION grammar, and it is the SECOND of camp's three.**
+/// It runs at cook, over EVERY field and EVERY metadata value, with **no
+/// exemption list** (gc `molecule.go:1035-1037`) — **including `check.path`**
+/// (→ `gc.check_path`, `ralph.go:76`) and **`drain.formula`** (→
+/// `gc.drain_formula`, `compile.go:590`). §9's "substitution asymmetry" list is
+/// wrong and is deleted; a templated `drain.formula` is blocked separately, at
+/// VALIDATION, exactly as gc blocks it.
+///
+/// An unknown token is LEFT VERBATIM — authored text, not a template language.
+/// A single left-to-right pass: a substituted value is never re-scanned.
+///
+/// **Do NOT merge this with [`substitute`] below.** That one is `{name}` over
+/// `CookOptions.vars` for bond children — a different grammar, a different
+/// scope, a different stage. Three substitution functions, three grammars, three
+/// stages; the day two of them meet, 55 routes corrupt.
+pub(crate) fn substitute_vars(text: &str, vars: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let token = &after[..close];
+        let legal = !token.is_empty()
+            && token.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        match vars.get(token).filter(|_| legal) {
+            Some(value) => out.push_str(value),
+            // Unknown (or not a legal var name): verbatim, braces and all.
+            None => {
+                out.push_str("{{");
+                out.push_str(token);
+                out.push_str("}}");
+            }
+        }
+        rest = &after[close + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Replace every `{key}` from `vars` in `text` — a SINGLE left-to-right
 /// pass (review MEDIUM 2): inserted values are worker output, never
 /// re-scanned as template syntax. Unknown tokens stay verbatim (authored
 /// text, not a template language).
+///
+/// This is the BOND FAN-OUT grammar (`{item}`, `{item.field}`, `{index}`), not
+/// the formula var grammar. See [`substitute_vars`].
 fn substitute(text: &str, vars: &BTreeMap<String, String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -70,6 +141,91 @@ fn substitute(text: &str, vars: &BTreeMap<String, String>) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// gc's routing key. 327 corpus occurrences; ZERO step `assignee`. Routing is
+/// ENTIRELY step metadata.
+pub const RUN_TARGET: &str = "gc.run_target";
+
+/// INSTANTIATE the compiled formula — gc's `stepToBead`, and the stage that
+/// makes the pinned recipe executable.
+///
+/// 1. `{{var}}` substituted over EVERY field and EVERY metadata value, with no
+///    exemption list — including `check.path` and `drain.formula`.
+/// 2. The route (`gc.run_target`) resolved through the binding namespace into
+///    the step's `assignee`.
+/// 3. The residual check, which §9 scopes to `title` ONLY.
+///
+/// **Both of those outputs are what campd actually uses at runtime** (BD-A):
+/// `spawn_check` EXECs `step.check.path` straight out of the reloaded recipe,
+/// and `create_attempt` reads `step.assignee` to route the ATTEMPT bead — a
+/// DIFFERENT bead from the anchor cook wrote. Pin the pre-substitution formula
+/// and campd execs a literal `{{kind}}.sh` and dispatches unrouted workers.
+pub fn instantiate(
+    formula: &Formula,
+    cfg: Option<&crate::config::CampConfig>,
+) -> Result<Formula, CoreError> {
+    let vars: BTreeMap<String, String> = formula
+        .vars
+        .iter()
+        .filter_map(|(k, v)| v.clone().map(|v| (k.clone(), v)))
+        .collect();
+    let sub = |s: &str| substitute_vars(s, &vars);
+
+    let mut out = formula.clone();
+    out.description = formula.description.as_deref().map(sub);
+    for step in &mut out.steps {
+        step.title = sub(&step.title);
+        step.description = step.description.as_deref().map(sub);
+        for value in step.metadata.values_mut() {
+            *value = sub(value);
+        }
+        if let Some(check) = &mut step.check {
+            // NO exemption (F8). gc substitutes here; §9 said it did not.
+            check.path = std::path::PathBuf::from(sub(&check.path.to_string_lossy()));
+        }
+        if let Some(oc) = &mut step.on_complete {
+            oc.bond = sub(&oc.bond);
+            for value in oc.vars.values_mut() {
+                *value = sub(value);
+            }
+        }
+        step.assignee = step.assignee.as_deref().map(sub);
+
+        // §9's residual check is TITLE-ONLY, and it runs HERE — after
+        // substitution. A residual `{{var}}` in a description is normal (561
+        // corpus steps carry one); in a title it is a bug the operator must see.
+        if step.title.contains("{{") {
+            return Err(CoreError::Cook(format!(
+                "formula {:?} step {:?}: title still has an unresolved variable after \
+                 substitution: {:?}",
+                formula.name, step.id, step.title
+            )));
+        }
+
+        // The ROUTE. Resolved through compat-1's binding namespace — the one
+        // resolver, never a second one.
+        if let Some(target) = step.metadata.get(RUN_TARGET) {
+            let target = target.clone();
+            if target.contains("{{") {
+                return Err(CoreError::Cook(format!(
+                    "formula {:?} step {:?}: route {target:?} still has an unresolved variable — \
+                     no binding can be found for it",
+                    formula.name, step.id
+                )));
+            }
+            let cfg = cfg.ok_or_else(|| {
+                CoreError::Cook(format!(
+                    "formula {:?} step {:?} routes to {target:?}, but this cook has no camp \
+                     config to resolve the binding against",
+                    formula.name, step.id
+                ))
+            })?;
+            let agent = crate::pack::resolve_agent(cfg, &target)?;
+            step.assignee = Some(agent.name);
+        }
+    }
+    Ok(out)
 }
 
 pub fn cook(
@@ -97,6 +253,12 @@ pub fn cook_with(
     actor: &str,
     opts: &CookOptions,
 ) -> Result<CookedRun, CoreError> {
+    // INSTANTIATE FIRST (BD-A). Everything below — the beads AND the pinned
+    // recipe — is written from the instantiated formula, because that is what
+    // campd reloads and executes.
+    let instantiated = instantiate(formula, opts.config.as_ref())?;
+    let formula = &instantiated;
+
     if formula.steps.is_empty() {
         // parse_and_validate guarantees this (rule S3); cook re-checks its
         // own precondition rather than cooking an empty run.
@@ -173,7 +335,23 @@ pub fn cook_with(
         std::fs::write(dir.join(name), bytes)
             .map_err(|e| CoreError::Cook(format!("cannot write {}/{name}: {e}", dir.display())))
     };
+    // The authored bytes, verbatim — invariant 3 ("human-readable run files").
+    // AUDIT ONLY. Nothing re-parses this.
     write(&format!("{}.toml", formula.name), formula.source.as_bytes())?;
+    // BD8 — the run's REAL reload path. `load_run` used to re-parse the authored
+    // `.toml` above with no layers and a default config; for every imported
+    // corpus formula (they carry `extends`, `description_file`, and routes that
+    // need `cfg.imports`) that re-parse CANNOT succeed, so every cooked corpus
+    // run dead-ended on campd's first event.
+    //
+    // This is the INSTANTIATED recipe (BD-A): written AFTER `{{var}}`
+    // substitution and AFTER route resolution, because merged campd EXECs
+    // `step.check.path` and DISPATCHES on `step.assignee` straight out of it.
+    let recipe = serde_json::json!({
+        "recipe_version": RECIPE_VERSION,
+        "formula": formula,
+    });
+    write("recipe.json", format!("{recipe:#}").as_bytes())?;
     let mut manifest = serde_json::json!({
         "run_id": run_id,
         "formula": formula.name,
@@ -203,6 +381,9 @@ pub fn cook_with(
     if !opts.extra_root_labels.is_empty() {
         root_data["labels"] = serde_json::json!(opts.extra_root_labels);
     }
+    if !opts.root_metadata.is_empty() {
+        root_data["metadata"] = serde_json::json!(opts.root_metadata);
+    }
     inputs.push(EventInput {
         kind: EventType::BeadCreated,
         rig: Some(rig.name.clone()),
@@ -225,6 +406,11 @@ pub fn cook_with(
         }
         if let Some(a) = &step.assignee {
             data["assignee"] = serde_json::json!(a);
+        }
+        // gc's step metadata, onto the bead (compat §6.1). This is where routing
+        // lives (`gc.run_target`) — it is not annotation.
+        if !step.metadata.is_empty() {
+            data["metadata"] = serde_json::json!(step.metadata);
         }
         inputs.push(EventInput {
             kind: EventType::BeadCreated,

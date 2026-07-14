@@ -1,0 +1,21 @@
+formula = "chain-base"
+contract = "graph.v2"
+
+[vars]
+drain_policy = "separate"
+who = "parent"
+
+[[steps]]
+id = "first"
+title = "First (parent)"
+description = "parent body"
+
+[[steps]]
+id = "second"
+title = "Second (parent)"
+needs = ["first"]
+
+[[steps]]
+id = "refused-here"
+title = "A parent step the child replaces"
+gate = { path = "x" }

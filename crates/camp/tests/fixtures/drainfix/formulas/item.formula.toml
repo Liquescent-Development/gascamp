@@ -1,0 +1,12 @@
+formula = "item"
+contract = "graph.v2"
+
+[vars]
+# gc's `graphv2.LegacyIssueVar` (invocation.go:35). The drain binds it to the
+# MEMBER BEAD ID (drain.go:997), so an item formula can name its own member.
+issue = { description = "the member bead this item run works" }
+
+[[steps]]
+id = "work"
+title = "Work member {{issue}}"
+description = "Work the member bead {{issue}}."

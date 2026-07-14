@@ -36,6 +36,15 @@ const STATE_TABLES: &[TableSpec] = &[
                labels, run_id, step_id, created_ts, updated_ts, closed_ts",
         key: "id",
     },
+    // AFTER `beads`: `replace_state_from_shadow` deletes with `.iter().rev()`,
+    // so a child table listed after its parent is deleted FIRST and the FK
+    // holds (`foreign_keys = ON`). Without this entry `--refold` never diffs a
+    // reservation and `--repair` hard-fails on the constraint.
+    TableSpec {
+        name: "bead_meta",
+        cols: "bead_id, key, value",
+        key: "bead_id || '/' || key",
+    },
     TableSpec {
         name: "deps",
         cols: "bead_id, needs_id",

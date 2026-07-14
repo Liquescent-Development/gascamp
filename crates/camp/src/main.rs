@@ -84,7 +84,7 @@ enum Command {
     },
     /// Verify ledger invariants
     #[command(group(
-        clap::ArgGroup::new("mode").required(true).args(["refold", "formula"])
+        clap::ArgGroup::new("mode").required(true).args(["refold", "formula", "drain_reservations"])
     ))]
     Doctor {
         /// Rebuild state from the event log and report drift (spec §13.5)
@@ -96,6 +96,24 @@ enum Command {
         /// Validate a formula file against the camp subset (spec §8.2)
         #[arg(long, value_name = "PATH", conflicts_with = "refold")]
         formula: Option<PathBuf>,
+        /// Machine-readable verdict. Exits 0 even when the formula does not load
+        /// — the VERDICT is the output, not the exit code (the §10 gate reads it).
+        #[arg(long, requires = "formula")]
+        json: bool,
+        /// List exclusive drain reservations, flagging ORPHANS (a reservation
+        /// whose holding anchor is closed or gone — a kill -9 between the reserve
+        /// batch and the cook).
+        #[arg(long, conflicts_with_all = ["refold", "formula"])]
+        drain_reservations: bool,
+        /// Release the orphans `--drain-reservations` finds. The operator escape:
+        /// a held member no drain will ever gather is a member no drain can ever
+        /// take.
+        #[arg(long, requires = "drain_reservations")]
+        release_orphans: bool,
+        /// Emit camp's COMPILED steps in the differential gate's normalized shape
+        /// (`ci/gc-compat/differential.py` diffs them against gc's real compiler).
+        #[arg(long, requires = "formula")]
+        compiled: bool,
     },
     /// Append events by hand (worker contract surface)
     Event {
@@ -141,6 +159,10 @@ enum Command {
         /// Routing hint to a pack agent
         #[arg(long)]
         assignee: Option<String>,
+        /// Add this bead to a run as a MEMBER (compat §9 D3): a drain step in
+        /// that run scatters one item run per member. The run must exist.
+        #[arg(long)]
+        run: Option<String>,
     },
     /// Claim a bead for a session (open → in_progress)
     Claim {
@@ -565,9 +587,30 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             refold: _,
             repair,
             formula,
+            json,
+            drain_reservations,
+            release_orphans,
+            compiled: _,
+        } if drain_reservations => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            let _ = (repair, formula, json);
+            cmd::doctor::run_drain_reservations(&camp, release_orphans)
+        }
+        Command::Doctor {
+            refold: _,
+            repair,
+            formula,
+            json,
+            compiled,
+            ..
         } => match formula {
-            // --formula validates a file, not a camp — no CampDir needed.
-            Some(path) => cmd::doctor::run_formula(&path),
+            // --formula compiles a file THROUGH THE LAYERS: an imported formula's
+            // `extends`, `description_file` and routes only resolve against a real
+            // camp, so this needs the CampDir like every other verb.
+            Some(path) => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::doctor::run_formula(&camp, &path, json, compiled)
+            }
             None => {
                 let camp = CampDir::resolve(cli.camp.as_deref())?;
                 cmd::doctor::run(&camp, repair)
@@ -602,6 +645,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             labels,
             bead_type,
             assignee,
+            run,
         } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::create::run(
@@ -613,6 +657,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 labels,
                 bead_type,
                 assignee,
+                run,
             )
         }
         Command::Claim { bead, session } => {
