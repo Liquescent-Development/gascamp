@@ -1442,8 +1442,9 @@ fn close_member_REFUSES_a_RUN_ROOT() {
     // exactly — so it passed the widened guard, and `close_member` CLAIMED AND CLOSED
     // IT. No panic. The harness would have called a run root a drain member.
     //
-    // `run_members` excludes the root by ID (`b.id <> ?2`, formula/runtime.rs:600). So
-    // does the guard now. This test is why that cannot be dropped.
+    // `run_members` excludes the root by ID (`b.id <> ?2`, formula/runtime.rs:600), and
+    // the guard now gets that for free by CALLING `run_members` rather than reproducing
+    // its conditions. This test is why that cannot regress.
     let mut c = Camp::new();
     c.spawn_campd();
     let run = c.sling("build");
@@ -1451,7 +1452,8 @@ fn close_member_REFUSES_a_RUN_ROOT() {
     c.settle();
 
     let root = c.manifest(&run)["root"].as_str().unwrap().to_owned();
-    // The root wears the member shape in every column the guard reads.
+    // The root wears the member shape in every column the hand-rolled guard USED to
+    // read — which is exactly why reproducing the predicate could never be safe.
     assert!(c.run_id_of(&root).is_some(), "precondition: run_id SET");
     assert_eq!(c.step_id_of(&root), None, "precondition: NULL step_id");
     assert_eq!(c.get_bead(&root).kind, "task", "precondition: type = task");
@@ -1459,10 +1461,12 @@ fn close_member_REFUSES_a_RUN_ROOT() {
     c.close_member(&root, "pass");
 }
 
-/// Build a bead that wears the run-member shape in EVERY column the guard reads —
-/// `run_id` set, `step_id` NULL, `type = 'task'`, not the root — but carries a
-/// cooked-run-root label, which is what `run_members` excludes it by. Reachable because
-/// `camp create` takes repeatable, unvalidated `--label` alongside `--run`.
+/// Build a bead that wears the run-member shape in every column a hand-rolled guard
+/// would read — `run_id` set, `step_id` NULL, `type = 'task'`, not the root — but
+/// carries a cooked-run-root label, which is what `run_members` excludes it by. The
+/// preconditions below assert that shape, so each decoy test proves the LABEL is the
+/// only thing rejecting it. Reachable because `camp create` takes repeatable,
+/// unvalidated `--label` alongside `--run`.
 fn labelled_decoy(c: &Camp, run: &str, label: &str) -> String {
     let bead: String = c
         .camp_ok(&["create", "decoy", "--run", run, "--label", label])
@@ -1483,16 +1487,21 @@ fn labelled_decoy(c: &Camp, run: &str, label: &str) -> String {
 #[should_panic(expected = "does not consider a run member")]
 fn close_member_REFUSES_a_DRAIN_LABELLED_nonroot() {
     // ⭐ F9. `run_members` (`formula/runtime.rs:597-621`) is SIX conditions, not four:
-    // it also drops anything wearing a `bond:` or `drain:` label, with the SQL LIKEs as
-    // a mere prefilter and `parse_drain_label` / `parse_bond_label` as the real test.
+    // it also drops anything wearing a `bond:` or `drain:` label, and it does so with
+    // TWO mechanisms ANDed — the SQL conjunct `labels NOT LIKE '%"drain:%'` AND a
+    // Rust-side re-parse. The LIKE is NOT a prefilter the re-parse subsumes: it excludes
+    // beads the parsers ADMIT, which is precisely what
+    // `close_member_REFUSES_a_MALFORMED_LABELLED_nonroot` proves.
     //
     // A `drain:`-labelled NON-ROOT bead wears the member shape in every column the
     // four-conjunct guard read, so it walked straight through and `close_member`
     // ABSORBED IT — while `run_members` excludes it. The harness would close a
     // NON-MEMBER as a member: the V-5 blindness again, third variant.
     //
-    // The guard now calls the PRODUCT'S OWN PARSERS rather than restating the
-    // predicate. Restating it is how this went wrong four rounds running.
+    // The guard no longer reproduces ANY of that. It calls `run_members` itself, so both
+    // mechanisms hold by construction. (An earlier version of this comment claimed the
+    // guard called the two label PARSERS and that the LIKEs were a mere prefilter —
+    // false on both counts, and that belief is what produced the malformed-label hole.)
     let mut c = Camp::new();
     c.spawn_campd();
     let run = c.sling("build");
@@ -1505,12 +1514,19 @@ fn close_member_REFUSES_a_DRAIN_LABELLED_nonroot() {
 #[test]
 #[should_panic(expected = "does not consider a run member")]
 fn close_member_REFUSES_a_BOND_LABELLED_nonroot() {
-    // ⭐ F9, the other half of the disjunction — and it is here for a reason of method,
-    // not symmetry. The guard rejects a decoy if `parse_drain_label` OR
-    // `parse_bond_label` matches. Pinning only the `drain:` case would leave the
-    // `parse_bond_label` arm DELETABLE with the suite still green — an unfalsifiable
-    // fix, which is the exact defect class this branch has been beaten for. A fix you
-    // can delete while its test stays green is not a fix.
+    // ⭐ F9, the `bond:` half — and it is here for a reason of method, not symmetry.
+    //
+    // `run_members` excludes BOTH label families, and when the guard reproduced that
+    // rule by hand it did so as a disjunction over two parsers. Pinning only the
+    // `drain:` case left the `bond:` arm DELETABLE with the suite still green — an
+    // unfalsifiable fix, the exact defect class this branch has been beaten for. A fix
+    // you can delete while its test stays green is not a fix.
+    //
+    // The guard now calls `run_members` and has no arms to delete, so this test no
+    // longer pins a branch of the harness — it pins the PRODUCT's treatment of `bond:`,
+    // independently of `drain:`. That is still worth holding: the two families are
+    // separate conditions in `run_members`, and a test for one is not a test for the
+    // other.
     let mut c = Camp::new();
     c.spawn_campd();
     let run = c.sling("build");
