@@ -101,7 +101,7 @@ jobs:
         run: python3 ci/gc-compat/rungs.py gcpacks-src
       - name: phase-2 formula gate (the rungs, the ceiling, RUNNABLE)
         run: python3 ci/gc-compat/formula_gate.py gcpacks-src target/debug/camp
-      - name: phase-2 END-TO-END gate (BD8: an imported corpus formula cooks AND RUNS)
+      - name: "phase-2 END-TO-END gate — an imported corpus formula COOKS AND RUNS (BD8)"
         run: python3 ci/gc-compat/e2e_corpus.py gcpacks-src target/debug/camp
       - name: read pinned gascity ref
         id: gc-ref
