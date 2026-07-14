@@ -41,9 +41,21 @@ struct Manifest {
     rig: String,
     root: String,
     steps: BTreeMap<String, String>,
-    // actor / cooked_ts / vars: audit content, not needed here
+    // actor / cooked_ts: audit content, not needed here.
+    //
+    // `vars` too, and DELIBERATELY: the recipe is already INSTANTIATED (BD-A),
+    // so there is nothing left to substitute at load. The vars are pinned in the
+    // manifest for audit — so an operator can see what the run was cooked with —
+    // not for re-derivation.
     #[serde(flatten)]
     _rest: BTreeMap<String, serde_json::Value>,
+}
+
+/// `runs/<id>/recipe.json` — the INSTANTIATED formula (D6/BD-A).
+#[derive(Deserialize)]
+struct PinnedRecipe {
+    recipe_version: u32,
+    formula: Formula,
 }
 
 /// Load a run's context from `<runs_dir>/<run_id>/`. A missing dir,
@@ -64,9 +76,42 @@ pub fn load_run(runs_dir: &Path, run_id: &str) -> Result<RunContext, CoreError> 
             manifest.run_id
         )));
     }
-    let formula_path = dir.join(format!("{}.toml", manifest.formula));
-    let formula = crate::formula::parse_and_validate(&formula_path)
-        .map_err(|e| corrupt(format!("pinned formula invalid: {e}")))?;
+    // BD8 — deserialize the PINNED RECIPE. This used to re-parse the authored
+    // `<formula>.toml` with `parse_and_validate` (no layers, no config), which
+    // for any imported formula could not possibly succeed: `ctx()` turned the
+    // error into `None` and every caller then DEAD-ENDED the run. Every one of
+    // the 62 runnable corpus formulas would have hit it.
+    //
+    // Nothing here re-parses, resolves layers, or reads config. The recipe is
+    // already instantiated: `{{var}}` substituted, routes resolved.
+    let recipe_path = dir.join("recipe.json");
+    let raw = std::fs::read_to_string(&recipe_path).map_err(|_| {
+        corrupt(format!(
+            "no recipe.json at {} — this run was cooked by an older camp; re-sling it",
+            recipe_path.display()
+        ))
+    })?;
+    let pinned: PinnedRecipe =
+        serde_json::from_str(&raw).map_err(|e| corrupt(format!("bad recipe.json: {e}")))?;
+    // STRICT equality, and it kills in-flight runs LOUDLY rather than
+    // deserializing a recipe that means something else (BD-C).
+    if pinned.recipe_version != crate::formula::cook::RECIPE_VERSION {
+        return Err(corrupt(format!(
+            "was cooked by a different camp (recipe v{}, this camp reads v{}) — re-sling it",
+            pinned.recipe_version,
+            crate::formula::cook::RECIPE_VERSION
+        )));
+    }
+    let formula = pinned.formula;
+    // The two pinned artifacts must agree about what was cooked. They are written
+    // in the same transaction, so a mismatch means the run dir was edited or
+    // corrupted — never a thing to shrug at.
+    if formula.name != manifest.formula {
+        return Err(corrupt(format!(
+            "manifest names formula {:?} but recipe.json holds {:?}",
+            manifest.formula, formula.name
+        )));
+    }
     let formula_steps: Vec<&str> = formula.steps.iter().map(|s| s.id.as_str()).collect();
     let manifest_steps: Vec<&str> = manifest.steps.keys().map(String::as_str).collect();
     if formula_steps

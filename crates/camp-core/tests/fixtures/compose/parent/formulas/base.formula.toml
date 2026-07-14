@@ -1,0 +1,8 @@
+formula = "base"
+contract = "graph.v2"
+
+[[steps]]
+id = "impl"
+title = "Implement"
+description_file = "../assets/workflows/implement.md"
+metadata = { "gc.run_target" = "{{implementation_target}}", "gc.build.artifact_schema" = "x" }

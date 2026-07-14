@@ -7,6 +7,7 @@
 //! Gas City that camp declines — §4 rule 1), and **ignored keys** (gc's dead
 //! config, and unrecognised keys in an imported layer).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -34,6 +35,14 @@ pub(crate) struct RawStep {
     pub id: Option<String>,
     pub title: Option<String>,
     pub description: Option<String>,
+    /// Rung 2a. CONSUMED at compile (stage 4): the file's contents REPLACE
+    /// `description`. 328 corpus uses, and the steps that carry one typically
+    /// have no inline description at all — ignore it and the worker gets zero
+    /// instructions.
+    pub description_file: Option<String>,
+    /// Rung 2a. gc's step metadata, carried VERBATIM onto the bead. This is
+    /// where routing lives (`gc.run_target`, 327 uses) — it is not annotation.
+    pub metadata: BTreeMap<String, String>,
     pub needs: Vec<String>,
     pub assignee: Option<String>,
     pub timeout: Option<Duration>,
@@ -214,6 +223,32 @@ fn get_string_array(
     }
 }
 
+/// A flat map of string values — `steps.<id>.metadata`. gc's metadata values
+/// are strings; a non-string is a violation, never a silent drop.
+fn get_string_map(
+    table: &toml::Table,
+    key: &str,
+    construct: &str,
+    out: &mut Vec<Violation>,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    match table.get(key) {
+        None => {}
+        Some(Value::Table(t)) => {
+            for (k, v) in t {
+                match v {
+                    Value::String(s) => {
+                        map.insert(k.clone(), s.clone());
+                    }
+                    _ => out.push(wrong_type(&format!("{construct}.{k}"), "a string")),
+                }
+            }
+        }
+        Some(_) => out.push(wrong_type(construct, "a table of strings")),
+    }
+    map
+}
+
 fn get_duration(
     table: &toml::Table,
     key: &str,
@@ -386,6 +421,8 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
     let out = &mut ctx.violations;
     let title = get_string(step, "title", &at("title"), out);
     let description = get_string(step, "description", &at("description"), out);
+    let description_file = get_string(step, "description_file", &at("description_file"), out);
+    let metadata = get_string_map(step, "metadata", &at("metadata"), out);
     let needs = get_string_array(step, "needs", &at("needs"), out);
     let assignee = get_string(step, "assignee", &at("assignee"), out);
     let timeout = get_duration(step, "timeout", &at("timeout"), out);
@@ -398,6 +435,8 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
         id,
         title,
         description,
+        description_file,
+        metadata,
         needs,
         assignee,
         timeout,

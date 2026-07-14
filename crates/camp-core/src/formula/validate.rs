@@ -19,6 +19,31 @@ fn declares_compiler(raw: &RawFormula) -> bool {
     raw.formula_compiler.is_some() || raw.contract.as_deref() == Some("graph.v2")
 }
 
+/// D1 — RUNNABLE, evaluated over the extends-MERGED formula: a `graph.v2`
+/// contract AND not an expansion.
+///
+/// **Compiling is not enough to `camp sling` something.** Of the 95 corpus
+/// formulas camp LOADS, 19 declare no contract and 14 are expansions (disjoint)
+/// — so only 62 can actually be run. "95/100" alone is a misleading headline and
+/// both numbers are stated wherever one is.
+pub(crate) fn not_runnable(raw: &RawFormula) -> Option<String> {
+    if is_expansion(raw) {
+        Some(
+            "this is a `type = \"expansion\"` formula: it supplies `template` steps for another \
+             formula's `expand` rule and is not directly runnable (compat §9)"
+                .to_owned(),
+        )
+    } else if raw.contract.as_deref() != Some("graph.v2") {
+        Some(
+            "this formula declares no `contract = \"graph.v2\"`: camp compiles it, but only \
+             graph.v2 formulas can be run (compat §9)"
+                .to_owned(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Camp's formula-compiler capability. Mirrors gc's v2 host capability
 /// (gc formula-spec-v2 §5); `[requires] formula_compiler` comparators are
 /// checked against this version.
@@ -398,6 +423,7 @@ pub(crate) fn assemble(raw: RawFormula, source: String) -> Formula {
                 description: s.description,
                 needs: s.needs,
                 assignee: s.assignee,
+                metadata: s.metadata,
                 timeout: s.timeout,
                 check: s.check,
                 retry: s.retry.map(|r| Retry {

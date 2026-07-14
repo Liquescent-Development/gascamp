@@ -1,0 +1,5 @@
+formula = "no-contract"
+
+[[steps]]
+id = "a"
+title = "A"

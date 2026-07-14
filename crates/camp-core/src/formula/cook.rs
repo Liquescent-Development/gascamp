@@ -23,6 +23,17 @@ use crate::event::{EventInput, EventType};
 use crate::formula::ast::Formula;
 use crate::ledger::Ledger;
 
+/// The schema of `runs/<id>/recipe.json`.
+///
+/// **STRICT EQUALITY** (BD-C). `recipe.json` is the reload path for every live
+/// run. compat-3 touches the worker contract; compat-4 adds `type = "mail"`. If
+/// either adds a field to `Formula`/`Step`, this MUST be bumped — and bumping it
+/// kills in-flight runs LOUDLY, with a named remedy ("re-sling it"), which is
+/// invariant 5. The alternative — deserializing a recipe that means something
+/// else — is the failure mode BD8 already shipped once, and no compat-2 gate can
+/// see it, because every fixture cooks and loads with the SAME binary.
+pub const RECIPE_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CookedRun {
     pub run_id: String,
@@ -173,7 +184,23 @@ pub fn cook_with(
         std::fs::write(dir.join(name), bytes)
             .map_err(|e| CoreError::Cook(format!("cannot write {}/{name}: {e}", dir.display())))
     };
+    // The authored bytes, verbatim — invariant 3 ("human-readable run files").
+    // AUDIT ONLY. Nothing re-parses this.
     write(&format!("{}.toml", formula.name), formula.source.as_bytes())?;
+    // BD8 — the run's REAL reload path. `load_run` used to re-parse the authored
+    // `.toml` above with no layers and a default config; for every imported
+    // corpus formula (they carry `extends`, `description_file`, and routes that
+    // need `cfg.imports`) that re-parse CANNOT succeed, so every cooked corpus
+    // run dead-ended on campd's first event.
+    //
+    // This is the INSTANTIATED recipe (BD-A): written AFTER `{{var}}`
+    // substitution and AFTER route resolution, because merged campd EXECs
+    // `step.check.path` and DISPATCHES on `step.assignee` straight out of it.
+    let recipe = serde_json::json!({
+        "recipe_version": RECIPE_VERSION,
+        "formula": formula,
+    });
+    write("recipe.json", format!("{recipe:#}").as_bytes())?;
     let mut manifest = serde_json::json!({
         "run_id": run_id,
         "formula": formula.name,
@@ -225,6 +252,11 @@ pub fn cook_with(
         }
         if let Some(a) = &step.assignee {
             data["assignee"] = serde_json::json!(a);
+        }
+        // gc's step metadata, onto the bead (compat §6.1). This is where routing
+        // lives (`gc.run_target`) — it is not annotation.
+        if !step.metadata.is_empty() {
+            data["metadata"] = serde_json::json!(step.metadata);
         }
         inputs.push(EventInput {
             kind: EventType::BeadCreated,

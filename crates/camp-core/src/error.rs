@@ -42,6 +42,13 @@ pub enum CoreError {
     /// integrity finding — that is `Corrupt`.
     #[error("cook: {0}")]
     Cook(String),
+    /// A formula could not be COMPILED for a reason outside the key table:
+    /// an unresolvable `extends` parent, an asset that no layer ships, a
+    /// `description_file` escaping its pack root, an expansion cycle. A
+    /// per-key verdict is a `Violation` or a `Refusal`; this is everything
+    /// that is neither.
+    #[error("formula: {0}")]
+    Formula(String),
     /// An order is misconfigured or failed at the order level; the reason
     /// names the offending field where one exists (spec §9: parse errors
     /// name the order and the field).

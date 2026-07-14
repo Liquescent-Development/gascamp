@@ -2,6 +2,7 @@
 //! and the cook() transaction itself.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(non_snake_case)]
 
 use camp_core::clock::FixedClock;
 use camp_core::event::{EventInput, EventType};
@@ -249,6 +250,7 @@ fn cook_rejects_unknown_needs_ids_in_hand_built_formulas() {
         description: None,
         needs: needs.iter().map(|s| (*s).to_owned()).collect(),
         assignee: None,
+        metadata: Default::default(),
         timeout: None,
         check: None,
         retry: None,
@@ -475,5 +477,182 @@ fn substitution_never_reinterprets_inserted_values_as_templates() {
     assert_eq!(
         step.title, "Handle literal {position} inside at 0",
         "inserted values are worker output, not template syntax"
+    );
+}
+
+// ---- BD8: the pinned recipe, and the round-trip that was DEAD ---------------
+
+/// The two-layer fixture from `compose.rs`: a camp root (CAMP-LOCAL, highest)
+/// importing a parent pack. This is the shape EVERY corpus formula has, and the
+/// shape no rev-2 fixture had — which is precisely why the phase-killer was
+/// invisible to the whole suite.
+fn layered_camp() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    camp_core::config::CampConfig,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let fixtures =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compose");
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            let dest = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_tree(&e.path(), &dest);
+            } else {
+                std::fs::copy(e.path(), &dest).unwrap();
+            }
+        }
+    }
+    copy_tree(&fixtures.join("local"), &root);
+    std::fs::write(
+        root.join("camp.toml"),
+        format!(
+            "[camp]\nname = \"t\"\n\n[imports.gc]\nsource = {:?}\n",
+            fixtures.join("parent").display().to_string()
+        ),
+    )
+    .unwrap();
+    let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+    (dir, root, cfg)
+}
+
+#[test]
+fn cook_pins_the_compiled_recipe_and_the_authored_source() {
+    let (_d, mut ledger) = temp_ledger();
+    let formula = parse_and_validate(&fixture("diamond")).unwrap();
+    let runs = tempfile::tempdir().unwrap();
+    let cooked = cook(&mut ledger, &formula, runs.path(), &rig(), "cli").unwrap();
+    let dir = runs.path().join(&cooked.run_id);
+
+    // The authored bytes, verbatim — invariant 3. AUDIT ONLY.
+    let authored = std::fs::read_to_string(dir.join("diamond.toml")).unwrap();
+    assert_eq!(authored, formula.source);
+
+    // And the recipe, which is what load_run actually reads.
+    let recipe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("recipe.json")).unwrap()).unwrap();
+    assert_eq!(recipe["recipe_version"], 1);
+    assert_eq!(recipe["formula"]["name"], "diamond");
+    // `source` is skipped — otherwise the recipe embeds a full duplicate of the
+    // authored bytes sitting right next to it (BD-C).
+    assert!(recipe["formula"]["source"].is_null(), "{recipe:#}");
+}
+
+#[test]
+fn cook_pins_a_recipe_whose_step_ids_are_exactly_the_manifest_steps() {
+    let (_d, mut ledger) = temp_ledger();
+    let formula = parse_and_validate(&fixture("diamond")).unwrap();
+    let runs = tempfile::tempdir().unwrap();
+    let cooked = cook(&mut ledger, &formula, runs.path(), &rig(), "cli").unwrap();
+    let dir = runs.path().join(&cooked.run_id);
+
+    let recipe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("recipe.json")).unwrap()).unwrap();
+    let recipe_ids: std::collections::BTreeSet<String> = recipe["formula"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_owned())
+        .collect();
+    let manifest_ids: std::collections::BTreeSet<String> =
+        cooked.step_beads.keys().cloned().collect();
+    assert_eq!(recipe_ids, manifest_ids);
+}
+
+#[test]
+fn load_run_reconstitutes_a_run_cooked_from_an_IMPORTED_formula_with_extends_and_description_file()
+{
+    // ⭐ THE TEST THAT WOULD HAVE CAUGHT THE PHASE-KILLER (BD8).
+    //
+    // `load_run` used to RE-PARSE the pinned authored `.toml` with
+    // `parse_and_validate` — no layers, no config. This formula is imported and
+    // carries a `description_file` that only resolves THROUGH THE LAYERS, so
+    // that re-parse could not possibly succeed. `ctx()` turned the error into
+    // `None` and every caller then DEAD-ENDED the run. All 62 runnable corpus
+    // formulas would have hit it, and not one gate in rev 2 could see it:
+    // formula_gate only COMPILED, differential diffed COMPILERS, and every drain
+    // fixture was a layer-free camp-local pack that happened to re-parse cleanly.
+    let (_fixtures, root, cfg) = layered_camp();
+    let (_d, mut ledger) = temp_ledger();
+    let layers = camp_core::formula::FormulaLayers::from_config(&cfg, &root).unwrap();
+    let compiled = camp_core::formula::compile_named(
+        &layers,
+        &cfg,
+        "base",
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+
+    let runs = root.join("runs");
+    let cooked = cook(&mut ledger, &compiled.formula, &runs, &rig(), "cli").unwrap();
+
+    // The whole point: this must be Ok, with no layers and no config in hand.
+    let ctx = camp_core::formula::runtime::load_run(&runs, &cooked.run_id)
+        .expect("a cooked run must reload from its pinned recipe alone");
+    assert_eq!(ctx.formula.name, "base");
+    let step = ctx
+        .step_ref("impl")
+        .expect("the step survives the round trip");
+    // And its metadata — the ROUTE — survives with it.
+    assert!(
+        step.step.metadata.contains_key("gc.run_target"),
+        "the route must survive the pin: {:?}",
+        step.step.metadata
+    );
+    // The description came from an asset that no re-parse could have resolved.
+    assert!(step.step.description.is_some());
+}
+
+#[test]
+fn load_run_on_a_pre_recipe_run_dir_fails_loudly() {
+    // `recipe.json` is a run-dir schema change. A campd started against a run
+    // cooked by an OLDER camp finds none — and must say so, never fall back to
+    // the re-parse that BD8 is about.
+    let (_d, mut ledger) = temp_ledger();
+    let formula = parse_and_validate(&fixture("diamond")).unwrap();
+    let runs = tempfile::tempdir().unwrap();
+    let cooked = cook(&mut ledger, &formula, runs.path(), &rig(), "cli").unwrap();
+    std::fs::remove_file(runs.path().join(&cooked.run_id).join("recipe.json")).unwrap();
+
+    let err = camp_core::formula::runtime::load_run(runs.path(), &cooked.run_id).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("no recipe.json"), "{text}");
+    assert!(
+        text.contains("re-sling"),
+        "the remedy must be NAMED: {text}"
+    );
+}
+
+#[test]
+fn load_run_rejects_a_recipe_with_an_unknown_recipe_version() {
+    // BD-C — the CROSS-VERSION dimension no fixture spans, because every fixture
+    // cooks and loads with the SAME binary.
+    //
+    // compat-3 touches the worker contract; compat-4 adds `type = "mail"`. Adding
+    // a field to Formula/Step means bumping RECIPE_VERSION — and this is the
+    // check that makes that bump kill in-flight runs LOUDLY, with a named remedy,
+    // instead of deserializing a recipe that means something else.
+    let (_d, mut ledger) = temp_ledger();
+    let formula = parse_and_validate(&fixture("diamond")).unwrap();
+    let runs = tempfile::tempdir().unwrap();
+    let cooked = cook(&mut ledger, &formula, runs.path(), &rig(), "cli").unwrap();
+
+    let path = runs.path().join(&cooked.run_id).join("recipe.json");
+    let mut recipe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    recipe["recipe_version"] = serde_json::json!(camp_core::formula::RECIPE_VERSION + 1);
+    std::fs::write(&path, recipe.to_string()).unwrap();
+
+    let err = camp_core::formula::runtime::load_run(runs.path(), &cooked.run_id).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("different camp"), "{text}");
+    assert!(
+        text.contains("re-sling"),
+        "the remedy must be NAMED: {text}"
     );
 }

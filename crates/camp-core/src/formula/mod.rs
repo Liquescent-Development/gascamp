@@ -21,8 +21,10 @@
 //! [`keys::Origin`], because the two tiers are asking different questions.
 
 pub mod ast;
-mod cook;
+pub mod compose;
+pub(crate) mod cook;
 pub mod keys;
+pub mod layers;
 mod parse;
 pub mod runtime;
 mod validate;
@@ -31,8 +33,10 @@ pub use ast::{
     Check, CheckMode, Disposition, Formula, FormulaError, OnComplete, Refusal, Requires, Step,
     Violation,
 };
-pub use cook::{CookOptions, CookedRun, cook, cook_with};
+pub use compose::{Compiled, compile, compile_named};
+pub use cook::{CookOptions, CookedRun, RECIPE_VERSION, cook, cook_with};
 pub use keys::{Class, Origin, Site};
+pub use layers::FormulaLayers;
 pub use validate::{FORMULA_COMPILER_CAPABILITY, formula_stem};
 
 use std::path::Path;

@@ -6,37 +6,59 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[derive(Debug, Clone, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Formula {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires: Option<Requires>,
     pub steps: Vec<Step>,
-    /// Verbatim bytes of the authored file (plan contract deviation 1).
+    /// Verbatim bytes of the authored file.
+    ///
+    /// **`skip`, deliberately (BD-C).** `cook` pins BOTH the authored `.toml`
+    /// (verbatim, for audit — invariant 3) and the INSTANTIATED `recipe.json`.
+    /// Serializing `source` would embed a full duplicate of the authored bytes
+    /// inside the recipe sitting right next to them.
+    #[serde(skip)]
     pub source: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Requires {
     /// A semver comparator, e.g. ">=2.0.0" (gc: the only [requires] axis).
     pub formula_compiler: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Step {
     pub id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// gc's step metadata, carried VERBATIM. Routing lives here
+    /// (`gc.run_target`) — this is not annotation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
     /// General bound on the step's check script (gc: requires `check`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<Check>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<Retry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_complete: Option<OnComplete>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CheckMode {
     Exec,
 }
@@ -49,15 +71,17 @@ impl CheckMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Check {
     pub max_attempts: u32,
     pub mode: CheckMode,
     pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<Duration>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Disposition {
     HardFail,
     SoftFail,
@@ -72,14 +96,14 @@ impl Disposition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Retry {
     pub max_attempts: u32,
     /// Default hard_fail (gc formula-spec-v2 §3.2).
     pub on_exhausted: Disposition,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OnComplete {
     /// Path into structured step output; must start with "output.".
     pub for_each: String,
