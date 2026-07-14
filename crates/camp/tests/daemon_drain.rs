@@ -211,11 +211,13 @@ impl Camp {
     /// it — all 14 of them.
     ///
     /// The books BALANCE, and they are meant to be checked: 14 callers + 6 failure-path
-    /// tests that must not call it (below) + 3 `should_panic` harness-guard tests
+    /// tests that must not call it (below) + 5 `should_panic` harness-guard tests
     /// (`close_member_REFUSES_a_dispatched_bead`,
     /// `close_member_REFUSES_a_RUNLESS_dispatched_bead`,
+    /// `close_member_REFUSES_a_RUN_SCOPED_MAIL_bead`,
+    /// `close_member_REFUSES_a_RUN_ROOT`,
     /// `close_dispatched_REFUSES_a_CLOSED_bead_no_worker_ever_touched`), which panic
-    /// INSIDE the harness and can never reach a call site = 23 `#[test]` fns, the whole
+    /// INSIDE the harness and can never reach a call site = 25 `#[test]` fns, the whole
     /// file. An earlier version of this comment accounted for 20 of 23 and left the
     /// other 3 unmentioned — in a comment whose entire job is to make every exclusion
     /// explicit. If these three numbers stop summing to the `#[test]` count, an
@@ -343,41 +345,72 @@ impl Camp {
     /// `a_CLOSED_member_is_never_scattered` STILL PASSES, because this method absorbs
     /// the wrongly-dispatched member. The guard is what turns that into a hard failure.
     ///
-    /// So the guard admits ONLY THE RUN-MEMBER SHAPE: `run_id IS NOT NULL` **and**
-    /// `step_id IS NULL`. Both halves, because that shape is a CONJUNCTION — a NULL
-    /// `step_id` alone is NECESSARY BUT NOT SUFFICIENT, and round 4's guard tested only
-    /// that half. The missing conjunct was a real hole, proven by execution: a RUNLESS
-    /// bead (`camp create <title>` with no `--run`) has `run_id` NULL *and* `step_id`
-    /// NULL, so the member exclusion does not fire, campd DISPATCHES it, and it slid
-    /// through the `step_id`-only guard into `close_member`, which absorbed it — the
-    /// V-5 blindness reinstated in its exact shape, through the check meant to prevent
-    /// it.
+    /// So the guard admits ONLY WHAT THE PRODUCT CALLS A MEMBER, and it takes all THREE
+    /// of the columns `run_members` keys on (`formula/runtime.rs:600`):
+    /// `run_id = ?1 AND step_id IS NULL AND type = 'task'`. This has been widened once
+    /// per round because each time it was short, a real bead walked through:
     ///
-    /// What this guard is NOT is a mirror of `dispatchable_beads`. That predicate
+    /// - round 4 checked `step_id` alone. A RUNLESS bead (`camp create` with no `--run`)
+    ///   has `run_id` NULL *and* `step_id` NULL, so the member exclusion in
+    ///   `dispatchable_beads` does not fire, campd DISPATCHES it — and it slid straight
+    ///   into `close_member`, which absorbed a bead a worker had really run. That is the
+    ///   V-5 blindness, reinstated through the check meant to prevent it.
+    /// - round 5 added `run_id` and was BLIND TO `type`. A run-scoped MAIL bead has
+    ///   `run_id` NOT NULL and `step_id` NULL, so it satisfied both columns and
+    ///   `close_member` closed it AS A MEMBER — in the same file as
+    ///   `a_mail_bead_in_a_run_is_never_a_drain_member`, which exists to forbid exactly
+    ///   that fiction. `type = 'task'` IS D3.
+    ///
+    /// What the guard is NOT is a mirror of `dispatchable_beads`. That predicate
     /// (`readiness.rs:161-172`) is a SIX-WAY conjunction — `status='open'`,
     /// `type='task'`, `dispatch_failure IS NULL`, the member exclusion, no `sessions`
-    /// row, no unmet deps — and this tests ONE of the six. It is the one that MATTERS
-    /// here: the member shape is the conjunct that GUARANTEES campd will not dispatch
-    /// the bead, so accepting only that shape is SOUND (nothing campd wakes gets in).
-    /// It is not EXHAUSTIVE, and it must not claim to be: plenty of beads campd will
-    /// never dispatch — a memory bead, a mail bead, a task with an unmet `--needs` —
-    /// are also rejected here, and rightly so, because they are not members and this
-    /// method is only for members. The panic below therefore does NOT tell such an
-    /// author that campd dispatches their bead; an earlier version did, and it would
-    /// have sent them to `close_dispatched` to spin ten seconds and hard-fail on
+    /// row, no unmet deps. The member SHAPE is the one conjunct of the six that
+    /// GUARANTEES campd will not dispatch the bead, which is what makes accepting only
+    /// that shape SOUND: nothing campd wakes can get in here. It is not EXHAUSTIVE and
+    /// must not claim to be — a memory bead, a mail bead or a task with an unmet
+    /// `--needs` is also undispatchable, and is also rejected here, because this method
+    /// is for MEMBERS, not merely for undispatched beads. So the panic does not tell
+    /// such an author that campd dispatches their bead; an earlier version did, and it
+    /// would have sent them to `close_dispatched` to spin ten seconds and hard-fail on
     /// "NEVER DISPATCHED".
     ///
-    /// `close_member_REFUSES_a_dispatched_bead` and
-    /// `close_member_REFUSES_a_RUNLESS_dispatched_bead` hold this shut.
+    /// …and the ROOT is excluded too, because `run_members` excludes it — by ID
+    /// (`b.id <> ?2`), the fourth condition of that predicate. This was NOT theoretical
+    /// either: a run root has `run_id` SET, `step_id` NULL and `type = 'task'`, so it
+    /// wears the member shape EXACTLY, and a probe routing one here found `close_member`
+    /// CLAIMED AND CLOSED IT with no panic. The docstring of this very method briefly
+    /// claimed a root would hard-fail on `InvalidTransition` instead; that was measured
+    /// and it was false. Excluding by id is what `run_members` does, so it is what this
+    /// does. It also catches a COOKED run root (`bond:`/`drain:` labelled), which is the
+    /// root of its own run and therefore its own `manifest.root`.
+    ///
+    /// One condition of `run_members` is deliberately NOT asserted: `status <> 'closed'`.
+    /// A CLOSED member is still a member and this method must accept one — its `closed`
+    /// arm returns, and `a_CLOSED_member_is_never_scattered` closes one through here on
+    /// purpose.
+    ///
+    /// `close_member_REFUSES_a_dispatched_bead`,
+    /// `close_member_REFUSES_a_RUNLESS_dispatched_bead`,
+    /// `close_member_REFUSES_a_RUN_SCOPED_MAIL_bead` and
+    /// `close_member_REFUSES_a_RUN_ROOT` hold this shut.
     fn close_member(&self, bead: &str, outcome: &str) {
+        let run_id = self.run_id_of(bead);
+        let step_id = self.step_id_of(bead);
+        let kind = self.get_bead(bead).kind;
+        // `run_members`' `b.id <> ?2`: the root wears the member shape exactly.
+        let is_root = run_id
+            .as_deref()
+            .is_some_and(|r| self.manifest(r)["root"].as_str() == Some(bead));
         assert!(
-            self.run_id_of(bead).is_some() && self.step_id_of(bead).is_none(),
+            run_id.is_some() && step_id.is_none() && kind == "task" && !is_root,
             "close_member called on a bead that is NOT a run member ({bead}: run_id={:?} \
-             step_id={:?}) — a member is `run_id IS NOT NULL AND step_id IS NULL`, and \
-             this method is ONLY for members. If campd dispatches this bead, use \
-             close_dispatched; if it does not, the bead does not belong in this suite",
-            self.run_id_of(bead),
-            self.step_id_of(bead)
+             step_id={:?} type={kind:?} is_root={is_root}) — the product's member \
+             predicate is `run_id = ? AND step_id IS NULL AND type = 'task'` AND \
+             `id <> <root>` (formula/runtime.rs:600), and this method is ONLY for \
+             members. If campd dispatches this bead, use close_dispatched; if it does \
+             not, the bead does not belong in this suite",
+            run_id,
+            step_id
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1350,6 +1383,75 @@ fn close_member_REFUSES_a_RUNLESS_dispatched_bead() {
     );
 
     c.close_member(&bead, "pass");
+}
+
+#[test]
+#[should_panic(expected = "is NOT a run member")]
+fn close_member_REFUSES_a_RUN_SCOPED_MAIL_bead() {
+    // ⭐ F8. The guard read `run_id` and `step_id` and was BLIND TO `type`.
+    //
+    // The product's member predicate (`formula/runtime.rs:600`) is
+    // `run_id = ?1 AND step_id IS NULL AND type = 'task'` — THREE columns. Round 4's
+    // guard had one, round 5 widened it to two, and a run-scoped MAIL bead satisfies
+    // both of those: `run_id` NOT NULL, `step_id` NULL. It sailed through, and
+    // `close_member` closed it AS A MEMBER.
+    //
+    // This file already creates exactly this bead 480 lines up, inside a test named
+    // `a_mail_bead_in_a_run_is_never_a_drain_member` — so the harness stood ready to
+    // call a mail bead a member in the same file that forbids it. `type` is not a
+    // detail of the member predicate; it is the whole of D3.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("build");
+    let mail: String = c
+        .camp_ok(&["create", "a message", "--run", &run, "--type", "mail"])
+        .trim()
+        .into();
+    c.settle();
+
+    // The exact shape that defeated the two-column guard.
+    assert!(
+        c.run_id_of(&mail).is_some(),
+        "precondition: scoped to the run"
+    );
+    assert_eq!(c.step_id_of(&mail), None, "precondition: NULL step_id");
+    assert_eq!(c.get_bead(&mail).kind, "mail", "precondition: NOT a task");
+    assert!(
+        !c.woken_beads().contains(&mail),
+        "precondition: campd never woke it — a mail bead is an open ledger record, \
+         not work"
+    );
+
+    c.close_member(&mail, "pass");
+}
+
+#[test]
+#[should_panic(expected = "is NOT a run member")]
+fn close_member_REFUSES_a_RUN_ROOT() {
+    // ⭐ F8, second hole — found by refusing to SAY a thing I had not MEASURED.
+    //
+    // While fixing the type-blindness I wrote in the docstring that a run ROOT routed
+    // here could not be silently absorbed, because `camp close` on a live root hits
+    // `InvalidTransition`. Then I probed it instead of shipping it, and it was FALSE:
+    // the root has `run_id` SET, `step_id` NULL and `type = 'task'` — the member shape,
+    // exactly — so it passed the widened guard, and `close_member` CLAIMED AND CLOSED
+    // IT. No panic. The harness would have called a run root a drain member.
+    //
+    // `run_members` excludes the root by ID (`b.id <> ?2`, formula/runtime.rs:600). So
+    // does the guard now. This test is why that cannot be dropped.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("build");
+    c.create_member(&run, "member one");
+    c.settle();
+
+    let root = c.manifest(&run)["root"].as_str().unwrap().to_owned();
+    // The root wears the member shape in every column the guard reads.
+    assert!(c.run_id_of(&root).is_some(), "precondition: run_id SET");
+    assert_eq!(c.step_id_of(&root), None, "precondition: NULL step_id");
+    assert_eq!(c.get_bead(&root).kind, "task", "precondition: type = task");
+
+    c.close_member(&root, "pass");
 }
 
 #[test]
