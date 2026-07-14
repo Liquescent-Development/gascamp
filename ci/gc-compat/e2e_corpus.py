@@ -225,13 +225,24 @@ try:
         if "{{" in agent:
             die(f"campd dispatched with an unsubstituted route {agent!r} (BD-A)")
 
-    # ⭐ THE NAMED ONE. `superpowers-development.implement` is a RALPH step whose
-    # route is a residual `{{implementation_target}}` in gc's own Recipe. The bead
-    # campd dispatches for it is the ATTEMPT — a DIFFERENT bead from the anchor cook
-    # routed, and the anchor is never dispatched. Its agent is
-    # `superpowers.implementer` ONLY IF cook substituted the var into the pinned
-    # recipe AND resolved it through the binding namespace. If BD-A were unfixed this
-    # worker would not exist at all.
+    # ⭐ THE NAMED ONE, and its scope stated HONESTLY.
+    #
+    # `superpowers-development.implement` is a ralph step whose route is a residual
+    # `{{implementation_target}}` in gc's own Recipe. The bead campd dispatches for it
+    # is the ATTEMPT — a DIFFERENT bead from the anchor cook routed — and its agent is
+    # `superpowers.implementer` only if cook substituted the var into the pinned recipe
+    # AND resolved it through the binding namespace.
+    #
+    # ⚠️ It does NOT, on its own, catch the BD-A regression: measured, the workers that
+    # regression kills are the `bmad.prd-writer` attempts, and THIS bead still
+    # dispatches. An earlier version of this comment claimed "if BD-A were unfixed this
+    # worker would not exist at all" — that sentence was FALSE, and a false claim in a
+    # gate's own failure message is the exact class of defect this wave keeps finding.
+    #
+    # BD-A is caught by the two prongs above (ANY `dispatch.failed`, and the exact
+    # dispatched COUNT), each of which fails on it independently. This prong pins the
+    # SUBSTITUTED-AND-BOUND route positively, on a named bead, and that is all it
+    # claims.
     sd_run = results["superpowers-development"]
     sd_anchor = json.load(
         open(os.path.join(root, "runs", sd_run, "manifest.json"))
@@ -246,10 +257,12 @@ try:
     }
     if "superpowers.implementer" not in attempt_agents:
         die(
-            "superpowers-development.implement's ATTEMPT bead was never dispatched to "
-            "`superpowers.implementer` — its route is a residual "
-            "`{{implementation_target}}` in gc's Recipe, so this is EXACTLY the bead "
-            "BD-A is about (cook routed the ANCHOR, which is never dispatched). "
+            "superpowers-development.implement's ATTEMPT bead was not dispatched to "
+            "`superpowers.implementer`. Its route is a residual "
+            "`{{implementation_target}}` in gc's own Recipe, so this bead's agent is "
+            "correct ONLY IF cook substituted the var into the pinned recipe AND "
+            "resolved it through the binding namespace (BD-A: cook routed the ANCHOR, "
+            "which is never dispatched — the ATTEMPT is a different bead). "
             f"agents seen: {sorted({e['data']['agent'] for e in dispatched})}"
         )
     routed = dispatched

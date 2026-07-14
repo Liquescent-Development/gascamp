@@ -18,8 +18,10 @@ subjects. (And "0 collisions" would still have been true: one back-reference per
 authored parent is trivially unique. **0 collisions is a RELATIVE property. It
 never asks whether the key MEANS anything.**)
 
-Measured at GCPACKS_REF: 530 authored keys, 0 collisions, all 20 drains, 431
-comparable dep edges.
+Measured at GCPACKS_REF: 530 authored keys, 0 collisions, all 20 drains. The gate
+compares 394 dep edges — the shim reports 431, and the 37 it does not compare have an
+endpoint in a formula the diff scopes out (an expansion formula gc materializes
+standalone against a synthesized `main` target).
 
   A  THE COMPILE SET     gc compiles 99/100; camp compiles 95. The delta is
                          EXACTLY the 4 camp deliberately refuses.
@@ -27,7 +29,11 @@ comparable dep edges.
                          identical in camp. Catches gc's DEFAULTING, camp's
                          condition-pruning, and extends propagation.
   C  ROUTES              `gc.run_target` byte-for-byte, PRE-substitution.
-  D  DESCRIPTIONS        sha256 per key, SKIPPING the 49 steps gc CORRUPTS (D7).
+  D  DESCRIPTIONS        sha256 per key. The steps gc CORRUPTS are NOT compared
+                         here — they are asserted DIFFERENT below (D7).
+  D7 THE DIVERGENCE      on the steps gc corrupts, camp's sha MUST DIFFER. 10 of the
+                         530 authored keys carry gc's corruption; 6 fall inside the
+                         compared set. RULING 6 is a GATE, not a claim.
   E  ⭐ THE STEP SET     set(gc's authored ids) == set(camp's step ids), per
                          formula. Catches OVER-PRUNING — missing work, silently.
   F  ⭐ DEPENDENCY EDGES set(gc's Deps) == set(camp's needs), both endpoints

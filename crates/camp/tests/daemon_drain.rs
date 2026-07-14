@@ -178,11 +178,89 @@ impl Camp {
             .unwrap_or(None)
     }
 
-    /// Close a bead, whoever holds it. A DISPATCHED bead has already been claimed by
-    /// its (held) worker, so the harness must not claim it — `camp close` does not
-    /// require the claiming session. A bead campd has not dispatched is still `open`
-    /// and the harness claims it itself. Both are real states.
-    fn close_bead(&self, bead: &str, outcome: &str) {
+    /// Every bead campd has woken a worker for, by bead id.
+    ///
+    /// `session.woke` is campd SAYING WHAT IT DISPATCHED AND TO WHOM. It is the only
+    /// evidence in the ledger that a worker ever EXISTED — and it is the evidence the
+    /// suite was missing entirely.
+    fn woken_beads(&self) -> std::collections::BTreeSet<String> {
+        self.events_of_type("session.woke")
+            .into_iter()
+            .filter_map(|e| e["data"]["bead"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// ⭐ No dispatch may have FAILED. Call this on every happy path.
+    ///
+    /// BD-R3-1: the V-5 fix (a valid TOML agent pack) was real and NOTHING asserted
+    /// it. Restoring the bug — YAML in a TOML file — left all 20 tests GREEN while
+    /// campd spawned ZERO workers and logged THREE `dispatch.failed`. The suite
+    /// counted survivors and never asked whether anyone had died. Same survivorship
+    /// shape as BD-1 in `e2e_corpus.py`, which I fixed there and left here.
+    fn assert_no_dispatch_failures(&self) {
+        let failed = self.events_of_type("dispatch.failed");
+        assert!(
+            failed.is_empty(),
+            "campd failed {} dispatch(es) — on a happy path there is no such thing as \
+             an acceptable one:\n  {}",
+            failed.len(),
+            failed
+                .iter()
+                .map(|e| e["data"]["reason"].as_str().unwrap_or("?").to_owned())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+    }
+
+    /// Close a bead campd DISPATCHED to a worker.
+    ///
+    /// **There is NO fallback here (invariant 5).** The old `close_bead` would claim
+    /// the bead itself if campd had not dispatched it — "both are real states" — which
+    /// made the whole suite structurally indifferent to whether a worker ever existed.
+    /// That is a harness FALLBACK papering over a real failure, and it is exactly what
+    /// let the V-5 mutant pass 20/20.
+    ///
+    /// A bead that should be dispatched and is not is a HARD FAILURE, and it says so.
+    fn close_dispatched(&self, bead: &str, outcome: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let row = self.get_bead(bead);
+            match row.status.as_str() {
+                // The (held) worker claimed it. `camp close` does not require the
+                // claiming session.
+                "in_progress" => {
+                    assert!(
+                        self.woken_beads().contains(bead),
+                        "bead {bead} is in_progress but campd never woke a worker for it"
+                    );
+                    self.camp_ok(&["close", bead, "--outcome", outcome]);
+                    return;
+                }
+                "closed" => return,
+                _ => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "bead {bead} was NEVER DISPATCHED (still {:?} after 10s). campd \
+                         must spawn a worker for it — if it did not, the agent pack, the \
+                         route or the dispatch path is broken, and the harness will NOT \
+                         paper over that by claiming the bead itself (invariant 5).\n\
+                         dispatch.failed: {:?}",
+                        row.status,
+                        self.events_of_type("dispatch.failed")
+                            .iter()
+                            .map(|e| e["data"]["reason"].as_str().unwrap_or("?").to_owned())
+                            .collect::<Vec<_>>()
+                    );
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+            }
+        }
+    }
+
+    /// Close a run MEMBER. A member is NEVER dispatched — campd excludes it from
+    /// `dispatchable_beads` by design (a DRAIN scatters over it). So the harness
+    /// claims it, and that is not a fallback: it is the only path a member has.
+    fn close_member(&self, bead: &str, outcome: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let row = self.get_bead(bead);
@@ -202,7 +280,7 @@ impl Camp {
             }
             assert!(
                 Instant::now() < deadline,
-                "bead {bead} never became closable"
+                "member {bead} never became closable"
             );
             std::thread::sleep(Duration::from_millis(40));
         }
@@ -252,7 +330,9 @@ impl Camp {
             })
             .unwrap();
         let work = self.step_bead(&run_id, "work");
-        self.close_bead(&work, outcome);
+        // An item run's `work` bead IS dispatched — that is the whole point of a
+        // drain, and it is the fact the suite never checked.
+        self.close_dispatched(&work, outcome);
     }
 
     /// Wait until campd has caught up AND has no pending drains — i.e. the
@@ -294,7 +374,7 @@ impl Camp {
     /// Close the member-producing step so the drain anchor goes ready.
     fn close_decompose(&self, run: &str) {
         let d = self.step_bead(run, "decompose");
-        self.close_bead(&d, "pass");
+        self.close_dispatched(&d, "pass");
     }
 }
 
@@ -336,6 +416,9 @@ fn a_drain_step_creates_NO_ATTEMPT_and_dispatches_NO_WORKER() {
     c.settle();
 
     let anchor = c.step_bead(&run, "implement");
+    // A drain step spawns no worker for its ANCHOR — but the rest of the run must
+    // still dispatch normally. Zero failures (BD-R3-1).
+    c.assert_no_dispatch_failures();
 
     assert!(
         c.attempts(&run, "implement", &anchor).is_empty(),
@@ -376,6 +459,28 @@ fn a_drain_scatters_EVERY_member_in_one_pass() {
 
     let anchor = c.step_bead(&run, "implement");
     let children = c.drain_children(&anchor);
+
+    // ⭐ BD-R3-1 — THE WORK ACTUALLY RAN. A drain that materializes item runs nobody
+    // ever works is a drain-shaped no-op, and the suite could not tell the difference:
+    // with the V-5 agent-pack bug restored, campd spawned ZERO workers and all 20
+    // tests still passed.
+    c.assert_no_dispatch_failures();
+    let woken = c.woken_beads();
+    for (index, root) in &children {
+        let run_id = c
+            .conn()
+            .query_row("SELECT run_id FROM beads WHERE id = ?1", [&root.id], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        let work = c.step_bead(&run_id, "work");
+        assert!(
+            woken.contains(&work),
+            "item {index}: campd never WOKE A WORKER for its work bead {work} — the \
+             drain scattered a run nobody works. session.woke: {woken:?}"
+        );
+    }
+
     assert_eq!(
         children.len(),
         3,
@@ -590,7 +695,7 @@ fn a_CLOSED_member_is_never_scattered() {
     let run = c.sling("build");
     let live = c.create_member(&run, "live member");
     let done = c.create_member(&run, "already done");
-    c.close_bead(&done, "pass");
+    c.close_member(&done, "pass");
 
     c.close_decompose(&run);
     c.settle();
@@ -944,7 +1049,7 @@ fn a_member_that_CLOSES_MID_DRAIN_is_still_released_at_gather() {
     );
 
     // The member CLOSES while its item run is still open.
-    c.close_bead(&m, "pass");
+    c.close_member(&m, "pass");
     c.settle();
     assert_eq!(c.get_bead(&m).status, "closed");
 
