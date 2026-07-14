@@ -2046,6 +2046,746 @@ mod tests {
             }
         }
     }
+    // ======== Task 8: session.subscribe ==================================
+
+    use std::io::Read as _;
+
+    /// A stream file holding `content`, plus its length (a natural `tail`).
+    fn stream_file(content: &[u8]) -> (tempfile::TempDir, std::fs::File, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t-dev-1.json");
+        std::fs::write(&path, content).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        (dir, file, content.len() as u64)
+    }
+
+    /// Read the client end to EOF (the server `Conn` must be DROPPED for this to
+    /// return). Used from a reader thread while the main thread pumps — a reader
+    /// that gave up on the first read gap would stop MID-FRAME and see a truncated
+    /// line, which is a bug in the test, not in `pump`.
+    fn read_to_eof(client: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 65536];
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match client.read(&mut chunk) {
+                Ok(0) => break, // EOF: the server end was dropped
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
+        buf
+    }
+
+    fn frames_to_eof(client: &mut std::os::unix::net::UnixStream) -> Vec<serde_json::Value> {
+        parse_frames(&read_to_eof(client))
+    }
+
+    fn parse_frames(raw: &[u8]) -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(raw)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str(l)
+                    .unwrap_or_else(|e| panic!("campd put a NON-JSON line on the wire: {l:?}: {e}"))
+            })
+            .collect()
+    }
+
+    /// Pump until the subscriber is genuinely DRAINED — every byte framed AND
+    /// every frame written. Dropping the `Conn` while `out` still holds bytes
+    /// closes the socket on unsent data and TRUNCATES the last frame: a bug in the
+    /// test, not in `pump`. (A concurrent reader must be draining the client end,
+    /// or the socket stays full and this never completes.)
+    fn pump_to_completion(rt: &mut ControlRuntime, token: Token, conn: &mut Conn) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            rt.pump(token, conn, t0());
+            let s = rt.test_sub(token);
+            if s.out.is_empty() && !s.held && s.cursor == s.tail {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pump never drained: cursor={} tail={} out={} held={}",
+                s.cursor,
+                s.tail,
+                s.out.len(),
+                s.held
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Read whatever the client end has RIGHT NOW (no pump is running concurrently).
+    fn drain_client(client: &mut std::os::unix::net::UnixStream) -> Vec<serde_json::Value> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 65536];
+        loop {
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break, // WouldBlock: nothing more right now
+            }
+        }
+        parse_frames(&buf)
+    }
+
+    const T: Token = Token(6);
+
+    /// C2: the worker's line is SPLICED IN VERBATIM — never re-serialized through
+    /// a `Value`, which would SORT its keys and hand cp-2/cp-4 a wire camp
+    /// invented by accident.
+    #[test]
+    fn event_frame_splices_verbatim_and_refuses_a_non_object_line() {
+        // `type` before `subtype` is NOT alphabetical — a Value round-trip would
+        // reorder them. This assertion is what makes the splice observable.
+        let frame = event_frame("t/dev/1", 123, br#"{"type":"system","subtype":"init"}"#).unwrap();
+        assert_eq!(
+            String::from_utf8(frame).unwrap(),
+            "{\"frame\":\"event\",\"session\":\"t/dev/1\",\"offset\":123,\
+             \"event\":{\"type\":\"system\",\"subtype\":\"init\"}}\n"
+        );
+
+        // Not a JSON OBJECT => None; the caller emits skipped{not_a_json_object}.
+        assert!(event_frame("t/dev/1", 1, b"not json").is_none());
+        assert!(
+            event_frame("t/dev/1", 1, b"[1,2,3]").is_none(),
+            "an ARRAY is valid JSON but splicing it would emit an invalid frame — \
+             deliberately STRICTER than cp-0, which counts any JSON value as parsed"
+        );
+        assert!(event_frame("t/dev/1", 1, b"42").is_none());
+    }
+
+    /// The whole frame wire, pinned. cp-2/3/4/5 all extend it.
+    #[test]
+    fn subscribe_frame_shapes_are_pinned() {
+        assert_eq!(
+            String::from_utf8(skipped_frame("t/dev/1", 456, 2_097_152, "over_cap")).unwrap(),
+            "{\"frame\":\"skipped\",\"session\":\"t/dev/1\",\"offset\":456,\
+             \"bytes\":2097152,\"reason\":\"over_cap\"}\n"
+        );
+        assert_eq!(
+            String::from_utf8(skipped_frame("t/dev/1", 460, 17, "not_a_json_object")).unwrap(),
+            "{\"frame\":\"skipped\",\"session\":\"t/dev/1\",\"offset\":460,\
+             \"bytes\":17,\"reason\":\"not_a_json_object\"}\n"
+        );
+        assert_eq!(
+            String::from_utf8(end_frame("t/dev/1", 789, "stopped")).unwrap(),
+            "{\"frame\":\"end\",\"session\":\"t/dev/1\",\"offset\":789,\"reason\":\"stopped\"}\n"
+        );
+        // The hello carries the protocol version — the last free place for it.
+        assert_eq!(
+            serde_json::to_string(&Response::Subscribed {
+                ok: true,
+                v: 1,
+                subscription: "sub-1".into(),
+                cursor: 0,
+            })
+            .unwrap(),
+            r#"{"ok":true,"v":1,"subscription":"sub-1","cursor":0}"#
+        );
+    }
+
+    /// G1: a line LONGER THAN ONE CHUNK is buffered across chunks and delivered as
+    /// ONE frame.
+    ///
+    /// With only a cursor and "lex each complete line in the chunk", a 100 KiB line
+    /// contains no '\n' in its first 64 KiB chunk, advances nothing, and LIVELOCKS
+    /// campd at 100% CPU. A Read/Bash/Grep tool-result line routinely exceeds
+    /// 64 KiB — this is the ORDINARY case, not a pathological one.
+    #[test]
+    fn pump_lexes_a_line_that_spans_many_chunks() {
+        let pad = "x".repeat(100 * 1024); // > HISTORY_CHUNK_BYTES
+        let line = format!("{{\"type\":\"assistant\",\"text\":\"{pad}\"}}\n");
+        let (_d, file, tail) = stream_file(line.as_bytes());
+
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+        // Reader thread: a real client drains as campd writes.
+        let reader = std::thread::spawn(move || frames_to_eof(&mut client));
+        pump_to_completion(&mut rt, T, &mut conn);
+        drop(conn);
+        let frames = reader.join().unwrap();
+
+        assert_eq!(frames.len(), 1, "ONE event frame: {frames:?}");
+        assert_eq!(frames[0]["frame"], "event");
+        assert_eq!(frames[0]["event"]["text"], pad);
+        assert_eq!(
+            rt.test_sub(T).cursor,
+            tail,
+            "the cursor advanced exactly past the whole line"
+        );
+    }
+
+    /// G1/C8: a line LARGER THAN THE CAP switches to OVERSIZE SCAN — counted, never
+    /// buffered — and a `skipped{over_cap}` frame carries its TRUE byte count.
+    ///
+    /// The frame is only reachable BECAUSE the scan can lex a line it refuses to
+    /// buffer. A pump that cannot lex an over-cap line makes this frame
+    /// structurally unreachable.
+    #[test]
+    fn pump_skips_an_over_cap_line_without_buffering_it() {
+        let cap = 8 * 1024;
+        let pad = "x".repeat(64 * 1024); // way over the cap
+        let monster = format!("{{\"type\":\"assistant\",\"text\":\"{pad}\"}}\n");
+        let after = "{\"type\":\"assistant\",\"text\":\"after the monster\"}\n";
+        let content = format!("{monster}{after}");
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let mut rt = ControlRuntime::new(cap);
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+        let reader = std::thread::spawn(move || frames_to_eof(&mut client));
+        // `partial` is NEVER allowed past the cap — that IS the RSS bound.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            rt.pump(T, &mut conn, t0());
+            assert!(
+                rt.test_sub(T).partial.len() <= cap,
+                "partial grew past the cap: {}",
+                rt.test_sub(T).partial.len()
+            );
+            let s = rt.test_sub(T);
+            if s.out.is_empty() && !s.held && s.cursor == s.tail {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "pump never drained");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(conn);
+        let frames = reader.join().unwrap();
+
+        assert_eq!(frames[0]["frame"], "skipped");
+        assert_eq!(frames[0]["reason"], "over_cap");
+        assert_eq!(
+            frames[0]["bytes"].as_u64().unwrap(),
+            monster.len() as u64 - 1,
+            "the TRUE byte count of the line (without its newline)"
+        );
+        // The cursor advanced PAST the monster, so the next line still arrives.
+        assert_eq!(frames[1]["frame"], "event");
+        assert_eq!(frames[1]["event"]["text"], "after the monster");
+        assert_eq!(rt.test_sub(T).cursor, tail);
+        assert!(
+            rt.test_sub(T).oversize.is_none(),
+            "the oversize scan ended at the newline"
+        );
+    }
+
+    /// R1 — THE CAP IS A STOP, NOT A KILL.
+    ///
+    /// With a non-draining socket, FILL fills `out` to the cap and then STOPS: the
+    /// complete line stays in `partial`, `held` is true, `cursor` does NOT advance,
+    /// and NOTHING is dropped. Then the socket drains and the held line goes out as
+    /// its own frame.
+    ///
+    /// A cap that KILLS drops every client that joins more than ~1 MiB behind the
+    /// tail, however fast it reads — because during catch-up the producer is a FILE
+    /// read and a file ALWAYS outruns a socket.
+    #[test]
+    fn a_frame_that_would_cross_the_cap_stalls_and_the_line_is_held() {
+        let cap = 4 * 1024;
+        let line = "{\"type\":\"assistant\",\"text\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n";
+        let content = line.repeat(400); // far more than the cap can hold at once
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let mut rt = ControlRuntime::new(cap);
+        // The client NEVER reads => the socket fills, then `out` fills to the cap.
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+        for _ in 0..4 {
+            match rt.pump(T, &mut conn, t0()) {
+                PumpOutcome::Ok => {}
+                PumpOutcome::Drop(_) => panic!(
+                    "THE CAP IS A STOP, NOT A KILL — a subscriber that is merely BEHIND \
+                     must never be dropped"
+                ),
+                PumpOutcome::Gone => panic!("the peer is still there"),
+            }
+        }
+        let sub = rt.test_sub(T);
+        assert!(sub.out.len() <= cap, "out is bounded by the cap");
+        assert!(sub.held, "the complete line is HELD, not lost");
+        assert!(
+            !sub.partial.is_empty(),
+            "and it is still IN `partial` — nothing was thrown away"
+        );
+        let held_cursor = sub.cursor;
+        assert!(
+            held_cursor < tail,
+            "the cursor did NOT advance past the line it could not send"
+        );
+
+        // Now the client reads. The held line goes out AS ITS OWN FRAME.
+        let frames = drain_client(&mut client);
+        assert!(!frames.is_empty());
+        rt.pump(T, &mut conn, t0());
+        assert!(
+            rt.test_sub(T).cursor > held_cursor,
+            "once the socket drained, the held line was delivered and the cursor moved"
+        );
+    }
+
+    /// G3: `out` keeps FILLING while non-empty, across many chunks, up to the cap —
+    /// which is what makes the cap meaningful at all. (Refilling only when EMPTY
+    /// means `out` never holds more than one chunk, the cap is unreachable, and the
+    /// drop path is DEAD CODE.)
+    ///
+    /// The DROP is not tested here: it fires at the STALL TIMEOUT, and its own test
+    /// owns it.
+    #[test]
+    fn out_keeps_filling_while_non_empty_up_to_the_cap() {
+        // The cap must EXCEED one chunk, or "accumulates across MANY chunks" is not
+        // even expressible.
+        let cap = 256 * 1024;
+        let line = "{\"type\":\"assistant\",\"text\":\"filler\"}\n";
+        let content = line.repeat(4000);
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let mut rt = ControlRuntime::new(cap);
+        let (_client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+        // The client never reads, so the socket fills and `out` accumulates.
+        for _ in 0..8 {
+            rt.pump(T, &mut conn, t0());
+        }
+        let out = rt.test_sub(T).out.len();
+        assert!(
+            out > HISTORY_CHUNK_BYTES,
+            "`out` must accumulate across MANY chunks (it held {out} bytes) — \
+             otherwise the cap is unreachable and the drop path is dead code"
+        );
+        assert!(out <= cap, "...and it STOPS at the cap: {out} > {cap}");
+    }
+
+    /// G2: a non-empty `out` must arm NOTHING. It means the last write returned
+    /// WouldBlock, and the correct wakeup is the WRITABLE EDGE — already registered.
+    ///
+    /// Arming ZERO on top of it turns every blocked write into a SPIN: poll(0) ->
+    /// pump -> WouldBlock -> poll(0)… And this is the COMMON case, not the
+    /// pathological one — macOS's socket send buffer (~8 KiB) is far smaller than
+    /// one chunk's worth of frames, so EVERY healthy subscriber WouldBlocks on
+    /// essentially every chunk. campd would spin for the duration of any stream.
+    #[test]
+    fn poll_timeout_never_arms_on_a_wouldblock_alone() {
+        let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
+        let content = line.repeat(4000);
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (_client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+
+        // BEHIND with an EMPTY `out`: no fd will ever signal this — arm the
+        // continuation.
+        assert_eq!(
+            rt.poll_timeout(t0()),
+            Some(Duration::ZERO),
+            "pumpable file work with an empty `out` must arm a continuation"
+        );
+
+        // Pump until the socket blocks and `out` is non-empty (the client reads
+        // nothing).
+        for _ in 0..6 {
+            rt.pump(T, &mut conn, t0());
+        }
+        assert!(!rt.test_sub(T).out.is_empty(), "the write blocked");
+
+        // THE ANTI-SPIN PROPERTY: with `out` NON-EMPTY, poll_timeout must NOT be
+        // ZERO. The only thing armed is the STALL DEADLINE — a real deadline in the
+        // future. The wakeup that matters here is the WRITABLE EDGE, and it is
+        // already registered.
+        let armed = rt.poll_timeout(t0()).expect("the stall deadline is armed");
+        assert_ne!(
+            armed,
+            Duration::ZERO,
+            "a blocked write must NEVER arm a zero timeout — that is a SPIN: \
+             poll(0) -> pump -> WouldBlock -> poll(0)…, for the whole duration of \
+             every stream"
+        );
+        assert_eq!(
+            armed, SUBSCRIBER_STALL_TIMEOUT_DEFAULT,
+            "what is armed is the stall deadline, and nothing else"
+        );
+    }
+
+    /// R3 — THE ~60-BYTE BAND. A line whose RAW length is under the cap but whose
+    /// FRAME is not.
+    ///
+    /// Testing the LINE against the cap and the FRAME against the drop leaves this
+    /// band: the line is never skipped, yet its frame cannot fit an empty `out`, so
+    /// it takes the DROP path — a perfectly-reading subscriber killed,
+    /// re-subscribing, re-reading the same line, dropped again, deterministically
+    /// and FOREVER.
+    #[test]
+    fn a_line_whose_frame_just_exceeds_the_cap_is_skipped_not_dropped() {
+        let cap = 4096;
+        let overhead = measure_frame_overhead("t/dev/1");
+        // Exactly ONE byte too long for its FRAME to fit the cap.
+        let body_len = cap - overhead + 1;
+        let filler = "x".repeat(body_len - 8); // the {"a":"…"} wrapper is 8 bytes
+        let line = format!("{{\"a\":\"{filler}\"}}\n");
+        assert_eq!(line.len() - 1, body_len, "the line is exactly at the band");
+        assert!(line.len() - 1 < cap, "its RAW length is UNDER the cap");
+        assert!(
+            overhead + (line.len() - 1) > cap,
+            "but its FRAME does not fit — this is the band"
+        );
+
+        let (_d, file, tail) = stream_file(line.as_bytes());
+        let mut rt = ControlRuntime::new(cap);
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+        let reader = std::thread::spawn(move || frames_to_eof(&mut client));
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let outcome = rt.pump(T, &mut conn, t0());
+            assert!(
+                !matches!(outcome, PumpOutcome::Drop(_)),
+                "a line in the frame-vs-line band must be SKIPPED, never DROP the \
+                 subscriber — a dropped subscriber re-subscribes and is dropped again, \
+                 forever"
+            );
+            let s = rt.test_sub(T);
+            if s.out.is_empty() && !s.held && s.cursor == s.tail {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "pump never drained");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(conn);
+        let frames = reader.join().unwrap();
+        assert_eq!(frames[0]["frame"], "skipped");
+        assert_eq!(frames[0]["reason"], "over_cap");
+    }
+
+    /// R3's SECOND HOLE: a line whose CROSSING BYTE IS THE '\n'.
+    ///
+    /// Pushing the byte BEFORE the cap test means the `continue` bypasses the
+    /// newline check, `oversize` arms, and the scan runs on to the NEXT line's '\n'
+    /// — SILENTLY CONSUMING A WHOLE LINE with no frame, and reporting a byte count
+    /// that spans two. The newline must be tested FIRST.
+    #[test]
+    fn a_line_ending_exactly_at_the_cap_boundary_is_not_conflated_with_the_next() {
+        let cap = 4096;
+        let overhead = measure_frame_overhead("t/dev/1");
+        // The LAST byte that still fits: pushing it leaves partial.len() + overhead
+        // == cap. The '\n' is then the byte that would "cross".
+        let body_len = cap - overhead;
+        let filler = "x".repeat(body_len - 8);
+        let first = format!("{{\"a\":\"{filler}\"}}\n");
+        assert_eq!(first.len() - 1, body_len);
+        let second = "{\"type\":\"assistant\",\"text\":\"the next line\"}\n";
+        let content = format!("{first}{second}");
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let mut rt = ControlRuntime::new(cap);
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+        let reader = std::thread::spawn(move || frames_to_eof(&mut client));
+        pump_to_completion(&mut rt, T, &mut conn);
+        drop(conn);
+        let frames = reader.join().unwrap();
+
+        assert_eq!(frames.len(), 2, "TWO lines, TWO frames: {frames:?}");
+        // The first fits EXACTLY (frame.len() == cap) and is DELIVERED.
+        assert_eq!(frames[0]["frame"], "event");
+        // ...and the SECOND arrives as its OWN frame — not swallowed by an
+        // oversize scan that ran past the first line's newline.
+        assert_eq!(frames[1]["frame"], "event");
+        assert_eq!(frames[1]["event"]["text"], "the next line");
+    }
+
+    /// R7/B4 — THE REFUSAL, and the U+FFFD that must NEVER reach the wire.
+    ///
+    /// JSON text is UTF-8 BY DEFINITION and `serde_json::from_slice` ENFORCES it, so
+    /// a byte-identical round-trip of non-UTF-8 is unachievable by any
+    /// implementation. The property actually worth having is that camp REFUSES the
+    /// line rather than CORRUPTING it: a `&str` + `from_utf8_lossy` path would
+    /// substitute U+FFFD and splice the corrupted bytes onto the wire, and no ASCII
+    /// fixture would ever catch it.
+    #[test]
+    fn a_non_utf8_line_is_refused_not_silently_corrupted() {
+        let mut content = Vec::new();
+        content.extend_from_slice(br#"{"type":"assistant","text":""#);
+        content.extend_from_slice(&[0xff, 0xfe, 0x80]); // raw non-UTF-8
+        content.extend_from_slice(b"\"}\n");
+        let (_d, file, tail) = stream_file(&content);
+
+        // event_frame REFUSES it outright.
+        assert!(
+            event_frame("t/dev/1", 0, &content[..content.len() - 1]).is_none(),
+            "from_slice ENFORCES UTF-8 — the line must be REFUSED"
+        );
+
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+        let reader = std::thread::spawn(move || read_to_eof(&mut client));
+        pump_to_completion(&mut rt, T, &mut conn);
+        drop(conn);
+        let raw = reader.join().unwrap();
+
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.contains("not_a_json_object"),
+            "the client must be told the line was SKIPPED: {text}"
+        );
+        // THE POINT: the corrupted bytes never reached the wire.
+        assert!(
+            !raw.windows(3).any(|w| w == [0xef, 0xbf, 0xbd]),
+            "U+FFFD (the from_utf8_lossy replacement char) MUST NOT appear on the \
+             wire — camp refuses the bytes, it does not rewrite them"
+        );
+    }
+
+    /// R1's DROP RULE: the drop is a peer that has STOPPED READING — detected by
+    /// ZERO bytes accepted across the stall timeout — never a large backlog.
+    #[test]
+    fn a_peer_that_accepts_nothing_is_dropped_at_the_stall_timeout() {
+        let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
+        let content = line.repeat(20_000);
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let stall = Duration::from_millis(200);
+        let mut rt = ControlRuntime::with_stall_timeout(64 * 1024, stall);
+        // The client NEVER reads a single byte.
+        let (_client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+
+        // First pumps: the socket fills; `blocked_since` is STAMPED.
+        for _ in 0..6 {
+            assert!(matches!(rt.pump(T, &mut conn, t0()), PumpOutcome::Ok));
+        }
+        assert!(
+            rt.test_sub(T).blocked_since.is_some(),
+            "a zero-accept write must stamp `blocked_since`"
+        );
+        // The stall deadline is the ONLY thing that can ever fire for this
+        // subscriber — nothing else will.
+        assert!(rt.poll_timeout(t0()).is_some());
+
+        // Past the stall timeout with STILL zero bytes accepted => DROPPED, loudly.
+        let later = t0() + SignedDuration::from_millis(300);
+        let event = match rt.pump(T, &mut conn, later) {
+            PumpOutcome::Drop(e) => e,
+            other => panic!(
+                "a peer that has accepted ZERO bytes for the stall timeout must be \
+                 dropped: {}",
+                matches!(other, PumpOutcome::Ok)
+            ),
+        };
+        assert_eq!(event.kind, EventType::SubscriberDropped);
+        assert_eq!(data(&event)["session"], "t/dev/1");
+        assert!(
+            data(&event)["buffered_bytes"].as_u64().unwrap() > 0,
+            "§4.4: the drop names the HIGH-WATER MARK"
+        );
+        assert_eq!(data(&event)["cap_bytes"], 64 * 1024);
+    }
+
+    /// THE CONVERSE, and it is the accepted residual: a client that accepts even
+    /// ONE byte CLEARS `blocked_since` and is never dropped.
+    ///
+    /// A peer dripping one byte per interval can hold a buffer and a slot
+    /// indefinitely. That is a DECISION — it IS reading, and any byte-rate floor is
+    /// a policy number nobody has evidence for — recorded in the §4.4 amendment and
+    /// as a cp-2 obligation, not an oversight.
+    #[test]
+    fn a_peer_that_accepts_even_one_byte_is_never_dropped() {
+        let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
+        let content = line.repeat(20_000);
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let stall = Duration::from_millis(200);
+        let mut rt = ControlRuntime::with_stall_timeout(64 * 1024, stall);
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+
+        for _ in 0..6 {
+            rt.pump(T, &mut conn, t0());
+        }
+        assert!(rt.test_sub(T).blocked_since.is_some());
+
+        // The peer accepts SOME bytes — it is reading, however slowly.
+        let mut chunk = [0u8; 4096];
+        let n = client.read(&mut chunk).unwrap_or(0);
+        assert!(n > 0, "the test peer must actually accept some bytes");
+
+        // WELL PAST the original stall deadline — but the peer accepted bytes, so
+        // its stall clock RESTARTED and it is never dropped.
+        let later = t0() + SignedDuration::from_millis(300);
+        assert!(
+            matches!(rt.pump(T, &mut conn, later), PumpOutcome::Ok),
+            "a peer that is READING must never be dropped, however far behind it is"
+        );
+        // `blocked_since` may be freshly re-stamped (the socket filled again — it is
+        // a slow reader, not a stopped one). What must NOT survive is the ORIGINAL
+        // stamp: accepting a byte RESETS the clock.
+        if let Some(since) = rt.test_sub(T).blocked_since {
+            assert!(
+                since >= later,
+                "accepting ANY byte must RESET the stall clock — the original stamp \
+                 must not survive, or a slow reader is eventually killed for being slow"
+            );
+        }
+    }
+
+    /// B3 — THE MECHANISM THAT NEVER FIRED.
+    ///
+    /// A `partial ends with '\n'` predicate is ALWAYS FALSE under the newline-first
+    /// rule, so the held line is never retried: the NEXT line's bytes are appended
+    /// onto it, TWO LINES ARE CONCATENATED into one body, `event_frame` rejects the
+    /// result, and campd emits `skipped{not_a_json_object}` — corruption reported
+    /// with a FALSE CAUSE. The flag must be REAL.
+    #[test]
+    fn a_line_held_at_the_cap_is_retried_and_never_concatenated() {
+        let cap = 2048;
+        // The SOCKET buffer (~8 KiB) must fill BEFORE `out` can ever reach the cap —
+        // otherwise every frame is simply accepted and no line is ever HELD, and the
+        // test would prove nothing.
+        let a = "{\"type\":\"assistant\",\"n\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}\n";
+        let b = "{\"type\":\"assistant\",\"n\":\"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"}\n";
+        let content = format!("{}{b}", a.repeat(1000));
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let mut rt = ControlRuntime::new(cap);
+        // The client reads NOTHING yet: the socket fills, then `out` fills to the
+        // cap, and then a complete line is HELD.
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !rt.test_sub(T).held {
+            assert!(
+                !matches!(rt.pump(T, &mut conn, t0()), PumpOutcome::Drop(_)),
+                "THE CAP IS A STOP: a subscriber merely BEHIND is never dropped"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a line was never HELD — the cap was never reached, so this test \
+                 proves nothing"
+            );
+        }
+        assert!(
+            rt.test_sub(T).out.len() <= cap,
+            "`out` is bounded by the cap"
+        );
+        assert!(
+            !rt.test_sub(T).partial.is_empty(),
+            "the held line is STILL IN `partial` — nothing was thrown away"
+        );
+
+        // Now the client drains, and the held line must be RETRIED as its OWN frame.
+        let reader = std::thread::spawn(move || frames_to_eof(&mut client));
+        pump_to_completion(&mut rt, T, &mut conn);
+        drop(conn);
+        let frames = reader.join().unwrap();
+
+        // EVERY frame is a well-formed `event`. A `skipped{not_a_json_object}` here
+        // would mean two lines were CONCATENATED into one body — corruption reported
+        // with a FALSE CAUSE, which is exactly what a fake `held` flag produces.
+        for f in &frames {
+            assert_eq!(
+                f["frame"], "event",
+                "a held line must be retried AS ITS OWN FRAME — a `skipped` here means \
+                 two lines were GLUED together: {f}"
+            );
+            assert_eq!(f["event"]["type"], "assistant");
+        }
+        assert_eq!(frames.len(), 1001, "every line, exactly once");
+        assert_eq!(
+            frames[1000]["event"]["n"],
+            "B".repeat(36),
+            "the line AFTER the held one is a SEPARATE frame, never glued to it"
+        );
+        assert_eq!(rt.test_sub(T).cursor, tail, "every byte was delivered");
+    }
+
+    /// B2 — SILENT TRUNCATION. A stall MID-CHUNK must lose nothing.
+    ///
+    /// Advancing `scan` over the WHOLE chunk up front and then breaking mid-buffer
+    /// throws away every byte after the stall point while `scan` already points past
+    /// them: up to 64 KiB of lines SILENTLY LOST (§9: "never a silently truncated
+    /// stream"), plus a permanent cursor/scan desync. `scan` must advance PER BYTE
+    /// ABSORBED, so the remainder is simply re-read.
+    #[test]
+    fn a_cap_stop_mid_chunk_loses_no_bytes() {
+        let cap = 2048; // far smaller than one chunk => FILL stalls mid-chunk
+        let mut content = String::new();
+        for i in 0..500 {
+            content.push_str(&format!("{{\"type\":\"assistant\",\"i\":{i}}}\n"));
+        }
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let mut rt = ControlRuntime::new(cap);
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+        let reader = std::thread::spawn(move || frames_to_eof(&mut client));
+        pump_to_completion(&mut rt, T, &mut conn);
+        drop(conn);
+        let frames = reader.join().unwrap();
+
+        assert_eq!(
+            frames.len(),
+            500,
+            "EVERY line in every chunk must arrive — a mid-chunk stall must leave \
+             the remainder re-readable, not throw it away"
+        );
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f["frame"], "event");
+            assert_eq!(f["event"]["i"], i, "in order, none skipped");
+        }
+        assert_eq!(rt.test_sub(T).cursor, tail);
+    }
+
+    /// R5: the `end` frame reaches a CAUGHT-UP subscriber — driven deterministically,
+    /// with no daemon, no notify and no timing.
+    ///
+    /// ⚠ THIS TEST DOES NOT PROVE THE DISPOSAL ORDERING, and no black-box test can:
+    /// `close_disposed` is called here DIRECTLY with a hand-built `&[Disposed]`, so
+    /// it cannot observe the event loop's call order at all. The ordering guarantee
+    /// is STRUCTURAL — `take_disposed()` has exactly one caller, immediately after
+    /// `dispose_pending()`, and `close_disposed` is not reachable from
+    /// `control_step`. What this test proves is that the end frame ARRIVES. That is
+    /// worth having, and it is all it is.
+    #[test]
+    fn close_disposed_emits_the_end_frame_for_a_caught_up_subscriber() {
+        let (_dir, mut ledger) = temp_ledger();
+        seed_live_session(&mut ledger, "t/dev/1");
+        let line = "{\"type\":\"assistant\",\"text\":\"hi\"}\n";
+        let (_d, file, tail) = stream_file(line.as_bytes());
+
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (mut client, conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+        let mut conns: HashMap<Token, Conn> = HashMap::new();
+        conns.insert(T, conn);
+
+        // Caught up: everything delivered, `out` empty.
+        rt.pump(T, conns.get_mut(&T).unwrap(), t0());
+        let first = drain_client(&mut client);
+        assert_eq!(first[0]["frame"], "event");
+
+        // The session is reaped and disposed.
+        let disposed = vec![Disposed {
+            session: "t/dev/1".into(),
+            final_offset: tail,
+        }];
+        let (gone, _events) = rt.close_disposed(&disposed, &ledger, &mut conns, t0());
+
+        let frames = drain_client(&mut client);
+        assert_eq!(frames.len(), 1, "the END frame: {frames:?}");
+        assert_eq!(frames[0]["frame"], "end");
+        assert_eq!(
+            frames[0]["offset"].as_u64().unwrap(),
+            tail,
+            "the end frame's offset is the session's TRUE final offset"
+        );
+        // `stopped` or `crashed` — NEVER `capped`: that value does not exist in the
+        // sessions table's status column.
+        assert!(
+            ["stopped", "crashed"].contains(&frames[0]["reason"].as_str().unwrap()),
+            "reason was {:?}",
+            frames[0]["reason"]
+        );
+        assert_eq!(gone, vec![T], "and the connection is closed (EOF follows)");
+    }
 }
 
 // ===========================================================================
@@ -2825,14 +3565,18 @@ impl ControlRuntime {
         let mut events = Vec::new();
 
         for d in disposed {
-            // `stopped` or `crashed` — NEVER `capped`: that value does not exist in
-            // the sessions table's status column, and a phantom value on the wire is
-            // a contract nobody can honour.
-            let reason = ledger
-                .session_status(&d.session)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "stopped".into());
+            // `stopped` or `crashed` — and NOTHING ELSE may ever reach the wire.
+            //
+            // NOT `capped` (that value does not exist in the sessions table's status
+            // column), and NOT `live` either: `close_disposed` runs on the disposal
+            // wake, and if the status row has not settled yet a raw read yields
+            // "live" — an `end` frame whose reason says the session is still running.
+            // A phantom value is a contract nobody can honour, so the mapping is
+            // TOTAL: crashed is crashed, everything else is stopped.
+            let reason = match ledger.session_status(&d.session).ok().flatten().as_deref() {
+                Some("crashed") => "crashed".to_owned(),
+                _ => "stopped".to_owned(),
+            };
 
             let tokens: Vec<Token> = self
                 .subscribers
@@ -2894,5 +3638,67 @@ impl ControlRuntime {
     #[allow(dead_code)] // PERMANENT: test observable (the read_channel.rs:445 precedent)
     pub fn subscriber_count(&self) -> usize {
         self.subscribers.len()
+    }
+}
+
+// ---- the `pump` unit harness (the dispatch::test_insert_held_cat precedent) --
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+impl ControlRuntime {
+    /// Insert a subscriber directly over a `UnixStream::pair()`, so `pump` can be
+    /// driven with NO daemon, NO socket and NO timing.
+    ///
+    /// Returns the CLIENT end (the test reads it) and the `Conn` (the test passes
+    /// it back into `pump`). **A test that never reads its client end IS a stalled
+    /// peer** — which is how the stall drop and the terminal branch are exercised
+    /// deterministically.
+    pub fn test_insert_subscriber(
+        &mut self,
+        token: Token,
+        session: &str,
+        file: std::fs::File,
+        cursor: u64,
+        tail: u64,
+    ) -> (std::os::unix::net::UnixStream, Conn) {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        // The CLIENT is non-blocking too, so test readers never need `setsockopt`
+        // on a live socket (which flakes with EINVAL under parallel load) and never
+        // block forever on a stream that has stopped.
+        client.set_nonblocking(true).unwrap();
+        let conn = Conn {
+            stream: mio::net::UnixStream::from_std(server),
+            buf: Vec::new(),
+        };
+        self.next_subscription += 1;
+        self.subscribers.insert(
+            token,
+            Subscriber {
+                id: format!("sub-{}", self.next_subscription),
+                session: session.to_owned(),
+                file,
+                cursor,
+                scan: cursor,
+                partial: Vec::new(),
+                held: false,
+                oversize: None,
+                tail,
+                closing: None,
+                end_sent: false,
+                out: Vec::new(),
+                high_water: 0,
+                frame_overhead: measure_frame_overhead(session),
+                blocked_since: None,
+            },
+        );
+        (client, conn)
+    }
+
+    /// The tests live in THIS module, so this needs no visibility at all —
+    /// `Subscriber` is private and must stay that way (its invariants are `pump`'s).
+    #[cfg(test)]
+    fn test_sub(&self, token: Token) -> &Subscriber {
+        &self.subscribers[&token]
     }
 }
