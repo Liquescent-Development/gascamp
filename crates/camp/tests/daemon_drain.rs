@@ -32,6 +32,11 @@ struct Camp {
     _dir: tempfile::TempDir,
     root: PathBuf,
     child: Option<Child>,
+    /// The agent pack is VALID now (V-5), so campd really does spawn workers. This
+    /// gate (`FAKE_AGENT_HOLD_DIR`) makes them CLAIM and then WAIT, so the tests keep
+    /// deterministic control of every outcome while the DISPATCH PATH IS GENUINELY
+    /// EXERCISED.
+    hold: PathBuf,
 }
 
 impl Camp {
@@ -54,13 +59,20 @@ impl Camp {
         .unwrap();
         let agent = root.join("agents/dev");
         std::fs::create_dir_all(&agent).unwrap();
-        std::fs::write(agent.join("agent.toml"), "isolation: none\n").unwrap();
+        // V-5: this was `isolation: none` — YAML, in a file parsed as TOML. Every
+        // dispatch died with "agent.toml is not valid TOML", so NO WORKER WAS EVER
+        // SPAWNED in any drain test, and any "the items really ran" assertion built
+        // on this harness was vacuous BY CONSTRUCTION.
+        std::fs::write(agent.join("agent.toml"), "isolation = \"none\"\n").unwrap();
         std::fs::write(agent.join("prompt.md"), "do the work\n").unwrap();
 
+        let hold = dir.path().join("hold");
+        std::fs::create_dir_all(&hold).unwrap();
         let c = Camp {
             _dir: dir,
             root,
             child: None,
+            hold,
         };
         c.camp_ok(&["events", "--json"]); // create the ledger
         c.camp_ok(&[
@@ -97,6 +109,7 @@ impl Camp {
         let mut cmd = Command::new(BIN);
         cmd.env_remove("CAMP_DIR")
             .env("CAMP_BIN", BIN)
+            .env("FAKE_AGENT_HOLD_DIR", &self.hold)
             .arg("--camp")
             .arg(&self.root)
             .arg("daemon")
@@ -154,6 +167,47 @@ impl Camp {
             .to_owned()
     }
 
+    /// The bead's `step_id` — NOT on `BeadRow` (not in `BEAD_COLS`), so read from the
+    /// fold. V-6 needs it: the money-invariant assertion must key on the STEP, not on
+    /// a title `create_attempt` happens to copy.
+    fn step_id_of(&self, id: &str) -> Option<String> {
+        self.conn()
+            .query_row("SELECT step_id FROM beads WHERE id = ?1", [id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .unwrap_or(None)
+    }
+
+    /// Close a bead, whoever holds it. A DISPATCHED bead has already been claimed by
+    /// its (held) worker, so the harness must not claim it — `camp close` does not
+    /// require the claiming session. A bead campd has not dispatched is still `open`
+    /// and the harness claims it itself. Both are real states.
+    fn close_bead(&self, bead: &str, outcome: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let row = self.get_bead(bead);
+            match row.status.as_str() {
+                "closed" => return,
+                "in_progress" => {
+                    self.camp_ok(&["close", bead, "--outcome", outcome]);
+                    return;
+                }
+                _ => {
+                    let out = self.camp(&["claim", bead, "--session", "harness"]);
+                    if out.status.success() {
+                        self.camp_ok(&["close", bead, "--outcome", outcome]);
+                        return;
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bead {bead} never became closable"
+            );
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+
     fn get_bead(&self, id: &str) -> BeadRow {
         camp_core::readiness::get_bead(&self.conn(), id)
             .unwrap()
@@ -198,8 +252,7 @@ impl Camp {
             })
             .unwrap();
         let work = self.step_bead(&run_id, "work");
-        self.camp_ok(&["claim", &work, "--session", "s"]);
-        self.camp_ok(&["close", &work, "--outcome", outcome]);
+        self.close_bead(&work, outcome);
     }
 
     /// Wait until campd has caught up AND has no pending drains — i.e. the
@@ -241,13 +294,20 @@ impl Camp {
     /// Close the member-producing step so the drain anchor goes ready.
     fn close_decompose(&self, run: &str) {
         let d = self.step_bead(run, "decompose");
-        self.camp_ok(&["claim", &d, "--session", "s"]);
-        self.camp_ok(&["close", &d, "--outcome", "pass"]);
+        self.close_bead(&d, "pass");
     }
 }
 
 impl Drop for Camp {
     fn drop(&mut self) {
+        // Release every held worker so none lingers past the test.
+        if let Ok(mut s) = self.conn().prepare("SELECT id FROM beads")
+            && let Ok(rows) = s.query_map([], |r| r.get::<_, String>(0))
+        {
+            for id in rows.filter_map(Result::ok) {
+                let _ = std::fs::write(self.hold.join(id), "go");
+            }
+        }
         self.stop_campd();
     }
 }
@@ -284,8 +344,9 @@ fn a_drain_step_creates_NO_ATTEMPT_and_dispatches_NO_WORKER() {
     assert!(
         !c.dispatchable()
             .iter()
-            .any(|b| b.id == anchor || b.title.contains("Implement each")),
-        "NOTHING carrying the drain step's identity is dispatchable"
+            .any(|b| c.step_id_of(&b.id).as_deref() == Some("implement")),
+        "NOTHING carrying the drain step's STEP_ID is dispatchable (V-6: on the \
+         step_id, not a title `create_attempt` happens to copy)"
     );
     // The anchor is campd's: claimed, in_progress, held.
     let row = c.get_bead(&anchor);
@@ -363,8 +424,12 @@ fn a_conflicting_drain_reserves_NOTHING_and_materializes_NOTHING() {
     // Here the loser must have cooked NOTHING.
     let mut c = Camp::new();
     c.spawn_campd();
+    // V-1: TWO members. With ONE, a single-event `append_batch` and rev-2's
+    // incremental per-event loop are INDISTINGUISHABLE — BD4's mutant survived the
+    // ENTIRE suite because this fixture could not reach the regime where it differs.
     let run = c.sling("two-drains");
-    c.create_member(&run, "contested member");
+    c.create_member(&run, "contested A");
+    c.create_member(&run, "contested B");
     c.close_decompose(&run);
     c.settle();
 
@@ -372,23 +437,27 @@ fn a_conflicting_drain_reserves_NOTHING_and_materializes_NOTHING() {
     let b = c.step_bead(&run, "drain-b");
     let (a_kids, b_kids) = (c.drain_children(&a).len(), c.drain_children(&b).len());
 
-    // Exactly one drain won.
+    // Exactly one drain won — and it took BOTH members.
     assert!(
-        (a_kids == 1 && b_kids == 0) || (a_kids == 0 && b_kids == 1),
-        "exactly one drain may materialize: a={a_kids} b={b_kids}"
+        (a_kids == 2 && b_kids == 0) || (a_kids == 0 && b_kids == 2),
+        "exactly one drain may materialize, and it materializes EVERY member: \
+         a={a_kids} b={b_kids}"
     );
-    let (winner, loser) = if a_kids == 1 { (&a, &b) } else { (&b, &a) };
+    let (winner, loser) = if a_kids == 2 { (&a, &b) } else { (&b, &a) };
 
-    // The LOSER materialized NOTHING.
+    // The LOSER materialized NOTHING — not "some of it".
     assert_eq!(c.drain_children(loser).len(), 0);
-    // The WINNER still holds the member — the loser's rolled-back batch did not
-    // strip it.
-    let held = c.bead_metadata(&c.create_member_ids(&run)[0]);
-    assert_eq!(
-        held.get(EXCLUSIVE_DRAIN_RESERVATION).map(String::as_str),
-        Some(winner.as_str()),
-        "the winner's reservation survived the loser's rollback"
-    );
+    // …and holds NOTHING. Under the incremental shape the loser would have taken
+    // member[0] before conflicting on member[1], and there would be no rollback.
+    for m in c.create_member_ids(&run) {
+        assert_eq!(
+            c.bead_metadata(&m)
+                .get(EXCLUSIVE_DRAIN_RESERVATION)
+                .map(String::as_str),
+            Some(winner.as_str()),
+            "every member is held by the WINNER; the loser's batch rolled back WHOLE"
+        );
+    }
 }
 
 #[test]
@@ -399,8 +468,12 @@ fn a_reserve_conflict_closes_the_losing_anchor_and_the_run_FINALIZES() {
     // would have been traded for a RUN leak.
     let mut c = Camp::new();
     c.spawn_campd();
+    // V-1: TWO members. With ONE, a single-event `append_batch` and rev-2's
+    // incremental per-event loop are INDISTINGUISHABLE — BD4's mutant survived the
+    // ENTIRE suite because this fixture could not reach the regime where it differs.
     let run = c.sling("two-drains");
-    c.create_member(&run, "contested member");
+    c.create_member(&run, "contested A");
+    c.create_member(&run, "contested B");
     c.close_decompose(&run);
     c.settle();
 
@@ -517,8 +590,7 @@ fn a_CLOSED_member_is_never_scattered() {
     let run = c.sling("build");
     let live = c.create_member(&run, "live member");
     let done = c.create_member(&run, "already done");
-    c.camp_ok(&["claim", &done, "--session", "s"]);
-    c.camp_ok(&["close", &done, "--outcome", "pass"]);
+    c.close_bead(&done, "pass");
 
     c.close_decompose(&run);
     c.settle();
@@ -689,4 +761,276 @@ impl Camp {
             .filter(|id| *id != root)
             .collect()
     }
+}
+
+// ---- the review's gaps ----------------------------------------------------
+
+#[test]
+fn each_item_run_NAMES_ITS_OWN_MEMBER_and_two_items_are_distinguishable() {
+    // ⭐ BD-3. The drain used to scatter BYTE-IDENTICAL CLONES: nothing on an item
+    // run named its member, so a worker dispatched for it could not know WHICH
+    // member it was meant to work. The correspondence existed only as a positional
+    // index into `run_members` — never persisted, and not even stable.
+    //
+    // gc answers this and camp reproduces gc: the member is BOUND into the item
+    // formula's vars (`{{issue}}`, gc's LegacyIssueVar) and STAMPED on the item
+    // root (`gc.drain_member_id`, gc's key verbatim).
+    //
+    // This test was IMPOSSIBLE to write against the old code. That was the tell.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("build");
+    let m0 = c.create_member(&run, "member ALPHA");
+    let m1 = c.create_member(&run, "member BETA");
+    c.close_decompose(&run);
+    c.settle();
+
+    let anchor = c.step_bead(&run, "implement");
+    let children = c.drain_children(&anchor);
+    assert_eq!(children.len(), 2);
+
+    // Each item root NAMES its own member, with gc's keys.
+    let mut named: Vec<String> = Vec::new();
+    for (index, root) in &children {
+        let md = c.bead_metadata(&root.id);
+        let member = md
+            .get("gc.drain_member_id")
+            .unwrap_or_else(|| panic!("item {index} does not name its member: {md:?}"))
+            .clone();
+        assert_eq!(
+            md.get("gc.drain_control_id").map(String::as_str),
+            Some(anchor.as_str())
+        );
+        assert_eq!(
+            md.get("gc.drain_index").map(String::as_str),
+            Some(index.to_string().as_str())
+        );
+        assert_eq!(md.get("gc.drain_count").map(String::as_str), Some("2"));
+        assert_eq!(
+            md.get("gc.drain_member_access").map(String::as_str),
+            Some("exclusive")
+        );
+        named.push(member);
+    }
+    named.sort();
+    let mut want = vec![m0.clone(), m1.clone()];
+    want.sort();
+    assert_eq!(
+        named, want,
+        "the two item runs name the two DISTINCT members"
+    );
+
+    // …and the member is BOUND INTO THE WORK, so the item worker's own bead says
+    // which member it is working. The two item runs are DISTINGUISHABLE.
+    let mut titles: Vec<String> = Vec::new();
+    for root in children.values() {
+        let run_id = c
+            .conn()
+            .query_row("SELECT run_id FROM beads WHERE id = ?1", [&root.id], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        let work = c.step_bead(&run_id, "work");
+        titles.push(c.get_bead(&work).title);
+    }
+    titles.sort();
+    assert_eq!(
+        titles,
+        vec![format!("Work member {m0}"), format!("Work member {m1}")]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        "each item's WORK bead names its own member — the runs are not clones"
+    );
+}
+
+#[test]
+fn a_post_reserve_failure_RELEASES_every_member_it_held() {
+    // ⭐ BD-1. `execute_drain` reserves the WHOLE member set and only THEN resolves
+    // the rig, compiles the item formula, checks runnability and cooks. Every one of
+    // those failures used to close the anchor and release NOTHING — so a plain
+    // MISSING ITEM FORMULA leaked the reservation WITH CAMPD ALIVE AND HEALTHY, and
+    // `reconcile` (the only automatic sweep) runs ONCE, AT STARTUP.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("bad-item");
+    let m = c.create_member(&run, "member one");
+    c.close_decompose(&run);
+    c.settle();
+
+    let anchor = c.step_bead(&run, "implement");
+    let row = c.get_bead(&anchor);
+    assert_eq!(row.status, "closed");
+    assert_eq!(row.outcome.as_deref(), Some("fail"));
+
+    // THE POINT: the reservation is GONE, with campd still running.
+    assert!(
+        !c.bead_metadata(&m)
+            .contains_key(EXCLUSIVE_DRAIN_RESERVATION),
+        "a failed drain must release what it reserved — campd is alive, and nothing \
+         else will sweep this until the next restart"
+    );
+    // …and `doctor` agrees there is nothing orphaned.
+    let listed = c.camp_ok(&["doctor", "--drain-reservations"]);
+    assert!(listed.contains("no orphaned"), "{listed}");
+}
+
+#[test]
+fn a_failed_drain_does_not_poison_a_HEALTHY_SIBLING_drain() {
+    // ⭐ BD-2. The leaked reservation used to hard-fail a sibling drain whose item
+    // formula was FINE — its member was "held" by a CLOSED anchor that would never
+    // gather anything — and the `dispatch.failed` asserted "two drains must never
+    // mutate one bead" WHEN ONLY ONE DRAIN WAS LIVE. Invariant 3: the event named a
+    // cause that was not true.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("mixed-drains");
+    let m = c.create_member(&run, "member one");
+    c.close_decompose(&run);
+    c.settle();
+
+    let bad = c.step_bead(&run, "drain-bad");
+    let good = c.step_bead(&run, "drain-good");
+
+    // The broken drain fails — and releases.
+    assert_eq!(c.get_bead(&bad).outcome.as_deref(), Some("fail"));
+
+    // ⭐ The HEALTHY sibling ran: it scattered its member and holds it.
+    assert_eq!(
+        c.drain_children(&good).len(),
+        1,
+        "the healthy drain's item formula is fine and its member is free — it must \
+         scatter, not be poisoned by the other drain's leak"
+    );
+    assert_eq!(
+        c.bead_metadata(&m)
+            .get(EXCLUSIVE_DRAIN_RESERVATION)
+            .map(String::as_str),
+        Some(good.as_str()),
+        "the LIVE drain holds the member, not the dead one"
+    );
+    // …and no event claims a conflict that never happened.
+    for e in c.events_of_type("dispatch.failed") {
+        let reason = e["data"]["reason"].as_str().unwrap_or("");
+        assert!(
+            !reason.contains("already reserved"),
+            "a `dispatch.failed` naming a reservation conflict when only ONE drain is \
+             live names a cause that is not true (invariant 3): {reason}"
+        );
+    }
+}
+
+#[test]
+fn a_member_that_CLOSES_MID_DRAIN_is_still_released_at_gather() {
+    // V-4. The gather's release loop used to iterate `run_members`, which filters
+    // `status <> 'closed'` — so a member that closed while its item run was in
+    // flight was SKIPPED and kept its reservation forever. Releases now ask
+    // `bead_meta`, which is status-agnostic.
+    //
+    // Reachable only because BD-3 is fixed: the item worker now has a handle on its
+    // member.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("build");
+    let m = c.create_member(&run, "member one");
+    c.close_decompose(&run);
+    c.settle();
+
+    let anchor = c.step_bead(&run, "implement");
+    assert!(
+        c.bead_metadata(&m)
+            .contains_key(EXCLUSIVE_DRAIN_RESERVATION)
+    );
+
+    // The member CLOSES while its item run is still open.
+    c.close_bead(&m, "pass");
+    c.settle();
+    assert_eq!(c.get_bead(&m).status, "closed");
+
+    let item = c.drain_children(&anchor)[&0].id.clone();
+    c.close_item(&item, "pass");
+    c.settle();
+
+    assert!(
+        !c.bead_metadata(&m)
+            .contains_key(EXCLUSIVE_DRAIN_RESERVATION),
+        "a member that closed mid-drain must still be released at gather"
+    );
+}
+
+#[test]
+fn execute_drain_refuses_a_not_runnable_item_formula() {
+    // V-3 — D1's THIRD cook entry point, and §13's MONEY INVARIANT on the very path
+    // this phase added to guard it.
+    //
+    // The old test used a formula whose NAME did not resolve, which exercises the
+    // `compile_named` Err arm — NOT the `not_runnable` arm. The whole `not_runnable`
+    // guard could be deleted and the suite stayed green, while a not-runnable item
+    // formula was cooked and dispatched to real workers.
+    //
+    // `no-contract-item` COMPILES fine. It is IMPORTED and declares no graph
+    // compiler, so D1 (ruling E) refuses it at RUN time.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("not-runnable-drain");
+    let m = c.create_member(&run, "member one");
+    c.close_decompose(&run);
+    c.settle();
+
+    let anchor = c.step_bead(&run, "implement");
+    assert_eq!(c.get_bead(&anchor).outcome.as_deref(), Some("fail"));
+    assert_eq!(c.drain_children(&anchor).len(), 0, "NOTHING may be cooked");
+    assert!(
+        c.events_of_type("dispatch.failed").iter().any(|e| {
+            let r = e["data"]["reason"].as_str().unwrap_or("");
+            r.contains("cannot be run") && r.contains("no-contract-item")
+        }),
+        "the refusal must name the formula AND say it cannot be RUN (not that it \
+         failed to compile — it compiles fine)"
+    );
+    // BD-1: and it released.
+    assert!(
+        !c.bead_metadata(&m)
+            .contains_key(EXCLUSIVE_DRAIN_RESERVATION)
+    );
+}
+
+#[test]
+fn a_drain_over_100_members_fails_the_drain_and_scatters_nothing() {
+    // V-2 — gc's runtime cap (`defaultDrainMaxUnits`, drain.go:24). Correct today,
+    // and UNDEFENDED: `flow::DRAIN_MAX_UNITS` and the `>` boundary could both change
+    // with a green suite.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("build");
+    let members: Vec<String> = (0..101)
+        .map(|i| c.create_member(&run, &format!("member {i}")))
+        .collect();
+    c.close_decompose(&run);
+    c.settle();
+
+    let anchor = c.step_bead(&run, "implement");
+    let row = c.get_bead(&anchor);
+    assert_eq!(row.status, "closed");
+    assert_eq!(row.outcome.as_deref(), Some("fail"));
+    assert_eq!(
+        c.drain_children(&anchor).len(),
+        0,
+        "over the cap, the drain scatters NOTHING — camp will not spawn 101 workers \
+         where gc hard-fails"
+    );
+    // Nothing was reserved: the cap is checked BEFORE the reserve.
+    for m in &members {
+        assert!(!c.bead_metadata(m).contains_key(EXCLUSIVE_DRAIN_RESERVATION));
+    }
+    assert!(
+        c.events_of_type("bead.closed")
+            .iter()
+            .any(|e| e["data"]["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("limit_exceeded")),
+        "the close names gc's reason"
+    );
 }

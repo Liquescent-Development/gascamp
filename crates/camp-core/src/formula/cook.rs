@@ -53,6 +53,11 @@ pub struct CookOptions {
     pub extra_root_needs: Vec<String>,
     /// Labels on the root bead (`bond:<anchor>:<index>` linkage).
     pub extra_root_labels: Vec<String>,
+    /// Metadata stamped on the run's ROOT bead. A drain uses it to carry gc's
+    /// `gc.drain_member_id` / `_index` / `_count` / `_control_id` onto each item
+    /// run — the link that tells the item worker WHICH MEMBER it is working.
+    /// Without it a drain scatters byte-identical clones.
+    pub root_metadata: BTreeMap<String, String>,
     /// The camp config, for RESOLVING ROUTES through the binding namespace
     /// (compat §7.1). `None` cooks a formula with no `gc.run_target` — every
     /// camp-local fixture — and fails loudly on one that has a route, rather
@@ -375,6 +380,9 @@ pub fn cook_with(
     }
     if !opts.extra_root_labels.is_empty() {
         root_data["labels"] = serde_json::json!(opts.extra_root_labels);
+    }
+    if !opts.root_metadata.is_empty() {
+        root_data["metadata"] = serde_json::json!(opts.root_metadata);
     }
     inputs.push(EventInput {
         kind: EventType::BeadCreated,

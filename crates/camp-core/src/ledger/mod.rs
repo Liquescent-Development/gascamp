@@ -237,6 +237,14 @@ impl Ledger {
         crate::formula::runtime::drain_children(&self.conn, anchor)
     }
 
+    /// Every member this anchor holds a reservation on (status-agnostic — V-4).
+    pub fn reservations_held_by(
+        &self,
+        anchor: &str,
+    ) -> Result<Vec<crate::readiness::BeadRow>, CoreError> {
+        crate::formula::runtime::reservations_held_by(&self.conn, anchor)
+    }
+
     /// Reservations whose holding anchor is closed or gone (the orphan sweep).
     pub fn orphaned_reservations(&self) -> Result<Vec<(String, String)>, CoreError> {
         crate::formula::runtime::orphaned_reservations(&self.conn)
@@ -807,6 +815,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
@@ -3522,6 +3531,70 @@ mod tests {
                 .get(EXCLUSIVE_DRAIN_RESERVATION)
                 .map(String::as_str),
             Some("drain-b")
+        );
+    }
+
+    #[test]
+    fn a_reserve_BATCH_with_one_conflict_appends_ZERO_ROWS() {
+        // ⭐ V-1 — the assertion BD4's all-or-nothing reserve actually rests on, and
+        // the one the daemon suite CANNOT make.
+        //
+        // At the daemon level a losing drain always conflicts on member[0] (both
+        // drains enumerate through the same `run_members` ordering and campd runs
+        // them serially), so a single-event batch and rev-2's incremental
+        // per-event loop are INDISTINGUISHABLE — the BD4 mutant survives the whole
+        // daemon suite even with two members. The property is a LEDGER property, so
+        // it is asserted at the ledger.
+        //
+        // A batch that reserves m1 and then conflicts on m2 must append NOTHING —
+        // not "m1 and then stop". Under the incremental shape m1 stays reserved,
+        // item-run 1 is already cooked and dispatchable on it, and releasing it
+        // later would let a SECOND drain cook its own item run over the same bead:
+        // two drains mutating one bead, the exact thing the reservation prevents.
+        let (_d, mut l) = temp_ledger();
+        mk_bead(&mut l, "gc-1", serde_json::json!({"title": "m1"}));
+        mk_bead(&mut l, "gc-2", serde_json::json!({"title": "m2"}));
+        // m2 is already held by another drain.
+        update(
+            &mut l,
+            "gc-2",
+            serde_json::json!({"metadata": {EXCLUSIVE_DRAIN_RESERVATION: "drain-other"}}),
+        )
+        .unwrap();
+
+        let reserve = |bead: &str| EventInput {
+            kind: EventType::BeadUpdated,
+            rig: Some("gc".into()),
+            actor: "campd".into(),
+            bead: Some(bead.to_owned()),
+            data: serde_json::json!({
+                "metadata": {EXCLUSIVE_DRAIN_RESERVATION: "drain-mine"}
+            }),
+        };
+        let err = l
+            .append_batch(vec![reserve("gc-1"), reserve("gc-2")])
+            .unwrap_err();
+        assert!(
+            matches!(&err, CoreError::InvalidEventData { reason, .. }
+                     if reason.contains("drain-other")),
+            "the conflict names the holder: {err:?}"
+        );
+
+        // ⭐ ZERO ROWS. m1 — which the batch reserved BEFORE it hit the conflict —
+        // must carry NO reservation. "Rejections appended nothing."
+        assert!(
+            !l.bead_metadata("gc-1")
+                .unwrap()
+                .contains_key(EXCLUSIVE_DRAIN_RESERVATION),
+            "a rejected batch must append NOTHING — m1 was reserved before the conflict"
+        );
+        // …and the prior holder is untouched.
+        assert_eq!(
+            l.bead_metadata("gc-2")
+                .unwrap()
+                .get(EXCLUSIVE_DRAIN_RESERVATION)
+                .map(String::as_str),
+            Some("drain-other")
         );
     }
 

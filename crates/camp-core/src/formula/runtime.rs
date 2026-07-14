@@ -658,6 +658,29 @@ pub fn drain_children(
     Ok(children)
 }
 
+/// Every member THIS anchor currently holds a reservation on.
+///
+/// **Status-agnostic, and that is the point (V-4).** `run_members` filters
+/// `status <> 'closed'`, so a member that CLOSED while its item run was in flight
+/// is invisible to it — and a release loop built on `run_members` would skip that
+/// member and leave its reservation held FOREVER. A reservation is a fact about
+/// `bead_meta`, so it is released by asking `bead_meta`.
+pub fn reservations_held_by(conn: &Connection, anchor: &str) -> Result<Vec<BeadRow>, CoreError> {
+    let sql = format!(
+        "SELECT {cols} FROM beads b
+           JOIN bead_meta m ON m.bead_id = b.id
+          WHERE m.key = ?1 AND m.value = ?2
+          ORDER BY b.id",
+        cols = crate::readiness::BEAD_COLS,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params![crate::readiness::EXCLUSIVE_DRAIN_RESERVATION, anchor],
+        crate::readiness::row_to_bead,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Reservations whose holding anchor is CLOSED or GONE — orphans.
 ///
 /// A `kill -9` between the reserve batch and the cook leaves members held by an

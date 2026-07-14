@@ -27,6 +27,26 @@ pub const MEMBER_ACCESS: &str = "gc.drain_member_access";
 pub const ON_ITEM_FAILURE: &str = "gc.drain_on_item_failure";
 pub const ITEM_SINGLE_LANE: &str = "gc.drain_item_single_lane";
 
+// ---- what a drain stamps on each ITEM RUN's ROOT bead ----------------------
+//
+// **This is the member↔item LINK, and without it a drain scatters
+// indistinguishable clones.** gc's `stampDrainItemRecipe` (`drain.go:1110-1128`)
+// puts these on the item root, and `gc.drain_member_id` is the one that answers
+// the only question the item worker actually has: *which member am I working?*
+//
+// Camp reproduces gc's keys VERBATIM (invariant 7). There is no camp analogue of
+// gc's `gc.input_convoy_id` (camp has no convoys), so it is not emitted.
+pub const CONTROL_ID: &str = "gc.drain_control_id";
+pub const INDEX: &str = "gc.drain_index";
+pub const COUNT: &str = "gc.drain_count";
+pub const MEMBER_ID: &str = "gc.drain_member_id";
+
+/// gc's `graphv2.LegacyIssueVar` (`invocation.go:35`): the var an item formula
+/// references to name its own member. gc binds it to `member.ID`
+/// (`drain.go:997`), and camp binds the same name to the same thing — the item
+/// formula's `{{issue}}` resolves to the member bead id.
+pub const MEMBER_VAR: &str = "issue";
+
 /// gc's `defaultDrainMaxUnits` (`drain.go:24`). The KEY `drain.max_units` is
 /// REFUSED by name (0 corpus uses, §4 rule 1) — but gc applies this as a RUNTIME
 /// cap and hard-closes a drain whose member set exceeds it (`drain.go:244-255`,

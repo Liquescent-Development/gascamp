@@ -385,6 +385,7 @@ fn cook_with_substitutes_vars_and_links_the_root() {
     vars.insert("position".to_owned(), "0".to_owned());
     let opts = CookOptions {
         config: None,
+        root_metadata: Default::default(),
         vars,
         extra_root_needs: vec!["gc-1".to_owned()],
         extra_root_labels: vec!["bond:gc-1:0".to_owned()],
@@ -462,6 +463,7 @@ fn substitution_never_reinterprets_inserted_values_as_templates() {
     vars.insert("position".to_owned(), "0".to_owned());
     let opts = CookOptions {
         config: None,
+        root_metadata: Default::default(),
         vars,
         ..Default::default()
     };
