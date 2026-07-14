@@ -1,0 +1,9 @@
+formula = "drain-no-needs"
+contract = "graph.v2"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+[steps.drain]
+context = "separate"
+formula = "item"

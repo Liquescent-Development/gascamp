@@ -1,0 +1,17 @@
+formula = "templated-drain"
+contract = "graph.v2"
+
+[vars]
+item_formula = "item"
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+needs = ["decompose"]
+[steps.drain]
+context = "separate"
+formula = "{{item_formula}}"

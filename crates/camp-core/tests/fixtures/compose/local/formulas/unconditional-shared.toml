@@ -1,0 +1,14 @@
+formula = "unconditional-shared"
+contract = "graph.v2"
+
+[[steps]]
+id = "decompose"
+title = "Decompose"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+needs = ["decompose"]
+[steps.drain]
+context = "shared"
+formula = "item"

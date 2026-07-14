@@ -208,6 +208,40 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
                 "`retry` must not be combined with `on_complete` (gc formula-spec-v2 §3.2)",
             );
         }
+        // S9, extended for rung 2e: a DRAIN step's anchor is CAMPD-HELD — campd
+        // scatters and gathers it and never dispatches a worker for it. A check or
+        // retry loop is a WORKER mechanism (`create_attempt`), and the two cannot
+        // both own the same anchor.
+        if step.has_drain && step.has_check {
+            violation(
+                out,
+                format!("{loc}.drain"),
+                "`drain` must not be combined with `check`: a drain step's anchor is \
+                 campd-held (it scatters and gathers), and a check loop dispatches worker \
+                 attempts against it",
+            );
+        }
+        if step.has_drain && step.has_retry {
+            violation(
+                out,
+                format!("{loc}.drain"),
+                "`drain` must not be combined with `retry`: a drain step's anchor is \
+                 campd-held, and a retry loop dispatches worker attempts against it",
+            );
+        }
+        // S17 (NEW) — a drain must depend on the step that CREATES its members.
+        // Without a `needs`, the anchor is claimed at cook time, before any member
+        // exists: it scatters zero members and gathers `pass` immediately. Every
+        // corpus drain has `needs`.
+        if step.has_drain && step.needs.is_empty() {
+            violation(
+                out,
+                format!("{loc}.needs"),
+                "a drain step must declare at least one `needs`: it depends on the step that \
+                 creates its members, and without that edge it is claimed before any member \
+                 exists and gathers an empty pass",
+            );
+        }
 
         // S10 — retry.on_exhausted vocabulary.
         if let Some(retry) = &step.retry
@@ -246,7 +280,7 @@ pub(crate) fn check(raw: &RawFormula, stem: Option<&str>, out: &mut Vec<Violatio
     let uses_graph_only = raw
         .steps
         .iter()
-        .any(|s| s.has_check || s.has_retry || s.has_on_complete);
+        .any(|s| s.has_check || s.has_retry || s.has_on_complete || s.has_drain);
     if uses_graph_only && !declares_compiler(raw) {
         violation(
             out,
@@ -422,7 +456,7 @@ pub(crate) fn assemble(
     source: String,
     vars: BTreeMap<String, Option<String>>,
 ) -> Formula {
-    Formula {
+    let mut formula = Formula {
         name: raw.name.unwrap_or_default(),
         description: raw.description,
         requires: raw
@@ -449,10 +483,21 @@ pub(crate) fn assemble(
                     },
                 }),
                 on_complete: s.on_complete,
+                drain: s.drain,
             })
             .collect(),
         source,
+    };
+    // F2 — gc's compiled Recipe has NO Drain struct: a drain lives entirely in the
+    // step's METADATA. Camp emits gc's map verbatim
+    // (`ApplyDrainControlMetadata`, compile.go:584-614) so the differential gate
+    // can diff it against gc's own 20 drain steps.
+    for step in &mut formula.steps {
+        if let Some(drain) = step.drain.clone() {
+            step.metadata.extend(drain.metadata());
+        }
     }
+    formula
 }
 
 #[cfg(test)]

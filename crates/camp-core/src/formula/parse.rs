@@ -14,6 +14,7 @@ use std::time::Duration;
 use toml::Value;
 
 use crate::formula::ast::{Check, CheckMode, OnComplete, Refusal, Violation};
+use crate::formula::drain::{Drain, DrainContext, DrainItem, MemberAccess, OnItemFailure};
 use crate::formula::keys::{self, Class, Origin, Site};
 
 pub(crate) struct RawFormula {
@@ -72,6 +73,9 @@ pub(crate) struct RawStep {
     /// `children` — rung 2d. 16 occurrences across 15 formulas, and 14 of them
     /// are on the `template` tree (rev 2 counted only `steps` and said "2").
     pub children: Vec<RawStep>,
+    /// `drain` — rung 2e. campd owns this step's anchor: it scatters one item run
+    /// per run MEMBER, gathers them, and closes.
+    pub drain: Option<Drain>,
     pub needs: Vec<String>,
     pub assignee: Option<String>,
     pub timeout: Option<Duration>,
@@ -84,6 +88,9 @@ pub(crate) struct RawStep {
     pub has_check: bool,
     pub has_retry: bool,
     pub has_on_complete: bool,
+    /// PRESENCE, not parse success — a malformed drain table is still a drain,
+    /// and S9/S11/S17 must not be muted by it.
+    pub has_drain: bool,
 }
 
 pub(crate) struct RawRetry {
@@ -139,20 +146,6 @@ impl Ctx {
                 continue;
             }
             match keys::classify(site, key) {
-                // §4 trap 3: accepted by the table, not yet honoured by the
-                // pipeline. Without this the key would compile to NOTHING,
-                // silently, and every rung count would be a lie. The check is
-                // SITE-AWARE (trap 1) — see `keys::is_unimplemented`.
-                Class::Accepted if keys::is_unimplemented(site, key) => {
-                    self.violations.push(Violation {
-                        construct: violation_at,
-                        message: format!(
-                            "`{key}` is on camp's key table but the compiler does not honour \
-                             it yet (compat phase 2 lands it at a later rung); camp will not \
-                             load a formula whose semantics it would silently drop"
-                        ),
-                    });
-                }
                 Class::Accepted => {}
                 // `refuse` handles every Refused key; reaching here means the
                 // two tables disagree, which is a bug in `keys`, not in the
@@ -555,6 +548,7 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
     let check = walk_check(step, &at("check"), ctx);
     let retry = walk_retry(step, &at("retry"), ctx);
     let on_complete = walk_on_complete(step, &at("on_complete"), ctx);
+    let drain = walk_drain(step, &at("drain"), id.as_deref(), ctx);
 
     RawStep {
         index,
@@ -568,6 +562,7 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
         expand,
         expand_vars,
         children,
+        drain,
         needs,
         assignee,
         timeout,
@@ -577,7 +572,131 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
         has_check: step.contains_key("check"),
         has_retry: step.contains_key("retry"),
         has_on_complete: step.contains_key("on_complete"),
+        has_drain: step.contains_key("drain"),
     }
+}
+
+/// `[steps.<id>.drain]` (rung 2e), on `walk_on_complete`'s mold.
+///
+/// `context = "shared"`, `continuation_group` and `max_units` never reach here —
+/// `Ctx::keys` refuses them first (step-scoped, so a pruned arm's refusal dies
+/// with it). What is left is the shape camp implements.
+fn walk_drain(
+    step: &toml::Table,
+    construct: &str,
+    step_id: Option<&str>,
+    ctx: &mut Ctx,
+) -> Option<Drain> {
+    let drain = match step.get("drain") {
+        None => return None,
+        Some(Value::Table(t)) => t,
+        Some(_) => {
+            ctx.violations.push(wrong_type(construct, "a table"));
+            return None;
+        }
+    };
+    ctx.keys(Site::Drain, drain, construct, step_id);
+    // `item` is a nested table with its own site (§4 trap 1: `single_lane` is
+    // DEAD at the top level and real here).
+    let mut single_lane = false;
+    match drain.get("item") {
+        None => {}
+        Some(Value::Table(item)) => {
+            ctx.keys(Site::DrainItem, item, &format!("{construct}.item"), step_id);
+            match item.get("single_lane") {
+                None => {}
+                Some(Value::Boolean(b)) => single_lane = *b,
+                Some(_) => ctx.violations.push(wrong_type(
+                    &format!("{construct}.item.single_lane"),
+                    "a boolean",
+                )),
+            }
+        }
+        Some(_) => ctx
+            .violations
+            .push(wrong_type(&format!("{construct}.item"), "a table")),
+    }
+
+    let out = &mut ctx.violations;
+    // `context` defaults to "separate" (the only shape camp implements; "shared"
+    // was already refused).
+    let context = match get_string(drain, "context", &format!("{construct}.context"), out) {
+        None | Some(_) => DrainContext::Separate,
+    };
+    let formula = match get_string(drain, "formula", &format!("{construct}.formula"), out) {
+        Some(f) if !f.is_empty() => f,
+        Some(_) | None => {
+            out.push(Violation {
+                construct: format!("{construct}.formula"),
+                message: "a drain must name the `formula` it instantiates per member".to_owned(),
+            });
+            return None;
+        }
+    };
+    // gc's OWN rule (`graphv2_validation.go:417-419`) — a VALIDATION reject, not a
+    // substitution exemption. §9's asymmetry list said `drain.formula` was exempt
+    // from `{{var}}` substitution; it is not (gc substitutes it into
+    // `gc.drain_formula`). It is blocked HERE instead, exactly as gc blocks it.
+    if formula.contains("{{") {
+        out.push(Violation {
+            construct: format!("{construct}.formula"),
+            message: format!(
+                "templated item formula names are not supported: {formula:?} (gc rejects this                  too — the drain's formula must be a literal name)"
+            ),
+        });
+        return None;
+    }
+
+    let member_access = match get_string(
+        drain,
+        "member_access",
+        &format!("{construct}.member_access"),
+        out,
+    ) {
+        None => MemberAccess::Read, // gc's compiler default (compile.go:590-598)
+        Some(s) => match MemberAccess::parse(&s) {
+            Some(m) => m,
+            None => {
+                out.push(Violation {
+                    construct: format!("{construct}.member_access"),
+                    message: format!(
+                        "member_access {s:?} is not legal; use \"read\" or \"exclusive\""
+                    ),
+                });
+                return None;
+            }
+        },
+    };
+    let on_item_failure = match get_string(
+        drain,
+        "on_item_failure",
+        &format!("{construct}.on_item_failure"),
+        out,
+    ) {
+        // gc: "skip_remaining" for shared, "continue" otherwise — and camp only
+        // has separate.
+        None => OnItemFailure::Continue,
+        Some(s) => match OnItemFailure::parse(&s) {
+            Some(v) => v,
+            None => {
+                out.push(Violation {
+                    construct: format!("{construct}.on_item_failure"),
+                    message: format!(
+                        "on_item_failure {s:?} is not legal; use \"continue\" or \"skip_remaining\""
+                    ),
+                });
+                return None;
+            }
+        },
+    };
+
+    Some(Drain {
+        context,
+        formula,
+        member_access,
+        on_item_failure,
+        item: DrainItem { single_lane },
+    })
 }
 
 fn walk_check(step: &toml::Table, construct: &str, ctx: &mut Ctx) -> Option<Check> {
@@ -1087,21 +1206,30 @@ mode = "fanout"
 
     #[test]
     fn walk_collects_every_finding_and_sorts_them_into_the_right_bucket() {
-        // One file, three verdicts — and the buckets are the point. `pour` is a
-        // REFUSAL (§4 rule 1, permanent). `drain` is a VIOLATION only because its
-        // rung has not landed (temporary — UNIMPLEMENTED). `tags` is an
-        // ANNOTATION and is SILENT. Conflating any two of these is how the old
-        // table refused 95 of the 100 corpus formulas.
-        let text = "formula = \"x\"\npour = true\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ntags = [\"x\"]\ndrain = { formula = \"i\" }\n";
+        // One file, FOUR verdicts, and the buckets are the whole point. `pour` is
+        // a REFUSAL (§4 rule 1, permanent). `bogus` is a VIOLATION (D2′: an
+        // unrecognised key is fatal in the operator's OWN formulas). `tags` is an
+        // ANNOTATION and is SILENT. `internal` is DEAD IN GC and is merely WARNED.
+        // Conflating any two of these is how the old table refused 95 of the 100
+        // corpus formulas.
+        let text = "formula = \"x\"\npour = true\nbogus = 1\ninternal = true\n\
+                    [[steps]]\nid = \"a\"\ntitle = \"t\"\ntags = [\"x\"]\n";
         let w = walk(text, Origin::CampLocal);
 
         let c: Vec<&str> = w.violations.iter().map(|v| v.construct.as_str()).collect();
-        assert_eq!(c, vec!["drain"], "only the unimplemented rung key: {c:?}");
+        assert_eq!(c, vec!["bogus"], "only the unrecognised key: {c:?}");
+        assert!(
+            w.ignored.iter().any(|s| s.contains("internal")),
+            "gc's dead config is warned, not fatal: {:?}",
+            w.ignored
+        );
 
         let r: Vec<&str> = w.refusals.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(r, vec!["pour"], "{r:?}");
 
-        assert!(w.ignored.is_empty(), "tags is silent: {:?}", w.ignored);
+        // `tags` is an ANNOTATION: SILENT — not a violation, not a refusal, and
+        // not even a warning. The only warning here is `internal`.
+        assert_eq!(w.ignored.len(), 1, "tags must be silent: {:?}", w.ignored);
     }
 
     #[test]

@@ -61,6 +61,11 @@ pub struct Step {
     pub retry: Option<Retry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_complete: Option<OnComplete>,
+    /// Rung 2e. A drain step's anchor is CAMPD-HELD: campd claims it, scatters
+    /// one item run per run member, gathers them, and closes it. It never gets a
+    /// worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<crate::formula::drain::Drain>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

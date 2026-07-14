@@ -917,6 +917,7 @@ mod single_brace_tests {
             expand: None,
             expand_vars: BTreeMap::new(),
             children: Vec::new(),
+            drain: None,
             needs: Vec::new(),
             assignee: None,
             timeout: None,
@@ -926,6 +927,7 @@ mod single_brace_tests {
             has_check: false,
             has_retry: false,
             has_on_complete: false,
+            has_drain: false,
         };
         let empty = BTreeMap::new();
         // Resolves with NO such var — it is a plain ReplaceAll over a fixed

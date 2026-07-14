@@ -13,9 +13,10 @@
 //!   "scope"` hiding in its VALUES is refused. [`classify`] cannot say that;
 //!   [`refuse`] can.
 //! * **Trap 3 — an accepted key that compiles to nothing is a silent lie.**
-//!   [`UNIMPLEMENTED`] names every key the table accepts before the pipeline
-//!   honours it, so the rung counts stay true. It is DELETED by the phase's
-//!   last rung.
+//!   An `UNIMPLEMENTED` list named every key the table accepted before the
+//!   pipeline honoured it, so no intermediate rung count could ever be a lie.
+//!   **Every rung has landed, so the list is GONE** — which is the point: if it
+//!   still existed, some accepted key would still be compiling to nothing.
 
 use toml::Value;
 
@@ -108,16 +109,6 @@ pub const RUNGS: &[Rung] = &[
     },
 ];
 
-/// §4 trap 3 — keys the table ACCEPTS that the pipeline does not yet honour.
-/// Each of Tasks 5–8 removes its own keys as it implements them; the last one
-/// DELETES this constant. Without it an accepted-but-unimplemented key would
-/// compile to nothing, silently, and every intermediate rung count would be a
-/// lie.
-pub const UNIMPLEMENTED: &[&str] = &[
-    // rungs 2b, 2c and 2d — LANDED.
-    "drain", // rung 2e
-];
-
 // ---- the tables ------------------------------------------------------------
 
 const BASE_TOP: &[&str] = &["description", "formula", "requires", "steps"];
@@ -161,25 +152,6 @@ fn accepted_step(key: &str) -> bool {
 /// Every key accepted at [`Site::Top`] across ALL rungs, plus the base set.
 fn accepted_top(key: &str) -> bool {
     BASE_TOP.contains(&key) || RUNGS.iter().any(|r| r.top.contains(&key))
-}
-
-/// §4 trap 3 AND trap 1, together: is `key` — **at `site`** — a rung key the
-/// pipeline does not yet honour?
-///
-/// **Site-aware, and that is not decoration.** [`UNIMPLEMENTED`] is a list of
-/// NAMES, and `vars` is on it (the top-level rung-2b key). But
-/// `steps.<id>.on_complete.vars` is a DIFFERENT KEY that merely shares the name
-/// — it is implemented, load-bearing, and carries every fan-out formula in the
-/// corpus. Matching UNIMPLEMENTED by name alone rejects all of them. Same shape
-/// as `mode` (dead at Top, load-bearing at [`Site::CheckInner`]) and
-/// `single_lane` (dead at Top, real at [`Site::DrainItem`]).
-pub fn is_unimplemented(site: Site, key: &str) -> bool {
-    let on_a_rung_at_this_site = RUNGS.iter().any(|r| match site {
-        Site::Top => r.top.contains(&key),
-        Site::Step => r.step.contains(&key),
-        _ => false,
-    });
-    on_a_rung_at_this_site && UNIMPLEMENTED.contains(&key)
 }
 
 /// What camp does with `key` at `site`. Pure; value-blind — the value-aware
@@ -413,6 +385,22 @@ mod tests {
     }
 
     #[test]
+    fn every_rung_key_is_accepted_and_none_is_left_unimplemented() {
+        // §4 trap 3, DISCHARGED. There is no longer an `UNIMPLEMENTED` list: every
+        // rung key is accepted by the table AND honoured by the pipeline. If a key
+        // were still accepted-but-unhonoured it would compile to NOTHING, silently,
+        // and the ceiling (95) would be a lie.
+        for r in RUNGS {
+            for k in r.top {
+                assert_eq!(classify(Site::Top, k), Class::Accepted, "rung top {k}");
+            }
+            for k in r.step {
+                assert_eq!(classify(Site::Step, k), Class::Accepted, "rung step {k}");
+            }
+        }
+    }
+
+    #[test]
     fn the_rung_table_is_section_9s_table_verbatim() {
         // A LITERAL transcription of §9's ladder — never derived from the
         // constant under test, which would make this true by construction and
@@ -463,36 +451,6 @@ mod tests {
         let md: Value = toml::from_str(r#""gc.scope_budget" = "3""#).unwrap();
         let r = refuse(Site::Step, "metadata", &md, "steps.a.metadata").expect("must refuse");
         assert_eq!(r.key, "gc.scope_budget");
-    }
-
-    #[test]
-    fn unimplemented_is_site_aware_because_on_complete_vars_is_not_top_level_vars() {
-        // §4 trap 1, and it really bit: matching UNIMPLEMENTED by NAME fired on
-        // `steps.<id>.on_complete.vars` — an implemented, load-bearing key —
-        // because top-level `vars` (rung 2b) happened to share its spelling. That
-        // rejected every fan-out formula in the corpus.
-        //
-        // Rung 2b has since landed, so `vars` is no longer on the list and this
-        // pair can no longer collide. The guard STAYS as a regression fence: a
-        // future rung key that shares a nested key's name must not resurrect the
-        // bug, and `on_complete.vars` must never be "unimplemented" at any point.
-        assert!(
-            !is_unimplemented(Site::OnComplete, "vars"),
-            "on_complete.vars is a DIFFERENT key that merely shares a name"
-        );
-        // The rule itself: a rung key is unimplemented only AT ITS OWN SITE.
-        assert!(is_unimplemented(Site::Step, "drain"));
-        assert!(!is_unimplemented(Site::Top, "drain"), "drain is a STEP key");
-        // Landed rungs are not unimplemented.
-        assert!(!is_unimplemented(Site::Top, "vars"));
-        assert!(!is_unimplemented(Site::Step, "condition"));
-        assert!(!is_unimplemented(Site::Top, "extends"));
-        assert!(!is_unimplemented(Site::Top, "template"));
-        assert!(!is_unimplemented(Site::Step, "children"));
-        assert!(!is_unimplemented(Site::Top, "contract"));
-        // Nothing on the base sets may ever be unimplemented.
-        assert!(!is_unimplemented(Site::Step, "check"));
-        assert!(!is_unimplemented(Site::Top, "steps"));
     }
 
     #[test]
@@ -556,27 +514,5 @@ mod tests {
         assert_eq!(r.step, None, "refuse() is location-blind");
         r.step = Some("a".to_owned());
         assert_eq!(r.step.as_deref(), Some("a"));
-    }
-
-    #[test]
-    fn unimplemented_names_only_keys_the_table_accepts() {
-        // §4 trap 3: an UNIMPLEMENTED key must be one the table ACCEPTS —
-        // otherwise it is refused/unknown and the const is lying about why the
-        // formula failed.
-        for k in UNIMPLEMENTED {
-            let accepted = classify(Site::Top, k) == Class::Accepted
-                || classify(Site::Step, k) == Class::Accepted;
-            assert!(accepted, "UNIMPLEMENTED key {k:?} is not an accepted key");
-        }
-        // And every one of them is a rung key — nothing from the base set may
-        // ever be unimplemented.
-        for k in UNIMPLEMENTED {
-            assert!(
-                RUNGS
-                    .iter()
-                    .any(|r| r.top.contains(k) || r.step.contains(k)),
-                "UNIMPLEMENTED key {k:?} is not on any rung"
-            );
-        }
     }
 }

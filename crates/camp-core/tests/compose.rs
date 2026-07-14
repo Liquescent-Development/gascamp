@@ -417,25 +417,35 @@ fn an_extends_cycle_is_a_hard_error_never_a_stack_overflow() {
 }
 
 #[test]
-fn a_formula_that_inherits_drain_ONLY_from_its_parent_is_blocked_until_rung_2e() {
-    // ⭐ BD1 — this is what moves rung 2c from 57 to 49.
+fn a_formula_that_inherits_drain_ONLY_from_its_parent_carries_it_in_the_merged_chain() {
+    // ⭐ BD1 — this is what moves rung 2c from 57 to 49, and it is why the gate's
+    // per-rung counts are what they are.
     //
     // `inherits-drain` declares NOTHING but `extends`. Camp resolves the chain at
     // stage 2 and validates the MERGED step list at stage 6, so the parent's
-    // `drain` key is camp's problem even though the child never typed it. Seven
-    // corpus formulas (`build-from-*`) inherit `drain` exactly this way, and one
+    // `drain` is camp's problem even though the child never typed the key: while
+    // rung 2e was pending, this formula did not load. Seven corpus formulas
+    // (`build-from-*`) inherit `drain` exactly this way, and one
     // (`github-issue-fix`) inherits `expand`/`expand_vars`.
     //
     // gc corroborates: the corpus AUTHORS 12 separate drain steps and gc COMPILES
     // 19 — the seven extra are inherited.
     let c = camp();
-    let err = compile_named(&c.layers, &c.cfg, "inherits-drain", &no_vars())
-        .expect_err("an inherited drain is still a drain");
-    assert!(err.names("drain"), "{err}");
+    let compiled = compile_named(&c.layers, &c.cfg, "inherits-drain", &no_vars())
+        .expect("rung 2e has landed, so the inherited drain now compiles");
+    let implement = compiled
+        .formula
+        .steps
+        .iter()
+        .find(|s| s.id == "implement")
+        .expect("the parent's drain step is in the merged chain");
     assert!(
-        err.to_string().contains("does not honour it yet"),
-        "blocked as UNIMPLEMENTED, not refused: {err}"
+        implement.drain.is_some(),
+        "the drain came from the PARENT — the child never typed the key"
     );
+    // And it defaults exactly as gc's compiler defaults it.
+    assert_eq!(implement.metadata["gc.kind"], "drain");
+    assert_eq!(implement.metadata["gc.drain_member_access"], "read");
 }
 
 // ---- rung 2d: expansion, and the compile-stage {name} grammar --------------
@@ -579,4 +589,132 @@ fn an_expand_target_that_does_not_exist_is_a_hard_error() {
     let err = compile_named(&c.layers, &c.cfg, "bad-expand", &no_vars()).unwrap_err();
     assert!(err.names("expand"), "{err}");
     assert!(err.to_string().contains("no-such-expansion"), "{err}");
+}
+
+// ---- rung 2e: drain (the compile side) — THE CEILING ----------------------
+
+#[test]
+fn the_corpus_build_formulas_compile_clean_because_the_shared_arm_IS_PRUNED() {
+    // ⭐ THE LOAD-BEARING ONE (BD2). `bmad-build` / `gstack-build` /
+    // `compound-build` each carry TWO drain steps on mutually exclusive
+    // conditions. The default `drain_policy = "separate"` prunes the SHARED one —
+    // AND ITS REFUSAL — before stage 6 ever collects it.
+    //
+    // gc corroborates: 13 authored shared drains compile to exactly 1.
+    // Refuse at parse instead and 19 corpus formulas fail: the ceiling is 76, not 95.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "build-arms", &no_vars())
+        .expect("the shared arm and its refusal are pruned together");
+    assert_eq!(ids(&compiled), vec!["decompose", "implement"]);
+    assert!(compiled.refusals.is_empty(), "{:?}", compiled.refusals);
+}
+
+#[test]
+fn setting_drain_policy_to_same_session_refuses_instead_of_approximating() {
+    // Flip the var and the shared arm SURVIVES — so its refusal survives too.
+    // Camp refuses rather than silently running a same-session drain as separate.
+    let c = camp();
+    let overrides = BTreeMap::from([("drain_policy".to_owned(), "same-session".to_owned())]);
+    let err = compile_named(&c.layers, &c.cfg, "build-arms", &overrides).unwrap_err();
+    assert!(err.names("context"), "{err}");
+    assert!(err.to_string().contains("same-session"), "{err}");
+}
+
+#[test]
+fn an_UNCONDITIONAL_shared_drain_is_refused_and_nothing_can_prune_it() {
+    // `gascity/formulas/same-session-implement.formula.toml` — one of the 5 camp
+    // cannot load, and one §9 did not anticipate. 12 of the 13 corpus shared
+    // drains sit behind a condition; this one has none.
+    let c = camp();
+    let err = compile_named(&c.layers, &c.cfg, "unconditional-shared", &no_vars()).unwrap_err();
+    assert!(err.names("context"), "{err}");
+    assert_eq!(err.refusals.len(), 1);
+    assert_eq!(err.refusals[0].key, "context");
+    assert_eq!(err.refusals[0].step.as_deref(), Some("implement"));
+}
+
+#[test]
+fn a_drain_step_compiles_to_gcs_gc_drain_metadata() {
+    // F2/F3 — gc's compiled Recipe has NO Drain struct: a drain lives entirely in
+    // METADATA. Assertion B of the differential gate diffs this map against gc's
+    // own 20 drain steps.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "build-arms", &no_vars()).unwrap();
+    let md = &compiled.formula.steps[1].metadata;
+    assert_eq!(md["gc.kind"], "drain");
+    assert_eq!(md["gc.drain_context"], "separate");
+    assert_eq!(md["gc.drain_formula"], "item");
+    assert_eq!(md["gc.drain_member_access"], "exclusive");
+    // DEFAULTED by the compiler — the author wrote no `on_item_failure`.
+    assert_eq!(md["gc.drain_on_item_failure"], "continue");
+    assert!(!md.contains_key("gc.drain_item_single_lane"));
+}
+
+#[test]
+fn drain_defaults_follow_gcs_compiler() {
+    use camp_core::formula::{MemberAccess, OnItemFailure};
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "drain-no-needs", &no_vars());
+    // (that fixture fails S17; compile the arms one instead for the defaults)
+    drop(compiled);
+    let compiled = compile_named(&c.layers, &c.cfg, "build-arms", &no_vars()).unwrap();
+    let d = compiled.formula.steps[1].drain.as_ref().unwrap();
+    assert_eq!(d.member_access, MemberAccess::Exclusive);
+    assert_eq!(
+        d.on_item_failure,
+        OnItemFailure::Continue,
+        "gc defaults a SEPARATE drain to `continue` (skip_remaining is the shared \
+         context camp refuses)"
+    );
+    // F5/F6: parsed, round-tripped, and NEVER READ at runtime — because gc never
+    // reads them either.
+    assert!(!d.item.single_lane);
+}
+
+#[test]
+fn a_drain_step_with_no_needs_is_a_violation() {
+    // S17. Without a `needs` the anchor is claimed at cook time, before any member
+    // exists: it scatters zero members and gathers `pass` immediately. Every
+    // corpus drain has `needs`.
+    let c = camp();
+    let err = compile_named(&c.layers, &c.cfg, "drain-no-needs", &no_vars()).unwrap_err();
+    assert!(err.names("steps.implement.needs"), "{err}");
+    assert!(err.to_string().contains("creates its members"), "{err}");
+}
+
+#[test]
+fn a_templated_drain_formula_is_rejected_at_validation() {
+    // F8 — gc's OWN rule (graphv2_validation.go:417-419). §9 said `drain.formula`
+    // was EXEMPT from `{{var}}` substitution; it is not — gc substitutes it into
+    // `gc.drain_formula`. It is blocked by a VALIDATION reject instead, exactly as
+    // gc blocks it.
+    let c = camp();
+    let err = compile_named(&c.layers, &c.cfg, "templated-drain", &no_vars()).unwrap_err();
+    assert!(err.to_string().contains("templated item formula"), "{err}");
+}
+
+#[test]
+fn continuation_group_and_max_units_are_refused_by_name() {
+    let c = camp();
+    let err = compile_named(&c.layers, &c.cfg, "drain-refused-keys", &no_vars()).unwrap_err();
+    assert!(err.names("continuation_group"), "{err}");
+    assert!(err.names("max_units"), "{err}");
+}
+
+#[test]
+fn the_metadata_key_gc_continuation_group_is_ACCEPTED_and_carried() {
+    // 29 authored uses, 14 surviving compilation — and it is a DIFFERENT THING
+    // from the `drain.continuation_group` KEY (0 uses), which is refused. Rev 2
+    // conflated them. Camp carries this one verbatim and does not honour it
+    // (§11.4) — a NAMED fidelity cost.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "base", &no_vars()).unwrap();
+    assert_eq!(
+        compiled.formula.steps[0]
+            .metadata
+            .get("gc.build.artifact_schema")
+            .map(String::as_str),
+        Some("x"),
+        "an accepted-but-unhonoured annotation rides through untouched"
+    );
 }

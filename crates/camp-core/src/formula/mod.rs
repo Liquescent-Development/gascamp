@@ -23,6 +23,7 @@
 pub mod ast;
 pub mod compose;
 pub(crate) mod cook;
+pub mod drain;
 pub mod keys;
 pub mod layers;
 mod parse;
@@ -35,6 +36,7 @@ pub use ast::{
 };
 pub use compose::{Compiled, compile, compile_named};
 pub use cook::{CookOptions, CookedRun, RECIPE_VERSION, RUN_TARGET, cook, cook_with, instantiate};
+pub use drain::{Drain, DrainContext, DrainItem, MemberAccess, OnItemFailure};
 pub use keys::{Class, Origin, Site};
 pub use layers::FormulaLayers;
 pub use validate::{FORMULA_COMPILER_CAPABILITY, formula_stem};

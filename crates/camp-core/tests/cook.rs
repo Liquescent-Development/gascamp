@@ -255,6 +255,7 @@ fn cook_rejects_unknown_needs_ids_in_hand_built_formulas() {
         check: None,
         retry: None,
         on_complete: None,
+        drain: None,
     };
     let formula = Formula {
         name: "hand".into(),
@@ -753,6 +754,7 @@ fn cook_substitutes_every_metadata_value_with_no_exemption_list() {
             check: None,
             retry: None,
             on_complete: None,
+            drain: None,
         }],
         source: String::new(),
     };
@@ -791,6 +793,7 @@ fn an_undefined_var_in_a_TITLE_is_a_loud_cook_failure() {
             check: None,
             retry: None,
             on_complete: None,
+            drain: None,
         }],
         source: String::new(),
     };
