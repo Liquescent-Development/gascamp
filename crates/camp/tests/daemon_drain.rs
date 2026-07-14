@@ -187,8 +187,8 @@ impl Camp {
 
     /// The bead's `run_id` — the ONE column `close_member` reads, and it reads it only to
     /// know WHICH RUN to load. Membership itself is not decided here and must never be:
-    /// `close_member` asks `run_members` (`formula/runtime.rs:597-621`), which ANDs six
-    /// conditions plus a re-parse.
+    /// `close_member` asks `run_members` (`camp_core::formula::runtime`), which ANDs six
+    /// conditions plus a Rust-side re-parse.
     ///
     /// This docstring used to say the guard "needs BOTH columns because
     /// `dispatchable_beads` is a CONJUNCTION". That described the round-5 guard — the one
@@ -363,7 +363,8 @@ impl Camp {
     /// So the guard does not RESTATE the product's member predicate. It CALLS it.
     ///
     /// That distinction is the whole of this method's history. `run_members`
-    /// (`formula/runtime.rs:597-621`) is SIX conditions plus a Rust-side re-parse, and
+    /// (`camp_core::formula::runtime::run_members`) is SIX conditions plus a Rust-side
+    /// re-parse, and
     /// the guard was rewritten by hand SIX TIMES, each time reproducing a few of them
     /// and each time letting a real bead through:
     ///
@@ -421,7 +422,7 @@ impl Camp {
         assert!(
             is_member || status == "closed",
             "close_member called on a bead the PRODUCT does not consider a run member \
-             ({bead}: status={status:?}) — `run_members` (formula/runtime.rs:597-621) is \
+             ({bead}: status={status:?}) — `run_members` (camp_core::formula::runtime) is \
              asked directly, so this covers every one of its conditions: run_id, NULL \
              step_id, type = 'task', not the root, and no `bond:`/`drain:` label (SQL \
              exclusion AND re-parse). The only bead accepted without being a member is an \
@@ -1407,7 +1408,7 @@ fn close_member_REFUSES_a_RUNLESS_dispatched_bead() {
 fn close_member_REFUSES_a_RUN_SCOPED_MAIL_bead() {
     // ⭐ F8. The guard read `run_id` and `step_id` and was BLIND TO `type`.
     //
-    // The product's member predicate (`formula/runtime.rs:600`) is
+    // The product's member predicate (`run_members`, in `camp_core::formula::runtime`) is
     // `run_id = ?1 AND step_id IS NULL AND type = 'task'` — THREE columns. Round 4's
     // guard had one, round 5 widened it to two, and a run-scoped MAIL bead satisfies
     // both of those: `run_id` NOT NULL, `step_id` NULL. It sailed through, and
@@ -1454,7 +1455,7 @@ fn close_member_REFUSES_a_RUN_ROOT() {
     // exactly — so it passed the widened guard, and `close_member` CLAIMED AND CLOSED
     // IT. No panic. The harness would have called a run root a drain member.
     //
-    // `run_members` excludes the root by ID (`b.id <> ?2`, formula/runtime.rs:600), and
+    // `run_members` excludes the root by ID (its `AND b.id <> ?2` clause), and
     // the guard now gets that for free by CALLING `run_members` rather than reproducing
     // its conditions. This test is why that cannot regress.
     let mut c = Camp::new();
@@ -1498,7 +1499,7 @@ fn labelled_decoy(c: &Camp, run: &str, label: &str) -> String {
 #[test]
 #[should_panic(expected = "does not consider a run member")]
 fn close_member_REFUSES_a_DRAIN_LABELLED_nonroot() {
-    // ⭐ F9. `run_members` (`formula/runtime.rs:597-621`) is SIX conditions, not four:
+    // ⭐ F9. `run_members` (`camp_core::formula::runtime`) is SIX conditions, not four:
     // it also drops anything wearing a `bond:` or `drain:` label, and it does so with
     // TWO mechanisms ANDed — the SQL conjunct `labels NOT LIKE '%"drain:%'` AND a
     // Rust-side re-parse. The LIKE is NOT a prefilter the re-parse subsumes: it excludes
