@@ -211,15 +211,16 @@ impl Camp {
     /// it — all 14 of them.
     ///
     /// The books BALANCE, and they are meant to be checked: 14 callers + 6 failure-path
-    /// tests that must not call it (below) + 7 `should_panic` harness-guard tests
+    /// tests that must not call it (below) + 8 `should_panic` harness-guard tests
     /// (`close_member_REFUSES_a_dispatched_bead`,
     /// `close_member_REFUSES_a_RUNLESS_dispatched_bead`,
     /// `close_member_REFUSES_a_RUN_SCOPED_MAIL_bead`,
     /// `close_member_REFUSES_a_RUN_ROOT`,
     /// `close_member_REFUSES_a_DRAIN_LABELLED_nonroot`,
     /// `close_member_REFUSES_a_BOND_LABELLED_nonroot`,
+    /// `close_member_REFUSES_a_MALFORMED_LABELLED_nonroot`,
     /// `close_dispatched_REFUSES_a_CLOSED_bead_no_worker_ever_touched`), which panic
-    /// INSIDE the harness and can never reach a call site = 27 `#[test]` fns, the whole
+    /// INSIDE the harness and can never reach a call site = 28 `#[test]` fns, the whole
     /// file. An earlier version of this comment accounted for 20 of 23 and left the
     /// other 3 unmentioned — in a comment whose entire job is to make every exclusion
     /// explicit. If these three numbers stop summing to the `#[test]` count, an
@@ -347,106 +348,74 @@ impl Camp {
     /// `a_CLOSED_member_is_never_scattered` STILL PASSES, because this method absorbs
     /// the wrongly-dispatched member. The guard is what turns that into a hard failure.
     ///
-    /// So the guard admits ONLY WHAT THE PRODUCT CALLS A MEMBER, and it takes all THREE
-    /// of the columns `run_members` keys on (`formula/runtime.rs:600`):
-    /// `run_id = ?1 AND step_id IS NULL AND type = 'task'`. This has been widened once
-    /// per round because each time it was short, a real bead walked through:
+    /// So the guard does not RESTATE the product's member predicate. It CALLS it.
     ///
-    /// - round 4 checked `step_id` alone. A RUNLESS bead (`camp create` with no `--run`)
-    ///   has `run_id` NULL *and* `step_id` NULL, so the member exclusion in
-    ///   `dispatchable_beads` does not fire, campd DISPATCHES it — and it slid straight
-    ///   into `close_member`, which absorbed a bead a worker had really run. That is the
-    ///   V-5 blindness, reinstated through the check meant to prevent it.
-    /// - round 5 added `run_id` and was BLIND TO `type`. A run-scoped MAIL bead has
-    ///   `run_id` NOT NULL and `step_id` NULL, so it satisfied both columns and
-    ///   `close_member` closed it AS A MEMBER — in the same file as
-    ///   `a_mail_bead_in_a_run_is_never_a_drain_member`, which exists to forbid exactly
-    ///   that fiction. `type = 'task'` IS D3.
+    /// That distinction is the whole of this method's history. `run_members`
+    /// (`formula/runtime.rs:597-621`) is SIX conditions plus a Rust-side re-parse, and
+    /// the guard was rewritten by hand SIX TIMES, each time reproducing a few of them
+    /// and each time letting a real bead through:
     ///
-    /// What the guard is NOT is a mirror of `dispatchable_beads`. That predicate
-    /// (`readiness.rs:161-172`) is a SIX-WAY conjunction — `status='open'`,
-    /// `type='task'`, `dispatch_failure IS NULL`, the member exclusion, no `sessions`
-    /// row, no unmet deps. The member SHAPE is the one conjunct of the six that
-    /// GUARANTEES campd will not dispatch the bead, which is what makes accepting only
-    /// that shape SOUND: nothing campd wakes can get in here. It is not EXHAUSTIVE and
-    /// must not claim to be — a memory bead, a mail bead or a task with an unmet
-    /// `--needs` is also undispatchable, and is also rejected here, because this method
-    /// is for MEMBERS, not merely for undispatched beads. So the panic does not tell
-    /// such an author that campd dispatches their bead; an earlier version did, and it
-    /// would have sent them to `close_dispatched` to spin ten seconds and hard-fail on
-    /// "NEVER DISPATCHED".
+    /// - round 4 checked `step_id` alone -> a RUNLESS bead (`run_id` NULL too) is
+    ///   DISPATCHABLE, campd wakes a worker for it, and `close_member` absorbed it.
+    /// - round 5 added `run_id`, blind to `type` -> a run-scoped MAIL bead was closed AS
+    ///   A MEMBER, in the same file as `a_mail_bead_in_a_run_is_never_a_drain_member`.
+    /// - round 7 added `type`, blind to the ROOT -> the root wears the member shape
+    ///   exactly, and was claimed and closed.
+    /// - round 8 added `!is_root` and called `parse_bond_label`/`parse_drain_label` —
+    ///   and STILL let a bead through, because CALLING TWO OF A PREDICATE'S HELPERS IS
+    ///   NOT CALLING THE PREDICATE. `run_members` ANDs a SQL conjunct
+    ///   (`labels NOT LIKE '%"drain:%'`) with that Rust re-parse. The LIKE is not a
+    ///   prefilter the parsers subsume — it excludes beads the parsers ADMIT. A
+    ///   MALFORMED label proves it: `parse_drain_label("drain:gc-999")` is `None` (it
+    ///   needs `rsplit_once(':')` and there is no second colon), so the round-8 guard
+    ///   called it unlabelled — while the SQL excluded it. Measured: the product's own
+    ///   predicate answered "not a member", and `close_member` ABSORBED AND CLOSED it.
+    ///   A malformed label is likelier to be typed by a test author than a well-formed
+    ///   one.
     ///
-    /// …and the ROOT is excluded too, because `run_members` excludes it — by ID
-    /// (`b.id <> ?2`), the fourth condition of that predicate. This was NOT theoretical
-    /// either: a run root has `run_id` SET, `step_id` NULL and `type = 'task'`, so it
-    /// wears the member shape EXACTLY, and a probe routing one here found `close_member`
-    /// CLAIMED AND CLOSED IT with no panic. The docstring of this very method briefly
-    /// claimed a root would hard-fail on `InvalidTransition` instead; that was measured
-    /// and it was false. Excluding by id is what `run_members` does, so it is what this
-    /// does. It also catches a COOKED run root (`bond:`/`drain:` labelled), which is the
-    /// root of its own run and therefore its own `manifest.root`.
+    /// So the harness now asks the PRODUCT whether this bead is a member, via
+    /// `load_run` + `run_members`. All six conditions and the re-parse hold BY
+    /// CONSTRUCTION, and drift is structurally impossible rather than merely discouraged
+    /// — which is what round 8 reached for and did not reach.
     ///
-    /// …and the `bond:`/`drain:` LABEL exclusions, which are conditions FIVE and SIX.
-    /// A `drain:`-labelled NON-ROOT bead wears the member shape in every column above —
-    /// `run_id` set, `step_id` NULL, `type = 'task'`, not the root — and `run_members`
-    /// still excludes it. Measured: the four-conjunct guard ABSORBED it. `camp create`
-    /// takes repeatable, unvalidated `--label` next to `--run`, so it is reachable.
-    ///
-    /// The guard calls the PRODUCT'S OWN PARSERS — `parse_bond_label` /
-    /// `parse_drain_label`, the same two `run_members` uses for its Rust-side re-parse
-    /// — instead of restating the rule with a `starts_with`. The SQL `LIKE`s there are
-    /// only a PREFILTER; the parsers are the real test, and a bead whose label merely
-    /// CONTAINS `drain:` is not a cooked root. Restating the product's predicate in the
-    /// harness is precisely how this guard was wrong in four consecutive rounds. It does
-    /// not restate it any more; it calls it.
-    ///
-    /// EXACTLY ONE condition of `run_members` is not asserted, and the reason is not the
-    /// one an earlier version of this comment gave. That version said a CLOSED member is
-    /// still a member and this method must accept one. Both halves were false: the
-    /// product says the OPPOSITE (`run_members`' own docstring — "A CLOSED member is not
-    /// a member: it is finished work"), and NO test routes an already-closed bead
-    /// through here — `a_CLOSED_member_is_never_scattered` passes a freshly-created OPEN
-    /// member, and it is THIS METHOD that closes it. Adding `status <> 'closed'` to the
-    /// guard leaves the suite 27/27 GREEN, which is how that sentence was caught.
-    ///
-    /// The true reason to omit it: it keeps `close_member` IDEMPOTENT — the `closed` arm
-    /// returns early, so closing a member twice is a no-op rather than a panic. That arm
-    /// is currently unexercised, and this comment says so rather than inventing a test
-    /// that justifies it.
+    /// ONE carve-out, one token wide: a CLOSED bead. `run_members` excludes closed beads
+    /// by design (its docstring: "A CLOSED member is not a member: it is finished work"),
+    /// so a member that is already closed cannot be recognised by the predicate, and
+    /// `close_member` must stay IDEMPOTENT. This cannot launder a non-member: the
+    /// `closed` arm below RETURNS WITHOUT TOUCHING THE BEAD, so accepting one is a no-op
+    /// that creates no fiction — the absorbing arms (`in_progress` closes it, `_` claims
+    /// and closes it) are reachable only for a bead the product calls a member. That arm
+    /// is currently unexercised by any test, and this comment says so rather than
+    /// inventing one to justify it.
     ///
     /// `close_member_REFUSES_a_dispatched_bead`,
     /// `close_member_REFUSES_a_RUNLESS_dispatched_bead`,
     /// `close_member_REFUSES_a_RUN_SCOPED_MAIL_bead`,
     /// `close_member_REFUSES_a_RUN_ROOT`,
-    /// `close_member_REFUSES_a_DRAIN_LABELLED_nonroot` and
-    /// `close_member_REFUSES_a_BOND_LABELLED_nonroot` hold this shut.
+    /// `close_member_REFUSES_a_DRAIN_LABELLED_nonroot`,
+    /// `close_member_REFUSES_a_BOND_LABELLED_nonroot` and
+    /// `close_member_REFUSES_a_MALFORMED_LABELLED_nonroot` hold this shut.
     fn close_member(&self, bead: &str, outcome: &str) {
-        let run_id = self.run_id_of(bead);
-        let step_id = self.step_id_of(bead);
-        let row = self.get_bead(bead);
-        let kind = row.kind;
-        // `run_members`' `b.id <> ?2`: the root wears the member shape exactly.
-        let is_root = run_id
-            .as_deref()
-            .is_some_and(|r| self.manifest(r)["root"].as_str() == Some(bead));
-        // `run_members`' label exclusions, via the product's OWN parsers — not a
-        // harness restatement of them.
-        let labelled = row.labels.iter().any(|l| {
-            camp_core::formula::runtime::parse_bond_label(l).is_some()
-                || camp_core::formula::runtime::parse_drain_label(l).is_some()
+        let status = self.get_bead(bead).status;
+        // THE PRODUCT'S ANSWER, not the harness's opinion of it.
+        let is_member = self.run_id_of(bead).is_some_and(|run_id| {
+            let ctx = camp_core::formula::runtime::load_run(&self.root.join("runs"), &run_id)
+                .unwrap_or_else(|e| panic!("run {run_id} of bead {bead} will not load: {e}"));
+            camp_core::formula::runtime::run_members(&self.conn(), &ctx)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == bead)
         });
         assert!(
-            run_id.is_some() && step_id.is_none() && kind == "task" && !is_root && !labelled,
-            "close_member called on a bead that is NOT a run member ({bead}: run_id={:?} \
-             step_id={:?} type={kind:?} is_root={is_root} bond/drain-labelled={labelled}) \
-             — `run_members` (formula/runtime.rs:597-621) admits a bead only when \
-             `run_id = ? AND step_id IS NULL AND type = 'task' AND id <> <root>` and it \
-             wears no `bond:`/`drain:` label; it also requires `status <> 'closed'`, \
-             which this guard omits on purpose to stay idempotent. This method is ONLY \
-             for members. If campd dispatches this bead, use close_dispatched; if it \
-             does not, the bead does not belong in this suite",
-            run_id,
-            step_id
+            is_member || status == "closed",
+            "close_member called on a bead the PRODUCT does not consider a run member \
+             ({bead}: status={status:?}) — `run_members` (formula/runtime.rs:597-621) is \
+             asked directly, so this covers every one of its conditions: run_id, NULL \
+             step_id, type = 'task', not the root, and no `bond:`/`drain:` label (SQL \
+             exclusion AND re-parse). The only bead accepted without being a member is an \
+             already-CLOSED one, for idempotence, and closing it is a no-op. This method \
+             is ONLY for members. If campd dispatches this bead, use close_dispatched; if \
+             it does not, the bead does not belong in this suite"
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1383,7 +1352,7 @@ fn close_member_REFUSES_a_dispatched_bead() {
 }
 
 #[test]
-#[should_panic(expected = "is NOT a run member")]
+#[should_panic(expected = "does not consider a run member")]
 fn close_member_REFUSES_a_RUNLESS_dispatched_bead() {
     // ⭐ F1-B. Round 4's guard asserted only `step_id IS NULL`, and was SOLD as
     // mirroring `dispatchable_beads`. It did not. That predicate is a CONJUNCTION —
@@ -1422,7 +1391,7 @@ fn close_member_REFUSES_a_RUNLESS_dispatched_bead() {
 }
 
 #[test]
-#[should_panic(expected = "is NOT a run member")]
+#[should_panic(expected = "does not consider a run member")]
 fn close_member_REFUSES_a_RUN_SCOPED_MAIL_bead() {
     // ⭐ F8. The guard read `run_id` and `step_id` and was BLIND TO `type`.
     //
@@ -1462,7 +1431,7 @@ fn close_member_REFUSES_a_RUN_SCOPED_MAIL_bead() {
 }
 
 #[test]
-#[should_panic(expected = "is NOT a run member")]
+#[should_panic(expected = "does not consider a run member")]
 fn close_member_REFUSES_a_RUN_ROOT() {
     // ⭐ F8, second hole — found by refusing to SAY a thing I had not MEASURED.
     //
@@ -1511,7 +1480,7 @@ fn labelled_decoy(c: &Camp, run: &str, label: &str) -> String {
 }
 
 #[test]
-#[should_panic(expected = "is NOT a run member")]
+#[should_panic(expected = "does not consider a run member")]
 fn close_member_REFUSES_a_DRAIN_LABELLED_nonroot() {
     // ⭐ F9. `run_members` (`formula/runtime.rs:597-621`) is SIX conditions, not four:
     // it also drops anything wearing a `bond:` or `drain:` label, with the SQL LIKEs as
@@ -1534,7 +1503,7 @@ fn close_member_REFUSES_a_DRAIN_LABELLED_nonroot() {
 }
 
 #[test]
-#[should_panic(expected = "is NOT a run member")]
+#[should_panic(expected = "does not consider a run member")]
 fn close_member_REFUSES_a_BOND_LABELLED_nonroot() {
     // ⭐ F9, the other half of the disjunction — and it is here for a reason of method,
     // not symmetry. The guard rejects a decoy if `parse_drain_label` OR
@@ -1546,6 +1515,38 @@ fn close_member_REFUSES_a_BOND_LABELLED_nonroot() {
     c.spawn_campd();
     let run = c.sling("build");
     let decoy = labelled_decoy(&c, &run, "bond:gc-998:0");
+    c.settle();
+
+    c.close_member(&decoy, "pass");
+}
+
+#[test]
+#[should_panic(expected = "does not consider a run member")]
+fn close_member_REFUSES_a_MALFORMED_LABELLED_nonroot() {
+    // ⭐ F13 — the sixth hole, and the one that proves the METHOD was wrong, not just
+    // the conjunct count.
+    //
+    // Round 8 called `parse_bond_label`/`parse_drain_label` and declared the harness
+    // unable to drift from the product. It still drifted. `run_members` ANDs a SQL
+    // conjunct — `labels NOT LIKE '%"drain:%'` — with the Rust re-parse; the LIKE is NOT
+    // a prefilter the parsers subsume. `parse_drain_label("drain:gc-999")` returns None
+    // (it needs `rsplit_once(':')`, and there is no second colon), so the round-8 guard
+    // saw an UNLABELLED bead — while the SQL LIKE excluded it. The product said "not a
+    // member" and `close_member` absorbed and closed it anyway.
+    //
+    // This bead is the whole argument for calling `run_members` instead of reproducing
+    // it: a MALFORMED label is likelier to be typed by a test author than a well-formed
+    // one, and no amount of care in restating the predicate would have caught it.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let run = c.sling("build");
+    // No second colon — the parsers return None, the SQL LIKE still excludes it.
+    let decoy = labelled_decoy(&c, &run, "drain:gc-999");
+    assert_eq!(
+        camp_core::formula::runtime::parse_drain_label("drain:gc-999"),
+        None,
+        "precondition: the PARSER does not recognise this label — only the SQL does"
+    );
     c.settle();
 
     c.close_member(&decoy, "pass");
