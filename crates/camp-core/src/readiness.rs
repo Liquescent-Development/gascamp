@@ -3,6 +3,8 @@
 //! missing dependency never unblocks its dependents. Also the read surface
 //! `camp ls` uses. Pure queries over the state tables — no writes.
 
+use std::collections::BTreeMap;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
@@ -45,8 +47,31 @@ pub struct ListFilter<'a> {
     pub mine: Option<&'a str>,
 }
 
-const BEAD_COLS: &str = "id, rig, type, title, status, assignee, claimed_by, outcome, \
+// `pub(crate)`: `formula::runtime::run_members` selects the same projection.
+pub(crate) const BEAD_COLS: &str = "id, rig, type, title, status, assignee, claimed_by, outcome, \
                          labels, created_ts, updated_ts, work_outcome, dispatch_failure";
+
+/// gc's key, VERBATIM (`beadmeta/keys.go:93`; invariant 7 — camp mirrors the
+/// vocabulary where the concept exists). The value is the reserving drain's
+/// anchor bead id, so a conflict can NAME the holder.
+///
+/// It is METADATA, not an event name. No event may ever be called
+/// `drain.reserved` — `vocab::no_reservation_vocabulary_exists` forbids any
+/// event name containing "reserv", and that guard scans event names only.
+pub const EXCLUSIVE_DRAIN_RESERVATION: &str = "gc.exclusive_drain_reservation";
+
+/// Metadata keys that have a DEDICATED COLUMN on `beads`: PROJECTED at read,
+/// REFUSED at write, and the refusal NAMES the column.
+///
+/// Two sources of truth for one fact is how state rots. compat-3 stamps
+/// `gc.routed_to` / `gc.work_branch` when it dispatches; if metadata could also
+/// hold them, a bead could say it was routed to one agent in its column and
+/// another in its metadata, and nothing would be wrong enough to fail. The
+/// storage rule is fixed HERE, before compat-3 can inherit the ambiguity.
+pub const PROJECTED_METADATA: &[(&str, &str)] = &[
+    ("gc.routed_to", "assignee"),
+    ("gc.work_branch", "work_branch"),
+];
 
 fn row_to_bead(row: &rusqlite::Row<'_>) -> rusqlite::Result<BeadRow> {
     let labels_json: String = row.get(8)?;
@@ -162,11 +187,49 @@ pub fn ready_task_count(conn: &Connection) -> Result<u64, CoreError> {
         "SELECT count(*) FROM beads b
          WHERE b.status = 'open' AND {TASK}
            AND b.dispatch_failure IS NULL
+           AND NOT (b.run_id IS NOT NULL AND b.step_id IS NULL)
            AND NOT EXISTS (
              SELECT 1 FROM deps d LEFT JOIN beads t ON t.id = d.needs_id
              WHERE d.bead_id = b.id AND {UNMET_DEP})"
     );
     count_nonneg(conn, &sql, "ready-task")
+}
+
+/// A bead's metadata: the `bead_meta` rows, with the dedicated columns
+/// PROJECTED over them ([`PROJECTED_METADATA`]) so a reader sees one complete
+/// map and never has to know which facts live in a column.
+pub fn bead_metadata(conn: &Connection, bead: &str) -> Result<BTreeMap<String, String>, CoreError> {
+    let mut out = BTreeMap::new();
+    let mut stmt = conn.prepare("SELECT key, value FROM bead_meta WHERE bead_id = ?1")?;
+    let rows = stmt.query_map([bead], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (k, v) = row?;
+        out.insert(k, v);
+    }
+    // The projections. A NULL column contributes no key — absent, not empty.
+    let mut stmt = conn.prepare("SELECT assignee, work_branch FROM beads WHERE id = ?1")?;
+    let cols: Option<(Option<String>, Option<String>)> = stmt
+        .query_row([bead], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    if let Some((assignee, work_branch)) = cols {
+        for (key, column) in PROJECTED_METADATA {
+            let value = match *column {
+                "assignee" => assignee.clone(),
+                "work_branch" => work_branch.clone(),
+                other => {
+                    return Err(CoreError::Corrupt(format!(
+                        "PROJECTED_METADATA names column {other:?}, which bead_metadata does not read"
+                    )));
+                }
+            };
+            if let Some(value) = value {
+                out.insert((*key).to_owned(), value);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The reason prefix campd stamps on a `dispatch.failed` that is a worker-cap

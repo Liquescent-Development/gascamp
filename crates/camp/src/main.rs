@@ -141,6 +141,10 @@ enum Command {
         /// Routing hint to a pack agent
         #[arg(long)]
         assignee: Option<String>,
+        /// Add this bead to a run as a MEMBER (compat §9 D3): a drain step in
+        /// that run scatters one item run per member. The run must exist.
+        #[arg(long)]
+        run: Option<String>,
     },
     /// Claim a bead for a session (open → in_progress)
     Claim {
@@ -602,6 +606,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             labels,
             bead_type,
             assignee,
+            run,
         } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::create::run(
@@ -613,6 +618,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 labels,
                 bead_type,
                 assignee,
+                run,
             )
         }
         Command::Claim { bead, session } => {

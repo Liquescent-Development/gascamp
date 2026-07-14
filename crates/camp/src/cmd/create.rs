@@ -19,11 +19,22 @@ pub fn run(
     labels: Vec<String>,
     bead_type: Option<String>,
     assignee: Option<String>,
+    run: Option<String>,
 ) -> Result<()> {
     let config = CampConfig::load(&camp.config_path())?;
     let rig_cfg = resolve_rig(&config, rig.as_deref())?;
 
     let mut ledger = Ledger::open(&camp.db_path())?;
+
+    // Fail fast on an unknown run: a member bead silently attached to a run
+    // that does not exist would simply never be scattered, and nothing would
+    // say why.
+    if let Some(run_id) = &run
+        && !ledger.run_exists(run_id)?
+    {
+        bail!("unknown run {run_id:?} — `camp sling` cooks a run before it can have members");
+    }
+
     let id = ledger.next_bead_id(&rig_cfg.prefix)?;
 
     let mut data = serde_json::json!({ "title": title });
@@ -41,6 +52,11 @@ pub fn run(
     }
     if let Some(a) = assignee {
         data["assignee"] = serde_json::json!(a);
+    }
+    // D3 — a run MEMBER: run_id set, step_id NULL, type task. That triple is
+    // exactly what `run_members` selects and what a drain scatters over.
+    if let Some(r) = run {
+        data["run_id"] = serde_json::json!(r);
     }
 
     let seq = ledger.append(EventInput {

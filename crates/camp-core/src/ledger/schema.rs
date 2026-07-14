@@ -1,4 +1,4 @@
-//! Schema v2 for camp.db (spec §7.1/§7.4). One WAL-mode SQLite file: the
+//! Schema v3 for camp.db (spec §7.1/§7.4). One WAL-mode SQLite file: the
 //! append-only `events` table (history + bus) plus the state tables that are
 //! a fold of it. All tables are STRICT; opening a db with a different schema
 //! version is a hard error — no auto-upgrade in v1: the operator re-inits
@@ -11,7 +11,7 @@ use rusqlite::Connection;
 
 use crate::error::CoreError;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// State tables only — everything `refold` rebuilds from the event log.
 /// (`cursors` is consumer bookkeeping, `meta`/`events` are not fold-derived.)
@@ -39,6 +39,23 @@ CREATE TABLE beads (
   closed_ts    TEXT
 ) STRICT;
 CREATE INDEX beads_status_rig ON beads(status, rig);
+
+-- Arbitrary key/value metadata on a bead (schema v3, compat §6.1/§9).
+-- Gas City keeps a bead's compat facts here and nowhere else: the drain
+-- reservation (`gc.exclusive_drain_reservation`), the routing target
+-- (`gc.run_target`), the build annotations. Camp mirrors the keys verbatim
+-- (invariant 7).
+--
+-- Keys that have a DEDICATED COLUMN on `beads` (assignee, work_branch) are
+-- PROJECTED at read and REFUSED at write, so there is exactly one source of
+-- truth per fact — compat-3 must not inherit two.
+CREATE TABLE bead_meta (
+  bead_id TEXT NOT NULL REFERENCES beads(id),
+  key     TEXT NOT NULL,
+  value   TEXT NOT NULL,
+  PRIMARY KEY (bead_id, key)
+) STRICT;
+CREATE INDEX bead_meta_key ON bead_meta(key, value);
 
 CREATE TABLE deps (
   bead_id  TEXT NOT NULL REFERENCES beads(id),
@@ -75,7 +92,7 @@ CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 ) STRICT;
-INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+INSERT INTO meta (key, value) VALUES ('schema_version', '3');
 
 CREATE TABLE events (
   seq   INTEGER PRIMARY KEY AUTOINCREMENT,
