@@ -26,6 +26,7 @@ So this gate SLINGS TWO REAL CORPUS FORMULAS and watches campd actually move the
      substituted AND binding-resolved.
 """
 
+import collections
 import json
 import os
 import shutil
@@ -34,9 +35,19 @@ import sys
 import tempfile
 import time
 
-# The workers campd must dispatch for the two runs. A BD-A regression does not make
-# a worker BAD — it makes a worker NOT EXIST, so the count is the only thing that can
-# see it (survivorship bias: the failure removes beads from the population).
+# The workers campd must dispatch for the two runs, counted as DISTINCT BEADS. A BD-A
+# regression does not make a worker BAD — it makes a worker NOT EXIST, so the count is
+# the only thing that can see it (survivorship bias: the failure removes beads from the
+# population).
+#
+# It must be distinct BEADS, not `session.woke` EVENTS. Counting events let a duplicate
+# wake SUBSTITUTE for a missing worker — 13 real + 1 duplicate = 14 = PASS — which is
+# the same survivorship hole one level up, hiding inside the instrument built to close
+# it. Measured, not reasoned: with a bead's wake deleted and another's duplicated, the
+# event-counting gate returned exit 0.
+#
+# 14 is a QUIESCENT count, not a sample of a moving system: locally it is reached by
+# t=5s and is stable to t=90s with zero duplicates across 12 consecutive runs.
 EXPECTED_DISPATCHED = 14
 
 FORMULA_PACKS = [
@@ -196,8 +207,20 @@ try:
         )
         die(f"campd failed {len(failed)} dispatch(es):\n    {reasons}")
 
+    # (3b) ⭐ NO WORKER MAY HAVE CRASHED. Same principle as `dispatch.failed` above,
+    # and it was missing: campd is driving two healthy corpus formulas against a fake
+    # agent that always passes, so a crashed session has no innocent explanation. It is
+    # also the state most likely to make campd re-wake a bead, which is exactly the
+    # anomaly (4) exists to catch — so if both fire, this one names the cause.
+    crashed = events("session.crashed")
+    if crashed:
+        detail = "\n    ".join(
+            f"{e['data'].get('name')}: {e['data'].get('reason')}" for e in crashed
+        )
+        die(f"campd crashed {len(crashed)} session(s):\n    {detail}")
+
     # (4) ⭐ THE BEAD CAMPD DISPATCHES IS ROUTED — asserted POSITIVELY, on a NAMED
-    # bead, with an EXPECTED COUNT.
+    # bead, with an EXPECTED COUNT OF DISTINCT BEADS.
     #
     # The old loop iterated `session.woke` and checked that every worker that DID
     # dispatch carried an agent. That is SURVIVORSHIP BIAS: an unrouted attempt bead
@@ -208,14 +231,45 @@ try:
     #
     # So: pin the COUNT (a silently-missing worker now fails), and assert on a NAMED
     # bead whose route only resolves if BD-A is fixed.
+    #
+    # ⭐ AND COUNT DISTINCT BEADS, NOT EVENTS. The count above was `len(events)`, which
+    # reopened the very survivorship hole this comment claims to have closed: 13 real
+    # dispatches + 1 duplicate `session.woke` = 14 = PASS, with a worker GENUINELY
+    # MISSING. The instrument could be satisfied by a bead being woken twice. One bead,
+    # one worker — so the population is the SET of beads.
+    #
+    # The duplicate is then checked SEPARATELY rather than tolerated. Counting the set
+    # alone would make a double-wake invisible, and a gate that hides a double dispatch
+    # is the same sin one layer down: two workers on one bead is a PRODUCT bug, not a
+    # rounding error. With `dispatch.failed` and `session.crashed` both asserted empty
+    # above, no retry or recovery can legitimately re-wake a bead here — so a repeat is
+    # an anomaly, and it FAILS, naming the bead.
+    #
+    # This is what a real CI failure (15 events / expected 14) could not tell us: the
+    # gate printed only the distinct AGENT set, and 14 dispatches already span just 11
+    # agents, so a 15th event on an existing agent was invisible. The evidence for the
+    # question the gate itself raised had been discarded. It now prints the beads.
     woke = events("session.woke")
     dispatched = [e for e in woke if e["data"].get("bead")]
-    if len(dispatched) != EXPECTED_DISPATCHED:
+    beads = [e["data"]["bead"] for e in dispatched]
+    repeats = {b: n for b, n in collections.Counter(beads).items() if n > 1}
+    if repeats:
+        die(
+            f"campd woke MORE THAN ONE worker for {len(repeats)} bead(s): {repeats}. "
+            f"One bead gets one worker. With no failed dispatch and no crashed session "
+            f"(both asserted above), nothing can legitimately re-wake a bead — this is a "
+            f"double dispatch, and counting the bead SET instead of the events would "
+            f"have hidden it.\n"
+            f"  woke events: {len(beads)}  distinct beads: {len(set(beads))}\n"
+            f"  beads: {sorted(beads)}"
+        )
+    if len(set(beads)) != EXPECTED_DISPATCHED:
         agents = sorted({e["data"].get("agent") or "<none>" for e in dispatched})
         die(
-            f"campd dispatched {len(dispatched)} worker(s), expected "
+            f"campd dispatched {len(set(beads))} distinct worker(s), expected "
             f"{EXPECTED_DISPATCHED}. A BD-A regression does not produce a BAD worker "
             f"— it produces NO worker, so the count is the only thing that sees it.\n"
+            f"  beads: {sorted(set(beads))}\n"
             f"  agents: {agents}"
         )
     for e in dispatched:
