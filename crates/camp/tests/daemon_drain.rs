@@ -210,6 +210,17 @@ impl Camp {
     /// ⭐ No dispatch may have FAILED. Called by EVERY test in this file that can call
     /// it — all 14 of them.
     ///
+    /// The books BALANCE, and they are meant to be checked: 14 callers + 6 failure-path
+    /// tests that must not call it (below) + 3 `should_panic` harness-guard tests
+    /// (`close_member_REFUSES_a_dispatched_bead`,
+    /// `close_member_REFUSES_a_RUNLESS_dispatched_bead`,
+    /// `close_dispatched_REFUSES_a_CLOSED_bead_no_worker_ever_touched`), which panic
+    /// INSIDE the harness and can never reach a call site = 23 `#[test]` fns, the whole
+    /// file. An earlier version of this comment accounted for 20 of 23 and left the
+    /// other 3 unmentioned — in a comment whose entire job is to make every exclusion
+    /// explicit. If these three numbers stop summing to the `#[test]` count, an
+    /// exclusion is hiding again; that is exactly how F3-B hid.
+    ///
     /// The comment here used to SAY "call this on every happy path" while 2 of 20 tests
     /// called it. That is the same class of false in-code claim as a `die()` message
     /// asserting something untrue (invariant 3): the file stated a coverage rule it did
@@ -332,27 +343,39 @@ impl Camp {
     /// `a_CLOSED_member_is_never_scattered` STILL PASSES, because this method absorbs
     /// the wrongly-dispatched member. The guard is what turns that into a hard failure.
     ///
-    /// So the guard MIRRORS THE PRODUCT PREDICATE EXACTLY, and it takes both columns to
-    /// do it. `dispatchable_beads` (`readiness.rs:166`) excludes a bead by a
-    /// CONJUNCTION — `NOT (run_id IS NOT NULL AND step_id IS NULL)` — so a bead is a
-    /// member iff `run_id IS NOT NULL` **and** `step_id IS NULL`. A NULL `step_id` alone
-    /// is NECESSARY BUT NOT SUFFICIENT, and round 4's guard tested only that half.
+    /// So the guard admits ONLY THE RUN-MEMBER SHAPE: `run_id IS NOT NULL` **and**
+    /// `step_id IS NULL`. Both halves, because that shape is a CONJUNCTION — a NULL
+    /// `step_id` alone is NECESSARY BUT NOT SUFFICIENT, and round 4's guard tested only
+    /// that half. The missing conjunct was a real hole, proven by execution: a RUNLESS
+    /// bead (`camp create <title>` with no `--run`) has `run_id` NULL *and* `step_id`
+    /// NULL, so the member exclusion does not fire, campd DISPATCHES it, and it slid
+    /// through the `step_id`-only guard into `close_member`, which absorbed it — the
+    /// V-5 blindness reinstated in its exact shape, through the check meant to prevent
+    /// it.
     ///
-    /// The missing conjunct was a real hole, proven by execution: a RUNLESS bead
-    /// (`camp create <title>` with no `--run` — `run` is `Option<String>`) has `run_id`
-    /// NULL *and* `step_id` NULL, so `NOT(false AND true)` = TRUE and campd DISPATCHES
-    /// it. It slid through the `step_id`-only guard and `close_member` absorbed it —
-    /// the V-5 blindness reinstated in its exact shape, straight through the check that
-    /// exists to prevent it. Both conjuncts, or it is not a contract.
+    /// What this guard is NOT is a mirror of `dispatchable_beads`. That predicate
+    /// (`readiness.rs:161-172`) is a SIX-WAY conjunction — `status='open'`,
+    /// `type='task'`, `dispatch_failure IS NULL`, the member exclusion, no `sessions`
+    /// row, no unmet deps — and this tests ONE of the six. It is the one that MATTERS
+    /// here: the member shape is the conjunct that GUARANTEES campd will not dispatch
+    /// the bead, so accepting only that shape is SOUND (nothing campd wakes gets in).
+    /// It is not EXHAUSTIVE, and it must not claim to be: plenty of beads campd will
+    /// never dispatch — a memory bead, a mail bead, a task with an unmet `--needs` —
+    /// are also rejected here, and rightly so, because they are not members and this
+    /// method is only for members. The panic below therefore does NOT tell such an
+    /// author that campd dispatches their bead; an earlier version did, and it would
+    /// have sent them to `close_dispatched` to spin ten seconds and hard-fail on
+    /// "NEVER DISPATCHED".
+    ///
     /// `close_member_REFUSES_a_dispatched_bead` and
     /// `close_member_REFUSES_a_RUNLESS_dispatched_bead` hold this shut.
     fn close_member(&self, bead: &str, outcome: &str) {
         assert!(
             self.run_id_of(bead).is_some() && self.step_id_of(bead).is_none(),
             "close_member called on a bead that is NOT a run member ({bead}: run_id={:?} \
-             step_id={:?}) — a member is `run_id IS NOT NULL AND step_id IS NULL`, which \
-             is exactly what `dispatchable_beads` excludes. Anything else campd \
-             DISPATCHES; use close_dispatched",
+             step_id={:?}) — a member is `run_id IS NOT NULL AND step_id IS NULL`, and \
+             this method is ONLY for members. If campd dispatches this bead, use \
+             close_dispatched; if it does not, the bead does not belong in this suite",
             self.run_id_of(bead),
             self.step_id_of(bead)
         );
