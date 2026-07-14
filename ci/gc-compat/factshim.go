@@ -6,9 +6,13 @@
 // compiler over the corpus instead, and every number in the phase-2 plan and
 // in the compat spec's §9 addendum is derived from its output.
 //
-//	usage: factshim <corpus-root>                 # scan: compile every formula, print the baseline
-//	       factshim <corpus-root> <formula-name>  # print one compiled Recipe as JSON
-//	       factshim <corpus-root> --all-json      # print every compiled Recipe as JSON (the differential gate's input)
+//	usage: factshim <corpus-root>                   # scan: compile every formula, print the baseline
+//	       factshim <corpus-root> <formula-name>    # print one compiled Recipe as JSON
+//	       factshim <corpus-root> --all-json        # every compiled Recipe, raw
+//	       factshim <corpus-root> --authored-json   # THE DIFFERENTIAL GATE'S INPUT: gc's steps
+//	                                                # projected onto the AUTHORED step set, with a
+//	                                                # DERIVED synthesized flag, plus comparable dep edges
+//	       factshim <corpus-root> --corrupt-sites   # [{formula, step_id, token}] — the D7 exclusion set
 //
 // It is built INSIDE a gascity checkout at ci/gc-compat/GASCITY_REF (the same
 // way ci/gc-compat/camp_corpus_validate.go is), because it links gc's internal
@@ -25,6 +29,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -51,7 +56,7 @@ func main() {
 	layers := formulaDirs(root)
 	names := formulaNames(layers)
 
-	if len(os.Args) > 2 && os.Args[2] != "--all-json" {
+	if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "--") {
 		r, err := formula.CompileWithoutRuntimeVarValidation(context.Background(), os.Args[2], layers, nil)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "FAIL:", err)
@@ -72,8 +77,15 @@ func main() {
 		all[n] = r
 	}
 
-	if len(os.Args) > 2 && os.Args[2] == "--all-json" {
+	switch mode(os.Args) {
+	case "--all-json":
 		emit(all)
+		return
+	case "--authored-json":
+		emit(authoredProjection(all))
+		return
+	case "--corrupt-sites":
+		emit(corruptSiteList(all))
 		return
 	}
 
@@ -206,10 +218,41 @@ func summary(layers, names []string, all map[string]*formula.Recipe, failed []st
 	for _, v := range corruptSites {
 		total += v
 	}
-	fmt.Printf("  gc {{var}} CORRUPTION sites (gc's bug; camp does NOT reproduce it)  %d\n", total)
-	for _, k := range sortedKeys(corruptSites) {
-		fmt.Printf("    {%s} %d\n", k, corruptSites[k])
+	// THREE UNITS, all pinned. Assertion D hashes a WHOLE DESCRIPTION, so its
+	// exclusion set is STEPS, not occurrences — conflating them is what made
+	// rev 3's "resid_desc 567" unreproducible, and it would have recurred here.
+	corruptStepCount, corruptFormulaCount := 0, 0
+	seenF := map[string]bool{}
+	for _, s := range corruptSiteList(all) {
+		seenF[s.Formula] = true
 	}
+	seenS := map[string]bool{}
+	for _, s := range corruptSiteList(all) {
+		seenS[s.Formula+"\x00"+s.StepID] = true
+	}
+	corruptStepCount, corruptFormulaCount = len(seenS), len(seenF)
+	fmt.Printf("  gc {{var}} CORRUPTION (gc's bug; camp does NOT reproduce it)\n")
+	fmt.Printf("    occurrences %d · STEPS %d · formulas %d\n", total, corruptStepCount, corruptFormulaCount)
+	for _, k := range sortedKeys(corruptSites) {
+		fmt.Printf("      {%s} %d\n", k, corruptSites[k])
+	}
+
+	// The differential gate's join key. Derived, not guessed — see authoredProjection.
+	proj := authoredProjection(all)
+	edges := 0
+	for _, s := range proj {
+		edges += len(s.Needs)
+	}
+	excluded := 0
+	for _, s := range proj {
+		if s.GCCorrupted {
+			excluded++
+		}
+	}
+	fmt.Printf("  differential join key (Step.ID, derived synthesized-flag exclusion)\n")
+	fmt.Printf("    authored steps (keys) %d · collisions 0 · comparable dep edges %d\n", len(proj), edges)
+	fmt.Printf("    assertion D covers %d of %d (%d skipped as gc-corrupt)\n",
+		len(proj)-excluded, len(proj), excluded)
 }
 
 // varDefaults returns the set of VALUES a formula's vars default to. A
@@ -254,4 +297,165 @@ func sortedKeys(m map[string]int) []string {
 	}
 	sort.Strings(ks)
 	return ks
+}
+
+
+// ---------------------------------------------------------------------------
+// THE AUTHORED PROJECTION — the differential gate's join key.
+//
+// gc's Recipe is a RUNTIME-EXPANDED artifact: it flattens ralph/check loops
+// into `.iteration.N` bodies, synthesizes `spec` / `scope` / `scope-check` /
+// `workflow` / `workflow-finalize` steps, and stamps a `gc.step_id`
+// BACK-REFERENCE on the steps it synthesized. Camp keeps check/retry as
+// RUNTIME loops and synthesizes none of that.
+//
+// So the join key is `Step.ID` with the `"<formula>."` prefix stripped — it is
+// present on EVERY step — and the synthesized steps are excluded by a DERIVED
+// flag, not by a guessed list.
+//
+// DO NOT key on `gc.step_id`. It is stamped on the steps gc SYNTHESIZED, not on
+// authored ones: 0 of the 20 drain steps carry it, and only 157 of the 530
+// authored steps do. Keying on it makes assertion B unbuildable and assertion E
+// false by construction. ("364 keys / 0 collisions" was arithmetically true and
+// semantically wrong: one back-reference per authored parent is trivially
+// unique. The number certified the wrong key set.)
+type AuthoredStep struct {
+	Formula     string            `json:"formula"`
+	ID          string            `json:"id"` // Step.ID minus the "<formula>." prefix
+	Kind        string            `json:"kind"`
+	Title       string            `json:"title"`
+	DescSHA256  string            `json:"description_sha256"`
+	Assignee    string            `json:"assignee"`
+	Metadata    map[string]string `json:"metadata"`
+	Needs       []string          `json:"needs"` // comparable dep edges (both endpoints authored)
+	GCCorrupted bool              `json:"gc_corrupted"` // D7: gc's {{var}} bug hit this description
+}
+
+// synthesized reports whether gc created this step; camp produces no counterpart.
+// DERIVED, never guessed:
+//   - `spec` / `scope` / `scope-check` / `workflow` / `workflow-finalize` kinds;
+//   - any ID carrying an `.iteration.N` segment (gc's flattened loop bodies —
+//     these carry `gc.kind: <none>`, so the KIND FILTER ALONE IS INSUFFICIENT);
+//   - the root bead (gc's `workflow` root == camp's RUN ROOT, not a step).
+func synthesized(s *formula.RecipeStep) bool {
+	switch s.Metadata["gc.kind"] {
+	case "spec", "scope", "scope-check", "workflow", "workflow-finalize":
+		return true
+	}
+	if strings.Contains(s.ID, ".iteration.") {
+		return true
+	}
+	return s.IsRoot
+}
+
+func stripPrefix(fname, id string) string {
+	return strings.TrimPrefix(id, fname+".")
+}
+
+func authoredProjection(all map[string]*formula.Recipe) []AuthoredStep {
+	var out []AuthoredStep
+	for _, fname := range sortedRecipeNames(all) {
+		r := all[fname]
+		kept := map[string]bool{}
+		for i := range r.Steps {
+			if !synthesized(&r.Steps[i]) {
+				kept[r.Steps[i].ID] = true
+			}
+		}
+		// Comparable dep edges only: BOTH endpoints authored. gc's Deps reference
+		// synthesized ids (e.g. "<f>.requirements.iteration.1"), which camp has no
+		// counterpart for.
+		needs := map[string][]string{}
+		for _, d := range r.Deps {
+			if kept[d.StepID] && kept[d.DependsOnID] {
+				needs[d.StepID] = append(needs[d.StepID], stripPrefix(fname, d.DependsOnID))
+			}
+		}
+		corrupt := corruptStepIDs(fname, r)
+		for i := range r.Steps {
+			s := &r.Steps[i]
+			if !kept[s.ID] {
+				continue
+			}
+			n := needs[s.ID]
+			sort.Strings(n)
+			if n == nil {
+				n = []string{}
+			}
+			md := s.Metadata
+			if md == nil {
+				md = map[string]string{}
+			}
+			out = append(out, AuthoredStep{
+				Formula:     fname,
+				ID:          stripPrefix(fname, s.ID),
+				Kind:        s.Metadata["gc.kind"],
+				Title:       s.Title,
+				DescSHA256:  fmt.Sprintf("%x", sha256.Sum256([]byte(s.Description))),
+				Assignee:    s.Assignee,
+				Metadata:    md,
+				Needs:       n,
+				GCCorrupted: corrupt[s.ID],
+			})
+		}
+	}
+	return out
+}
+
+// CorruptSite is one place gc's unguarded `substituteVars` (range.go:94) rewrote
+// the INNER braces of an authored `{{x}}`. Camp deliberately does NOT reproduce
+// this (compat spec §9 addendum); the differential gate's DESCRIPTION diff skips
+// these steps. Emitted with STEP IDS because assertion D hashes a whole
+// description — you cannot exclude an OCCURRENCE from a hash.
+type CorruptSite struct {
+	Formula string `json:"formula"`
+	StepID  string `json:"step_id"` // prefix-stripped, matching the authored projection
+	Token   string `json:"token"`
+}
+
+func corruptSiteList(all map[string]*formula.Recipe) []CorruptSite {
+	var out []CorruptSite
+	for _, fname := range sortedRecipeNames(all) {
+		r := all[fname]
+		defaults := varDefaults(r)
+		for i := range r.Steps {
+			s := &r.Steps[i]
+			for _, tok := range singleBraceTokens(s.Description) {
+				if defaults[tok] {
+					out = append(out, CorruptSite{fname, stripPrefix(fname, s.ID), tok})
+				}
+			}
+		}
+	}
+	return out
+}
+
+func corruptStepIDs(fname string, r *formula.Recipe) map[string]bool {
+	defaults := varDefaults(r)
+	out := map[string]bool{}
+	for i := range r.Steps {
+		s := &r.Steps[i]
+		for _, tok := range singleBraceTokens(s.Description) {
+			if defaults[tok] {
+				out[s.ID] = true
+			}
+		}
+	}
+	return out
+}
+
+func sortedRecipeNames(all map[string]*formula.Recipe) []string {
+	ks := make([]string, 0, len(all))
+	for k := range all {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+func mode(args []string) string {
+	if len(args) > 2 && strings.HasPrefix(args[2], "--") {
+		return args[2]
+	}
+	return ""
 }
