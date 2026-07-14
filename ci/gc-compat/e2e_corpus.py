@@ -34,6 +34,11 @@ import sys
 import tempfile
 import time
 
+# The workers campd must dispatch for the two runs. A BD-A regression does not make
+# a worker BAD — it makes a worker NOT EXIST, so the count is the only thing that can
+# see it (survivorship bias: the failure removes beads from the population).
+EXPECTED_DISPATCHED = 14
+
 FORMULA_PACKS = [
     "bmad",
     "compound-engineering",
@@ -174,35 +179,79 @@ try:
 
     settle()
 
-    # (3) ⭐ campd DID NOT DEAD-END THE RUN — the exact failure BD8 names.
-    for e in events("dispatch.failed"):
-        reason = str(e.get("data", {}).get("reason", ""))
-        if "recipe" in reason or "load_run" in reason or "pinned formula" in reason:
-            die(f"a run dead-ended on its pinned formula (BD8): {reason}")
+    # (3) ⭐ campd DID NOT DEAD-END THE RUN, AND DID NOT FAIL A SINGLE DISPATCH.
+    #
+    # This used to scan `dispatch.failed` for the substrings "recipe" / "load_run" /
+    # "pinned formula" — so campd's ACTUAL unrouted-dispatch reason ("no agent to
+    # dispatch to: bead has no assignee …") contained NONE of them and was SILENTLY
+    # SKIPPED. The gate that exists to prove BD-A could not fail on BD-A.
+    #
+    # There is no such thing as an acceptable `dispatch.failed` in this gate: campd
+    # is driving two healthy corpus formulas against a fake agent. ANY of them is a
+    # failure, and it is reported with its own reason rather than filtered by one.
+    failed = events("dispatch.failed")
+    if failed:
+        reasons = "\n    ".join(
+            str(e.get("data", {}).get("reason", "")) for e in failed
+        )
+        die(f"campd failed {len(failed)} dispatch(es):\n    {reasons}")
 
-    # …and a step bead really reached in_progress: campd moved the run.
-    claimed = [e for e in events("bead.claimed")]
-    if not claimed:
-        die("campd claimed nothing — the run did not advance")
-
-    # (4) ⭐ the bead campd DISPATCHES is ROUTED. For a check/retry step that is
-    # the ATTEMPT bead, NOT the anchor (BD-A): cook routed the anchor, which is
-    # never dispatched.
-    # `session.woke` is campd SAYING WHAT IT DISPATCHED AND TO WHOM. For a
-    # check/retry step the bead named here is the ATTEMPT, not the anchor — cook
-    # routed the anchor, and the anchor is never dispatched. If BD-A were unfixed,
-    # `attempt_bead_input` would read a `{{...}}` assignee off the recipe (or none
-    # at all) and every one of these workers would be UNROUTED.
+    # (4) ⭐ THE BEAD CAMPD DISPATCHES IS ROUTED — asserted POSITIVELY, on a NAMED
+    # bead, with an EXPECTED COUNT.
+    #
+    # The old loop iterated `session.woke` and checked that every worker that DID
+    # dispatch carried an agent. That is SURVIVORSHIP BIAS: an unrouted attempt bead
+    # never dispatches, so it emits no `session.woke` and is INVISIBLE. The BD-A
+    # regression REMOVES beads from the inspected population instead of adding bad
+    # ones — the gate counted the survivors and asked whether they looked healthy,
+    # while the bug killed them before they were counted.
+    #
+    # So: pin the COUNT (a silently-missing worker now fails), and assert on a NAMED
+    # bead whose route only resolves if BD-A is fixed.
     woke = events("session.woke")
     dispatched = [e for e in woke if e["data"].get("bead")]
-    if not dispatched:
-        die("campd dispatched no worker — the run did not advance")
+    if len(dispatched) != EXPECTED_DISPATCHED:
+        agents = sorted({e["data"].get("agent") or "<none>" for e in dispatched})
+        die(
+            f"campd dispatched {len(dispatched)} worker(s), expected "
+            f"{EXPECTED_DISPATCHED}. A BD-A regression does not produce a BAD worker "
+            f"— it produces NO worker, so the count is the only thing that sees it.\n"
+            f"  agents: {agents}"
+        )
     for e in dispatched:
         agent = e["data"].get("agent") or ""
         if not agent:
             die(f"campd dispatched an UNROUTED worker for bead {e['data']['bead']} (BD-A)")
         if "{{" in agent:
             die(f"campd dispatched with an unsubstituted route {agent!r} (BD-A)")
+
+    # ⭐ THE NAMED ONE. `superpowers-development.implement` is a RALPH step whose
+    # route is a residual `{{implementation_target}}` in gc's own Recipe. The bead
+    # campd dispatches for it is the ATTEMPT — a DIFFERENT bead from the anchor cook
+    # routed, and the anchor is never dispatched. Its agent is
+    # `superpowers.implementer` ONLY IF cook substituted the var into the pinned
+    # recipe AND resolved it through the binding namespace. If BD-A were unfixed this
+    # worker would not exist at all.
+    sd_run = results["superpowers-development"]
+    sd_anchor = json.load(
+        open(os.path.join(root, "runs", sd_run, "manifest.json"))
+    )["steps"]["implement"]
+    ls_all = json.loads(camp("ls", "--json").stdout or "[]")
+    by_id = {b["id"]: b for b in ls_all}
+    attempt_agents = {
+        e["data"]["agent"]
+        for e in dispatched
+        if by_id.get(e["data"]["bead"], {}).get("id") != sd_anchor
+        and e["data"]["agent"] == "superpowers.implementer"
+    }
+    if "superpowers.implementer" not in attempt_agents:
+        die(
+            "superpowers-development.implement's ATTEMPT bead was never dispatched to "
+            "`superpowers.implementer` — its route is a residual "
+            "`{{implementation_target}}` in gc's Recipe, so this is EXACTLY the bead "
+            "BD-A is about (cook routed the ANCHOR, which is never dispatched). "
+            f"agents seen: {sorted({e['data']['agent'] for e in dispatched})}"
+        )
     routed = dispatched
 
     # And no bead anywhere may carry an unsubstituted route.

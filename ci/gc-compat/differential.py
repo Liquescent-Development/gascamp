@@ -89,12 +89,20 @@ def fail(assertion, msg):
 # ---- gc's side: the real compiler ------------------------------------------
 gc_steps = json.loads(subprocess.run([shim, corpus, "--authored-json"],
                                      capture_output=True, text=True, check=True).stdout)
-corrupt = json.loads(subprocess.run([shim, corpus, "--corrupt-sites"],
-                                    capture_output=True, text=True, check=True).stdout)
-# D7's exclusion set is STEPS (49), not occurrences (52). Assertion D hashes a
-# WHOLE description, so conflating the two units is the 561-vs-2396 trap one level
-# up.
-corrupt_steps = {(c["formula"], c["step_id"]) for c in corrupt}
+# ---- D7's exclusion set, IN THE JOIN'S OWN KEY SPACE (W-1) -----------------
+#
+# This used to be built from `--corrupt-sites`, whose `step_id`s live in gc's
+# SYNTHESIZED key space (`.iteration.N`, `.spec`). Only 10 of those 49 ids exist
+# among the 530 AUTHORED keys, so 39 were NO-OP exclusions and the gate's headline
+# ("49 gc-corrupt steps excluded") was false by ~8x. It is the SAME UNITS ERROR the
+# README warns about — "you cannot exclude an occurrence from a per-step sha256" —
+# committed one level up: the exclusion set was drawn from a DIFFERENT KEY SPACE
+# than the join.
+#
+# The shim already emits the right thing: a DERIVED per-step `gc_corrupted` flag on
+# `--authored-json`, which is exactly the authored steps gc corrupts.
+corrupt_sites = json.loads(subprocess.run([shim, corpus, "--corrupt-sites"],
+                                          capture_output=True, text=True, check=True).stdout)
 
 gc_by_formula = {}
 for s in gc_steps:
@@ -130,6 +138,8 @@ for fname, recipe in all_recipes.items():
             ids.add(tail.split(".", 1)[1])
     loop_body[fname] = ids
 
+corrupt_steps = {(s["formula"], s["id"]) for s in gc_steps if s.get("gc_corrupted")}
+
 keys = [(s["formula"], s["id"]) for s in gc_steps]
 if len(keys) != len(set(keys)):
     print("DIFFERENTIAL FAIL: the join key COLLIDES — the oracle cannot be built")
@@ -137,7 +147,9 @@ if len(keys) != len(set(keys)):
 print(
     f"join key: {len(keys)} authored steps, 0 collisions, "
     f"{sum(1 for s in gc_steps if s['kind'] == 'drain')} drains, "
-    f"{len(corrupt_steps)} gc-corrupt steps excluded from assertion D"
+    f"{len(corrupt_steps)} gc-corrupt AUTHORED steps excluded from assertion D "
+    f"(gc corrupts {len(corrupt_sites)} sites overall; the rest land on SYNTHESIZED "
+    f"steps that are outside the join)"
 )
 
 # ---- camp's side: the real binary ------------------------------------------
@@ -190,6 +202,7 @@ if extra:
 
 # ---- B/C/D/E/F, per formula ------------------------------------------------
 drains_checked = routes_checked = descs_checked = edges_checked = 0
+corrupt_checked = 0
 
 # gc's `MaterializeExpansion` synthesizes a target step literally named `main`.
 # The AUTHORED projection strips the `<formula>.` prefix, so an expansion formula
@@ -244,11 +257,34 @@ for formula, gc_map in sorted(gc_by_formula.items()):
         if g_route is not None:
             routes_checked += 1
 
-        # ---- D: DESCRIPTIONS, skipping the steps gc CORRUPTS (D7).
+        # ---- D: DESCRIPTIONS.
         if (formula, sid) not in corrupt_steps:
             if g["description_sha256_norm"] != c["description_sha256_norm"]:
                 fail("D", f"{formula}.{sid}: description sha256 differs")
             descs_checked += 1
+        else:
+            # ---- ⭐ D7 (W-2) — THE INVERSE ASSERTION.
+            #
+            # These are the steps gc CORRUPTS: its unguarded `substituteVars` eats the
+            # inner `{x}` of an authored `{{x}}`. Camp carries the guard gc's own
+            # residual CHECKER has and its MUTATOR lacks, so camp MUST DIFFER here.
+            #
+            # Merely SKIPPING them left RULING 6 — the deliberate divergence — with a
+            # single unit test behind it: removing the double-brace guard passed BOTH
+            # corpus gates, because the only steps it affects are exactly the ones D
+            # excluded. A regression that reintroduced gc's bug shipped green.
+            #
+            # Asserting the difference turns the divergence from an unguarded claim
+            # into a GATE.
+            if g["description_sha256_norm"] == c["description_sha256_norm"]:
+                fail(
+                    "D7",
+                    f"{formula}.{sid}: camp REPRODUCED gc's `{{{{var}}}}` corruption. "
+                    f"Camp is supposed to be CORRECT where gc is buggy (RULING 6) — "
+                    f"the double-brace guard in `resolve_single_brace` is gone or "
+                    f"broken.",
+                )
+            corrupt_checked += 1
 
         # ---- F: ⭐ DEPENDENCY EDGES, both endpoints authored.
         # BD2 rewrote condition-pruning to "drop dangling needs". A step camp
@@ -275,8 +311,9 @@ print(
     f"delta == the {len(CAMP_REFUSES)} camp deliberately refuses\n"
     f"  B  drain md    : {drains_checked} drain step(s), gc's defaulting reproduced exactly\n"
     f"  C  routes      : {routes_checked} route(s) byte-for-byte, pre-substitution\n"
-    f"  D  descriptions: {descs_checked} of {len(gc_steps)} step(s) "
-    f"({len(corrupt_steps)} skipped — gc CORRUPTS them and camp does not, D7)\n"
+    f"  D  descriptions: {descs_checked} step(s) hashed equal\n"
+    f"  D7 divergence : {corrupt_checked} step(s) where gc CORRUPTS `{{{{var}}}}` and "
+    f"camp MUST NOT — asserted DIFFERENT, not skipped (RULING 6 is now a GATE)\n"
     f"  E  step set    : equal, per formula (over-pruning would show here)\n"
     f"  F  dep edges   : {edges_checked} edge(s) equal (a dangling need would show here)"
 )

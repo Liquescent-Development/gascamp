@@ -3,7 +3,7 @@
 Camp's claim is **invariant 6**: every valid camp formula is a valid Gas City
 formula-v2 file. Compat phase 2 adds the converse-ish claim that matters
 commercially: **camp reads the real Gas City corpus** — 95 of 100 formulas at
-`GCPACKS_REF`, 62 of them runnable.
+`GCPACKS_REF`, 65 of them runnable.
 
 Neither claim is worth anything asserted. Everything here MEASURES.
 
@@ -32,7 +32,7 @@ The corpus is **never vendored** (compat §10). CI fetches it at the ref.
 1. **The ceiling** — exactly 95 of 100 compile, and the 5 that do not refuse
    **naming the right key**. A refusal that fires for the wrong reason is not a
    pass.
-2. **RUNNABLE** — exactly 62. Compiling is not enough to `camp sling` something,
+2. **RUNNABLE** — exactly 65. Compiling is not enough to `camp sling` something,
    and "95/100" alone is a misleading headline.
 3. **The falsifiable cross-check** — the **SET** camp loaded must equal the
    **SET** `rungs.py` predicts. Comparing *counts* would mean recomputing them
@@ -59,7 +59,7 @@ of it in **ONE PR**:
 3. **Update `formula_gate.py`**: `CEILING`, `RUNNABLE`, `RUNG_COUNTS`,
    `NOT_LOADABLE`.
 4. **Re-run `differential.py`** against the new corpus.
-5. **Update the compat spec's §9 addendum** — it hard-codes 95 / 62 / the rung
+5. **Update the compat spec's §9 addendum** — it hard-codes 95 / 65 / the rung
    ladder into the spec as measured fact. A spec that disagrees with the gate is
    worse than no spec.
 

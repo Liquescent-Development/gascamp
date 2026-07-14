@@ -741,3 +741,111 @@ mod tests {
         assert_eq!(dispatchable[0].claimed_by, None);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(non_snake_case)]
+mod ready_count_tests {
+    use crate::clock::FixedClock;
+    use crate::event::{EventInput, EventType};
+    use crate::ledger::Ledger;
+
+    fn ledger() -> (tempfile::TempDir, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Ledger::open_with_clock(
+            &dir.path().join("camp.db"),
+            Box::new(FixedClock::new("2026-07-05T21:14:03Z")),
+        )
+        .unwrap();
+        (dir, l)
+    }
+
+    fn bead(l: &mut Ledger, id: &str, data: serde_json::Value) {
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some(id.into()),
+            data,
+        })
+        .unwrap();
+    }
+
+    fn close(l: &mut Ledger, id: &str) {
+        l.append(EventInput {
+            kind: EventType::BeadClaimed,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some(id.into()),
+            data: serde_json::json!({"session": "s"}),
+        })
+        .unwrap();
+        l.append(EventInput {
+            kind: EventType::BeadClosed,
+            rig: Some("gc".into()),
+            actor: "test".into(),
+            bead: Some(id.into()),
+            data: serde_json::json!({"outcome": "pass"}),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn ready_excludes_a_RUN_MEMBER_and_a_COMPLETED_RUN_ROOT() {
+        // ⭐ B1 — the ONLY production line this change adds to `readiness.rs`, and
+        // NOTHING defended it: deleting the run-root exclusion left the entire
+        // workspace green.
+        //
+        // It was not merely untested — it was UNTESTABLE by the fixtures that
+        // existed, because a run ROOT is always blocked by its own step deps, so the
+        // predicate is a NO-OP for it. The exclusion only bites on the two shapes no
+        // fixture had:
+        //
+        //   (a) a run MEMBER — `camp create --run <id>`: run_id set, step_id NULL,
+        //       NO deps. NEW in this change. campd never dispatches it (a drain
+        //       scatters over it), so counting it as `ready` is a lie.
+        //   (b) a run ROOT whose steps have ALL CLOSED — no longer blocked, and
+        //       campd never dispatches a root either.
+        //
+        // This test constructs both, and it FAILS if the exclusion is removed.
+        let (_d, mut l) = ledger();
+
+        // A run: root + one step. The root `needs` the step, as cook writes it.
+        bead(
+            &mut l,
+            "gc-1",
+            serde_json::json!({"title": "root", "run_id": "r1", "needs": ["gc-2"]}),
+        );
+        bead(
+            &mut l,
+            "gc-2",
+            serde_json::json!({"title": "step", "run_id": "r1", "step_id": "s1"}),
+        );
+        // A run MEMBER (`camp create --run r1`): no step_id, NO needs.
+        bead(
+            &mut l,
+            "gc-3",
+            serde_json::json!({"title": "member", "run_id": "r1"}),
+        );
+        // …and one ordinary bead, which IS ready.
+        bead(&mut l, "gc-4", serde_json::json!({"title": "plain"}));
+
+        // Only the step and the plain bead are ready. The MEMBER is not: campd will
+        // never dispatch it. (Without the exclusion it would be counted — it is open,
+        // a task, and has no unmet deps.)
+        assert_eq!(
+            l.status_summary().unwrap().ready,
+            2,
+            "a run MEMBER is never dispatched and must not be counted ready"
+        );
+
+        // Close the step. The root is now UNBLOCKED — and still must not be ready,
+        // because campd never dispatches a run root either.
+        close(&mut l, "gc-2");
+        assert_eq!(
+            l.status_summary().unwrap().ready,
+            1,
+            "a COMPLETED run root is unblocked but is still never dispatched"
+        );
+    }
+}

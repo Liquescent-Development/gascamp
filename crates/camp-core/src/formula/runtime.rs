@@ -80,7 +80,7 @@ pub fn load_run(runs_dir: &Path, run_id: &str) -> Result<RunContext, CoreError> 
     // `<formula>.toml` with `parse_and_validate` (no layers, no config), which
     // for any imported formula could not possibly succeed: `ctx()` turned the
     // error into `None` and every caller then DEAD-ENDED the run. Every one of
-    // the 62 runnable corpus formulas would have hit it.
+    // the 65 runnable corpus formulas would have hit it.
     //
     // Nothing here re-parses, resolves layers, or reads config. The recipe is
     // already instantiated: `{{var}}` substituted, routes resolved.
@@ -103,6 +103,20 @@ pub fn load_run(runs_dir: &Path, run_id: &str) -> Result<RunContext, CoreError> 
         )));
     }
     let formula = pinned.formula;
+    // `Formula::source` is `#[serde(skip)]` (BD-C: the authored bytes are already
+    // pinned verbatim next to the recipe, and duplicating them here would double the
+    // run dir). So a formula reconstituted from `recipe.json` carries an EMPTY
+    // source — by design, and NOTHING reads it today.
+    //
+    // It is asserted rather than merely commented, because a future caller reaching
+    // for `.source` off a reloaded formula would silently get `""` and behave as if
+    // the file were empty. Make that structural: if the invariant ever changes, this
+    // fires in dev before it ships.
+    debug_assert!(
+        formula.source.is_empty(),
+        "a formula reloaded from recipe.json has no authored source (serde skip); \
+         read <run>/<formula>.toml if you need the bytes"
+    );
     // The two pinned artifacts must agree about what was cooked. They are written
     // in the same transaction, so a mismatch means the run dir was edited or
     // corrupted — never a thing to shrug at.
