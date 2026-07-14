@@ -125,6 +125,19 @@ pub struct ReadChannelRuntime {
     /// of the other tailed sessions. Drained into durable
     /// `patrol.degraded` events by `take_drain_error_events`.
     drain_errors: Vec<DrainError>,
+    /// cp-1: the complete lines this wake's drains consumed, in file order.
+    /// `mem::take`-drained by `take_stream_lines` — a line handed over twice
+    /// would be INGESTED twice (a double `control.responded`), so the harvest is
+    /// destructive by construction.
+    stream_lines: Vec<StreamLine>,
+    /// cp-1 (D7): when each session last produced a complete line. It resets a
+    /// pending control request's SILENCE deadline, and it is `sessions.list`'s
+    /// `last_activity`.
+    last_activity: HashMap<String, jiff::Timestamp>,
+    /// cp-1 (C5/C7): sessions disposed by `dispose_pending` this wake, with
+    /// their final offsets. Consumed by the event loop — which hands them to
+    /// the subscriber registry so a Closing subscriber gets its `end` frame.
+    disposed: Vec<Disposed>,
     /// The notify watcher on `sessions/` (held for liveness; the drain-
     /// all-on-every-wake rule makes it latency-only — §2.3).
     watcher: Option<notify::RecommendedWatcher>,
@@ -163,6 +176,34 @@ pub struct DrainError {
     pub error: String,
 }
 
+/// cp-1: one complete JSON line the drain consumed, handed to the control
+/// runtime so it can correlate a `control_response`, refuse a dialog, and
+/// reset a session's silence deadline.
+///
+/// A1/G8: there is NO `offset_after` field. Under D6" NOTHING would read it —
+/// `pump` derives every offset from its own cursor, and `ingest` reads only
+/// `session` and `line`. A phase that needs a per-line offset here adds it
+/// TOGETHER WITH ITS READER.
+#[derive(Debug, Clone)]
+pub struct StreamLine {
+    #[allow(dead_code)] // cp-1: first read in Task 6 (ingest)
+    pub session: String,
+    #[allow(dead_code)] // cp-1: first read in Task 6 (ingest)
+    pub line: String,
+}
+
+/// cp-1 (C5/C7): a session whose stream file has just been disposed, with the
+/// authoritative final byte offset campd drained from it. That offset is what
+/// a subscriber's `end` frame carries — the promise that it saw the whole
+/// stream, not a truncated prefix.
+#[derive(Debug, Clone)]
+pub struct Disposed {
+    #[allow(dead_code)] // cp-1: first read in Task 8 (close_disposed)
+    pub session: String,
+    #[allow(dead_code)] // cp-1: first read in Task 8 (close_disposed — the end frame's offset)
+    pub final_offset: u64,
+}
+
 #[derive(Debug)]
 enum TrackOp {
     Register(String),
@@ -187,8 +228,58 @@ impl ReadChannelRuntime {
             parse_errors: Vec::new(),
             cap_breaches: Vec::new(),
             drain_errors: Vec::new(),
+            stream_lines: Vec::new(),
+            last_activity: HashMap::new(),
+            disposed: Vec::new(),
             watcher: None,
         })
+    }
+
+    /// cp-1: harvest the complete lines the drains consumed. `mem::take`-drained
+    /// — the caller ingests them exactly once.
+    #[allow(dead_code)] // cp-1: first read in Task 6
+    pub fn take_stream_lines(&mut self) -> Vec<StreamLine> {
+        std::mem::take(&mut self.stream_lines)
+    }
+
+    /// cp-1 (D7/§4.1): when this session last produced a complete line.
+    #[allow(dead_code)] // cp-1: first read in Task 7
+    pub fn last_activity(&self, session: &str) -> Option<jiff::Timestamp> {
+        self.last_activity.get(session).copied()
+    }
+
+    /// cp-1 (D6"): where a subscriber may read UP TO — the stream file and the
+    /// byte offset campd has actually DRAINED. `pump` reads only `[cursor,
+    /// tail)`, so it can never hand a subscriber bytes campd has not consumed.
+    ///
+    /// `None` means the session is not tailed (it never existed, or it was
+    /// reaped and disposed) — which is what makes a subscribe against a dead
+    /// session an explicit error rather than an empty stream (§9).
+    ///
+    /// THE TAIL IS LINE-ALIGNED, and Task 8's TERMINAL branch silently depends
+    /// on it: `t.offset` advances only past `\n`-terminated lines (see
+    /// `drain_one`), so a worker that exits mid-line leaves those bytes OUTSIDE
+    /// `tail`. A future phase that advanced the offset mid-line would make a
+    /// subscriber's `end` frame unreachable.
+    #[allow(dead_code)] // cp-1: first read in Task 8
+    pub fn tail_state(&self, session: &str) -> Option<(PathBuf, u64)> {
+        self.tailed
+            .get(session)
+            .map(|t| (t.stdout_path.clone(), t.offset))
+    }
+
+    /// cp-1 (C5/C7): the sessions `dispose_pending` disposed this wake.
+    /// `mem::take`-drained.
+    ///
+    /// EXACTLY ONE CALLER, in the event loop, IMMEDIATELY AFTER
+    /// `dispose_pending()`. That ordering is the STRUCTURAL guarantee that a
+    /// caught-up subscriber gets its `end` frame on the disposal wake — and it
+    /// is structural precisely because no black-box test can prove it (the
+    /// stream watch always delivers another wake, which would mask a broken
+    /// ordering by making the frame merely LATE rather than absent).
+    #[allow(dead_code)] // cp-1: first read in Task 8
+    pub fn take_disposed(&mut self) -> Vec<Disposed> {
+        std::mem::take(&mut self.disposed)
     }
 
     /// The slot the notify callback closure captures (the patrol mold).
@@ -292,8 +383,30 @@ impl ReadChannelRuntime {
     ///
     /// Returns `true` when it appended events (the caller settles to advance
     /// the campd cursor past them).
+    ///
+    /// cp-1 (C5): this is now a THIN WRAPPER over the two halves — the final
+    /// drain and the disposal — kept so every merged cp-0 caller and unit test
+    /// keeps working unchanged. The EVENT LOOP calls the halves separately, with
+    /// the control-plane harvest BETWEEN them: a reaped worker's last line
+    /// carries the `control_response` to an interrupt, and it must be INGESTED
+    /// before its file is unlinked, not merely read.
     pub fn apply_pending_unregisters(&mut self, ledger: &mut Ledger) -> Result<bool> {
-        let pending = std::mem::take(&mut self.pending_unregisters);
+        let appended = self.final_drain_pending(ledger)?;
+        self.dispose_pending(ledger)?;
+        Ok(appended)
+    }
+
+    /// cp-1 (C5), the FIRST half: the final drain, cp-0's ordering guard, and
+    /// cp-0's fault flushes. It does NOT dispose, and — load-bearing — it does
+    /// NOT consume the pending list.
+    ///
+    /// IT PEEKS. The merged `apply_pending_unregisters` began with a
+    /// `mem::take` of `pending_unregisters`; a naive split would leave
+    /// `dispose_pending` re-taking an ALREADY-EMPTIED queue, disposing nothing,
+    /// unlinking no file and clearing no cursor. So this half iterates the queue
+    /// in place and `dispose_pending` is the one that takes it.
+    pub fn final_drain_pending(&mut self, ledger: &mut Ledger) -> Result<bool> {
+        let pending: Vec<String> = self.pending_unregisters.clone();
         let mut appended = false;
         for session in &pending {
             // The unconditional final drain. `drain_one` is itself a no-op for
@@ -374,10 +487,33 @@ impl ReadChannelRuntime {
             ledger.append(input)?;
             appended = true;
         }
+        Ok(appended)
+    }
+
+    /// cp-1 (C5), the SECOND half: unlink each pending session's stream file,
+    /// clear its cursor, and RECORD a `Disposed { session, final_offset }` for
+    /// each — the authoritative end of the stream, which is what a subscriber's
+    /// `end` frame carries.
+    ///
+    /// This is the half that consumes the queue (`mem::take`), and it must run
+    /// AFTER the caller has harvested the final drain's lines (the whole point
+    /// of the split) and BEFORE the caller consumes `take_disposed()`.
+    /// Idempotent: a second call with an empty queue disposes nothing.
+    pub fn dispose_pending(&mut self, ledger: &mut Ledger) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending_unregisters);
         for session in &pending {
+            // The final offset is read BEFORE `unregister` drops the state.
+            // A session already gone (a double-queued unregister) records
+            // nothing — there is no stream left to end.
+            if let Some(t) = self.tailed.get(session) {
+                self.disposed.push(Disposed {
+                    session: session.clone(),
+                    final_offset: t.offset,
+                });
+            }
             self.unregister(ledger, session)?;
         }
-        Ok(appended)
+        Ok(())
     }
 
     /// review fix 3: queue a session for disposal from outside the observe
@@ -638,6 +774,17 @@ impl ReadChannelRuntime {
                             .entry(session.to_owned())
                             .and_modify(|c| *c += 1)
                             .or_insert(1);
+                        // cp-1: hand the line over. The control runtime
+                        // correlates a `control_response` from it, refuses a
+                        // dialog, and resets the session's SILENCE deadline —
+                        // which is why the activity stamp lands here too, on
+                        // the line, rather than on the wake.
+                        self.stream_lines.push(StreamLine {
+                            session: session.to_owned(),
+                            line: line.to_owned(),
+                        });
+                        self.last_activity
+                            .insert(session.to_owned(), jiff::Timestamp::now());
                     }
                     Err(e) => {
                         self.parse_errors.push(ParseError {
@@ -1611,5 +1758,161 @@ mod tests {
             0,
             "offset row cleared"
         );
+    }
+    // ======== cp-1 Task 4: the hand-over, and the SPLIT disposal ==========
+
+    /// cp-1: every complete line `drain_all` consumes is handed over, in FILE
+    /// ORDER, exactly once. `take_stream_lines` is `mem::take`-drained, so a
+    /// line is never redelivered — and a PARTIAL line is never handed over at
+    /// all (it is not a line yet).
+    #[test]
+    fn drain_all_hands_over_the_complete_lines_it_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        // Two complete lines and a trailing PARTIAL (no newline yet).
+        std::fs::write(
+            &stdout,
+            "{\"type\":\"system\"}\n{\"type\":\"assistant\"}\n{\"type\":\"par",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+
+        let lines = rc.take_stream_lines();
+        assert_eq!(lines.len(), 2, "only the COMPLETE lines are handed over");
+        assert_eq!(lines[0].session, "t/dev/1");
+        assert_eq!(lines[0].line, "{\"type\":\"system\"}");
+        assert_eq!(lines[1].line, "{\"type\":\"assistant\"}", "in FILE order");
+
+        // mem::take-drained: a second harvest yields nothing. A line handed
+        // over twice would be ingested twice — a double control.responded.
+        assert!(
+            rc.take_stream_lines().is_empty(),
+            "lines are drained, never redelivered"
+        );
+
+        // The partial completes on the next drain, and only then is it a line.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stdout)
+            .unwrap()
+            .write_all(b"tial\"}\n")
+            .unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        let lines = rc.take_stream_lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, "{\"type\":\"partial\"}");
+    }
+
+    /// C5/C7: the disposal-time final drain ALSO hands its lines over — while
+    /// the file still exists — and `dispose_pending` is what unlinks it. The
+    /// `Disposed` it records carries the TRUE final offset, which is the `end`
+    /// frame's offset source (Task 8).
+    #[test]
+    fn the_disposal_time_final_drain_also_hands_over_its_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        std::fs::write(&stdout, "{\"type\":\"system\"}\n").unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        ledger.append(woke_input("t/dev/1", "gc-1")).unwrap();
+        let woke = ledger.events_range(1, None).unwrap().pop().unwrap();
+        rc.observe(&woke);
+        rc.apply_tracking(&mut ledger).unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+        assert_eq!(rc.take_stream_lines().len(), 1);
+
+        // The worker writes its LAST line and exits; the reap queues the
+        // unregister. This is the shape where the answer to an interrupt lives.
+        let last = b"{\"type\":\"control_response\"}\n";
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stdout)
+            .unwrap()
+            .write_all(last)
+            .unwrap();
+        ledger.append(stopped_input("t/dev/1")).unwrap();
+        let stopped = ledger.events_range(2, None).unwrap().pop().unwrap();
+        rc.observe(&stopped);
+        rc.apply_tracking(&mut ledger).unwrap();
+
+        // THE FINAL DRAIN — and the file is still there for it to read.
+        rc.final_drain_pending(&mut ledger).unwrap();
+        let lines = rc.take_stream_lines();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the final line is HANDED OVER, not just read"
+        );
+        assert_eq!(lines[0].line, "{\"type\":\"control_response\"}");
+        assert!(stdout.exists(), "the final drain does NOT dispose");
+
+        // ...and THEN disposal unlinks it and records the Disposed.
+        let final_offset = rc.offset_of("t/dev/1").unwrap();
+        rc.dispose_pending(&mut ledger).unwrap();
+        assert!(!stdout.exists(), "dispose_pending is what unlinks");
+
+        let disposed = rc.take_disposed();
+        assert_eq!(disposed.len(), 1);
+        assert_eq!(disposed[0].session, "t/dev/1");
+        assert_eq!(
+            disposed[0].final_offset, final_offset,
+            "the end frame's offset comes from HERE — it must be the true final offset"
+        );
+        // ...and "the true final offset" means EVERY byte of the file: the
+        // first line plus the last one. An `end` frame whose offset is short of
+        // this would tell a subscriber the stream ended before it did.
+        assert_eq!(
+            disposed[0].final_offset,
+            (br#"{"type":"system"}"#.len() + 1 + last.len()) as u64
+        );
+        assert!(rc.take_disposed().is_empty(), "drained, never redelivered");
+    }
+
+    /// C5's ENABLING GUARD. Harvesting a session's last lines BEFORE its file is
+    /// unlinked is only possible if the two halves are separable at all. After
+    /// `final_drain_pending` the file still EXISTS and the session is still
+    /// TAILED; only `dispose_pending` removes either.
+    #[test]
+    fn the_final_drain_and_the_disposal_are_separable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let stdout = sessions_dir.join("t-dev-1.json");
+        std::fs::write(&stdout, "{\"type\":\"system\"}\n").unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions_dir, 256 * 1024 * 1024).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.queue_unregister("t/dev/1");
+
+        rc.final_drain_pending(&mut ledger).unwrap();
+        assert!(
+            stdout.exists(),
+            "the final drain must NOT unlink — the harvest has not happened yet"
+        );
+        assert_eq!(
+            rc.tailed_sessions(),
+            vec!["t/dev/1".to_owned()],
+            "and the session is still TAILED, so tail_state still answers"
+        );
+        assert!(
+            rc.tail_state("t/dev/1").is_some(),
+            "a subscriber can still be told where the tail is"
+        );
+        assert!(
+            rc.take_disposed().is_empty(),
+            "nothing is disposed until dispose_pending runs"
+        );
+
+        rc.dispose_pending(&mut ledger).unwrap();
+        assert!(!stdout.exists(), "only dispose_pending unlinks");
+        assert!(rc.tailed_sessions().is_empty(), "and only it untails");
+        assert_eq!(rc.take_disposed().len(), 1);
     }
 }
