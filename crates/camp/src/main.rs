@@ -96,6 +96,10 @@ enum Command {
         /// Validate a formula file against the camp subset (spec §8.2)
         #[arg(long, value_name = "PATH", conflicts_with = "refold")]
         formula: Option<PathBuf>,
+        /// Machine-readable verdict. Exits 0 even when the formula does not load
+        /// — the VERDICT is the output, not the exit code (the §10 gate reads it).
+        #[arg(long, requires = "formula")]
+        json: bool,
     },
     /// Append events by hand (worker contract surface)
     Event {
@@ -569,9 +573,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             refold: _,
             repair,
             formula,
+            json,
         } => match formula {
-            // --formula validates a file, not a camp — no CampDir needed.
-            Some(path) => cmd::doctor::run_formula(&path),
+            // --formula compiles a file THROUGH THE LAYERS: an imported formula's
+            // `extends`, `description_file` and routes only resolve against a real
+            // camp, so this needs the CampDir like every other verb.
+            Some(path) => {
+                let camp = CampDir::resolve(cli.camp.as_deref())?;
+                cmd::doctor::run_formula(&camp, &path, json)
+            }
             None => {
                 let camp = CampDir::resolve(cli.camp.as_deref())?;
                 cmd::doctor::run(&camp, repair)
