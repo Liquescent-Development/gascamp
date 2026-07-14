@@ -10,6 +10,50 @@
 
 ---
 
+## What changed in rev 6 — THE FINAL PLAN ROUND (after the rev-5 REJECT at 03cf832)
+
+**The design is not reopened.** "The cap is a STOP; the drop is a STALLED PEER" is the answer §4.1 and §9 needed, and it stands. R2, R3, R4, R5's withdrawal, R6 are CLOSED. Everything below is inside **~15 lines**: the FILL byte loop and `try_emit_line`.
+
+### The root cause: one edit cascaded
+
+**R3's "test the newline FIRST, before any push" broke `try_emit_line`'s own stated precondition** (*"emit ONE complete line from `partial`, **which ends with `\n`**"*). Under rev 5's only call site, **`partial` never ends with `\n`.** B1–B3 all fall out of that. I added the `+1` for the newline in the *oversize* branch and **did not make the identical fix in the normal branch** — an incomplete refactor, visible in the diff.
+
+### THE FOURTH DIMENSION — offset fidelity. This is the one that explains all four rounds.
+
+> *"Every revision breaks precisely the property its suite measures only RELATIVELY. Rev 3 asserted lines ARRIVE; it never asked HOW LONG. Rev 4 asserted drops HAPPEN; it never asked TO WHOM. Rev 5 asserts offsets INCREASE; it never asks whether an offset MEANS anything."*
+
+**Not one test in rev 5 ever takes an `offset` off the wire and feeds it back as a `cursor`.** Tests 7 and 16 assert offsets are *strictly increasing* — **and drifting offsets still increase.** So B1's cumulative drift was invisible to all 23 tests, exactly as the long line was invisible in rev 3 and the reading-client backlog in rev 4. **Fourth round, same shape: the fix broke the thing no fixture measures.**
+
+| dimension | spanned by | gap | rev 6 |
+|---|---|---|---|
+| line length | `FAKE_AGENT_HUGE_LINE` (2 MiB) | — | kept |
+| backlog × read rate | test 16 (≥2 MiB, **reading**, default cap) | — | kept |
+| frame-vs-line boundary | unit 8, 9 | — | kept |
+| byte fidelity | unit 10 | **premise false (B4)** | re-aimed at the REFUSAL |
+| lifetime × read state | tests 4, 5 + hard deadlines | — | kept |
+| **OFFSET FIDELITY — the cursor round-trip** | **NOTHING** | **B1's per-line drift is invisible to every test** | **(i) one line in test 4: `assert_eq!(last_event.offset, end.offset)` — drift makes them differ by the line count; (ii) NEW test 13 `a_client_that_resubscribes_from_a_delivered_offset_resumes_exactly_there` — §9's resume promise, tested by nothing** |
+| **two subscribers, one session** | **NOTHING** | the `over_cap` `patrol.degraded` dedupe (`HashSet<(session,offset)>`) — **its whole reason to exist** — is never exercised; cp-2 inherits it | **NEW test 14** |
+| **a live subscriber across a campd restart** | **NOTHING** | named in rev-3's notes, tested by nothing | **NEW test 15** (the subscription dies with campd; the client's cursor stays valid and it resumes — §9) |
+
+| # | Defect | Fix (one line each, in the FILL loop) | **What the fix could newly break, and the test for it** |
+|---|---|---|---|
+| **B1** | **`off` is off by one, PER LINE, CUMULATIVELY.** `off = cursor + partial.len()` with the `\n` no longer in `partial` ⇒ `cursor` lands **ON** the newline, drifting one byte per line. §9 makes these the **durable resume cursors**: a client reconnecting with a cursor campd handed it lands **mid-file at the wrong byte**. The `end` frame's offset (`= tail`) is correct, so the last `event` offset and the `end` offset **disagree by the line count**. | **Push the `\n` into `partial`, THEN call `try_emit_line`.** Cap-safe: R3's pre-push guard already bounds `partial.len() ≤ cap − frame_overhead`, and `body` strips the `\n`, so `frame.len() ≤ cap` still fits an empty `out`. | An off-by-one the other way (skipping a byte) would corrupt every body. **Tests: the one-line offset-equality assertion in test 4, and the round-trip in test 13** — a *relative* assertion can never catch either direction. |
+| **B2** | **The stall `break` abandons the rest of the chunk while `scan` has already advanced past it — SILENT TRUNCATION.** `scan += buf.len()` up front, then `break` mid-`buf`; `Subscriber` has no field for an unconsumed remainder, and the next read is positional at `scan`. **Up to 64 KiB of lines silently lost**, plus a permanent `cursor`/`scan` desync. **Rev 4 was safe here ONLY because its early exit was `return Drop`** — my `break` keeps the subscriber alive and converts a wrong-but-LOUD drop into a silent truncation (§9: *"never a silently truncated stream"*). **Reachable in my own flagship test:** in test 16's steady state `out` sits at the cap, so `try_emit_line` returns false on most chunks — **test 16 is RED against rev 5's `pump`.** | **Advance `scan` (and `scanned`) PER BYTE ABSORBED**, not per chunk read. On a stall, the unconsumed remainder is still at `[scan, …)` and is simply re-read. The `cursor ≤ scan` gap stays exactly *"the in-progress line"*, as the doc comment already claims. | Per-byte accounting could double-count on a retry. It cannot: the retry path consumes from `partial`, not from the file, and `scan` is never rewound. **Test: `a_cap_stop_mid_chunk_loses_no_bytes`** (unit) — plus test 16, which now genuinely exercises it. |
+| **B3** | **The held-line retry is DEAD CODE, and a line held at `scan == tail` strands the subscriber FOREVER.** (a) the predicate `if partial ends with b'\n'` is **always false** under R3 ⇒ the held line is never retried, the next line's bytes are appended onto it, **two lines are concatenated into one body** ⇒ `event_frame` rejects it ⇒ `skipped{not_a_json_object}` — corruption with a **false cause**. **The central rev-5 mechanism never fires.** (b) the retry sits inside `while … scan < tail`, so a line held at `scan == tail` — **the normal terminal state of any catch-up that ran at the cap** — is never re-entered; `poll_timeout`'s `subscriber_work` needs `scan < tail` ⇒ false; `blocked_since` is `None` (the peer IS reading) ⇒ **nothing armed, no wakeup source, the last line never delivered.** (c) TERMINAL then requires `partial.is_empty()` ⇒ **no `end` frame, no EOF, fd + slot leaked** — R2's exact symptom, resurrected through R1's own fix. Also `stalled` is declared outside the outer `loop` and **never reset**. | **(a)** a real **`held: bool`** flag, not a `partial` inspection. **(b)** hoist the retry out of the tail guard: `while !stalled && (sub.held || sub.scan < sub.tail) && …`. **(c)** `poll_timeout`'s `subscriber_work` gains `|| s.held`. **(d)** TERMINAL's guard becomes `!sub.held && partial.is_empty() && oversize.is_none()`. **(e)** `stalled` is reset at the top of each outer iteration. | A `held` flag that is set but never cleared would stall forever. `try_emit_line` is the ONLY writer and clears it on every success path (including the blank-line path). **Test: `a_line_held_at_the_cap_is_retried_and_never_concatenated`** (unit) — assert the held line is delivered **as its own frame** after `out` drains, and that the next line is a separate frame. |
+| **B4** | **Unit test 10's premise is FALSE and the test is unsatisfiable — verified by running it.** I claimed *"JSON permits non-UTF-8 in strings"*. It does not: **JSON text is UTF-8 by definition and `serde_json::from_slice` ENFORCES it** — `Err("invalid unicode code point")`. So `event_frame` returns `None`, the body is *skipped*, and a byte-identical round-trip is **unachievable by any implementation of my own spec**. The implementer inherits a permanently-RED test they are forbidden to delete, whose only escape is to strip `event_frame`'s validation — which would put invalid JSON on the wire and break test 1. | **The R7 signature stands** (`&[u8]` + `from_slice` **REFUSES**; the `&str` + `from_utf8_lossy` path would substitute U+FFFD and splice the **corrupted** bytes — *that* is the difference worth having). **The TEST is re-aimed at the refusal**: a line carrying raw non-UTF-8 yields `skipped{reason:"not_a_json_object"}` and is **never delivered with silently-substituted bytes**. The false claim is deleted. | Re-aiming could hide a real corruption path. It cannot: the test asserts the bytes are **refused**, not merely "handled" — and asserts the U+FFFD substitution does **not** appear on the wire. |
+
+**Mechanical fixes, all applied:** R5's replacement over-claim **struck** (the unit test calls `close_disposed` directly, so it *cannot* observe the event loop's call order — the **structural** guarantee is the real protection; this is the third false "this test gates it" claim and I am now asking, for each one, *what code change would make it red?*) · `close_disposed_emits_the_end_frame…` **moved to the UNIT list** (it uses `test_insert_subscriber`, and integration tests cannot link `daemon::*`) · **unit tests 5 and 6 and integration test 6 rewritten against the new contract** — they specified rev-4's cap-drop, which R1 **deleted** (a frame crossing the cap now **stalls**; the drop fires at the stall timeout) · **`CAMP_SUBSCRIBER_STALL_TIMEOUT` env override added** (without it, the stall tests are mandatory 30 s wall-clock and their hard deadlines would exceed the hang they exist to detect) · **counts recomputed once, carefully** (unit **31**, integration **21**) · **§4.4 is AMENDED IN THE SAME PR** (below) · the memory bound is **~2× cap per subscriber** (`out` ≤ cap **and** `partial` ≤ cap) ⇒ **~16 MiB at 8 subscribers, not 8 MiB** · the cp-2 `OutBuf` claim is **struck** (the struct I wrote is flat) and replaced with an honest note · `pump`'s signature carries `now` · the `oversize` `skipped` frame is appended without a cap check, so `out` may exceed the cap by **one small frame** — bounded, and stated.
+
+### §4.4 IS AMENDED IN THIS PR (AGENTS.md: spec and code never silently diverge)
+
+§4.4 says *"a subscriber whose buffer crosses the cap is dropped."* **cp-1 implements something different, deliberately**, and carrying that as an unrecorded divergence is exactly what the repo forbids. **Task 11 gains a step: amend §4.4 of `docs/superpowers/specs/2026-07-12-camp-control-plane-design.md` in the same PR**, to read (in substance):
+
+> **`subscriber_buffer_bytes` (1 MiB) is a STOP, not a kill.** When the buffer is full campd stops framing and holds the next complete line; nothing is lost and nothing is dropped. **A subscriber is dropped when its PEER STOPS READING** — its socket has accepted zero bytes for `SUBSCRIBER_STALL_TIMEOUT` (30 s) with data buffered — reported as `subscriber.dropped` naming the session and the high-water mark. *Rationale: during catch-up the producer is a FILE read and a file always outruns a socket, so a buffer-size kill drops healthy, fast-reading clients that are merely behind — which breaks §4.1's "a late joiner gets history, then follows" and §9's "never a silently truncated stream" for any session with more than 1 MiB of output. campd still never blocks, memory is still bounded (`out` ≤ cap, `partial` ≤ cap), and a genuinely stalled peer is still dropped loudly.*
+
+**Residual, decided and stated rather than hidden:** a peer accepting **one byte every 29 s** clears `blocked_since` on every wake and can hold 1 MiB and one of 8 slots indefinitely. **Decision: ACCEPT for cp-1** — that peer *is* reading, and any byte-rate floor is a policy number nobody has evidence for. **It is named here because cp-2 inherits this rule verbatim, and `camp watch` is precisely the thing an operator leaves open in a scrolled-back terminal all day.** A byte-rate floor, or a bound on time-at-cap, is the honest fix; it is recorded as a **cp-2 obligation**, not silently deferred.
+
+---
+
 ## What changed in rev 5, and why (after the rev-4 REJECT at bd7d404)
 
 **Scope, per the gate: `pump` and its struct. Nothing else.** Tasks 1, 2, 4, 5, 6, 7, 10, 11, the fixtures, the `cause` enum, the ceiling and the dead_code discipline are settled and are not reopened. Rev 4's G1–G11 fixes stand (the panel traced six inputs through the new data path and confirmed the livelock and the spin are dead).
@@ -190,14 +234,16 @@ Bounded on the event loop by `MAX_PUMP_BYTES_PER_WAKE`; while a subscriber is be
 
 The `{"frame":…}` tag lets cp-2 add `frame:"ledger"` with no breaking wire change. But `Subscriber` now carries **six file-shaped fields** (`file`, `cursor`, `scan`, `partial`, `oversize`, `tail`) and **four transport-shaped ones** (`out`, `high_water`, `blocked_since`, `end_sent` + `frame_overhead`), while `fleet.subscribe` (§4.1: session transitions, stalls, permission requests, completions) is **ledger-event-sourced** — it needs only the second group.
 
-**So the seam is NOT "an enum over two cursor kinds" (rev 4's cut, and it is the wrong one).** The right cut is:
-```rust
-struct Subscriber { out: OutBuf, source: Source }
-enum Source { Stream(StreamSource), Fleet(LedgerSource) }   // cp-2 adds the second
-```
-where **`OutBuf` owns the cap / stall / drop policy EXACTLY ONCE** — the flush loop, `blocked_since`, `SUBSCRIBER_STALL_TIMEOUT`, `high_water`, and the `subscriber.dropped` event.
+**⚠ THE SEAM IS NAMED, NOT TAKEN — and the rev-5 claim that it was is STRUCK.** I wrote that `Subscriber` is `{ out: OutBuf, source: Source }` with `OutBuf` owning the policy once. **The struct cp-1 actually ships is FLAT** (`out`, `high_water`, `blocked_since`, `frame_overhead`, `end_sent` as bare fields, and `pump` interleaves file-reading with buffer policy). Claiming a refactor I did not do is the same class of error as the "this test gates it" claims I have now withdrawn twice.
 
-**This matters more than a naming preference: whatever R1's drop rule finally is, `OutBuf` is what cp-2 INHERITS.** It took five revisions to get that rule right (the cap is a *stop*; the drop is a *stalled peer*, never a *large backlog*) — and duplicating it into a second subscriber kind is how it would be got wrong again. Naming the seam here costs a sentence; discovering it in cp-2 costs a refactor of the code that was hardest to get right.
+**What cp-2 should do, and the honest caveat:**
+```rust
+struct Subscriber { out: OutBuf, source: Source }   // cp-2's cut
+enum Source { Stream(StreamSource), Fleet(LedgerSource) }
+```
+`OutBuf` would own the flush loop, `blocked_since`, `SUBSCRIBER_STALL_TIMEOUT`, `high_water`, and the `subscriber.dropped` event — **the drop policy, in one place.** It took five revisions to get that policy right (the cap is a *stop*; the drop is a *stalled peer*, never a *large backlog*), and duplicating it into a second subscriber kind is how it gets broken again.
+
+**But only HALF of it transfers, and cp-2 must know which half.** *"The cap is a stop — hold the line in `partial`"* is a **file-source** mechanism: a ledger event cannot be "held in `partial`" and re-read from a byte offset. **What DOES transfer is the drop rule** (a peer that accepts zero bytes for the stall timeout) and the flush loop. **What does NOT transfer is the back-off**: a ledger-sourced subscriber that cannot keep up has no file to leave the data in, so cp-2 must decide *where its unsent events live* — and that is a real design question, not a refactor.
 
 ---
 
@@ -463,7 +509,7 @@ pub struct ControlRuntime {
 }
 ```
 
-- [ ] **Step 1: Write the failing tests** (**7**):
+- [ ] **Step 1: Write the failing tests** (**10** — the header said 7 over a list of 10 for three revisions; recounted):
 
 1. `a_pending_request_arms_a_deadline_and_an_empty_table_arms_none` — invariant 1.
 2. `a_control_response_that_never_arrives_becomes_a_durable_fault` — §2.1; the row is removed, so the fault is raised exactly once.
@@ -1095,7 +1141,25 @@ struct Subscriber {
     /// the line's bytes would cross `subscriber_buffer_bytes` it can never be
     /// delivered, so we stop buffering it (see `oversize`) rather than growing to
     /// max_stream_bytes (256 MiB) on the event loop.
+    ///
+    /// B1: when a line COMPLETES, its '\n' IS PUSHED HERE before `try_emit_line` is
+    /// called — because `off = cursor + partial.len()` must land PAST the newline.
+    /// Rev 5 tested the newline first and never pushed it, so `cursor` landed ON the
+    /// newline and drifted ONE BYTE PER LINE, cumulatively — and §9 makes these
+    /// offsets the durable RESUME CURSORS, so a client reconnecting with a cursor
+    /// campd handed it landed mid-file at the wrong byte.
     partial: Vec<u8>,
+    /// B3: `partial` holds a COMPLETE line (terminated by its '\n') that did not fit
+    /// `out`. A REAL FLAG — rev 5 tested `partial ends with b'\n'`, which R3's
+    /// newline-first rule makes ALWAYS FALSE, so the held line was never retried, the
+    /// next line's bytes were appended onto it, and TWO LINES WERE CONCATENATED into
+    /// one body: `event_frame` rejected it and campd emitted `skipped{not_a_json_object}`
+    /// — corruption reported with a false cause. The central rev-5 mechanism never
+    /// fired at all.
+    ///
+    /// It is cleared by `try_emit_line` on EVERY success path (including the blank
+    /// line path), which is the only writer.
+    held: bool,
     /// OVERSIZE SCAN (G1/C8): the in-progress line has already exceeded the cap.
     /// `partial` is DROPPED (memory freed) and we merely COUNT bytes while scanning
     /// for the terminating '\n'. At the newline a `skipped{reason:"over_cap"}` frame
@@ -1153,15 +1217,24 @@ struct Subscriber {
 ```
 
 ```rust
-/// R1: how long a peer may accept ZERO bytes, with data buffered for it, before
-/// campd drops it. A subscriber that is merely BEHIND is not stalled; a subscriber
-/// whose socket has accepted nothing for 30 s has stopped reading.
-pub const SUBSCRIBER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// R1: how long a peer may accept ZERO bytes, with data buffered for it, before campd
+/// drops it. A subscriber that is merely BEHIND is not stalled; a subscriber whose
+/// socket has accepted nothing for 30 s has stopped reading.
+pub const SUBSCRIBER_STALL_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
+
+/// Test-only override, the `CAMP_SUBSCRIBER_BUFFER_BYTES` twin. WITHOUT IT the stall
+/// tests are mandatory 30-second wall-clock tests, and their hard deadlines would have
+/// to EXCEED 30 s — which makes the deadline useless as the hang detector it exists to
+/// be. Fail fast on a malformed or zero value.
+pub fn subscriber_stall_timeout_from_env(default: Duration) -> Result<Duration>;
+    // reads CAMP_SUBSCRIBER_STALL_TIMEOUT_MS
 ```
+
+**The memory bound, corrected.** Each subscriber holds **`out` ≤ cap AND `partial` ≤ cap** ⇒ **~2 MiB per subscriber, ~16 MiB at `MAX_SUBSCRIBERS = 8`** — *not* the 8 MiB rev 5 stated. (§4.3's <20 MB figure is an **idle** bound and is unaffected: idle subscribers hold neither.) Plus one bounded overshoot: **the `oversize` `skipped` frame is appended with no cap check**, so `out` may exceed the cap by one small frame (~80 bytes). Bounded, deliberate, and stated.
 
 - [ ] **Step 1: Write the failing tests.**
 
-**The `pump` unit harness (non-blocking note, adopted — five unit tests need it and rev 4 named none).** A `Subscriber` is constructible only via `serve_subscribe` + a `Conn`. Add, on the `dispatch::test_insert_held_cat` precedent (dispatch.rs:352):
+**The `pump` unit harness (needed by tests 3–14).** A `Subscriber` is constructible only via `serve_subscribe` + a `Conn`. Add, on the `dispatch::test_insert_held_cat` precedent (dispatch.rs:352):
 ```rust
 #[cfg(test)]
 impl ControlRuntime {
@@ -1175,24 +1248,36 @@ impl ControlRuntime {
 }
 ```
 
-**Unit (`control.rs`, 11):**
+**Unit (`control.rs`, 14):**
 1. **`event_frame_splices_verbatim_and_refuses_a_non_object_line`** (C2) — `event_frame(b"t/dev/1", 123, br#"{"type":"system","subtype":"init"}"#)` produces **exactly** `{"frame":"event","session":"t/dev/1","offset":123,"event":{"type":"system","subtype":"init"}}\n` — **key order preserved, because the line is SPLICED, not re-serialized.** And `event_frame(_, _, b"not json")` ⇒ `None` (the caller emits `skipped{reason:"not_a_json_object"}`).
 2. `subscribe_frame_shapes_are_pinned` — the hello (**with `"v":1`**) and all three frames; `skipped` in **both** reason flavours.
 3. **`pump_lexes_a_line_that_spans_many_chunks`** (G1) — a **100 KiB** line (> `HISTORY_CHUNK_BYTES`) is buffered across chunks and delivered as ONE `event` frame; the cursor advances exactly past it. *Rev 3 livelocked here at 100 % CPU — the ordinary case on the ordinary session.*
 4. **`pump_skips_an_over_cap_line_without_buffering_it`** (G1/C8) — a line **larger than the cap** switches to OVERSIZE SCAN: `partial` stays bounded (assert `partial.len() <= cap` throughout), a `skipped{reason:"over_cap", bytes:<true length>}` frame is emitted at the newline, and the cursor advances past it. *This is only reachable because the scan can lex a line it refuses to buffer — rev 3 could not, so its `skipped` frame was structurally unreachable.*
-5. **`a_frame_that_would_cross_the_cap_drops_the_subscriber_before_it_is_appended`** (B10) — the HARD cap; `buffered_bytes` is the ATTEMPTED size.
-6. **`out_keeps_filling_while_non_empty_so_the_cap_is_reachable`** (G3) — with a non-draining socket, `out` grows across MANY chunks up to the cap and the drop fires **at the default 1 MiB**, not only at a toy 512 B cap. *Rev 3 refilled only when `out` was empty, so `out` never passed ~64 KiB and the drop was dead code.*
+5. **`a_frame_that_would_cross_the_cap_STALLS_and_the_line_is_held`** (**REWRITTEN — R1 deleted the behaviour rev 4/5 specified here**) — with a non-draining socket, FILL fills `out` to the cap and then **STOPS**: the complete line stays in `partial`, **`held` is true**, `cursor` does **not** advance, and **no `subscriber.dropped` is emitted**. Then drain the socket and pump again: the held line goes out **as its own frame**, unconcatenated. *The old assertion (a frame crossing the cap DROPS the subscriber) is now wrong by design and would have to be deleted anyway — it is rewritten, not removed.*
+6. **`out_keeps_filling_while_non_empty_up_to_the_cap`** (G3, rescoped) — with a slow socket, `out` grows across MANY chunks to the cap (proving G3's refill-while-non-empty still holds), and then stalls rather than dropping. **The drop is NOT tested here** — it fires at the stall timeout, and test 11 owns it.
 7. **`poll_timeout_never_arms_on_a_wouldblock_alone`** (G2) — a subscriber with a non-empty `out` and `scan == tail` contributes **`None`** *(unless it is stalled — see test 11)*; one with an empty `out` and `scan < tail` contributes `Some(ZERO)`. *Rev 3 armed ZERO on a non-empty `out`, which spun campd for the duration of every stream.*
 8. **`a_line_whose_frame_just_exceeds_the_cap_is_skipped_not_dropped`** (**R3 — the ~60-byte band**) — a line of exactly `cap - frame_overhead + 1` raw bytes. Rev 4 would neither skip it (the *line* is under the cap) nor deliver it (the *frame* is not), and took the `Drop` path: a perfectly-reading subscriber killed, permanently, on every re-subscribe. Assert `skipped{reason:"over_cap"}` and that the subscriber **survives**.
 9. **`a_line_ending_exactly_at_the_cap_boundary_is_not_conflated_with_the_next`** (**R3's second hole**) — a line whose crossing byte **is the `\n`**. Rev 4 pushed first and tested after, so the `continue` bypassed the newline check, `oversize` armed, and the scan ran to the NEXT line's `\n` — **silently consuming a whole line with no frame**, reporting a byte count spanning two. Assert the next line arrives as its own frame and the `skipped{bytes:N}` count covers **one** line.
-10. **`event_frame_preserves_non_utf8_bytes`** (**R7**) — a JSON line whose string contains raw non-UTF-8 bytes (JSON permits it) emerges **byte-identical** through the splice. *Every fixture in this repo is ASCII, so a `from_utf8_lossy` corruption would be invisible.*
-11. **`a_peer_that_accepts_nothing_is_dropped_at_the_stall_timeout`** (**R1's drop rule**) — a client that never reads: assert `blocked_since` is stamped on the zero-accept write, that `poll_timeout` arms **the stall deadline** (nothing else will ever fire for it), and that `Drop(subscriber.dropped)` fires at `SUBSCRIBER_STALL_TIMEOUT` with `buffered_bytes` = the high-water. **And the converse:** a client that accepts even one byte clears `blocked_since` and is never dropped.
+10. **`a_non_utf8_line_is_REFUSED_not_silently_corrupted`** (**R7, RE-AIMED — B4: the old premise was false, verified by running it**). JSON text is **UTF-8 by definition** and `serde_json::from_slice` **enforces** it (`Err("invalid unicode code point")`), so a byte-identical round-trip of non-UTF-8 is **unachievable by any implementation** and the old test could never pass. **The property actually worth having is the REFUSAL:** feed a line containing raw non-UTF-8 bytes; assert `event_frame` returns `None`, the client receives `skipped{reason:"not_a_json_object"}`, and **the U+FFFD replacement character NEVER appears on the wire.** *That is precisely what the `&str` + `from_utf8_lossy` path (which the rev-4 signature forced) would have produced — it substitutes U+FFFD and splices the CORRUPTED bytes. The `&[u8]` + `from_slice` signature refuses instead of corrupting, and this test is what pins that difference.*
+11. **`a_peer_that_accepts_nothing_is_dropped_at_the_stall_timeout`** (**R1's drop rule**) — a client that never reads (`CAMP_SUBSCRIBER_STALL_TIMEOUT_MS=200`): assert `blocked_since` is stamped on the zero-accept write, that `poll_timeout` arms **the stall deadline** (nothing else will ever fire for it), and that `Drop(subscriber.dropped)` fires with `buffered_bytes` = the high-water. **And the converse:** a client that accepts even **one byte** clears `blocked_since` and is never dropped. *(That converse is also the accepted residual — a peer dripping one byte per interval holds a slot indefinitely. It is a DECISION, recorded in the §4.4 amendment and as a cp-2 obligation, not an oversight.)*
+12. **`a_line_held_at_the_cap_is_retried_and_never_concatenated`** (**B3 — the mechanism that never fired**) — stall a line at the cap, drain the socket, pump again. Assert the held line is delivered **as its own frame**, and that the **next** line is a **separate** frame. *Under rev 5 the retry predicate was always false, so the next line's bytes were appended onto the held one and the two were emitted as a single body — rejected by `event_frame` and reported as `skipped{not_a_json_object}`: corruption with a false cause.*
+13. **`a_cap_stop_mid_chunk_loses_no_bytes`** (**B2 — silent truncation**) — stall FILL **mid-chunk** with bytes still unconsumed in `buf`; drain; pump. Assert **every** line in that chunk is eventually delivered, in order, none skipped. *Rev 5 advanced `scan` over the whole chunk up front and then broke mid-`buf`, throwing away up to 64 KiB of lines while `scan` already pointed past them.*
+14. **`close_disposed_emits_the_end_frame_for_a_caught_up_subscriber`** (**R5 — MOVED HERE from the integration list**, because it uses `test_insert_subscriber`, and integration tests cannot link `daemon::*` — a Global Constraint I wrote and then violated). Drive `close_disposed` directly over a `UnixStream::pair`: assert the `end` frame is on the wire and `Gone` is returned. **No daemon, no notify, no timing.** *(⚠ And the rev-5 claim that this test "fails if `close_disposed` stops being called after `dispose_pending`" is **STRUCK** — it calls `close_disposed` directly with a hand-built `&[Disposed]`, so it cannot observe the event loop's call order at all. **The STRUCTURAL guarantee is the real protection.** That is the third false "this test gates it" claim I have made; the standing correction is to ask, of every such claim, **what code change would make this red?**)*
 
-**Integration (`tests/control.rs`, 12 — items 12–23).** **EVERY test below carries a HARD DEADLINE** (R2): rev 4's tests 8 and 9 would have **hung, not failed**, and a hang that "passes" is exactly the failure mode I flagged for the huge-line test and then applied nowhere else. `SubClient` therefore gains **`next_frame_within(dur) -> Option<Value>`** — §4.4's timeout exemption clears the read deadline, so the *client* must impose one or every subscriber test can hang forever.
+**Integration (`tests/control.rs`, 14 — items 1–15 below, minus the one moved to the unit list; RECOUNTED ONCE, CAREFULLY — the counts have been stale four revisions running and this gate exists to catch a false green).** **EVERY test below carries a HARD DEADLINE** (R2): rev 4's tests 8 and 9 would have **hung, not failed**, and a hang that "passes" is exactly the failure mode I flagged for the huge-line test and then applied nowhere else. `SubClient` therefore gains **`next_frame_within(dur) -> Option<Value>`** — §4.4's timeout exemption clears the read deadline, so the *client* must impose one or every subscriber test can hang forever.
 5. **`a_wedged_campd_fails_the_subscribe_hello_fast`** — the EXIT CRITERION. A bare bound `UnixListener` is the wedge simulator (socket.rs:751). `SubClient::open` returns `Err` (`WouldBlock`/`TimedOut`) **inside REQUEST_TIMEOUT**; assert elapsed < 15 s.
 6. **`a_subscription_survives_a_quiet_period_longer_than_request_timeout`** (B13) — open at the tail, sleep **6 s** (> the 5 s `REQUEST_TIMEOUT`), then interrupt and assert a frame still arrives.
 7. **`a_subscriber_catching_up_across_a_live_burst_gets_every_line_exactly_once_in_order`** (C6) — a session with **> 256 KiB** of history (**not 64 KiB**: `MAX_PUMP_BYTES_PER_WAKE` is 256 KiB, so a smaller history is consumed in ONE wake and **the live-burst window never opens** — rev 3's ">64 KiB" would not have exercised the thing it exists for); subscribe at **cursor 0**; the worker appends **live lines DURING catch-up**. Assert every line arrives **exactly once**, **in file order**, with **strictly increasing `offset`s**.
 8. **`a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends`** (B12/C7) — `FAKE_AGENT_EXIT_AFTER_CONTROL`; assert **every** line arrives BEFORE the `end` frame (not a truncated prefix), its `offset` equals the session's final offset, and **EOF never arrives without an `end` frame**.
+
+    **PLUS ONE LINE, AND IT WOULD HAVE CAUGHT B1 (offset fidelity):**
+    ```rust
+    // The last `event` frame's offset is the byte just past that line; the `end`
+    // frame's offset is `tail`. In a correct stream they are THE SAME NUMBER.
+    // Under B1's per-line drift they differ by the LINE COUNT — and every
+    // "offsets strictly increase" assertion in this suite stays green while they do.
+    assert_eq!(last_event_frame["offset"], end_frame["offset"]);
+    ```
 9. **`a_subscriber_caught_up_at_the_tail_gets_an_end_frame_when_its_session_is_reaped`** — subscribe, **drain every frame until fully caught up** (the steady state of every long-lived `camp watch`), then let the worker exit. Assert the `end` frame arrives (within a hard deadline) and that EOF follows it.
 
     **⚠ THE REV-4 CLAIM FOR THIS TEST IS WITHDRAWN (R5), exactly as C5's falsifiability claim was.** I asserted it gates the disposal ordering. **It cannot, and no black-box test can.** `read_channel::on_watch_event` (read_channel.rs:806-815) sets `signal = true` in **every** `Ok` arm — `registered` is consulted only for `rescan`, never to suppress the self-pipe write — and `unregister`'s `remove_file` (:433) fires a `Remove` on the watched directory. **So campd always gets another wake, and under the BROKEN ordering the disposed list simply persists and the next wake emits the `end` frame one wake late. This test is GREEN on the broken ordering.** My patch ("this test also asserts the end frame arrives with the notify path unable to help") **named a mechanism that does not exist** — there is no knob to disable the stream watch — and would have stopped an implementer cold.
@@ -1204,8 +1289,14 @@ impl ControlRuntime {
     - **`close_disposed` is NOT reachable from `control_step`** (rev 4 lifted it out; that is the invariant, not an implementation detail).
     - **…and it gets a deterministic UNIT test** (below) that no notify can mask.
 
-10. **`close_disposed_emits_the_end_frame_for_a_caught_up_subscriber`** (**R5 — the real gate, at the unit level**) — using `test_insert_subscriber` over a `UnixStream::pair`: a subscriber with `out` empty and `scan == tail`; call `close_disposed(&[Disposed{session, final_offset}], …)` **directly**; assert the `end` frame is on the wire and `Gone` is returned. **No daemon, no notify, no timing** — so this fails if and only if `close_disposed` stops doing its job, which is the guarantee test 9 could never provide.
-10. **`a_closing_subscriber_that_stops_reading_is_still_dropped_at_the_cap`** (C7's new-failure test) — a Closing subscriber gets NO backpressure exemption, so it can never hold an fd forever.
+*(`close_disposed_emits_the_end_frame_for_a_caught_up_subscriber` has MOVED to the UNIT list — it uses `test_insert_subscriber`, and integration tests cannot link `daemon::*`.)*
+
+**THE THREE OFFSET/SHARING/RESTART TESTS — the dimensions nothing spanned:**
+
+13. **`a_client_that_resubscribes_from_a_delivered_offset_resumes_exactly_there`** (**§9's RESUME PROMISE, tested by nothing in five revisions**) — subscribe at `cursor: 0`, read K frames, take **frame K's `offset` OFF THE WIRE**, disconnect, reconnect with **`cursor` = that exact offset**. Assert: **frame K+1 arrives FIRST**, **byte-identical** to the one the first subscription would have delivered, and **NO `skipped` frame** appears (a drifted cursor lands mid-line and produces exactly that). *This is the only test in the plan that closes the loop on what an `offset` MEANS. Every other offset assertion is relative — and **drifting offsets still increase**, which is why B1 was invisible to all 23 rev-5 tests.*
+14. **`two_subscribers_on_one_session_share_an_over_cap_line_and_one_degraded_event`** — two `SubClient`s on the same session; drive one over-cap line. Assert **both** receive a `skipped{reason:"over_cap"}` frame, and that **exactly ONE `patrol.degraded` is appended**. *This is the `HashSet<(session, offset)>` dedupe's ENTIRE reason to exist, and nothing exercised it — cp-2 inherits it.*
+15. **`a_subscription_dies_with_campd_and_the_client_resumes_from_its_own_cursor`** — subscribe, read some frames, `kill9()` campd, restart it, reconnect with the last delivered `offset`. Assert the stream resumes exactly there with no loss and no duplication. *§9's "durable across a campd restart for free" — named in rev-3's notes and tested by nothing. **NOTE, honestly:** the client receives a bare **EOF with no `end` frame** when campd dies. That is a known gap, already recorded in the PR body; this test PINS the client-visible behaviour so cp-2's `camp watch` inherits a documented contract rather than a surprise.*
+10. **`a_closing_subscriber_that_stops_reading_is_still_dropped_at_the_stall_timeout`** (**RENAMED + REWRITTEN** — R1 deleted the cap-drop this test named) — a Closing subscriber gets **no exemption from the stall rule**, so it can never hold an fd or a slot forever. Uses `CAMP_SUBSCRIBER_STALL_TIMEOUT_MS`.
 11. **`a_hung_up_subscriber_is_forgotten_and_is_never_libeled_as_backpressure`** (B7) — drop the subscription, drive three wakes, assert campd still answers `status` promptly and **no `subscriber.dropped` exists**. A normal detach is not a fault (§5.2).
 12. **`a_subscriber_that_stops_reading_is_dropped_loudly_and_campd_keeps_serving`** (§8/B8/**G3/R1**) — **at the DEFAULT 1 MiB cap** (`CAMP_SUBSCRIBER_BUFFER_BYTES` is NOT set): `FAKE_AGENT_SPAM_ON_TURN=30000` (≈ 2.7 MB). Subscribe at the **tail** (clean hello), read **NOTHING**, `send_turn` to trigger the spam. Assert `subscriber.dropped{session, cap_bytes: 1048576, buffered_bytes …}` — **now fired by the STALL TIMEOUT (R1), because the peer accepted zero bytes, which is the true cause** — then that campd answers `status` on a FRESH connection in < 5 s. *(Rev 3's 512 B cap was smaller than one chunk, the only regime where its drop path fired at all — theatre. Rev 4 fired here for the wrong reason: `out` reaching a size that catch-up reaches by construction.)*
 
@@ -1325,7 +1416,8 @@ fn event_frame(session: &str, offset: u64, body: &[u8]) -> Option<Vec<u8>> {
 ```rust
 Subscriber {
     cursor: c, scan: c,                  // invariant `cursor <= scan <= tail`, from birth
-    partial: Vec::new(), oversize: None,
+    partial: Vec::new(), held: false,    // B3: a REAL flag, never a `partial` inspection
+    oversize: None,
     tail,
     closing: None, end_sent: false,      // R2
     out: Vec::new(), high_water: 0,
@@ -1347,68 +1439,83 @@ pub enum PumpOutcome {
 }
 ```
 ```
-pump(sub, conn, now):
-  scanned = 0                             // G1: bounds the SCAN, not the output
-  stalled = false                         // R1: FILL stopped because `out` is full
+pump(sub, conn, now):                       // `now` is REQUIRED: blocked_since uses it
+  scanned = 0                               // G1: bounds the SCAN, not the output
 
   loop {
-    // ---- (A) FILL: turn file bytes into frames, STOPPING at the cap ------------
-    // G3: this runs even while `out` is NON-EMPTY (rev 3 gated it on out.is_empty(),
-    // so `out` never exceeded one chunk and the cap was unreachable).
-    // R1: but the cap is a STOP, not a kill. Rev 4 returned Drop here, which killed
-    // every client that joined >1 MiB behind the tail however fast it read.
-    while !stalled && sub.scan < sub.tail && scanned < MAX_PUMP_BYTES_PER_WAKE {
+    stalled = false                         // B3(e): RESET every outer iteration. Rev 5
+                                            // declared it OUTSIDE the loop and never reset
+                                            // it, so its own comment ("the socket took
+                                            // bytes, so FILL may resume") was false.
 
-        // R1: a COMPLETE line held over from a previous call, because `out` was full.
-        // Nothing was lost and `cursor` never advanced past it — retry it FIRST.
-        if sub.partial ends with b'\n' {
+    // ---- (A) FILL: turn file bytes into frames, STOPPING at the cap ------------
+    // R1: the cap is a STOP, not a kill (rev 4 returned Drop here and killed every
+    // client that joined >1 MiB behind the tail, however fast it read).
+    // B3(b): the guard admits a HELD line even at `scan == tail` — the normal terminal
+    // state of any catch-up that ran at the cap. Rev 5 gated FILL on `scan < tail`
+    // alone, so a line held there was never re-entered, nothing was armed to wake it,
+    // the last line of the history was never delivered, and TERMINAL (which required
+    // `partial.is_empty()`) could never fire: no end frame, no EOF, fd + slot leaked.
+    while !stalled && (sub.held || sub.scan < sub.tail) && scanned < MAX_PUMP_BYTES_PER_WAKE {
+
+        // B3(a): a COMPLETE line held over because `out` was full. A REAL FLAG — rev 5
+        // tested `partial ends with b'\n'`, which R3's newline-first rule makes ALWAYS
+        // FALSE, so this never fired and the next line's bytes were concatenated onto
+        // the held one.
+        if sub.held {
             if !try_emit_line(sub) { stalled = true; break }
-            continue
+            continue                                  // try_emit_line cleared `held`
         }
 
         n = min(HISTORY_CHUNK_BYTES, sub.tail - sub.scan)
         chunk = read n bytes from sub.file at offset sub.scan   // bounded by `tail`:
                                                                 // never reads undrained bytes
         // ---- R4: the arms rev 4 omitted, either of which HANGS campd inside pump.
-        match chunk {
-            Ok(buf) if buf.is_empty() =>
+        buf = match chunk {
+            Ok(b) if b.is_empty() =>
                 // The stream file is append-only; it cannot shrink. scan < tail with a
                 // zero-byte read is a genuine inconsistency, not a benign EOF.
                 { push_fault(patrol.degraded, "stream file is shorter than campd's own
                               drained offset"); return Gone }
-            Err(Interrupted)          => continue,
-            Err(e)                    => { push_fault(patrol.degraded, e); return Gone }
-            Ok(buf)                   => buf,
+            Err(Interrupted)      => continue,
+            Err(e)                => { push_fault(patrol.degraded, e); return Gone }
+            Ok(b)                 => b,
         }
-        sub.scan += buf.len();  scanned += buf.len()
 
-        for each byte b in buf:                        // a BYTE scan. No UTF-8 decode. Ever. (R7)
+        // B2: `scan` and `scanned` advance PER BYTE ABSORBED — never per chunk read.
+        // Rev 5 advanced `scan` over the WHOLE chunk up front and then `break`ed
+        // mid-`buf` on a stall. `buf` is a local and `Subscriber` has no field for an
+        // unconsumed remainder, so every byte after the stall point was THROWN AWAY
+        // while `scan` already pointed past it: up to 64 KiB of SILENT LINE LOSS
+        // (§9: "never a silently truncated stream") plus a permanent cursor/scan
+        // desync. Rev 4 was safe here only because its early exit was `return Drop`,
+        // which destroyed the subscriber instead of continuing.
+        //
+        // With per-byte accounting a stall simply leaves the remainder at [scan, ..),
+        // and the next FILL re-reads it. Nothing is lost.
+        for each byte b in buf:                       // a BYTE scan. No UTF-8 decode. Ever. (R7)
+            sub.scan += 1;  scanned += 1
 
             // ---- oversize: the line's FRAME cannot fit the whole cap. Count, never buffer.
             if sub.oversize is Some(count):
                 if b == b'\n':
                     off = sub.cursor + count + 1                    // + the newline
-                    emit(skipped_frame(session, off, count, "over_cap"))   // fits: it is tiny
+                    emit(skipped_frame(session, off, count, "over_cap"))
                     emit_once_per(session, sub.cursor) -> patrol.degraded  // G11
                     sub.cursor = off; sub.oversize = None
                 else:
-                    count += 1
+                    sub.oversize = Some(count + 1)
                 continue
 
             // ---- R3: THE NEWLINE IS TESTED FIRST, before any push or cap check.
-            // Rev 4 pushed the byte and THEN tested the cap, so when the byte that
-            // crossed the cap WAS the '\n', the `continue` bypassed the newline check,
-            // `oversize` armed, and the scan ran on to the NEXT line's '\n' — silently
-            // consuming a whole line with no frame and reporting a byte count spanning
-            // two lines (a §9 truncation with a false cause).
             if b == b'\n':
-                if !try_emit_line(sub) { stalled = true; break }    // R1: HOLD, do not drop
+                sub.partial.push(b'\n')       // B1: THE NEWLINE GOES IN. `off` must land
+                sub.held = true               // PAST it, or `cursor` drifts one byte per
+                                              // line and §9's resume cursors are wrong.
+                if !try_emit_line(sub) { stalled = true; break }    // R1: HOLD, never Drop
                 continue
 
             // ---- R3: the over-cap decision is made on the FRAME, not the raw line.
-            // Rev 4 tested `partial.len() > cap` here and tested the FRAME only at the
-            // drop — leaving a ~60-byte band where a line was neither skipped nor
-            // deliverable, and its (perfectly-reading) subscriber was dropped, forever.
             if sub.partial.len() + 1 + sub.frame_overhead > cap:
                 sub.oversize = Some(sub.partial.len() + 1)
                 sub.partial.clear()                                 // free the memory
@@ -1418,10 +1525,13 @@ pump(sub, conn, now):
     }
 
     // ---- (B) TERMINAL: full history FIRST, then the end frame, ONCE (C7 + R2) ---
+    // B3(d): `!sub.held` — a HELD line is unfinished history, and rev 5's
+    // `partial.is_empty()` was satisfied by a held line's presence being invisible.
     if !sub.end_sent
        && sub.out.is_empty()
        && sub.closing.is_some()
        && sub.scan == sub.tail
+       && !sub.held
        && sub.partial.is_empty()
        && sub.oversize.is_none() {
         sub.out.extend(end_frame(session, sub.tail, reason))
@@ -1456,22 +1566,35 @@ pump(sub, conn, now):
     // Loop: the socket took bytes, so `out` has room and FILL may resume.
   }
 
-// R1/R3: emit ONE complete line from `partial` (which ends with '\n'), or report that
-// `out` has no room for it. Returns false => the caller STALLS: `partial` keeps the
-// complete line, `cursor` does NOT advance, and NOTHING is lost.
+// R1/R3: emit ONE complete line from `partial`, or report that `out` has no room for
+// it. Returns false => the caller STALLS: `partial` KEEPS the complete line, `held`
+// stays true, `cursor` does NOT advance, and NOTHING is lost.
+//
+// PRECONDITION, now actually established by the caller (B1): `sub.held` is true and
+// `sub.partial` ENDS WITH '\n'. Rev 5's doc comment claimed this and its only call
+// site never produced it.
 try_emit_line(sub) -> bool:
-    body = sub.partial without the trailing '\n' (and a trailing '\r')
+    // B1: `partial` INCLUDES the '\n', so `off` lands PAST the newline — which is
+    // what makes it a valid §9 resume cursor (the start of the NEXT line). Rev 5
+    // omitted the newline and drifted one byte per line, cumulatively.
     off  = sub.cursor + sub.partial.len()
-    if body is empty (whitespace only):
-        sub.cursor = off; sub.partial.clear(); return true    // G11: blank = silent no-op
+    body = sub.partial without the trailing '\n' (and a trailing '\r')
+
+    if body is empty (whitespace only):                        // G11: blank = silent no-op
+        sub.cursor = off; sub.partial.clear(); sub.held = false; return true
+
     frame = event_frame(session, off, body)                    // &[u8] in, VERBATIM splice
              or skipped_frame(session, off, body.len(), "not_a_json_object")
-    // R3's guarantee: `frame_overhead` bounded `partial` above, so this frame ALWAYS
-    // fits an EMPTY `out`. Therefore a stalled line can never stall forever — it goes
-    // out as soon as the socket drains what is ahead of it.
+
+    // R3's guarantee, and it survives B1's extra byte: the pre-push guard bounds
+    // `partial.len() + frame_overhead <= cap` BEFORE the '\n' is pushed, and `body`
+    // strips that '\n' again — so `frame.len() = frame_overhead + body.len() <= cap`
+    // and this frame ALWAYS fits an EMPTY `out`. A held line therefore can never
+    // stall forever: it goes out the moment the socket drains what is ahead of it.
     if sub.out.len() + frame.len() > cap: return false         // STALL (R1), never Drop
+
     sub.out.extend(frame); sub.high_water = max(sub.high_water, sub.out.len())
-    sub.cursor = off; sub.partial.clear(); return true
+    sub.cursor = off; sub.partial.clear(); sub.held = false; return true
 ```
 
 **Termination, per call — restated to cover (B) (R2 falsified rev 4's proof).** (A) is bounded by `MAX_PUMP_BYTES_PER_WAKE` and by `stalled`. **(B) fires AT MOST ONCE per subscriber, ever** (`end_sent`) — this is the branch rev 4's proof did not cover, and it neither advanced `scan` nor drained `out`, so it looped forever. (C) either drains `out`, returns `Ok`, or returns `Gone`/`Drop`. So every iteration advances `scan`, drains `out`, or sets a one-shot flag — all bounded. **`pump` always returns.**
@@ -1485,9 +1608,14 @@ try_emit_line(sub) -> bool:
 
 **`poll_timeout` (extended) — G2, and the disjunct rev 3 got wrong:**
 ```rust
-// ZERO iff some subscriber has PUMPABLE FILE WORK and no fd will signal it.
+// ZERO iff some subscriber has PUMPABLE WORK and no fd will signal it.
+// B3(c): `|| s.held` — a line HELD at `scan == tail` (the normal terminal state of a
+// catch-up that ran at the cap) is real, pending work. Rev 5 required `scan < tail`,
+// so for such a subscriber NOTHING was armed: `blocked_since` is None (the peer IS
+// reading), no WRITABLE edge is pending once `out` drains, and the last line of the
+// history was never delivered — and the end frame never followed it.
 let subscriber_work = self.subscribers.values()
-    .any(|s| s.out.is_empty() && s.scan < s.tail && !s.end_sent);
+    .any(|s| s.out.is_empty() && (s.held || s.scan < s.tail) && !s.end_sent);
 // R1: a peer that accepts NOTHING generates NO events at all — not a WRITABLE edge,
 // not an EOF. So the stall drop needs its own armed deadline, and it is the ONLY
 // thing that can ever fire for that subscriber. Armed only while blocked; None
@@ -1574,7 +1702,7 @@ Test 13 drives it with `FAKE_AGENT_HUGE_LINE=2097152` (2 MiB — over the 1 MiB 
 - [ ] **Step 5: Run.**
 
 Run: `cargo test -p camp --bins daemon::control && cargo test -p camp --test control 2>&1 | tail -40`
-Expected: PASS — unit **28** (7 from Task 1 + 10 from Task 3 + **11** here); integration **19** (6 from Task 6 + 1 from Task 7 + **12** here). *(G9: if an observed count differs, RECONCILE THE LIST against the enumerations above — never delete a test to satisfy a gate. **This is the third revision whose counts were stale; they are recomputed from the lists, not carried forward.**)*
+Expected: PASS — unit **31** (7 from Task 1 + 10 from Task 3 + **14** here); integration **21** (6 from Task 6 + 1 from Task 7 + **14** here). *(G9: if an observed count differs, RECONCILE THE LIST against the enumerations above — **never delete a test to satisfy a gate**. The counts have been stale four revisions running; these are recomputed from the lists, not carried forward.)*
 
 - [ ] **Step 6: Full suite + commit.**
 ```bash
@@ -1694,6 +1822,18 @@ git commit -m "test(compat): the \$0 gate sends camp's own bytes and proves the 
 
 - [ ] **Step 1: Rebase onto main.** `git fetch origin && git rebase origin/main`. **`event_loop.rs` is NOT additive** — expect a real conflict with compat-2. Keep both sides; if impossible, STOP and ask the lead.
 
+- [ ] **Step 1b: AMEND §4.4 OF THE SPEC — IN THIS PR.** AGENTS.md: *"If implementation reality contradicts the spec, stop and update the spec via PR in the same change — spec and code never silently diverge."* **cp-1 deliberately does NOT implement §4.4's literal "a subscriber whose buffer crosses the cap is dropped"** — the cap is a **stop** and the drop is a **stalled peer** (R1). Carrying that as an unrecorded divergence is exactly what the repo forbids.
+
+Edit `docs/superpowers/specs/2026-07-12-camp-control-plane-design.md` §4.4's second bullet to read, in substance:
+
+> **`subscriber_buffer_bytes` (default 1 MiB) is a STOP, not a kill.** When the buffer is full campd stops framing and holds the next complete line; nothing is lost and nothing is dropped. **A subscriber is dropped when its PEER STOPS READING** — its socket has accepted zero bytes for `SUBSCRIBER_STALL_TIMEOUT` (30 s) with data buffered — dropped loudly, with `subscriber.dropped` naming the session and the high-water mark. It is never blocked on, and events are never silently discarded.
+>
+> *Rationale (cp-1): during catch-up the producer is a FILE read and a file always outruns a socket (macOS's unix-socket send buffer is 8 KiB), so a buffer-SIZE kill drops healthy, fast-reading clients that are merely BEHIND — breaking §4.1's "a late joiner gets history, then follows" and §9's "never a silently truncated stream" for any session with more than 1 MiB of output. campd still never blocks; memory is still bounded (`out` ≤ cap and `partial` ≤ cap); a genuinely stalled peer is still dropped loudly.*
+>
+> *Known residual, accepted for cp-1: a peer accepting one byte per interval clears the stall timer indefinitely and can hold a buffer and a subscriber slot. It is reading, so it is not stalled. A byte-rate floor is a cp-2 obligation.*
+
+**This is a spec edit and it needs operator sign-off** (AGENTS.md, and the Global Constraints above). **Raise it with the lead as part of the PR — do not merge the code without it.**
+
 - [ ] **Step 2: Prove the dead_code discipline held (C4).**
 ```bash
 ! grep -rn "first read in Task" crates/camp/src/ \
@@ -1711,8 +1851,8 @@ cargo test --workspace
 
 | filter | expected | made of |
 |---|---|---|
-| `cargo test -p camp --bins daemon::control` | **28** | Task 1: 7 · Task 3: 10 · Task 8: **11** |
-| `cargo test -p camp --test control` | **19** | Task 6: 6 · Task 7: 1 · Task 8: **12** |
+| `cargo test -p camp --bins daemon::control` | **31** | Task 1: 7 · Task 3: 10 · Task 8: **14** |
+| `cargo test -p camp --test control` | **21** | Task 6: 6 · Task 7: 1 · Task 8: **14** |
 | `cargo test -p camp --bins daemon::read_channel` | **3 NEW** + every cp-0 test (25 total today) | Task 4 |
 | `cargo test -p camp --bins daemon::dispatch` | **2 NEW** + every existing | Task 5 |
 | `cargo test -p camp --bins daemon::socket` | **2 NEW** wire pins (`control_plane_verbs…`, `subscribe…`, `sessions_list…` minus the DELETED `nudge_wire_format_is_pinned`) + every existing | Tasks 6–8 |
