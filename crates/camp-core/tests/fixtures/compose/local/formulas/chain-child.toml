@@ -1,0 +1,15 @@
+formula = "chain-child"
+extends = "chain-base"
+
+[[steps]]
+id = "first"
+title = "First (child)"
+
+[[steps]]
+id = "refused-here"
+title = "Clean replacement"
+
+[[steps]]
+id = "third"
+title = "Third (child)"
+needs = ["second"]

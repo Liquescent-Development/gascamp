@@ -83,20 +83,32 @@ pub fn compile(
         }])
     })?;
 
-    // ---- stage 1: the key table, at this file's ORIGIN (D2′).
-    let origin = layers.origin_of(path);
-    let mut walked = parse::walk(&source, origin);
+    // ---- stages 1 + 2: the key table (at this file's ORIGIN, D2′) and the
+    // extends chain, merged deepest-ancestor-first.
+    let mut visiting = Vec::new();
+    let mut walked = match chain(layers, path, &source, &mut visiting) {
+        Ok(w) => w,
+        Err(e) => {
+            return Err(FormulaError {
+                path: path.to_path_buf(),
+                violations: vec![Violation {
+                    construct: "extends".to_owned(),
+                    message: e.to_string(),
+                }],
+                refusals: Vec::new(),
+            });
+        }
+    };
 
-    // ---- stage 2: extends (rung 2c). Identity until Task 6.
     // ---- stage 3: expansion + {name} (rung 2d). Identity until Task 7.
     //
-    // Until those rungs land, `keys::UNIMPLEMENTED` makes any formula that USES
-    // them a hard violation, so an identity stub here can never silently drop a
-    // construct (§4 trap 3). That is the whole reason UNIMPLEMENTED exists, and
-    // it is deleted the moment the last rung lands.
+    // Until that rung lands, `keys::UNIMPLEMENTED` makes any formula that USES it
+    // a hard violation, so an identity stub here can never silently drop a
+    // construct (§4 trap 3). That is the whole reason UNIMPLEMENTED exists, and it
+    // is deleted the moment the last rung lands.
     let _ = cfg;
 
-    // The merged var VALUES: the formula's declared defaults, with the caller's
+    // The merged var VALUES: the chain's declared defaults, with the caller's
     // overrides on top. Conditions are evaluated over these — never by text
     // substitution (that is `{{var}}`, and it happens at COOK).
     let vars = merge_vars(&walked.raw.vars, vars_override);
@@ -160,6 +172,140 @@ pub fn compile_named(
         refusals: Vec::new(),
     })?;
     compile(layers, cfg, &path, vars_override)
+}
+
+/// Stage 2 — `extends` (rung 2c), merged DEEPEST ANCESTOR FIRST.
+///
+/// §9: *a child seeds scalars; parents' steps **APPEND**; a child step whose `id`
+/// matches a parent's **REPLACES IT WHOLE, IN PLACE, preserving position**. No
+/// field-level merge.* Parents resolve by BARE NAME through the layers — §7.2 is
+/// what puts `build-base` in them.
+///
+/// **This is why 2c is 49 and not 57.** Camp resolves `extends` here, at stage 2,
+/// and validates the MERGED step list at stage 6 — so eight formulas that inherit
+/// a late-rung key ONLY from a parent (7 inherit `drain`, 1 inherits
+/// `expand`/`expand_vars`) are blocked until that parent's rung lands. gc
+/// corroborates: the corpus AUTHORS 12 separate drain steps and gc COMPILES 19.
+fn chain(
+    layers: &FormulaLayers,
+    path: &Path,
+    source: &str,
+    visiting: &mut Vec<String>,
+) -> Result<parse::Walked, CoreError> {
+    let origin = layers.origin_of(path);
+    let mut me = parse::walk(source, origin);
+    // Stamp each step with ITS OWN formula's directory, before any merge can move
+    // it into a child. A non-asset `description_file` on an inherited step
+    // resolves against the parent's dir, not the child's.
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    for step in &mut me.raw.steps {
+        step.base_dir = Some(base.to_path_buf());
+    }
+    if me.raw.extends.is_empty() {
+        return Ok(me);
+    }
+    let parents = std::mem::take(&mut me.raw.extends);
+
+    // Deepest ancestor first: fold the parents together, then lay the child on
+    // top of them.
+    let mut acc: Option<parse::Walked> = None;
+    for parent in &parents {
+        if visiting.iter().any(|v| v == parent) {
+            return Err(CoreError::Formula(format!(
+                "extends cycle: {} -> {parent}",
+                visiting.join(" -> ")
+            )));
+        }
+        let parent_path = layers.formula_path(parent).map_err(|e| {
+            CoreError::Formula(format!(
+                "extends {parent:?}: {e} (a parent resolves by bare name through the formula \
+                 layers)"
+            ))
+        })?;
+        let parent_source = std::fs::read_to_string(&parent_path).map_err(|e| {
+            CoreError::Formula(format!(
+                "extends {parent:?}: cannot read {}: {e}",
+                parent_path.display()
+            ))
+        })?;
+        visiting.push(parent.clone());
+        let walked = chain(layers, &parent_path, &parent_source, visiting)?;
+        visiting.pop();
+        acc = Some(match acc {
+            None => walked,
+            Some(lower) => overlay(lower, walked),
+        });
+    }
+    Ok(match acc {
+        None => me,
+        Some(ancestors) => overlay(ancestors, me),
+    })
+}
+
+/// Lay `child` over `parent`. Scalars: the child SEEDS them, so a child value
+/// wins and an absent one INHERITS (gc `parser.go:305-312` — `contract` and
+/// `requires` really do inherit).
+fn overlay(parent: parse::Walked, child: parse::Walked) -> parse::Walked {
+    let mut steps = parent.raw.steps;
+    let mut replaced: BTreeSet<String> = BTreeSet::new();
+    for step in child.raw.steps {
+        let existing = step
+            .id
+            .as_deref()
+            .and_then(|id| steps.iter().position(|s| s.id.as_deref() == Some(id)));
+        match existing {
+            // REPLACED WHOLE, IN PLACE, position preserved. No field-level merge:
+            // a child step that omits `description` does NOT inherit the parent's.
+            Some(at) => {
+                if let Some(id) = &step.id {
+                    replaced.insert(id.clone());
+                }
+                steps[at] = step;
+            }
+            // APPENDED.
+            None => steps.push(step),
+        }
+    }
+
+    // BD2's NEW failure mode: a refusal carried from a PARENT step that the child
+    // REPLACES IN PLACE must die with the step it belonged to.
+    let mut refusals: Vec<Refusal> = parent
+        .refusals
+        .into_iter()
+        .filter(|r| match &r.step {
+            Some(step) => !replaced.contains(step),
+            None => true,
+        })
+        .collect();
+    refusals.extend(child.refusals);
+
+    // Vars: PARENT DEFAULTS FIRST, CHILD OVERRIDES WIN. Load-bearing —
+    // `drain_policy = "separate"` is declared in gascity's `build-base`, not in
+    // the children that depend on it.
+    let mut vars = parent.raw.vars;
+    vars.extend(child.raw.vars);
+
+    let mut violations = parent.violations;
+    violations.extend(child.violations);
+    let mut ignored = parent.ignored;
+    ignored.extend(child.ignored);
+
+    parse::Walked {
+        raw: parse::RawFormula {
+            // The CHILD's identity, always — a formula is named by its own file.
+            name: child.raw.name,
+            description: child.raw.description.or(parent.raw.description),
+            formula_compiler: child.raw.formula_compiler.or(parent.raw.formula_compiler),
+            contract: child.raw.contract.or(parent.raw.contract),
+            kind: child.raw.kind.or(parent.raw.kind),
+            vars,
+            extends: Vec::new(),
+            steps,
+        },
+        violations,
+        refusals,
+        ignored,
+    }
 }
 
 /// The merged var VALUES. Declared defaults first, the caller's overrides on
@@ -301,7 +447,12 @@ fn inline_description_files(
         let Some(rel) = step.description_file.clone() else {
             continue;
         };
-        let resolved = layers.asset_path(&rel, base_dir)?;
+        // The step's OWN formula's directory — see `RawStep::base_dir`.
+        let base = step
+            .base_dir
+            .clone()
+            .unwrap_or_else(|| base_dir.to_path_buf());
+        let resolved = layers.asset_path(&rel, &base)?;
         let bytes = std::fs::read(&resolved).map_err(|e| {
             CoreError::Formula(format!(
                 "description_file {rel:?}: cannot read {}: {e}",

@@ -341,3 +341,99 @@ fn vars_with_no_default_are_declared_but_undefined() {
         Some("separate".to_owned())
     );
 }
+
+// ---- rung 2c: extends ------------------------------------------------------
+
+#[test]
+fn a_parents_steps_append_and_a_matching_child_id_replaces_in_place() {
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "chain-child", &no_vars()).unwrap();
+    // Position PRESERVED: `first` stays first even though the child re-declares it.
+    assert_eq!(
+        ids(&compiled),
+        vec!["first", "second", "refused-here", "third"]
+    );
+    let first = &compiled.formula.steps[0];
+    assert_eq!(first.title, "First (child)");
+    // REPLACED WHOLE — no field-level merge. The child omits `description`, so it
+    // does NOT inherit the parent's.
+    assert_eq!(
+        first.description, None,
+        "a replaced step is replaced WHOLE; there is no field-level merge"
+    );
+}
+
+#[test]
+fn a_refusal_on_a_parent_step_that_the_child_replaces_is_discarded() {
+    // BD2's NEW failure mode. The parent's `refused-here` step carries a `gate`
+    // (a §4 rule-1 refusal). The child REPLACES that step in place with a clean
+    // one — so the parent's refusal must die with the step it belonged to.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "chain-child", &no_vars())
+        .expect("the replaced parent step's refusal must be discarded");
+    assert!(compiled.refusals.is_empty(), "{:?}", compiled.refusals);
+    assert_eq!(compiled.formula.steps[2].title, "Clean replacement");
+}
+
+#[test]
+fn the_child_seeds_scalars_and_inherits_the_parents_vars() {
+    // `drain_policy = "separate"` is declared in gascity's `build-base`, NOT in
+    // the children that depend on it — that inheritance is load-bearing for the
+    // whole shared-drain pruning story.
+    let c = camp();
+    let compiled = compile_named(&c.layers, &c.cfg, "chain-child", &no_vars()).unwrap();
+    assert_eq!(
+        compiled.formula.vars["drain_policy"],
+        Some("separate".to_owned())
+    );
+    // And `contract` INHERITS (gc parser.go:308) — the child declares none.
+    assert!(compiled.is_runnable(), "contract inherits from the parent");
+}
+
+#[test]
+fn a_parent_resolves_by_bare_name_through_the_layers() {
+    // `chain-base` lives in the IMPORTED parent pack; the child is camp-local.
+    // Parents resolve by bare name through the layer stack — §7.2 is what puts
+    // `build-base` within reach of `bmad-build`.
+    let c = camp();
+    assert!(compile_named(&c.layers, &c.cfg, "chain-child", &no_vars()).is_ok());
+}
+
+#[test]
+fn an_unresolvable_parent_is_a_hard_error_naming_it() {
+    // `mol-polecat-work` extends `mol-polecat-base`, which is absent from the
+    // corpus. gc fails it too — gc compiles 99/100.
+    let c = camp();
+    let err = compile_named(&c.layers, &c.cfg, "orphan", &no_vars()).unwrap_err();
+    assert!(err.names("extends"), "{err}");
+    assert!(err.to_string().contains("no-such-parent"), "{err}");
+}
+
+#[test]
+fn an_extends_cycle_is_a_hard_error_never_a_stack_overflow() {
+    let c = camp();
+    let err = compile_named(&c.layers, &c.cfg, "cycle-a", &no_vars()).unwrap_err();
+    assert!(err.to_string().contains("cycle"), "{err}");
+}
+
+#[test]
+fn a_formula_that_inherits_drain_ONLY_from_its_parent_is_blocked_until_rung_2e() {
+    // ⭐ BD1 — this is what moves rung 2c from 57 to 49.
+    //
+    // `inherits-drain` declares NOTHING but `extends`. Camp resolves the chain at
+    // stage 2 and validates the MERGED step list at stage 6, so the parent's
+    // `drain` key is camp's problem even though the child never typed it. Seven
+    // corpus formulas (`build-from-*`) inherit `drain` exactly this way, and one
+    // (`github-issue-fix`) inherits `expand`/`expand_vars`.
+    //
+    // gc corroborates: the corpus AUTHORS 12 separate drain steps and gc COMPILES
+    // 19 — the seven extra are inherited.
+    let c = camp();
+    let err = compile_named(&c.layers, &c.cfg, "inherits-drain", &no_vars())
+        .expect_err("an inherited drain is still a drain");
+    assert!(err.names("drain"), "{err}");
+    assert!(
+        err.to_string().contains("does not honour it yet"),
+        "blocked as UNIMPLEMENTED, not refused: {err}"
+    );
+}

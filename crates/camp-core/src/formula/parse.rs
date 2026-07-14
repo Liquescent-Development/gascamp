@@ -31,6 +31,10 @@ pub(crate) struct RawFormula {
     /// the name still exists (gc's pointer prompt lists it) but no value
     /// resolves, so a `{{name}}` placeholder survives verbatim.
     pub vars: BTreeMap<String, Option<String>>,
+    /// `extends` — rung 2c. Parents resolve by BARE NAME through the layers.
+    /// 48 corpus formulas extend; none extends more than one parent, but gc's
+    /// shape is a list and camp implements the list.
+    pub extends: Vec<String>,
     pub steps: Vec<RawStep>,
 }
 
@@ -50,6 +54,11 @@ pub(crate) struct RawStep {
     /// Rung 2b. CONSUMED at compile (stage 5): a false condition PRUNES the
     /// step, its children, and its REFUSALS (BD2).
     pub condition: Option<String>,
+    /// The directory of the formula file this step was AUTHORED in — which,
+    /// after an `extends` merge, is not the child's. A non-asset
+    /// `description_file` resolves against it (gc resolves each formula's
+    /// description files against its own base dir). Set by `compose::chain`.
+    pub base_dir: Option<PathBuf>,
     pub needs: Vec<String>,
     pub assignee: Option<String>,
     pub timeout: Option<Duration>,
@@ -314,6 +323,7 @@ pub(crate) fn walk(text: &str, origin: Origin) -> Walked {
         contract: None,
         kind: None,
         vars: BTreeMap::new(),
+        extends: Vec::new(),
         steps: Vec::new(),
     };
     let table: toml::Table = match text.parse() {
@@ -340,6 +350,7 @@ pub(crate) fn walk(text: &str, origin: Origin) -> Walked {
     let kind = get_string(&table, "type", "type", &mut ctx.violations);
     let formula_compiler = walk_requires(&table, &mut ctx.violations);
     let vars = walk_vars(&table, &mut ctx.violations);
+    let extends = walk_extends(&table, &mut ctx.violations);
     let steps = walk_steps(&table, &mut ctx);
 
     Walked {
@@ -350,6 +361,7 @@ pub(crate) fn walk(text: &str, origin: Origin) -> Walked {
             contract,
             kind,
             vars,
+            extends,
             steps,
         },
         violations: ctx.violations,
@@ -395,6 +407,19 @@ fn walk_requires(table: &toml::Table, out: &mut Vec<Violation>) -> Option<String
 ///
 /// gc's var tables also carry `description` and `required`; camp reads neither.
 /// `required` is gc's own sling-time prompt, and camp has no interactive sling.
+/// `extends` (rung 2c): a bare name, or a list of them. gc's shape is a list.
+fn walk_extends(table: &toml::Table, out: &mut Vec<Violation>) -> Vec<String> {
+    match table.get("extends") {
+        None => Vec::new(),
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(_)) => get_string_array(table, "extends", "extends", out),
+        Some(_) => {
+            out.push(wrong_type("extends", "a formula name or a list of them"));
+            Vec::new()
+        }
+    }
+}
+
 fn walk_vars(table: &toml::Table, out: &mut Vec<Violation>) -> BTreeMap<String, Option<String>> {
     let mut vars = BTreeMap::new();
     match table.get("vars") {
@@ -490,6 +515,7 @@ fn walk_step(index: usize, step: &toml::Table, ctx: &mut Ctx) -> RawStep {
         description_file,
         metadata,
         condition,
+        base_dir: None,
         needs,
         assignee,
         timeout,
@@ -1010,15 +1036,15 @@ mode = "fanout"
     #[test]
     fn walk_collects_every_finding_and_sorts_them_into_the_right_bucket() {
         // One file, three verdicts — and the buckets are the point. `pour` is a
-        // REFUSAL (§4 rule 1, permanent). `extends` is a VIOLATION only because
-        // its rung has not landed (temporary — UNIMPLEMENTED). `tags` is an
+        // REFUSAL (§4 rule 1, permanent). `drain` is a VIOLATION only because its
+        // rung has not landed (temporary — UNIMPLEMENTED). `tags` is an
         // ANNOTATION and is SILENT. Conflating any two of these is how the old
         // table refused 95 of the 100 corpus formulas.
-        let text = "formula = \"x\"\nextends = \"p\"\npour = true\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ntags = [\"x\"]\n";
+        let text = "formula = \"x\"\npour = true\n[[steps]]\nid = \"a\"\ntitle = \"t\"\ntags = [\"x\"]\ndrain = { formula = \"i\" }\n";
         let w = walk(text, Origin::CampLocal);
 
         let c: Vec<&str> = w.violations.iter().map(|v| v.construct.as_str()).collect();
-        assert_eq!(c, vec!["extends"], "only the unimplemented rung key: {c:?}");
+        assert_eq!(c, vec!["drain"], "only the unimplemented rung key: {c:?}");
 
         let r: Vec<&str> = w.refusals.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(r, vec!["pour"], "{r:?}");
