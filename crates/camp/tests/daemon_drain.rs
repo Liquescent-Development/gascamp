@@ -183,6 +183,18 @@ impl Camp {
             .unwrap_or_else(|e| panic!("bead {id} has no row, so it has no step_id: {e}"))
     }
 
+    /// The bead's `run_id`. The OTHER half of the membership predicate — see
+    /// `close_member`, which needs BOTH columns because `dispatchable_beads` is a
+    /// CONJUNCTION. Same fail-fast contract as `step_id_of`: a missing row is a hard
+    /// failure, never a `None`.
+    fn run_id_of(&self, id: &str) -> Option<String> {
+        self.conn()
+            .query_row("SELECT run_id FROM beads WHERE id = ?1", [id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .unwrap_or_else(|e| panic!("bead {id} has no row, so it has no run_id: {e}"))
+    }
+
     /// Every bead campd has woken a worker for, by bead id.
     ///
     /// `session.woke` is campd SAYING WHAT IT DISPATCHED AND TO WHOM. It is the only
@@ -195,8 +207,8 @@ impl Camp {
             .collect()
     }
 
-    /// ⭐ No dispatch may have FAILED. Called by EVERY happy-path test in this file —
-    /// all 13 of them.
+    /// ⭐ No dispatch may have FAILED. Called by EVERY test in this file that can call
+    /// it — all 14 of them.
     ///
     /// The comment here used to SAY "call this on every happy path" while 2 of 20 tests
     /// called it. That is the same class of false in-code claim as a `die()` message
@@ -204,14 +216,23 @@ impl Camp {
     /// not keep, so a reader trusted a guarantee that was not there. It is now kept, and
     /// what follows is the whole truth about where this runs and what it can see.
     ///
-    /// It is NOT called by the seven FAILURE-path tests, because they EXPECT a
+    /// It is NOT called by the six FAILURE-path tests, because they EXPECT a
     /// `dispatch.failed` and assert its reason themselves: `a_conflicting_drain…`,
     /// `a_reserve_conflict…`, `execute_drain_closes_the_anchor…`,
     /// `a_post_reserve_failure…`, `a_failed_drain_does_not_poison…`,
-    /// `execute_drain_refuses…`, `a_drain_over_100_members…`. `dispatch.failed` is not
-    /// only a SPAWN failure — campd also emits it for a reservation conflict and an
-    /// unusable item formula, which those tests exist to provoke. So this is not a
-    /// universal invariant and must not be hoisted into `Drop`.
+    /// `execute_drain_refuses…`. Injecting this helper into each of those six turns it
+    /// RED, so the exclusion is earned, not asserted. `dispatch.failed` is not only a
+    /// SPAWN failure — campd also emits it for a reservation conflict and an unusable
+    /// item formula, which those six exist to provoke. So this is not a universal
+    /// invariant and must not be hoisted into `Drop`.
+    ///
+    /// F3-B: that list held a SEVENTH name — `a_drain_over_100_members…` — excused on
+    /// the same grounds, and for it the grounds were FALSE. It emits no
+    /// `dispatch.failed` at all: the cap is checked BEFORE the reserve, so nothing is
+    /// dispatched and nothing fails to dispatch (it asserts on a `bead.closed` carrying
+    /// `limit_exceeded`). It could always have called this and silently did not. It
+    /// calls it now — an exclusion nobody had ever checked, hiding inside the very
+    /// comment written to stop unchecked claims.
     ///
     /// And it can only see a dispatch that FAILED LOUDLY. A dispatch that never HAPPENS
     /// logs nothing, and silence is not evidence — that gap is `close_dispatched`'s,
@@ -311,16 +332,29 @@ impl Camp {
     /// `a_CLOSED_member_is_never_scattered` STILL PASSES, because this method absorbs
     /// the wrongly-dispatched member. The guard is what turns that into a hard failure.
     ///
-    /// It asserts the REAL contract, not a naming rule: a NULL `step_id` is *precisely*
-    /// the column `dispatchable_beads` uses to exclude members
-    /// (`NOT (run_id IS NOT NULL AND step_id IS NULL)`). Wrong-kind routing is now
-    /// impossible rather than merely discouraged.
-    /// `close_member_REFUSES_a_dispatched_bead` holds this shut.
+    /// So the guard MIRRORS THE PRODUCT PREDICATE EXACTLY, and it takes both columns to
+    /// do it. `dispatchable_beads` (`readiness.rs:166`) excludes a bead by a
+    /// CONJUNCTION — `NOT (run_id IS NOT NULL AND step_id IS NULL)` — so a bead is a
+    /// member iff `run_id IS NOT NULL` **and** `step_id IS NULL`. A NULL `step_id` alone
+    /// is NECESSARY BUT NOT SUFFICIENT, and round 4's guard tested only that half.
+    ///
+    /// The missing conjunct was a real hole, proven by execution: a RUNLESS bead
+    /// (`camp create <title>` with no `--run` — `run` is `Option<String>`) has `run_id`
+    /// NULL *and* `step_id` NULL, so `NOT(false AND true)` = TRUE and campd DISPATCHES
+    /// it. It slid through the `step_id`-only guard and `close_member` absorbed it —
+    /// the V-5 blindness reinstated in its exact shape, straight through the check that
+    /// exists to prevent it. Both conjuncts, or it is not a contract.
+    /// `close_member_REFUSES_a_dispatched_bead` and
+    /// `close_member_REFUSES_a_RUNLESS_dispatched_bead` hold this shut.
     fn close_member(&self, bead: &str, outcome: &str) {
         assert!(
-            self.step_id_of(bead).is_none(),
-            "close_member called on a bead with a step_id ({bead}) — that bead IS \
-             dispatched; use close_dispatched"
+            self.run_id_of(bead).is_some() && self.step_id_of(bead).is_none(),
+            "close_member called on a bead that is NOT a run member ({bead}: run_id={:?} \
+             step_id={:?}) — a member is `run_id IS NOT NULL AND step_id IS NULL`, which \
+             is exactly what `dispatchable_beads` excludes. Anything else campd \
+             DISPATCHES; use close_dispatched",
+            self.run_id_of(bead),
+            self.step_id_of(bead)
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1215,6 +1249,10 @@ fn a_drain_over_100_members_fails_the_drain_and_scatters_nothing() {
                 .contains("limit_exceeded")),
         "the close names gc's reason"
     );
+    // F3-B: this test emits NO `dispatch.failed` at all — the cap is checked BEFORE the
+    // reserve, so nothing is ever dispatched and nothing ever fails to dispatch. It was
+    // excluded from this helper for a reason that was simply untrue.
+    c.assert_no_dispatch_failures();
 }
 
 #[test]
@@ -1253,7 +1291,46 @@ fn close_member_REFUSES_a_dispatched_bead() {
 }
 
 #[test]
-#[should_panic(expected = "campd never woke a worker for it")]
+#[should_panic(expected = "is NOT a run member")]
+fn close_member_REFUSES_a_RUNLESS_dispatched_bead() {
+    // ⭐ F1-B. Round 4's guard asserted only `step_id IS NULL`, and was SOLD as
+    // mirroring `dispatchable_beads`. It did not. That predicate is a CONJUNCTION —
+    // `NOT (run_id IS NOT NULL AND step_id IS NULL)` — so a NULL `step_id` is merely
+    // NECESSARY for membership, never sufficient, and the guard tested one conjunct.
+    //
+    // A RUNLESS bead is the counter-example it let through: `camp create` with no
+    // `--run` leaves `run_id` NULL *and* `step_id` NULL, so the exclusion evaluates
+    // `NOT(false AND true)` = TRUE — it is DISPATCHABLE, campd really wakes a worker
+    // for it, and yet it satisfied the one-conjunct guard. `close_member` then absorbed
+    // a bead a worker had genuinely run: the V-5 blindness reinstated in its exact
+    // original shape, straight through the check that exists to prevent it.
+    //
+    // Nothing in the suite was blind (it creates no runless beads) — but a guard sold
+    // as making wrong-kind routing IMPOSSIBLE has to actually do that. This test is why
+    // the second conjunct cannot be dropped again.
+    let mut c = Camp::new();
+    c.spawn_campd();
+    let bead: String = c.camp_ok(&["create", "a runless bead"]).trim().into();
+    c.settle();
+
+    // Precisely the shape the old guard could not see.
+    assert_eq!(c.run_id_of(&bead), None, "precondition: belongs to NO run");
+    assert_eq!(
+        c.step_id_of(&bead),
+        None,
+        "precondition: NULL step_id — this is what satisfied round 4's guard"
+    );
+    assert!(
+        c.woken_beads().contains(&bead),
+        "precondition: campd DISPATCHED it — a runless bead is not excluded by \
+         `dispatchable_beads`, so a worker really ran it"
+    );
+
+    c.close_member(&bead, "pass");
+}
+
+#[test]
+#[should_panic(expected = "is closed but campd never woke")]
 fn close_dispatched_REFUSES_a_CLOSED_bead_no_worker_ever_touched() {
     // ⭐ F2. `close_dispatched` promises it accepts a bead ONLY on positive evidence a
     // worker existed — that promise is the entire reason it was split out of
