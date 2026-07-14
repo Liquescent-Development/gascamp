@@ -1,0 +1,1 @@
+{"type":"control_request","request_id":"cli-fixture-3","request":{"subtype":"request_user_dialog","dialog_kind":"unknown","payload":{},"tool_use_id":"toolu_fixture"}}

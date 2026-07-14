@@ -1,5 +1,28 @@
 # cp-1: the control protocol — one module owns the wire, four verbs on the socket — Implementation Plan
 
+## Plan-gate approval
+
+APPROVED 2026-07-13 (rev 6, b589672) after SIX adversarial review rounds
+(4-panelist panels: contract-completeness / interface-regression /
+execution-readiness + a completeness critic, each defaulting to BLOCK).
+
+Rounds 1-5 found and closed, among others: a silent-data-loss reintroduction
+of cp-0's own worst bug; a `pump` that livelocked campd on any stream line
+> 64 KiB; a `pump` that dropped healthy fast-reading subscribers on any
+backlog > 1 MiB; a cumulative one-byte-per-line offset drift that broke §9's
+resume cursor; three separate "this test gates it" claims that were false;
+and an invented `request_user_dialog` wire shape that cp-3 would have
+inherited as pinned (corrected by extracting the real shape from the shipped
+CLI bundle).
+
+D1-D5 ratified. §4.4 amendment approved by the operator (see below).
+
+Non-blocking notes accepted at approval: the loaded perf arm is local-only
+(`make perf` is #[ignore]d and never runs in CI) — the unit tests are the
+CI-side defence and the PR body must say so; only half the subscriber drop
+policy transfers to cp-2 (the stall rule does; "hold the line in `partial`"
+cannot, since a ledger event has no file to be held in).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task (this stream is planning-only; a FRESH implementer session executes after plan-gate APPROVE). Steps use checkbox (`- [ ]`) syntax. Branch: `cp-1-control-protocol`.
 
 **Goal:** Give campd a control plane: ONE module that owns the undocumented `claude` control wire format (pinned by fixtures whose provenance is labelled), and the first four socket verbs — `sessions.list`, `session.send_turn`, `session.interrupt`, `session.subscribe` — with `interrupt`'s `control_response` round-tripping back over cp-0's read channel, and `subscribe` as a bounded, drop-loudly, streaming connection MODE.

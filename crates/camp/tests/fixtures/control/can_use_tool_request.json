@@ -1,0 +1,1 @@
+{"type":"control_request","request_id":"cli-fixture-2","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"cargo publish"},"tool_use_id":"toolu_fixture","description":"run cargo publish","requires_user_interaction":true}}

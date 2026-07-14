@@ -1,0 +1,1 @@
+{"type":"control_response","response":{"subtype":"success","request_id":"cli-fixture-2","response":{"behavior":"deny","message":"denied by the operator"}}}

@@ -4,6 +4,7 @@
 //! readiness on stdout, and sleeps on the socket.
 
 pub mod bounded;
+pub mod control;
 pub mod cursor;
 pub mod dispatch;
 pub mod event_loop;
