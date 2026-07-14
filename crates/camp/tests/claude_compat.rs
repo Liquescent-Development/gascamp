@@ -86,7 +86,7 @@ fn pinned_version_file_is_present_and_shaped() {
         !pin.contains(char::is_whitespace),
         "pin must be a bare version token (no `(Claude Code)` suffix, no spaces): {pin:?}"
     );
-    // Shape: dotted numeric, e.g. 2.1.207.
+    // Shape: dotted numeric, e.g. 2.1.208.
     assert!(
         pin.split('.')
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
@@ -128,7 +128,10 @@ fn held_stream_flags_include_verbose_in_sdk_order() {
 
 #[test]
 fn control_response_parser_pins_the_wire_shape() {
-    // Recorded verbatim from claude 2.1.207 (pre-turn interrupt ack, $0 run).
+    // Recorded verbatim from claude 2.1.208 — the PINNED version — on a $0 run:
+    // a pre-turn interrupt with NO `initialize`, which is the configuration camp
+    // actually ships. Byte-for-byte identical on 2.1.207, so the pin bump moved
+    // nothing on the wire.
     let ok = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_int","response":{"still_queued":[]}}}"#;
     assert!(control_response_is_success(ok, "req_int"));
     // Wrong request_id must not match.
