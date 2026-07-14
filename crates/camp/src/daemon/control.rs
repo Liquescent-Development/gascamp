@@ -408,6 +408,12 @@ pub struct ControlRuntime {
     pending_events: Vec<EventInput>,
     /// G11: the `over_cap` `patrol.degraded` dedupe. N subscribers hit the SAME
     /// over-cap line and must not append N identical events.
+    ///
+    /// **RESIDUAL, RECORDED: it is never pruned** — not by `forget`, not by
+    /// `forget_session`, not by disposal. It holds one `(session, offset)` entry per
+    /// distinct over-cap LINE for campd's whole life. Over-cap lines are rare (a line
+    /// bigger than 1 MiB), so this is bounded in practice rather than by
+    /// construction; a phase that makes them common must prune it with the session.
     degraded_seen: HashSet<(String, u64)>,
     next_subscription: u64,
 }
@@ -694,7 +700,7 @@ impl ControlRuntime {
     /// re-read its stream, and no correction can ever arrive.
     ///
     /// Bounded: three full-type scans of the ledger, once per campd life.
-    pub fn rehydrate(&mut self, ledger: &Ledger, now: Timestamp) -> anyhow::Result<usize> {
+    pub fn rehydrate(&mut self, ledger: &Ledger, now: Timestamp) -> anyhow::Result<Rehydrated> {
         let events = ledger.events_range(1, None)?;
 
         let mut sent: Vec<(String, Pending)> = Vec::new();
@@ -736,10 +742,9 @@ impl ControlRuntime {
             }
         }
 
-        // The liveness filter: only sessions that are still live can ever
-        // produce another line, so only their requests can ever be corrected.
         let mut live: HashMap<String, bool> = HashMap::new();
         let mut restored = 0usize;
+        let mut events: Vec<EventInput> = Vec::new();
 
         for (id, p) in sent {
             let alive = match live.get(&p.session) {
@@ -751,27 +756,44 @@ impl ControlRuntime {
                     v
                 }
             };
-            if !alive {
-                continue;
-            }
 
+            // ---- ALREADY SETTLED ------------------------------------------------
+            // These branches run for LIVE and DEAD sessions alike, but a DEAD
+            // session's rows are dropped rather than rebuilt — THAT is the liveness
+            // filter, and that is ALL it may ever do. Nothing can arrive for a
+            // session that is gone, so rebuilding its `answered`/`timed_out` rows
+            // would grow both maps from the ledger's whole HISTORY on every start.
             if responded.contains(&id) {
-                self.answered.insert(id, p.session);
+                if alive {
+                    self.answered.insert(id, p.session);
+                }
                 continue;
             }
             match failed.get(&id).map(String::as_str) {
-                // The two CORRECTABLE causes: campd said "no answer came", and
-                // an answer may yet come.
+                // The two CORRECTABLE causes: campd said "no answer came", and an
+                // answer may yet come — but only from a session that still exists.
                 Some("silence_timeout") | Some("ceiling_timeout") => {
-                    self.timed_out.insert(id, p);
+                    if alive {
+                        self.timed_out.insert(id, p);
+                    }
                 }
-                Some(cause) if TERMINAL_CAUSES.contains(&cause) => {
-                    self.answered.insert(id, p.session);
+                // TERMINAL: nothing can ever arrive for these, so a stray
+                // `control_response` is a duplicate, never a correction. The
+                // partition lives in ONE place (`vocab::ControlFailureCause`), and
+                // its `match` is exhaustive — a cause added by a later phase must
+                // decide, at COMPILE TIME, which side it is on.
+                Some(cause)
+                    if camp_core::vocab::ControlFailureCause::parse(cause)
+                        .is_some_and(|c| c.is_terminal()) =>
+                {
+                    if alive {
+                        self.answered.insert(id, p.session);
+                    }
                 }
-                // An unrecognized cause is a HARD ERROR, never a default: a
-                // value this campd does not know means the ledger was written by
-                // a NEWER camp, and guessing its meaning is exactly the silent
-                // divergence invariant 5 forbids.
+                // An unrecognized cause is a HARD ERROR, never a default: a value
+                // this camp does not know means the ledger was written by a NEWER
+                // camp, and guessing its meaning is exactly the silent divergence
+                // invariant 5 forbids.
                 Some(unknown) => {
                     anyhow::bail!(
                         "control.failed for request_id {id} carries cause {unknown:?}, which \
@@ -780,13 +802,65 @@ impl ControlRuntime {
                          control_response is handled. Upgrade camp."
                     );
                 }
+
+                // ---- NOT SETTLED: NO terminal event exists for this request ------
+                //
+                // BD-1. The liveness filter must NEVER reach here. A request that
+                // reached no terminal state is the ONE case §2.1 forbids dropping,
+                // and skipping it produced NO EVENT AT ALL: the ledger kept
+                // `session.interrupted{request_id}` with no terminal event, FOREVER.
+                //
+                // A DEAD session cannot be disposed (it was never registered), so
+                // `forget_session` NEVER RUNS for it. `rehydrate` is the only thing
+                // left that can speak for the request — so it speaks, with the SAME
+                // event `forget_session` would have produced.
+                None if !alive => {
+                    events.push(ControlRuntime::session_ended_fault(&id, &p));
+                    // TERMINAL, and therefore IDEMPOTENT: the very
+                    // `control.failed{session_ended}` we just appended routes this id
+                    // to `answered` on the NEXT start, so a second restart appends
+                    // nothing. (That is the new case this fix creates, and
+                    // `a_restart_after_the_worker_also_died…` pins it by restarting
+                    // twice.)
+                }
                 None => {
+                    // Still live, still unanswered: a worker waiting across a restart
+                    // deserves the full window, so the deadline is FRESH.
                     self.pending.insert(id, p);
                     restored += 1;
                 }
             }
         }
-        Ok(restored)
+        Ok(Rehydrated { restored, events })
+    }
+
+    /// §2.1: the ONE event that says "this session ended with the request
+    /// unanswered". `forget_session` (campd is up, the session was disposed) and
+    /// `rehydrate` (campd was DOWN when the worker died, so disposal never ran)
+    /// must produce it IDENTICALLY — they are the same fact observed from two
+    /// different places, and an operator must not be able to tell which path
+    /// noticed.
+    fn session_ended_fault(id: &str, p: &Pending) -> EventInput {
+        EventInput {
+            kind: EventType::ControlFailed,
+            rig: p.rig.clone(),
+            actor: "campd".into(),
+            bead: p.bead.clone(),
+            data: serde_json::json!({
+                "session": p.session,
+                "request_id": id,
+                "verb": p.verb,
+                "cause": "session_ended",
+                "reason": format!(
+                    "the session {} ended with an unanswered control request \
+                     (request_id {id}, {}). The most likely story is that the interrupt \
+                     WORKED and the worker died before flushing its ack — but camp does \
+                     not know that, so it says what it does know rather than nothing \
+                     (invariant 3)",
+                    p.session, p.verb
+                ),
+            }),
+        }
     }
 
     /// G7: the session was disposed. Its still-PENDING rows are EXPIRED LOUDLY
@@ -808,26 +882,7 @@ impl ControlRuntime {
             let Some(p) = self.pending.remove(&id) else {
                 continue;
             };
-            events.push(EventInput {
-                kind: EventType::ControlFailed,
-                rig: p.rig,
-                actor: "campd".into(),
-                bead: p.bead,
-                data: serde_json::json!({
-                    "session": p.session,
-                    "request_id": id,
-                    "verb": p.verb,
-                    "cause": "session_ended",
-                    "reason": format!(
-                        "the session {session} ended with an unanswered control request \
-                         (request_id {id}, {}). The most likely story is that the interrupt \
-                         WORKED and the worker died before flushing its ack — but camp does \
-                         not know that, so it says what it does know rather than nothing \
-                         (invariant 3)",
-                        p.verb
-                    ),
-                }),
-            });
+            events.push(ControlRuntime::session_ended_fault(&id, &p));
         }
 
         // Prune the two SETTLED maps for this session — the other half of the
@@ -842,16 +897,15 @@ impl ControlRuntime {
     }
 }
 
-/// The causes from which NO answer can ever arrive. A `control_response` for a
-/// request settled by one of these is a duplicate, never a correction.
-const TERMINAL_CAUSES: &[&str] = &[
-    "session_ended",
-    "write_failed",
-    "unknown_request",
-    "unparsable",
-    "dialog_refused",
-    "permission_unanswerable",
-];
+/// What `rehydrate` rebuilt — and what it must SAY.
+///
+/// The events are not optional: a request whose session died while campd was down
+/// can never be disposed, so `forget_session` never runs for it and `rehydrate` is
+/// the only thing left that can give it a terminal event (§2.1).
+pub struct Rehydrated {
+    pub restored: usize,
+    pub events: Vec<EventInput>,
+}
 
 /// A deadline as a Duration from now. Saturates at ZERO — a deadline in the
 /// past is due NOW, never a negative timeout.
@@ -1529,7 +1583,7 @@ mod tests {
 
         let mut rt = ControlRuntime::new(1024);
         assert_eq!(
-            rt.rehydrate(&ledger, t0()).unwrap(),
+            rt.rehydrate(&ledger, t0()).unwrap().restored,
             1,
             "only the UNANSWERED request is restored as pending"
         );
@@ -1685,6 +1739,67 @@ mod tests {
             (300..=305).contains(&at),
             "the ceiling is 300s from created_at; it fired at {at}s"
         );
+    }
+
+    /// VT-1 — THE DELAYED WAKE. The `cause` discriminant, defended at last.
+    ///
+    /// `expire_pending` derives the cause by comparing THE TWO BOUNDS
+    /// (`p.deadline <= ceiling`), NEVER either against `now`. A `now`-derived
+    /// implementation (`if now < ceiling { silence } else { ceiling }`) is
+    /// indistinguishable on every ordinary wake — and a mutation to it passed the
+    /// ENTIRE suite, green, because **no test performed a wake past BOTH bounds.**
+    ///
+    /// A delayed wake is the ONLY observation that separates them, and it is
+    /// reachable: campd runs adoption probes and `exec_timeout`-bounded git/`pgrep`
+    /// subprocesses INLINE on the event loop, and a suspended laptop does it
+    /// trivially. Under the `now`-derived version a pure SILENCE timeout is reported
+    /// as `ceiling_timeout`, telling the operator "the session produced output for 5
+    /// minutes" when it went quiet immediately — invariant 3's false cause.
+    ///
+    /// BOTH directions are pinned, because only the pair distinguishes the two
+    /// implementations: at a very late `now`, `now` is past both bounds in BOTH
+    /// cases, so a `now`-derived cause is the SAME for both — and it must not be.
+    #[test]
+    fn a_delayed_wake_still_names_the_bound_that_actually_expired() {
+        // (a) SILENCE: the worker went quiet immediately and never came back. The
+        //     silence bound fired at t+30 — LONG before the ceiling at t+300.
+        //     campd does not wake until t+400.
+        let mut rt = ControlRuntime::new(1024);
+        track(&mut rt, "camp-quiet", "t/dev/1", t0());
+
+        let events = rt.expire_pending(secs(t0(), 400));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            data(&events[0])["cause"],
+            "silence_timeout",
+            "the SILENCE bound is what expired (at t+30). A cause derived from `now` \
+             would say `ceiling_timeout` here — and tell the operator the session \
+             produced output for five minutes when it went quiet immediately \
+             (invariant 3: an event must name its TRUE cause)"
+        );
+
+        // (b) CEILING: the worker never stopped talking, so its silence deadline was
+        //     pushed forward to t+295 and NEVER fired. The ceiling at t+300 is what
+        //     expired. campd, again, does not wake until t+400.
+        let mut rt = ControlRuntime::new(1024);
+        track(&mut rt, "camp-chatty", "t/dev/1", t0());
+        let mut n = 5;
+        while n <= 290 {
+            rt.note_activity("t/dev/1", secs(t0(), n));
+            n += 5;
+        }
+
+        let events = rt.expire_pending(secs(t0(), 400));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            data(&events[0])["cause"],
+            "ceiling_timeout",
+            "the CEILING is what expired — the session never went quiet for 30s"
+        );
+
+        // The pair is the point: at t+400 `now` is past BOTH bounds in BOTH cases, so
+        // any cause derived from `now` gives the SAME answer to both — and the two
+        // faults are NOT the same fault.
     }
 
     /// G5: THE SEAM NOTHING EXERCISED — a restart across a TIMED-OUT interrupt.
@@ -2422,6 +2537,103 @@ mod tests {
         );
     }
 
+    /// V1 — `poll_timeout`'s `held` ARM, GATED AT LAST.
+    ///
+    /// This is one of the seven bugs six plan rounds fought over: *a held line
+    /// stranded at `scan == tail` — never retried, no wakeup armed, no `end` frame.*
+    /// The code was correct and **nothing tested it**: deleting `s.held ||` from
+    /// `poll_timeout` passed the ENTIRE suite, unit and integration.
+    ///
+    /// The state is reachable: FILL cap-stops on the LAST line (`held`, `out` full),
+    /// FLUSH then drains `out` completely, and the per-wake scan budget prevents the
+    /// retry in the same call — leaving `held && out.is_empty() && scan == tail`,
+    /// `blocked_since == None`, and NO pending WRITABLE edge. Without the `held`
+    /// clause `poll_timeout` returns the 30 s stall deadline (or `None`), and **the
+    /// last line of the history is never delivered.**
+    #[test]
+    fn poll_timeout_arms_for_a_line_held_at_the_tail() {
+        let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
+        let (_d, file, tail) = stream_file(line.repeat(20_000).as_bytes());
+        let mut rt = ControlRuntime::new(2048);
+        let (_client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+
+        // Drive to a REAL cap-stop (the client never reads).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !rt.test_sub(T).held {
+            rt.pump(T, &mut conn, t0());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no line was ever held — this test proves nothing"
+            );
+        }
+
+        // ...and now make that held line the LAST one, with `out` flushed: exactly
+        // the terminal state of a catch-up that ran at the cap.
+        let sub = rt.subscribers.get_mut(&T).expect("the subscriber");
+        sub.tail = sub.scan;
+        sub.out.clear();
+
+        assert_eq!(
+            rt.poll_timeout(t0()),
+            Some(Duration::ZERO),
+            "a HELD line is real, pending work. Nothing else will EVER wake this \
+             subscriber: `blocked_since` is None (the peer is reading), no WRITABLE \
+             edge is pending once `out` drains, and `scan == tail` so there is no file \
+             work. Without an armed continuation the last line of the history is never \
+             delivered — and the end frame never follows it"
+        );
+    }
+
+    /// §4.4: `MAX_SUBSCRIBERS` is the local-DoS bound — 8 idle connections must not
+    /// be able to disable `subscribe` for everyone. It had NO test at all: the
+    /// mutation `if false && …` survived the whole suite.
+    #[test]
+    fn the_subscriber_cap_refuses_the_ninth_and_a_detach_frees_the_slot() {
+        let (_dir, mut ledger) = temp_ledger();
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("t-dev-1.json"), b"{\"type\":\"system\"}\n").unwrap();
+        let mut rc = ReadChannelRuntime::new(sessions, 256 * 1024 * 1024).unwrap();
+        rc.register(&mut ledger, "t/dev/1").unwrap();
+        rc.drain_all(&mut ledger).unwrap();
+
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        for i in 0..MAX_SUBSCRIBERS {
+            let r = rt.serve_subscribe(Token(100 + i), "t/dev/1", Some(0), &rc);
+            assert!(
+                matches!(r, Response::Subscribed { .. }),
+                "subscriber {i} must be accepted: {r:?}"
+            );
+        }
+        assert_eq!(rt.subscriber_count(), MAX_SUBSCRIBERS);
+
+        // The NINTH is refused, LOUDLY and by name.
+        let r = rt.serve_subscribe(Token(999), "t/dev/1", Some(0), &rc);
+        match r {
+            Response::Error { ok, error } => {
+                assert!(!ok);
+                assert!(
+                    error.contains("MAX_SUBSCRIBERS"),
+                    "the refusal must name the cap it hit: {error}"
+                );
+            }
+            other => panic!(
+                "the {}th subscription must be REFUSED — 8 idle connections must not \
+                 be able to disable `subscribe` for everyone: {other:?}",
+                MAX_SUBSCRIBERS + 1
+            ),
+        }
+
+        // A DETACH frees the slot — the cap bounds concurrency, not lifetime totals.
+        rt.forget(Token(100));
+        assert_eq!(rt.subscriber_count(), MAX_SUBSCRIBERS - 1);
+        assert!(matches!(
+            rt.serve_subscribe(Token(1000), "t/dev/1", Some(0), &rc),
+            Response::Subscribed { .. }
+        ));
+    }
+
     /// R3 — THE ~60-BYTE BAND. A line whose RAW length is under the cap but whose
     /// FRAME is not.
     ///
@@ -2910,6 +3122,14 @@ struct EndFrame<'a> {
 /// C2/R7 — THE ONE SIGNATURE. `body` is BYTES, and `pump` never decodes UTF-8
 /// anywhere.
 ///
+/// **WHAT `offset` MEANS — PINNED, because cp-2 will get this wrong otherwise.**
+/// A frame's `offset` is the byte offset of the **START OF THE NEXT LINE** — i.e.
+/// just PAST the line this frame carries. It is a **RESUME CURSOR** (§9): hand it
+/// back as `cursor` and you get the NEXT frame, byte-identical. It is **NOT** the
+/// address of the event it carries, so `camp watch` cannot use it to say "this
+/// event is at byte X" — it says "everything up to and including this event ends at
+/// byte X". Those are different statements, and only the second one is true.
+///
 /// The worker's line is SPLICED IN VERBATIM — never round-tripped through a
 /// `serde_json::Value`, which would SORT its keys (serde_json has no
 /// `preserve_order`, and `raw_value` is a cargo feature this phase does not add).
@@ -3094,9 +3314,25 @@ struct Subscriber {
     frame_overhead: usize,
     /// R1: when the peer last accepted ZERO bytes with data buffered. Stamped on a
     /// zero-accept write, CLEARED the moment ANY byte is accepted.
+    ///
+    /// **RESIDUAL, RECORDED (round-2 review).** This clears only when campd's own
+    /// `write()` accepts bytes — and a non-blocking write on a unix socket returns
+    /// `EAGAIN` with ZERO bytes until free space reaches the kernel's LOW-WATER MARK
+    /// (~2 KiB on macOS). So the code enforces *"a peer whose socket has not freed a
+    /// low-water mark's worth"*, which is very slightly stronger than §4.4's *"a peer
+    /// that stopped reading"*: a peer sipping < ~4 KiB per `SUBSCRIBER_STALL_TIMEOUT`
+    /// (30 s at the shipped default) is dropped while still, technically, reading.
+    /// At that rate it is indistinguishable from a stopped peer, so the reach is
+    /// small — but it is a real difference between the spec's words and the code's,
+    /// and it is written down rather than discovered later.
     blocked_since: Option<Timestamp>,
     /// The largest `out` reached — `buffered_bytes` in `subscriber.dropped`
     /// (§4.4: "naming the session and the high-water mark").
+    ///
+    /// NOTE: `out` is bounded by the cap *plus at most one small frame* — the
+    /// `oversize` `skipped` frame is appended with no cap check (it is ~100 bytes and
+    /// cannot be held, since the line it describes was never buffered). "out ≤ cap"
+    /// is therefore off by one frame, deliberately, and stated.
     high_water: usize,
 }
 
@@ -3508,8 +3744,14 @@ impl ControlRuntime {
             };
             // The tail refresh, specified for all three cases:
             match read_channel.tail_state(&sub.session) {
-                // A CLOSING subscriber's tail is PINNED at the final offset,
-                // whatever `tail_state` now says.
+                // A CLOSING subscriber's tail is PINNED at the final offset, whatever
+                // `tail_state` now says.
+                //
+                // HONESTLY: also defence in depth. Deleting this arm survives the
+                // suite — once a session is disposed `tail_state` returns None, which
+                // the `None` arm below already leaves `tail` untouched. It stays
+                // because a future phase could make `tail_state` answer for a disposed
+                // session; it is not gated today.
                 _ if sub.closing.is_some() => {}
                 Some((_, t)) => sub.tail = t,
                 // The session is no longer tailed. LEAVE `tail` UNCHANGED — never
@@ -3614,6 +3856,12 @@ impl ControlRuntime {
                 sub.closing = Some(reason.clone());
                 // The AUTHORITATIVE end of the stream (Task 4's `dispose_pending`
                 // recorded it). The `end` frame's offset comes from HERE.
+                //
+                // HONESTLY: this line is DEFENCE IN DEPTH, not a gated invariant.
+                // Deleting it survives the whole suite, because `fanout` has already
+                // refreshed `tail` from `tail_state` earlier in the SAME wake and the
+                // two agree. It stays because the ordering it relies on is a property
+                // of the event loop, not of this function — but do not call it tested.
                 sub.tail = d.final_offset;
                 let Some(conn) = conns.get_mut(&token) else {
                     gone.push(token);

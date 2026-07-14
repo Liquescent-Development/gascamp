@@ -684,14 +684,14 @@ pub fn run(
         // So: DISPOSE FIRST (which is what RECORDS Disposed{session, final_offset}),
         // and only THEN hand the list to the subscriber registry.
         //
-        // `take_disposed()` HAS EXACTLY ONE CALLER — this one, immediately after
-        // `dispose_pending()`. `close_disposed` is NOT reachable from
-        // `control_step`. That is the STRUCTURAL guarantee, and it is structural
-        // BECAUSE no black-box test can prove it: the stream watch always delivers
-        // another wake, which would mask a broken ordering by making the end frame
-        // merely LATE rather than absent.
-        read_channel.dispose_pending(ledger)?;
-        let disposed = read_channel.take_disposed();
+        // `close_disposed` is NOT reachable from `control_step`, and it CANNOT be:
+        // it needs a `Vec<Disposed>`, and only `dispose_pending` can mint one.
+        // The disposed list is the RETURN VALUE of `dispose_pending` — there is no
+        // way to obtain one without having disposed. That is the ordering guarantee,
+        // made structural rather than conventional (no black-box test can gate it:
+        // the stream watch always delivers another wake, so a broken ordering only
+        // makes the end frame LATE, never absent).
+        let disposed = read_channel.dispose_pending(ledger)?;
         if !disposed.is_empty() {
             let (gone, events) =
                 control.close_disposed(&disposed, ledger, &mut conns, Timestamp::now());
