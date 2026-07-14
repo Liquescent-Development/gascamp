@@ -10,6 +10,38 @@
 
 ---
 
+## What changed in rev 4, and why (after the rev-3 REJECT at 3681b43)
+
+**Rev 4's scope is deliberately narrow, per the gate:** a rewrite of **Task 8's data path (`pump`)**, **the event-loop disposal call order**, and **Task 3's rehydration + D7's ceiling** — plus the mechanical gates that stop an implementer cold (G8–G11). **Nothing else is touched.** Tasks 1, 2 (except one payload field), 5, 6 (except the Step-5 wiring), 7, 10 and the fixtures/provenance work are CLOSED and are not re-opened.
+
+**I traced the algorithm on paper against the three inputs before writing a line**, as instructed. All three were broken, exactly as reported:
+
+| input | rev-3 `pump` | rev-4 `pump` |
+|---|---|---|
+| **a single 100 KiB line** | chunk = 64 KiB contains no `\n` ⇒ the `for each COMPLETE line` body never runs ⇒ `cursor` never advances ⇒ `pumped` stays 0 ⇒ `poll_timeout` = `Some(ZERO)` ⇒ **campd re-reads the same 64 KiB forever at 100 % CPU** | a `partial` buffer spans chunks (cp-0's own discipline, read_channel.rs:588/613-624); the line completes on the second chunk and is framed |
+| **a `WouldBlock` on a healthy reader** (macOS `sendspace` ≈ 8 KiB vs a ~64 KiB chunk ⇒ **every** healthy subscriber WouldBlocks on **every** chunk) | `out` non-empty ⇒ `Some(ZERO)` ⇒ poll(0) → pump → WouldBlock → poll(0) … **campd spins for the whole duration of any stream**, re-running `apply_tracking`, `drain_all` and `persist_offsets` each pass | `poll_timeout` arms `ZERO` **only on `out.is_empty() && scan < tail`** — a blocked write is unblocked by the **WRITABLE edge**, which is already registered and already relied on |
+| **a subscriber exactly caught up when its session is reaped** | `take_disposed()` ran **before** `dispose_pending()` produced it ⇒ `closing` never set; the caught-up subscriber has `poll_timeout == None` ⇒ campd **blocks forever** ⇒ **no `end` frame, no EOF** — violating test 8's own assertion, on the steady state of every long-lived `camp watch` | `dispose_pending` runs **before** the harvest that consumes it; the `end` frame goes out **on the same wake** |
+
+| # | Defect | Fix, and where | **What the fix could newly break, and the test for it** |
+|---|---|---|---|
+| **G1** | **`pump` LIVELOCKS on any line longer than `HISTORY_CHUNK_BYTES`.** `Subscriber` had no partial-line buffer, so a chunk with no `\n` advanced nothing. **Not pathological:** a `Read`/`Bash`/`Grep` tool-result line routinely exceeds 64 KiB, and cp-0 accepts lines up to `max_stream_bytes` (256 MiB). **It also killed C8:** an over-cap line (≥ 1 MiB ⇒ ≥ 16 chunks) could never be *lexed*, so the `skipped` frame — whose `"bytes":N` requires finding the line's end — was **structurally unreachable**. | **Task 8 — `pump` is rewritten as a real bounded reader**, copying cp-0's discipline: a `partial: Vec<u8>` that spans chunks, bounded against the cap **before** extending; plus `scan` (read position) separate from `cursor` (the resume point = end of the last complete line). A line whose bytes cross the cap switches to **OVERSIZE SCAN**: `partial` is dropped (memory freed), the bytes are *counted, not buffered*, and at the `\n` a `skipped` frame is emitted with the true `bytes`. **`MAX_PUMP_BYTES_PER_WAKE` bounds the SCAN, not just the delivered bytes** — so a 256 MiB line is consumed over ⌈256 MiB / 256 KiB⌉ wakes, each doing bounded work, and it *terminates*. | The oversize scan could itself become an unbounded read. It cannot: nothing is buffered during it, and the per-wake scan budget bounds each pass. **Tests: `pump_lexes_a_line_that_spans_many_chunks`** (unit) and **`a_line_larger_than_the_cap_is_skipped_and_campd_does_not_livelock`** (integration, driven by a NEW fake-agent mode — see below). |
+| **G2** | **`poll_timeout`'s `Some(ZERO)` on a non-empty `out` is a TICK** (invariant 1, §4.3). A non-empty `out` means the last write returned `WouldBlock`; the correct wakeup is the **WRITABLE edge**, which is already registered and which C7 already relies on. Arming a zero timeout on top of it turns a blocked write into a spin — and since macOS's ≈ 8 KiB socket buffer is far smaller than a chunk's worth of frames, **every healthy subscriber hits this on every chunk**. | **Task 8 — `poll_timeout` arms `ZERO` iff `out.is_empty() && scan < tail`** (there is *pumpable file work* and no fd will signal it). The `out` disjunct is DELETED: while `out` is non-empty, no file progress is possible anyway, so only writability can unblock it. | Dropping the disjunct could strand a subscriber whose `out` never drains. It cannot: a WouldBlock arms the WRITABLE edge (edge-triggered `poll` re-arms on the transition), and a client that never drains is dropped at the cap (G3). **Test: `poll_timeout_never_arms_on_a_wouldblock_alone`**, plus the **LOADED perf arm** (below), which is the gate that would have caught this. |
+| **G3** | **`out` was refilled only when EMPTY ⇒ it never held more than one chunk (~64 KiB) ⇒ against the shipped 1 MiB cap the drop path was DEAD CODE.** So: a subscriber that stops reading is **never dropped** (it holds an fd and one of only `MAX_SUBSCRIBERS` slots — 8 such connections permanently disable `subscribe` for everyone: the local DoS the cap exists to prevent); **C7's own new-failure answer was false** ("the hard cap drops it" — it could not); **the backpressure tests were theatre** (they set the cap to 512 B, *smaller than one chunk* — the only regime where the drop fires); and the stated 8 MiB worst case was wrong (the real bound was ~8 × 64 KiB). | **Task 8 — `pump` keeps FILLING `out` up to the cap even while `out` is NON-empty.** That is what makes the cap meaningful and the drop reachable: frames accumulate across many chunks, and `out.len() + frame.len() > cap` ⇒ **Drop** with `buffered_bytes` = the attempted size. | Aggressive filling could drop a *healthy* reader. It cannot: filling stops at the cap, and any reader draining at any rate keeps `out` below it unless the producer genuinely outruns it — which is exactly what backpressure means. **Test 11 now runs at the DEFAULT 1 MiB cap** (not a 512 B toy), so the shipped configuration is the one under test; plus the unit test `out_keeps_filling_while_non_empty_so_the_cap_is_reachable`. |
+| **G4 / A2** | **`control_step` consumed `take_disposed()` BEFORE `dispose_pending()` produced it** ⇒ on the disposal wake `take_disposed()` is **empty**, `closing` is never set, and my inline comment was factually inverted. A *behind* subscriber recovered a wake late (which is why test 8 would have gone green); a **caught-up** subscriber — the steady state of every long-lived `camp watch`, cp-2's primary consumer — has `poll_timeout == None`, so campd **blocks forever** and it gets **no `end` frame and no EOF**. **A2 makes it disqualifying:** what "rescues" it in practice is that `unregister`'s `remove_file` fires a notify event and `on_watch_event` always signals — so the `end` frame's delivery would **depend on a delivered notify event**, which cp-0's law in the very block being edited (event_loop.rs:406-408) forbids: *"correctness never depends on a delivered event."* | **Task 6 Step 5 — the order is fixed.** `dispose_pending` runs **before** `close_disposed`, which is lifted **out of `control_step`** into its own step. The `end` frame is delivered **on the disposal wake**, for a caught-up and a behind subscriber alike, with **no dependence on the notify**. | A subscriber whose session vanishes between `fanout` and `close_disposed` could see `tail_state() == None`. Specified: `fanout` leaves `tail` **unchanged** when `tail_state` returns `None` (never zeroes it, never panics); `close_disposed` then pins `tail = final_offset` authoritatively. **Test: `a_subscriber_caught_up_at_the_tail_still_gets_an_end_frame_on_the_reap_wake`** — the case no rev-3 test reached. |
+| **G5** | **`rehydrate` collapsed timed-out ids into `answered` ⇒ a late `control_response` ACROSS A RESTART was SILENTLY SWALLOWED** — rev 2's swallow, restored, on the path C11 itself calls the most operationally important the phase ships. **Root cause: `control.failed` had no machine-readable cause** — only PROSE — so `rehydrate` could not tell "timed out, an answer may still come" from "the pipe write failed, no answer can ever come". Prose is not a cause (invariant 3), and it would have handed cp-2/cp-5 a prose-matching contract. | **Task 2 + Task 3 — `control.failed` gains a `cause` DISCRIMINANT** (`silence_timeout`, `ceiling_timeout`, `write_failed`, `unknown_request`, `unparsable`, `dialog_refused`, `permission_unanswerable`, `session_ended`). `rehydrate` **routes on it**: `control.responded` and the terminal causes ⇒ `answered`; **`silence_timeout` / `ceiling_timeout` ⇒ `timed_out`** (a late answer still corrects). | A new required field breaks the fold. `cause` is added to the `ControlFailed` payload struct in Task 2 **in the same commit as the variant** (its fold test appends every cause), so `deny_unknown_fields` and the refold stay green. **Test: `a_restart_across_a_TIMED_OUT_interrupt_still_appends_the_correction`** — the seam between rev-3's test 4 (answered ids only) and test 7 (late answers within one campd life), which nothing exercised. |
+| **G6 / A3** | **D7 had no absolute ceiling ⇒ a worker that never goes quiet NEVER faults an unanswered interrupt** — §2.1's swallowed timeout, through the front door. **And my stated backstop does not exist:** patrol's ladder is *also* activity-driven (`drain_touched` resets the stall timer on transcript activity), so a chatty worker is **never stalled and never control-faulted — neither mechanism can ever fire.** Both of D7's safety nets were the same net, with a hole in exactly this shape. | **Task 3 — D7 keeps the silence deadline and gains a HARD CEILING.** `Pending` carries `created_at`; a request expires at **`min(silence_deadline, created_at + CONTROL_RESPONSE_CEILING)`** (`CONTROL_RESPONSE_CEILING = 10 × CONTROL_RESPONSE_TIMEOUT` = 5 min), and the ceiling's `control.failed` carries `cause: "ceiling_timeout"` and names the true cause: *"the session produced output for N minutes but never answered request_id X"*. **The panel's argument is accepted: C11's late-correction already makes an early fault SELF-REPAIRING, so a correctable false positive is strictly better than an uncorrectable false negative.** | The ceiling could fire on a legitimately long queued interrupt. That is now the *correctable* direction: a late answer appends `control.responded{late:true}` naming the fault it corrects (C11), and rehydration preserves that across a restart (G5). **Test: `a_chatty_worker_that_never_answers_still_faults`** — a session streaming a line every 5 s for 3× the timeout eventually faults. No line of rev 3 contemplated this case. |
+| **G7** | **The plan contradicted itself on a worker that exits between deliver and response.** C11's fourth column claimed *"the reset is bounded by the session's own lifetime (a disposed session's rows are dropped)"*, while `forget_session` was specified to prune **`answered` only**. If an implementer made it drop `pending` too, **the interrupt vanishes with no event** — a silently swallowed fault in the *most likely* real scenario. And `timed_out` was pruned by nothing: an unbounded map. | **Task 3 — `forget_session(session, now) -> Vec<EventInput>` is specified, and it does NOT silently drop anything.** A disposed session's **`pending` rows are EXPIRED LOUDLY** with `cause: "session_ended"` (*"the session ended with an unanswered control request"*), and its **`answered` and `timed_out` rows are pruned** (bounding both maps by live sessions — the addendum's requirement, satisfied without swallowing a fault). `Pending` also carries `rig`/`bead` captured at `serve_interrupt`, so every fault has the **same provenance** as the `session.interrupted` it answers. | Expiring at disposal could double-fault a request that also hit the silence deadline on the same wake. It cannot: `expire_pending` removes the row, and `forget_session` only sees what remains. **Test: `a_worker_that_exits_before_answering_still_faults_loudly`.** |
+| **G8 / A1** | **The dead_code table was STILL not field-exhaustive — three gates fail.** Missing: `StreamLine.session` / `.line` (first production read in Task 6) ⇒ **Task 4's gate fails**; `Disposed.session` / `.final_offset` (absent entirely) ⇒ **Tasks 4–7 fail**; and `WorkerMessage::Stream`'s payload, which **no production path ever reads** ⇒ **Task 6 Step 7's "delete the module attribute" fails**. An item-level allow does **not** silence `field is never read` on the struct it returns. **A1 is worse: `StreamLine.offset_after` is production-DEAD under D6″** — `pump` derives every offset from its own cursor and `ingest` reads only `session` + `line` — so the implementer was trapped between "delete the allow at Task 8" (fails clippy) and Task 11's grep (forbids leaving it). | **`StreamLine.offset_after` is DELETED** (nothing reads it — A1's first option, taken). `StreamLine.session`/`.line`, `Disposed.session`/`.final_offset` get field-level allows naming their first production read. **`WorkerMessage::Stream`'s payload gets a PERMANENT allow** (it exists so `parse_worker_line` is TOTAL — D3's transparent surface — and so the passthrough test can assert it). | Deleting `offset_after` could strand a future consumer. The `end`-frame offset and the subscribe cursors all come from `pump`/`dispose_pending`, which own them; a phase that needs a per-line offset on `StreamLine` can add it *with* its reader. **Task 11's grep is unchanged and now actually passes.** |
+| **G9** | **C3's own anti-false-green guard was miscounted** — Task 8 headed its list "(7)" and listed EIGHT; the gate demanded 14 integration tests when the true total was 15; five run steps carried no count at all; and C8's test had two different names. *A verification gate that is itself wrong is worse than no gate.* | **Every run step now carries a count, and the counts are recomputed from the enumerated lists**: `daemon::control` unit = **24** (7 + 10 + 7); `tests/control.rs` = **17** (6 + 1 + 10). C8's test is named **`a_line_larger_than_the_cap_is_skipped_and_campd_does_not_livelock`** everywhere. **A standing rule is added: if the observed count differs from the plan's, RECONCILE THE LIST — never delete a test to satisfy a gate.** | A stale count in a later revision re-creates the trap. The rule above is what defuses it: the count is a cross-check, not an authority. |
+| **G10** | **`MAX_FAULTS_PER_SESSION_PER_WAKE` did not exist** — `grep` finds nothing — yet Task 6 referred to it as an existing dedupe, leaving the implementer to invent its home, its reset semantics, and (since `ControlFailed` is `deny_unknown_fields`) *where the suppressed count goes*. | **Task 6 Step 4 — it is DEFINED in `control.rs`: `pub const MAX_FAULTS_PER_SESSION_PER_WAKE: usize = 8`**, a per-`ingest`-call counter (reset at the top of every `ingest`, hence per-wake), and **the suppressed count rides the `reason` STRING of the 8th event** with `cause: "unparsable"` — a stated decision, not a guess, chosen precisely so no new payload field is needed. | Burying the count in prose makes it unqueryable. Accepted, and named: the `cause` discriminant (G5) is the machine-readable half; the count is diagnostic detail. |
+| **G11** | **The `skipped` frame was overloaded and DOUBLE-REPORTED.** It covered both over-cap lines and non-JSON lines — but cp-0 **already** reports every non-JSON line as `patrol.degraded` from `drain_one`'s `Err` arm (read_channel.rs:643-650), so C8's "record `patrol.degraded` once per (session, offset)" re-reported, from the file side, a fault the ledger already carries — the exact double-report Task 6 forbids. And **blank lines**: cp-0 skips them while advancing past them (read_channel.rs:631-633), while `pump` reads the file and would have emitted a `skipped` frame for a no-op. | **Task 8 — `skipped` gains a `reason` DISCRIMINANT** (`over_cap` \| `not_a_json_object`). **Only `over_cap` appends a durable `patrol.degraded`** (deduped per `(session, offset)` in `ControlRuntime`); `not_a_json_object` emits the frame and **NO event** — cp-0 already owns that fault. **Blank lines are SKIPPED silently, advancing the cursor, exactly as cp-0 does** (no frame, no event). | Suppressing the second event could hide a real fault. It cannot: cp-0's `patrol.degraded` for that line is already durable and names the session, offset and line. **Test: `a_non_json_line_yields_a_skipped_frame_and_no_second_patrol_degraded`.** |
+
+**Non-blocking items adopted (all cheap, none expanding scope):** test 7's history is now **> 256 KiB** (a 64–256 KiB history is consumed in ONE wake, so the live-burst window never opened) · **the perf gate gains a LOADED arm** — N subscribers with a *streaming* session, asserting bounded CPU — because the rev-3 gate (empty buffers, quiescent sessions) was *constructed to be blind* to both G1's and G2's spins · **a protocol version `"v":1` is added to the `Subscribed` hello** (named twice as "the last free place" and then not taken; `Subscribed` must precede `Ok` in the untagged `Response`, which it already does) · `session_status` can only return `live`/`stopped`/`crashed` — **`"capped"` was a phantom value** and is removed (a cap-killed session is `crashed`) · the false claim that `event_frame` "matches cp-0's `Ok(_v)` arm" is corrected (cp-0 accepts any JSON *value*; `event_frame` requires an *object*, and the resulting `skipped{reason:"not_a_json_object"}` frame is the honest difference) · **`final_drain_pending`/`dispose_pending` state threading is specified** (the merged code `mem::take`s the queue at the top, so a naive split would leave `dispose_pending` with an empty list and never unlink a file: `final_drain_pending` **peeks**, `dispose_pending` **takes**) · `pump` cannot take `&mut Ledger`, so its events ride a **`pending_events` collector** on `ControlRuntime` (cp-0's mold), drained by the caller · **UTF-8: `pump` operates on BYTES end to end** — `event_frame` takes `&[u8]` and validates with `from_slice`, because a `from_utf8_lossy` decode would silently rewrite the very bytes C2's design exists to preserve · **the ordering inversion is SANCTIONED IN WRITING**: a subscriber sees a line's bytes before that line's ledger effect commits (cp-0's law is about *offsets*, and the client owns its own cursor) · the O(subscribers × bytes) re-parse on the hot path is named and accepted, bounded by `MAX_PUMP_BYTES_PER_WAKE` × `MAX_SUBSCRIBERS`.
+
+**Also corrected (A-addendum):** C5's *"harvest 2 non-empty ⟺ the guard fires"* is only **⟹**, not ⟺ — `drain_one` advances past blank and non-JSON lines **without** pushing a `StreamLine`, so the guard can fire with harvest 2 empty. The prose is fixed; **test 2's assertion was already the correct guard and is unchanged.**
+
+---
+
 ## What changed in rev 3, and why (after the rev-2 REJECT at a2ca188)
 
 Rev 2 closed **B2, B5, B6, B7, B8, B9, B11, B13, B15** (panel-verified). D1–D5 and the architecture hold. The panel then found that **four of rev 2's fixes each introduced a new defect inside the answer to a rev-1 defect** (C5, C6, C7, C8 live in the fixes for B4, B9/B10, B12), each invisible to the very test written to prove the fix worked.
@@ -62,8 +94,11 @@ Rev 2 closed **B2, B5, B6, B7, B8, B9, B11, B13, B15** (panel-verified). D1–D5
 |---|---|---|---|
 | `control.rs` items: `ParentMessage`, `WorkerMessage`, `parse_worker_line`, `ControlWireError`, `new_request_id`, `REQUEST_ID_PREFIX`, `ControlRuntime` + methods | 1, 3 | ONE module-level `#![allow(dead_code)] // cp-1: first read in Task 6 — DELETE this attribute there` | **Task 6 Step 7** |
 | **`ControlWireError.line`** (field) | 1 | covered by the module-level attribute | Task 6 Step 7 (read by `ingest`'s fault arm) |
+| **`WorkerMessage::Stream`'s payload** (variant field) | 1 | `#[allow(dead_code)] // PERMANENT: never read in production. Subscribers are fed from the FILE by pump (D6″), not from this variant — it exists so parse_worker_line is TOTAL (D3's transparent surface) and so the passthrough test can assert the bytes are unchanged.` **(G8: no production path reads it, in ANY task — a temporary allow would fail Task 6 Step 7.)** | **never** |
 | **`ControlRuntime.subscriber_buffer_bytes`** (field) | 3 | `#[allow(dead_code)] // cp-1: first read in Task 8 (the subscriber hard cap)` — **the module-level attribute is gone by Task 6, so this field needs its OWN** | **Task 8** |
-| **`StreamLine.offset_after`** (field) | 4 | `#[allow(dead_code)] // cp-1: first read in Task 8 (event_frame's cursor)` — `ingest` reads only `session` + `line` | **Task 8** |
+| ~~`StreamLine.offset_after`~~ | — | **DELETED (A1).** Under D6″ NOTHING reads it: `pump` derives every offset from its own cursor and `ingest` reads only `session` + `line`. Rev 3 trapped the implementer between "delete the allow at Task 8" (fails clippy) and Task 11's grep (forbids leaving it). **The field does not exist in rev 4.** | n/a |
+| **`StreamLine.session`, `StreamLine.line`** (fields) | 4 | `#[allow(dead_code)] // cp-1: first read in Task 6 (ingest)` — **G8: the item-level allow on `take_stream_lines` does NOT silence `field is never read` on the struct it returns** | **Task 6** |
+| **`Disposed.session`, `Disposed.final_offset`** (fields) | 4 | `#[allow(dead_code)] // cp-1: first read in Task 8 (close_disposed)` — **G8: absent from rev 3's table entirely; without these, the Task 4/5/6/7 gates all fail** | **Task 8** |
 | `read_channel::take_stream_lines` / `last_activity` / `tail_state` / `take_disposed` / `final_drain_pending` / `dispose_pending` | 4 | per-item `#[allow(dead_code)] // cp-1: first read in Task N` (6 / 7 / 8 / 8 / 6 / 6) | the task each names |
 | `dispatch::write_control`, `ControlWrite` | 5 | `#[allow(dead_code)] // cp-1: first read in Task 6` | Task 6 |
 | `ControlRuntime::subscriber_count` | 8 | `#[allow(dead_code)] // PERMANENT: test observable (the read_channel.rs:445 precedent)` | never |
@@ -267,12 +302,27 @@ Spec: §2.1, §4.4, invariants 3 and 7.
 ```rust
 EventType::SessionInterrupted => "session.interrupted"  // {session, request_id}
 EventType::ControlResponded   => "control.responded"    // {session, request_id, verb, ok, detail, late}
-EventType::ControlFailed      => "control.failed"       // {session?, request_id?, verb?, reason}
+EventType::ControlFailed      => "control.failed"       // {session?, request_id?, verb?, cause, reason}
 EventType::SubscriberDropped  => "subscriber.dropped"   // {session, subscription, buffered_bytes, cap_bytes}
 ```
-**`late: bool` (default false) is C11's correction field.** None of the four names exists in `gc-vocab.json` ⇒ all camp-specific, additive (invariant 7).
+**`late: bool` (default false) is C11's correction field.**
 
-- [ ] **Step 1: Add the variants AND their fold arms together** (cp-0 note 3: a variant without its arm makes the next step's red an `E0004` compile error, not a test failure). `fold.rs` gets `fn audit<T: DeserializeOwned>(event) -> Result<(), CoreError>` (parse-and-discard) and four `#[serde(deny_unknown_fields)] #[allow(dead_code)]` payload structs — `ControlResponded` carrying `#[serde(default)] late: bool` and `#[serde(default)] detail: String`.
+**`cause: String` is G5's MACHINE-READABLE DISCRIMINANT, and it is the root fix, not a decoration.** Rev 3's `control.failed` carried only PROSE, so `rehydrate` could not tell *"timed out — an answer may still come"* from *"the pipe write failed — no answer can ever come"*, and it collapsed both into `answered`, **silently swallowing a late answer across a restart**. Prose is not a cause (invariant 3: *"every campd action is an event with its cause"*), and prose-matching is not a contract to hand cp-2/cp-5. The closed set:
+
+| `cause` | meaning | rehydration routes it to |
+|---|---|---|
+| `silence_timeout` | the session went quiet for `CONTROL_RESPONSE_TIMEOUT` with the request unanswered | **`timed_out`** — a late answer still corrects (C11) |
+| `ceiling_timeout` | the session kept producing output but never answered within `CONTROL_RESPONSE_CEILING` (G6) | **`timed_out`** |
+| `session_ended` | the session was disposed with the request still unanswered (G7) | `answered` (terminal — the session is gone; no answer can be re-read) |
+| `write_failed` | the pipe write itself failed; the request never reached the worker (C12) | `answered` (terminal) |
+| `unknown_request` | a `control_response` for an id camp never sent (§2.1) | `answered` (terminal) |
+| `unparsable` | a control message camp could not parse (§2.1) | `answered` (terminal) |
+| `dialog_refused` | a `request_user_dialog` was answered with the deterministic refusal (§9) | `answered` (terminal) |
+| `permission_unanswerable` | a `can_use_tool` arrived, which cp-1 cannot answer (§5.3.1) | `answered` (terminal) |
+
+None of the four event names exists in `gc-vocab.json` ⇒ all camp-specific, additive (invariant 7).
+
+- [ ] **Step 1: Add the variants AND their fold arms together** (cp-0 note 3: a variant without its arm makes the next step's red an `E0004` compile error, not a test failure). `fold.rs` gets `fn audit<T: DeserializeOwned>(event) -> Result<(), CoreError>` (parse-and-discard) and four `#[serde(deny_unknown_fields)] #[allow(dead_code)]` payload structs — `ControlResponded` carrying `#[serde(default)] late: bool` and `#[serde(default)] detail: String`, and **`ControlFailed` carrying a REQUIRED `cause: String`** alongside its `reason`. **The `cause` field lands in the SAME commit as the variant** (G5's new-failure guard): `deny_unknown_fields` means adding it later would break every already-appended event, so Task 2's fold test appends **one event per `cause` value** in the table above and asserts each folds and refolds clean.
 
 - [ ] **Step 2: Run the vocab-pin test and watch it fail RED.**
 
@@ -283,7 +333,7 @@ Expected: FAIL in `every_event_type_is_declared_mirrored_or_camp_specific_never_
 
 - [ ] **Step 4: Run and watch pass.** `cargo test -p camp-core --test vocab_pin` — PASS, including `camp_specific_names_do_not_collide_with_gc`.
 
-- [ ] **Step 5: Write the fold round-trip test** in `camp-core/src/ledger/mod.rs`'s `mod tests`, beside cp-0's `read_channel_patrol_degraded_shapes_round_trip_through_the_fold`: append all four shapes (including a `late: true` `control.responded`), assert a typo'd key (`requestId`) is REFUSED at append, then refold. **The API is `refold_check()` (refold.rs:64) returning `RefoldReport { events_replayed, drift }` — assert `report.drift.is_empty()`, exactly as `refold_prop.rs:170` does. There is no `is_clean()` and no `refold()`.**
+- [ ] **Step 5: Write the fold round-trip test** in `camp-core/src/ledger/mod.rs`'s `mod tests`, beside cp-0's `read_channel_patrol_degraded_shapes_round_trip_through_the_fold`: append all four shapes (including a `late: true` `control.responded`) **and ONE `control.failed` per `cause` value in Task 2's table** (G5 — `deny_unknown_fields` means a cause added later would break every already-appended event, so every value must fold from the first commit), assert a typo'd key (`requestId`) is REFUSED at append, then refold. **The API is `refold_check()` (refold.rs:64) returning `RefoldReport { events_replayed, drift }` — assert `report.drift.is_empty()`, exactly as `refold_prop.rs:170` does. There is no `is_clean()` and no `refold()`.**
 
 - [ ] **Step 6: Run it, then the property test.**
 
@@ -308,34 +358,62 @@ Spec: §2.1, invariants 1 and 3.
 **Interfaces produced:**
 ```rust
 pub const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// G6: the ABSOLUTE ceiling. A silence deadline alone can be pushed forward
+/// forever by a chatty worker, so an unanswered interrupt would NEVER fault —
+/// §2.1's swallowed timeout, through the front door.
+pub const CONTROL_RESPONSE_CEILING: Duration = Duration::from_secs(300); // 10x
 pub const MAX_PENDING_CONTROL_REQUESTS: usize = 64;
 pub struct ControlRuntime;
 impl ControlRuntime {
     pub fn new(subscriber_buffer_bytes: usize) -> ControlRuntime;
-    pub fn track_pending(&mut self, request_id: String, session: String, verb: &'static str, now: Timestamp);
-    /// D7/C11: ANY stream line from a session resets its pending deadlines.
+    pub fn track_pending(&mut self, request_id: String, session: String, verb: &'static str,
+                         rig: Option<String>, bead: Option<String>, now: Timestamp);
+    /// D7/C11: ANY stream line from a session resets its SILENCE deadline (never
+    /// its ceiling — G6).
     pub fn note_activity(&mut self, session: &str, now: Timestamp);
     pub fn poll_timeout(&self, now: Timestamp) -> Option<Duration>;
     pub fn expire_pending(&mut self, now: Timestamp) -> Vec<EventInput>;
     pub fn resolve(&mut self, request_id: &str, ok: bool, detail: String) -> Option<EventInput>;
     pub fn rehydrate(&mut self, ledger: &Ledger, now: Timestamp) -> anyhow::Result<usize>;
-    /// Prune this session's ids (bounds `answered`); called at disposal.
-    pub fn forget_session(&mut self, session: &str);
+    /// G7: the session was disposed. Its PENDING rows are EXPIRED LOUDLY (cause
+    /// `session_ended`) — never silently dropped — and its `answered` / `timed_out`
+    /// rows are pruned, which is what bounds both maps by LIVE sessions.
+    pub fn forget_session(&mut self, session: &str, now: Timestamp) -> Vec<EventInput>;
 }
 ```
 
-**State — `resolved` is SPLIT (C11):**
+**State — `resolved` is SPLIT (C11), and `Pending` carries its provenance (G7):**
 ```rust
+struct Pending {
+    session: String,
+    verb: &'static str,
+    /// G7: captured at `serve_interrupt` so EVERY fault this request produces
+    /// carries the SAME provenance as the `session.interrupted` it answers. Rev 3
+    /// built its fault EventInputs with rig/bead = None, so a fault and its cause
+    /// disagreed about which bead they belonged to.
+    rig: Option<String>,
+    bead: Option<String>,
+    /// G6: never moves. The ceiling is computed from this.
+    created_at: Timestamp,
+    /// D7: the SILENCE deadline; `note_activity` pushes it forward.
+    deadline: Timestamp,
+}
+
 pub struct ControlRuntime {
-    pending: HashMap<String, Pending>,       // { session, verb, deadline }
-    /// ANSWERED (or settled in a previous life). A re-read control_response for
-    /// one of these is a TRUE duplicate => None (B6).
+    pending: HashMap<String, Pending>,
+    /// ANSWERED, or settled TERMINALLY (a cause from which no answer can ever
+    /// arrive — see Task 2's cause table). A re-read control_response for one of
+    /// these is a TRUE duplicate => None (B6).
     answered: HashSet<String>,
-    /// C11: TIMED OUT — campd already appended `control.failed` saying the worker
-    /// never answered. A control_response for one of these is NOT a duplicate: it
-    /// is NEW INFORMATION saying that fault was PREMATURE, and it appends a
-    /// CORRECTION. Conflating the two sets is how rev 2 silently swallowed a real
-    /// answer on the most operationally important path the phase ships.
+    /// C11/G5: TIMED OUT (cause `silence_timeout` or `ceiling_timeout`) — campd
+    /// already appended `control.failed` saying the worker never answered. A
+    /// control_response for one of these is NOT a duplicate: it is NEW INFORMATION
+    /// saying that fault was PREMATURE, and it appends a CORRECTION.
+    ///
+    /// Rev 3's `rehydrate` collapsed these into `answered`, which silently swallowed
+    /// a late answer ACROSS A RESTART — the exact bug C11 exists to forbid. That
+    /// was only possible because `control.failed` had no machine-readable cause;
+    /// G5 adds one, and `rehydrate` routes on it.
     timed_out: HashMap<String, Pending>,
     #[allow(dead_code)] // cp-1: first read in Task 8 (the subscriber hard cap)
     subscriber_buffer_bytes: usize,
@@ -350,7 +428,10 @@ pub struct ControlRuntime {
 4. `a_restart_across_an_in_flight_interrupt_neither_lies_nor_forgets` (B6) — an answered id's re-read resolves to `None`; the orphan still expires.
 5. `a_control_response_for_a_never_sent_request_id_is_a_fault` (§2.1).
 6. **`session_activity_resets_a_pending_control_deadline`** (D7/C11) — track at T0; `note_activity` at T0+20 s; assert **nothing expires at T0+31 s** (the worker is streaming: it is alive), and that it DOES expire at T0+20 s+31 s (30 s of *silence*).
-7. **`a_late_control_response_after_the_deadline_appends_a_correction`** (C11) — track, expire (⇒ `control.failed`), then `resolve` the same id. Assert `Some(ControlResponded)` with **`late == true`** and a `detail` naming the premature fault — **not `None`.** *Rev 2 discarded this answer; this test is what makes that impossible.*
+7. **`a_late_control_response_after_the_deadline_appends_a_correction`** (C11) — track, expire (⇒ `control.failed{cause:"silence_timeout"}`), then `resolve` the same id. Assert `Some(ControlResponded)` with **`late == true`** and a `detail` naming the premature fault — **not `None`.** *Rev 2 discarded this answer; this test makes that impossible.*
+8. **`a_chatty_worker_that_never_answers_still_faults`** (G6/A3) — track at T0, then `note_activity` every 5 s for **3 × CONTROL_RESPONSE_TIMEOUT**. Assert the silence deadline **never** fires (the worker is streaming) but the **CEILING** does: at `created_at + CONTROL_RESPONSE_CEILING` a `control.failed{cause:"ceiling_timeout"}` appends, naming that the session produced output but never answered. *No line of rev 3 contemplated this case — and BOTH of D7's claimed backstops are dead (patrol's ladder is also activity-driven, A3), so without the ceiling campd emits nothing, ever: §2.1's swallowed timeout.*
+9. **`a_restart_across_a_timed_out_interrupt_still_appends_the_correction`** (G5) — the seam nothing exercised. Append `session.interrupted{id}` then `control.failed{request_id: id, cause:"silence_timeout"}`; `rehydrate`; then `resolve(id)`. Assert **`Some(ControlResponded{late:true})`** — NOT `None`. *Rev 3 routed every `control.failed` into `answered`, so this returned `None` and the worker's real answer died with the restart.* Also assert the converse: a `control.failed{cause:"write_failed"}` id rehydrates into `answered`, so a stray response for it is **not** treated as a late correction.
+10. **`a_worker_that_exits_before_answering_still_faults_loudly`** (G7) — track a pending request, then `forget_session(session)`. Assert it returns **one `control.failed{cause:"session_ended"}`** carrying the session's `rig`/`bead`, and that `pending`, `answered` and `timed_out` are all empty for that session afterwards. *The interrupt must never vanish with no event — that is the most likely real scenario (the interrupt worked; the worker died before flushing its ack).*
 
 - [ ] **Step 2: Run and watch fail.** `cargo test -p camp --bins daemon::control 2>&1 | tail -20` → FAIL (`cannot find type ControlRuntime`).
 
@@ -372,23 +453,52 @@ pub struct ControlRuntime {
 /// 30s with an unanswered request" — a real fault under EITHER semantics. The
 /// residual (a worker that goes silent mid-turn with its interrupt queued) is
 /// REPAIRED, not hidden: a late answer appends a correction (C11).
+///
+/// G6/A3 — AND IT IS NOT ENOUGH ON ITS OWN. A worker that NEVER goes quiet (a long
+/// tool loop; anything under cp-4's --include-partial-messages) would have its
+/// deadline pushed forward FOREVER, so an interrupt the CLI never processes would
+/// fault NEVER — §2.1's swallowed timeout through the front door. And there is no
+/// backstop: patrol's stall ladder is ALSO activity-driven (drain_touched resets
+/// its timer on transcript activity), so a chatty worker is never stalled EITHER.
+/// Both safety nets are the same net, with a hole in exactly this shape. Hence the
+/// ABSOLUTE CEILING below, which nothing resets.
 pub const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// G6: the absolute ceiling on ONE control request, measured from `created_at` and
+/// RESET BY NOTHING. A worker that has been producing output for five minutes
+/// without acknowledging an interrupt is broken, under either mid-turn semantics.
+///
+/// The trade, stated: an elapsed-time bound can fire a FALSE fault on a
+/// legitimately long queued interrupt — but C11 makes that fault SELF-REPAIRING (a
+/// late answer appends `control.responded{late:true}` naming the fault it
+/// corrects, and G5's rehydration preserves that across a restart). D7 alone traded
+/// a CORRECTABLE FALSE POSITIVE for an UNCORRECTABLE FALSE NEGATIVE, which is
+/// strictly worse under invariant 3.
+pub const CONTROL_RESPONSE_CEILING: Duration = Duration::from_secs(300);
 ```
-- `track_pending` — `deadline = now + CONTROL_RESPONSE_TIMEOUT` (jiff: `SignedDuration::try_from(...).unwrap_or(SignedDuration::from_secs(30))`; clippy denies `unwrap`).
-- **`note_activity(session, now)`** — every pending row of that session gets `deadline = now + CONTROL_RESPONSE_TIMEOUT`.
-- `poll_timeout` — earliest pending deadline as a `Duration`-from-now; `None` when empty. **Task 8 extends this with the subscriber continuation.**
-- `expire_pending(now)` — due rows are REMOVED from `pending`, **MOVED into `timed_out`**, each yielding a `control.failed` naming the verb and the silence bound.
+- `track_pending(id, session, verb, rig, bead, now)` — stores `created_at = now` (G6: never moves) and `deadline = now + CONTROL_RESPONSE_TIMEOUT`, plus the `rig`/`bead` provenance (G7). (jiff: `SignedDuration::try_from(...).unwrap_or(SignedDuration::from_secs(30))` — clippy denies `unwrap`.)
+- **`note_activity(session, now)`** — every pending row of that session gets `deadline = now + CONTROL_RESPONSE_TIMEOUT`. **It NEVER touches `created_at`** (G6).
+- **`due_at(p) = min(p.deadline, p.created_at + CONTROL_RESPONSE_CEILING)`** — the single expiry predicate. Both `poll_timeout` and `expire_pending` use it, so they can never disagree.
+- `poll_timeout` — the earliest `due_at` as a `Duration`-from-now; `None` when `pending` is empty. **Task 8 extends this with the subscriber continuation (and G2 constrains exactly when that may arm).**
+- `expire_pending(now)` — rows with `due_at <= now` are REMOVED from `pending`, **MOVED into `timed_out`**, each yielding a `control.failed` with the row's `rig`/`bead` and:
+  - `cause: "silence_timeout"` when `p.deadline <= now` — *"the session went quiet for 30s with `verb` unanswered"*;
+  - `cause: "ceiling_timeout"` otherwise — *"the session produced output for 5m but never answered request_id X"* (G6's true cause, named).
 - `resolve(id, ok, detail)`:
   - in `pending` ⇒ remove; insert into `answered`; `Some(ControlResponded { late: false, … })`.
   - in `timed_out` ⇒ remove; insert into `answered`; **`Some(ControlResponded { late: true, detail: "… arrived after control.failed declared it unanswered — that fault was PREMATURE; this is the correction", … })`** (C11).
   - in `answered` ⇒ `None` (a true duplicate: a restart re-read — B6).
-  - otherwise ⇒ `Some(ControlFailed { reason: "…camp never sent…" })` (§2.1).
-- `rehydrate(ledger, now)` — scan `session.interrupted`; ids also present in `control.responded`/`control.failed` go into `answered` (so a re-read is a silent no-op — B6); everything else is `track_pending`ed with a FRESH deadline (the previous life's clock is not ours). Returns the restored count.
-- `forget_session(session)` — drops that session's ids from `answered` (bounding it by live sessions).
+  - otherwise ⇒ `Some(ControlFailed { cause: "unknown_request", reason: "…camp never sent…" })` (§2.1).
+- **`rehydrate(ledger, now)` — G5, the fix.** Scan `session.interrupted` for the ids camp sent. Then, for each id, ROUTE ON THE `cause` DISCRIMINANT (Task 2's table):
+  - present in `control.responded` ⇒ `answered`.
+  - present in `control.failed` with `cause ∈ {silence_timeout, ceiling_timeout}` ⇒ **`timed_out`** (reconstruct the `Pending` from the event's `session`/`rig`/`bead`/`verb`) — **so a late `control_response` re-read after the restart appends a CORRECTION, not silence.** *Rev 3 put these in `answered` and swallowed the answer.*
+  - present in `control.failed` with any TERMINAL cause ⇒ `answered` (no answer can ever arrive).
+  - present in neither ⇒ `track_pending` with a **FRESH** `created_at` and deadline (the previous life's clock is not ours, and a worker waiting across a restart deserves the full window).
+  Returns the restored count. **An unrecognized `cause` is a hard error, not a default** — a value this campd does not know means the ledger was written by a newer camp, and guessing its meaning is exactly the silent divergence invariant 5 forbids.
+- **`forget_session(session, now) -> Vec<EventInput>` — G7, and it does NOT silently drop anything.** For that session: every **`pending`** row is EXPIRED LOUDLY as `control.failed{cause: "session_ended", reason: "the session ended with an unanswered control request"}` (carrying its `rig`/`bead`), then removed; every **`answered`** and **`timed_out`** id for that session is PRUNED. That satisfies both halves of the addendum — the maps are bounded by LIVE sessions, and no fault is swallowed. *(A late answer cannot arrive after disposal: the session is no longer tailed, so there is nothing left to re-read.)* Called by `close_disposed` (Task 8), which has the disposed-session list.
 
-**Bounds (non-blocking notes, adopted).** `rehydrate` does three full-type ledger scans, once per campd life, bounded by ledger size — stated. `answered` is pruned at disposal. **`pending` is capped at `MAX_PENDING_CONTROL_REQUESTS` (64)**: past it, `serve_interrupt` refuses loudly, so neither an overseer loop nor a hostile client can grow the table or the ledger without bound (the `MAX_FAULTS_PER_SESSION_PER_WAKE` dedupe protects only the INBOUND path).
+**Bounds.** `rehydrate` does three full-type ledger scans, once per campd life, bounded by ledger size — stated. `answered` and `timed_out` are pruned at disposal (G7), bounding both by live sessions. **`pending` is capped at `MAX_PENDING_CONTROL_REQUESTS` (64)**: past it, `serve_interrupt` refuses loudly, so neither an overseer loop nor a hostile client can grow the table or the ledger without bound (the `MAX_FAULTS_PER_SESSION_PER_WAKE` dedupe, defined in Task 6, protects only the INBOUND path).
 
-- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --bins daemon::control` → PASS, **14 tests** (7 from Task 1 + 7 here).
+- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --bins daemon::control` → PASS, **17 tests** (7 from Task 1 + 10 here). *(If the observed count differs, RECONCILE THE LIST — never delete a test to satisfy a gate — G9.)*
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -408,29 +518,44 @@ Spec: §2.3, §4.1, §9.
 **Interfaces produced:**
 ```rust
 pub struct StreamLine {
+    #[allow(dead_code)] // cp-1: first read in Task 6 (ingest)
     pub session: String,
+    #[allow(dead_code)] // cp-1: first read in Task 6 (ingest)
     pub line: String,
-    #[allow(dead_code)] // cp-1: first read in Task 8 (event_frame's cursor)
-    pub offset_after: u64,
+    // A1/G8: there is NO `offset_after`. Under D6" NOTHING reads it — `pump`
+    // derives every offset from its own cursor and `ingest` reads only `session`
+    // and `line`. Rev 3 carried it with an allow that could never be removed
+    // (deleting it failed clippy; keeping it failed Task 11's grep). A phase that
+    // needs a per-line offset here adds it TOGETHER WITH ITS READER.
 }
-pub struct Disposed { pub session: String, pub final_offset: u64 }
+
+pub struct Disposed {
+    #[allow(dead_code)] // cp-1: first read in Task 8 (close_disposed)
+    pub session: String,
+    #[allow(dead_code)] // cp-1: first read in Task 8 (close_disposed — the end frame's offset)
+    pub final_offset: u64,
+}
+
 impl ReadChannelRuntime {
     pub fn take_stream_lines(&mut self) -> Vec<StreamLine>;
     pub fn last_activity(&self, session: &str) -> Option<jiff::Timestamp>;
     pub fn tail_state(&self, session: &str) -> Option<(PathBuf, u64)>;
     /// C5: the final drain + cp-0's ordering guard + cp-0's fault flushes.
-    /// Does NOT dispose. Returns true when it appended events.
+    /// Does NOT dispose, and does NOT consume the pending list.
     pub fn final_drain_pending(&mut self, ledger: &mut Ledger) -> Result<bool>;
-    /// C5: unlink + clear cursor — AFTER the caller has harvested.
+    /// C5: unlink + clear cursor + record each `Disposed` — AFTER the caller has
+    /// harvested, and BEFORE the caller consumes `take_disposed()` (G4).
     pub fn dispose_pending(&mut self, ledger: &mut Ledger) -> Result<()>;
     pub fn take_disposed(&mut self) -> Vec<Disposed>;
 }
 ```
 **`apply_pending_unregisters` is KEPT as a thin wrapper** (`final_drain_pending` then `dispose_pending`) so every merged cp-0 unit test that calls it stays green. The event loop calls the halves separately, with the harvest between them.
 
+**The state threading between the halves — SPECIFIED (non-blocking note, adopted).** Merged `apply_pending_unregisters` begins with `let pending = std::mem::take(&mut self.pending_unregisters)` (read_channel.rs:296). **A naive split leaves `dispose_pending` re-taking an ALREADY-EMPTIED queue: it would dispose nothing, no stream file would ever be unlinked, and no cursor cleared.** So: **`final_drain_pending` PEEKS** — it iterates `&self.pending_unregisters` (cloning the names it needs) and leaves the queue in place — and **`dispose_pending` is the one that `mem::take`s it.** The wrapper preserves the merged behaviour exactly.
+
 - [ ] **Step 1: Write the failing tests** (**3**):
 
-1. `drain_all_hands_over_the_complete_lines_it_consumed` — file order; `offset_after` correct; `mem::take`-drained (never redelivered); a partial line is never handed over.
+1. `drain_all_hands_over_the_complete_lines_it_consumed` — file order; `mem::take`-drained (never redelivered); a partial line is never handed over. *(A1: it does NOT assert an `offset_after` — that field no longer exists.)*
 2. `the_disposal_time_final_drain_also_hands_over_its_lines` — `final_drain_pending` produces the last line **while the file still exists**; `dispose_pending` is what unlinks it; `take_disposed()` yields `Disposed { session, final_offset }` with the true final offset (**the `end` frame's offset source — C7**).
 3. **`the_final_drain_and_the_disposal_are_separable`** (C5's enabling guard) — after `final_drain_pending`, the stream file **still exists** and the session is **still tailed**; only `dispose_pending` removes both. *This is what makes harvesting before the unlink possible at all.*
 
@@ -443,7 +568,7 @@ Split `apply_pending_unregisters` **at the seam cp-0 already documents** (read_c
 - [ ] **Step 4: Run the new tests AND the entire cp-0 suite.**
 
 Run: `cargo test -p camp --bins daemon::read_channel && cargo test -p camp --test read_channel`
-Expected: PASS — 3 new + **every cp-0 test**, including `a_workers_final_stdout_line_is_drained_before_the_reap_disposes_the_file` (read_channel.rs:509) and the ordering-guard tests. **If any cp-0 test goes red, the split broke a merged invariant — STOP.**
+Expected: PASS — **3 new** unit tests plus **every cp-0 test** (the merged `--bins daemon::read_channel` count is 22 today, so expect **25**), including `a_workers_final_stdout_line_is_drained_before_the_reap_disposes_the_file` (read_channel.rs:509) and the ordering-guard tests. **If any cp-0 test goes red, the split broke a merged invariant — STOP.**
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -469,7 +594,7 @@ Spec: §2, issue #55.
 
 - [ ] **Step 3: Implement** — `pub enum ControlWrite { Delivered, NoPipe, Failed(String) }` and `pub fn write_control(&mut self, session, line) -> ControlWrite`, a structural twin of `nudge_via_stdin`: bounded `write_bounded` with `STDIN_WRITE_TIMEOUT`; on error `worker.stdin = None` (never write after a torn line). Both carry `#[allow(dead_code)] // cp-1: first read in Task 6`. **`NoPipe` is a caller-visible FAILURE, not a designed degrade** — unlike a turn, an interrupt has no resume path.
 
-- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --bins daemon::dispatch` — the 2 new tests plus every existing dispatch test.
+- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --bins daemon::dispatch` — **2 new** tests plus every existing dispatch test (G9: a count of 2 means the filter matched only the new ones — reconcile).
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -556,10 +681,16 @@ impl ControlRuntime {
                 data: serde_json::json!({"session": session, "request_id": request_id}),
             }) {
                 Ok(_) => {
+                    // G7: the rig/bead go INTO the pending row, so every fault this
+                    // request may later produce (silence_timeout, ceiling_timeout,
+                    // session_ended) carries the SAME provenance as the
+                    // session.interrupted it answers.
                     self.track_pending(
                         request_id.clone(),
                         session.to_owned(),
                         "session.interrupt",
+                        rig.clone(),
+                        bead.clone(),
                         now,
                     );
                     Response::Interrupt { ok: true, request_id }
@@ -607,6 +738,11 @@ impl ControlRuntime {
                         "session": session,
                         "request_id": request_id,
                         "verb": "session.interrupt",
+                        // G5: the machine-readable cause. TERMINAL — the request never
+                        // reached the worker, so no answer can ever arrive, and
+                        // `rehydrate` must route this id to `answered`, never to
+                        // `timed_out`.
+                        "cause": "write_failed",
                         "reason": reason,
                     }),
                 }) {
@@ -627,12 +763,21 @@ impl ControlRuntime {
 ```
 
 **`ingest(&mut self, lines: &[StreamLine], dispatcher: &mut Dispatcher, now: Timestamp) -> Vec<EventInput>`:**
-- **FIRST, for every line: `self.note_activity(&sl.session, now)`** (D7/C11 — the session is producing output, so its pending deadlines reset).
+- **FIRST, for every line: `self.note_activity(&sl.session, now)`** (D7/C11 — the session is producing output, so its SILENCE deadline resets; the G6 ceiling does not).
 - `ControlResponse` ⇒ `self.resolve(id, ok, detail)`, pushing the `Option` when `Some` (B6/C11).
-- `RequestUserDialog` ⇒ write `ParentMessage::DialogRefusal` via `dispatcher.write_control`; append `control.failed` naming the outcome (delivered / no pipe / write failed), **deduped per `request_id`** so a worker re-asking the same id appends once.
-- `CanUseTool` ⇒ `control.failed` stating plainly that the worker is now blocked forever holding a dispatch slot and must be killed by the operator. camp takes no automatic action: the flow is structurally unreachable in cp-1 (§5.3.1), and phase 3 owns both the answer and §5.3.2's slot rule.
-- `Stream(_)` ⇒ **nothing** (D6″: subscribers are fed from the FILE by `pump`, never from here).
-- `Err(ControlWireError)` ⇒ `control.failed`, **capped at `MAX_FAULTS_PER_SESSION_PER_WAKE` (8)** with the suppressed count named in the last event (loud is right; unbounded-loud is a self-DoS). *cp-0's `drain_one` hands over only already-parsed lines (the `Ok(_v)` arm) and surfaces non-JSON separately as `patrol.degraded`, so `ingest` never double-reports. Do not add a guard.*
+- `RequestUserDialog` ⇒ write `ParentMessage::DialogRefusal` via `dispatcher.write_control`; append `control.failed{cause: "dialog_refused"}` naming the outcome (delivered / no pipe / write failed), **deduped per `request_id`** so a worker re-asking the same id appends once.
+- `CanUseTool` ⇒ `control.failed{cause: "permission_unanswerable"}` stating plainly that the worker is now blocked forever holding a dispatch slot and must be killed by the operator. camp takes no automatic action: the flow is structurally unreachable in cp-1 (§5.3.1), and phase 3 owns both the answer and §5.3.2's slot rule.
+- `Stream(_)` ⇒ **nothing** (D6″: subscribers are fed from the FILE by `pump`, never from here — which is why the variant's payload carries a PERMANENT dead_code allow, G8).
+- `Err(ControlWireError)` ⇒ `control.failed{cause: "unparsable"}`. *cp-0's `drain_one` hands over only already-parsed lines (the `Ok(_v)` arm) and surfaces non-JSON separately as `patrol.degraded`, so `ingest` never double-reports. Do not add a guard.*
+
+**`MAX_FAULTS_PER_SESSION_PER_WAKE` — DEFINED HERE (G10).** Rev 3 referred to it as an existing dedupe; `grep` finds nothing, and the implementer was left to invent its home, its reset semantics, and — since `ControlFailed` is `deny_unknown_fields` — where a suppressed count could even go. So:
+```rust
+/// Loud is right; UNBOUNDED-loud is a self-DoS. A worker spraying malformed control
+/// lines would otherwise drive one synchronous SQLite append per line on the event
+/// loop. This bounds the fault events ONE `ingest` call may emit for ONE session.
+pub const MAX_FAULTS_PER_SESSION_PER_WAKE: usize = 8;
+```
+It is a **per-`ingest`-call counter** (a local `HashMap<&str, usize>` reset at the top of every `ingest`, hence per-wake — it is NOT runtime state). Past the cap, further faults for that session are suppressed and **the 8th event's `reason` STRING names the suppressed count** (`"… and N further unparsable control lines this wake were suppressed"`), with `cause: "unparsable"`. **This is a stated decision, not a guess:** the count rides `reason` precisely so that no new payload field is needed and Task 2's `deny_unknown_fields` fold test stays green. The `cause` discriminant (G5) is the machine-readable half; the count is diagnostic detail.
 
 Also define here: `SUBSCRIBER_BUFFER_BYTES_DEFAULT: usize = 1024 * 1024` and `subscriber_buffer_bytes_from_env(default) -> Result<usize>` (`CAMP_SUBSCRIBER_BUFFER_BYTES`) — the exact `max_stream_bytes_from_env` twin (read_channel.rs:34-50), failing fast on a malformed or zero value.
 
@@ -674,12 +819,53 @@ Also define here: `SUBSCRIBER_BUFFER_BYTES_DEFAULT: usize = 1024 * 1024` and `su
         // If this harvest is EVER non-empty, cp-0's ordering guard fires in the same
         // breath and appends a durable patrol.degraded ORDERING VIOLATION. That is
         // CORRECT, not libel: non-empty here MEANS the ordering really was violated.
-        // The two must co-occur, and the tests assert both directions.
+        //
+        // PRECISELY (the A-addendum's correction to rev 3's prose): the implication
+        // is ONE-WAY. harvest-2-non-empty ==> the guard fires. NOT the converse:
+        // `drain_one` advances `t.offset` past BLANK lines (read_channel.rs:631-633)
+        // and past NON-JSON lines (642-649) WITHOUT pushing a StreamLine, so the
+        // guard can fire with this harvest empty. Test 2's assertion (no
+        // patrol.degraded ORDERING VIOLATION on the normal path) is the correct guard
+        // either way and is unchanged — it is the PROSE that was wrong, not the test.
         appended |= control_step(ledger, control, dispatcher, read_channel, &mut conns, &mut poll)?;
-        // Only NOW: unlink the files and clear the cursors. The `take_disposed()`
-        // inside control_step already captured each session's FINAL offset for the
-        // `end` frame (C7).
+
+        // ---- G4/A2: THE DISPOSAL HAND-OFF, IN THE ONLY ORDER THAT WORKS --------
+        // Rev 3 consumed `take_disposed()` INSIDE control_step — i.e. BEFORE
+        // `dispose_pending` had produced anything — so on the disposal wake the list
+        // was EMPTY, `closing` was never set, and a subscriber that was exactly
+        // CAUGHT UP (poll_timeout == None: the steady state of every long-lived
+        // `camp watch`) got NO end frame and NO EOF, forever.
+        //
+        // A2 is why that could not be papered over: what "rescued" it in practice was
+        // that `unregister`'s remove_file (read_channel.rs:433) fires a notify event
+        // and `on_watch_event` always signals — so the end frame's delivery would have
+        // DEPENDED ON A DELIVERED NOTIFY EVENT, which cp-0's law in this very block
+        // (event_loop.rs:406-408) forbids: "correctness never depends on a delivered
+        // event". It is also why a test would have passed while the design was broken.
+        //
+        // So: dispose FIRST (which is what RECORDS Disposed{session, final_offset}),
+        // and only then hand the list to the subscriber registry. The end frame now
+        // goes out ON THE DISPOSAL WAKE, for a caught-up and a behind subscriber
+        // alike, with no dependence on the watch.
         read_channel.dispose_pending(ledger)?;
+        let disposed = read_channel.take_disposed();
+        if !disposed.is_empty() {
+            // Sets `closing` + pins `tail = final_offset` + pumps (so a caught-up
+            // subscriber emits its end frame immediately), and expires each disposed
+            // session's still-pending control requests LOUDLY (G7's forget_session).
+            let (gone, events) = control.close_disposed(&disposed, ledger, &mut conns);
+            for input in events {
+                ledger.append(input)?;
+                appended = true;
+            }
+            for token in gone {
+                if let Some(mut conn) = conns.remove(&token) {
+                    let _ = poll.registry().deregister(&mut conn.stream);
+                }
+                control.forget(token);
+            }
+        }
+        // -----------------------------------------------------------------------
 
         // B5: ONLY NOW may a deadline expire — after EVERY ingest this wake. A
         // response sitting in the file because its notify was coalesced must be read
@@ -693,7 +879,9 @@ Also define here: `SUBSCRIBER_BUFFER_BYTES_DEFAULT: usize = 1024 * 1024` and `su
             if let Err(e) = settle(/* … */) { eprintln!("campd: control settle failed: {e:#}"); }
         }
 ```
-**`control_step`** (one helper, two call sites): `take_stream_lines` → `control.ingest(...)` → append → **`control.fanout(read_channel, &mut conns)`** (Task 8: refresh each subscriber's `tail`, pump, drop over-cap ones) → **`control.close_disposed(read_channel.take_disposed(), ledger, &mut conns)`** (Task 8: mark subscribers `Closing` with the true final offset; also calls `control.forget_session` to prune `answered`) → deregister returned tokens. Returns whether it appended.
+**`control_step`** (one helper, two call sites — harvest 1 and harvest 2): `take_stream_lines` → `control.ingest(...)` → append the events → **`control.fanout(read_channel, &mut conns)`** (Task 8: refresh each subscriber's `tail`, `pump`, collect drops) → append the `subscriber.dropped` events → deregister + `forget` the dropped tokens. Returns whether it appended.
+
+**`close_disposed` is NO LONGER inside `control_step`** (G4). It is its own step, above, and it runs **after** `dispose_pending`. That is the whole of the fix.
 
 - [ ] **Step 6: `mod.rs` — construct and REHYDRATE (B6).** Beside the read channel (mod.rs:167), rehydrating AFTER `patrol::adopt`:
 ```rust
@@ -721,9 +909,9 @@ Create `crates/camp/tests/control.rs`, copying the harness (`munge`, `stdout_pat
 5. **`interrupting_a_session_with_no_held_pipe_fails_loudly`** — `ok:false`, "no stdin pipe".
 6. **`a_campd_restart_across_an_in_flight_interrupt_invents_no_fault`** (B6) — interrupt, wait for `session.interrupted`, `kill9()`, spawn a fresh campd, assert `control.responded{request_id}` lands **and no `control.failed` exists**.
 
-- [ ] **Step 9: Run.** `cargo test -p camp --test control 2>&1 | tail -30` → PASS, **6 tests**.
+- [ ] **Step 9: Run.** `cargo test -p camp --test control 2>&1 | tail -30` → PASS, **6 tests** (Task 8 adds 11 more later; Task 7 adds 1).
 
-- [ ] **Step 10: Full suite** (the D4 blast radius). `cargo test --workspace` → PASS. **`cli_nudge.rs` MUST still pass** (the CLI verb is unchanged), and so must `daemon_patrol.rs` (`nudge_via_stdin` survives — D4).
+- [ ] **Step 10: Full suite** (the D4 blast radius). `cargo test --workspace` → PASS, **with no test count DECREASING versus main**. **`cli_nudge.rs` MUST still pass** (the CLI verb is unchanged), and so must `daemon_patrol.rs` (**`patrol.rs:788` calls `dispatcher.nudge_via_stdin` DIRECTLY; D4 deletes only the socket verb, so the method survives and there is no orphaned caller** — the merged-caller sweep confirms this is the complete list).
 
 - [ ] **Step 11: Commit.**
 ```bash
@@ -750,7 +938,7 @@ Spec: §4.1, §4.2, §4.3.
 - `control.rs::serve_sessions_list(ledger, patrol, read_channel)` — answers from the **LEDGER's** registry (`live_sessions()`), not campd's child map: an ADOPTED worker from a previous campd life is a live session too (§4.3). `state` is **exactly two values in cp-1** (`"stalled"` / `"working"`) and the doc comment promises no third. `blocked` is `false`; its producer is phase 3 (§5.3); the flow is structurally unreachable (§5.3.1); and a `can_use_tool` that arrives anyway is a LOUD `control.failed`, never a quietly-flipped bit. **The field is in the shape because §4.1's shape requires it: a protocol field awaiting its producer, not a guess.** `last_activity` = `read_channel.last_activity(name)`, else the registry's `spawned_ts`.
 - `event_loop.rs`: one delegating arm.
 
-- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --bins daemon::socket && cargo test -p camp --test control` (**7** integration tests now).
+- [ ] **Step 4: Run and watch pass.** `cargo test -p camp --bins daemon::socket` (**4** wire-pin tests: the merged 2 + `control_plane_verbs_wire_format_is_pinned` + `sessions_list_wire_format_is_pinned`; `nudge_wire_format_is_pinned` is DELETED by D4) `&& cargo test -p camp --test control` (**7** integration tests now: 6 from Task 6 + this one).
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -766,32 +954,52 @@ Spec: §4.4, §9, §8, §5.2.
 
 **Files:** `daemon/control.rs`, `daemon/socket.rs` (wire types only — **no client API**, B2), `daemon/event_loop.rs`, `tests/fake-agent.sh`, `tests/control.rs`.
 
-### The frame wire — TAGGED FROM BIRTH, and now THREE frames (B12/C8)
+### The frame wire — TAGGED FROM BIRTH; THREE frames; `skipped` carries a REASON DISCRIMINANT (B12/C8/G11)
 
 ```json
 {"frame":"event","session":"t/dev/1","offset":123,"event":{ …the worker's line, VERBATIM BYTES… }}
-{"frame":"skipped","session":"t/dev/1","offset":456,"bytes":2097152,"reason":"line exceeds subscriber_buffer_bytes"}
+{"frame":"skipped","session":"t/dev/1","offset":456,"bytes":2097152,"reason":"over_cap"}
+{"frame":"skipped","session":"t/dev/1","offset":460,"bytes":17,"reason":"not_a_json_object"}
 {"frame":"end","session":"t/dev/1","offset":789,"reason":"stopped"}
+{"ok":true,"v":1,"subscription":"sub-1","cursor":0}
 ```
-**`event`'s payload is the worker's line SPLICED IN VERBATIM (C2)** — never re-serialized through a `Value`, which would sort its keys and hand cp-2/cp-4 a wire camp invented by accident. After the `end` frame campd flushes and closes (EOF).
+**`event`'s payload is the worker's line SPLICED IN VERBATIM (C2)** — never re-serialized through a `Value`, which would sort its keys and hand cp-2/cp-4 a wire camp invented by accident.
+
+**`skipped`'s `reason` is a DISCRIMINANT, and only one of them is evented (G11).** Rev 3 overloaded one `skipped` frame for two different faults and appended a `patrol.degraded` for both — but **cp-0 already reports every non-JSON line as `patrol.degraded`** from `drain_one`'s `Err` arm (read_channel.rs:643-650). So:
+- `over_cap` ⇒ the frame **and** ONE durable `patrol.degraded`, deduped per `(session, offset)` (many subscribers hit the same line).
+- `not_a_json_object` ⇒ the frame and **NO event** — cp-0 already owns that fault, and re-reporting it from the file side is exactly the double-report Task 6 forbids.
+- **Blank lines are SKIPPED SILENTLY** — no frame, no event — advancing the cursor, exactly as cp-0 does (read_channel.rs:631-633). Rev 3 would have emitted a `skipped` frame for a no-op.
+
+*(Honest correction: `event_frame` does NOT "match cp-0's `Ok(_v)` arm" — cp-0 accepts any valid JSON **value**, including a bare array or number, and counts it parsed. `event_frame` requires an **object**. The `skipped{reason:"not_a_json_object"}` frame is the honest difference, not an agreement.)*
+
+**`"v":1` in the hello — the protocol version (non-blocking note, adopted).** Named twice as "the last free place" and then not taken. It costs one field now and is unbuyable later; cp-2/3/4/5 all extend this wire. `Subscribed` already precedes `Ok` in the untagged `Response`, so it is not shadowed.
+
+**End-of-stream:** after the `end` frame campd flushes and closes (EOF). `reason` is `stopped` or `crashed` — **NOT `capped`** (non-blocking note, adopted: `ledger/mod.rs:341`'s column only ever holds `live`/`stopped`/`crashed`; a cap-killed session is recorded `crashed`, per event_loop.rs:533. Rev 3's `"capped"` was a **phantom value**).
 
 ### Constants, with their arithmetic
 
 ```rust
 pub const SUBSCRIBER_BUFFER_BYTES_DEFAULT: usize = 1024 * 1024;  // §4.4's number
 pub const HISTORY_CHUNK_BYTES: usize = 64 * 1024;
-pub const MAX_PUMP_BYTES_PER_WAKE: usize = 256 * 1024;           // per subscriber (C6)
+/// G1: this bounds the SCAN, not merely the delivered bytes — otherwise an
+/// over-cap line (which is scanned but never buffered) would be unbounded work on
+/// the event loop.
+pub const MAX_PUMP_BYTES_PER_WAKE: usize = 256 * 1024;           // per subscriber
 /// §4.4 bounds BYTES PER CONNECTION; nothing bounded the CONNECTION COUNT.
 /// WORST CASE, STATED: MAX_SUBSCRIBERS * SUBSCRIBER_BUFFER_BYTES = 8 MiB of
 /// outbound buffers on top of campd's idle RSS. That CAN approach the spec's
-/// <20 MB figure — so, plainly: <20 MB is an IDLE bound (and it is exactly what
-/// `make perf` measures: N subscribers with EMPTY buffers). A campd with 8
-/// SATURATED subscribers is outside that bound BY DESIGN, and this cap is what
-/// keeps it bounded at all. Raising it is a spec question, not a local call.
+/// <20 MB figure — so, plainly: <20 MB is an IDLE bound (and it is what `make perf`
+/// measures: N subscribers with EMPTY buffers). A campd with 8 SATURATED
+/// subscribers is outside that bound BY DESIGN, and this cap is what keeps it
+/// bounded at all. Raising it is a spec question, not a local call.
+///
+/// G3 — and this arithmetic is only TRUE in rev 4. Rev 3 refilled `out` only when
+/// EMPTY, so it never held more than one chunk (~64 KiB): the real bound was
+/// ~8 x 64 KiB, the 1 MiB cap was UNREACHABLE, and the drop path was DEAD CODE.
 pub const MAX_SUBSCRIBERS: usize = 8;
 ```
 
-### `Subscriber` — ONE cursor (D6″/C6), and a `Closing` state (C7)
+### `Subscriber` — ONE monotone cursor (D6″), a PARTIAL-LINE BUFFER (G1), a `Closing` state (C7)
 
 ```rust
 struct Subscriber {
@@ -799,24 +1007,48 @@ struct Subscriber {
     session: String,
     /// The open stream file. Held across disposal ON PURPOSE — on Unix an unlinked
     /// inode survives while an fd is open, so a Closing subscriber FINISHES ITS
-    /// HISTORY (C7: rev 2's text promised this and its code foreclosed it).
+    /// HISTORY (C7).
     file: std::fs::File,
-    /// THE ONE CURSOR (D6″): the next byte this subscriber needs. MONOTONE, and the
-    /// SOLE delivery gate — there is no separate live path, so there is no boundary
-    /// to get wrong (C6: rev 2's catch-up/live split could BOTH duplicate AND
-    /// silently truncate, and no test could see either).
+
+    // ---- the reader state. THREE positions, and the distinction is what fixes G1.
+    /// THE DELIVERY CURSOR (D6″): the byte offset just past the last COMPLETE line
+    /// delivered. MONOTONE, and the sole delivery gate — this is what a client
+    /// resumes from (§9), so it may only ever advance past a whole line.
     cursor: u64,
+    /// THE READ POSITION: how far `pump` has read from the file. `scan >= cursor`
+    /// always; the gap is the in-progress line.
+    ///
+    /// G1: rev 3 had ONLY `cursor`, and lexed "each complete line in the chunk" — so
+    /// a line longer than one 64 KiB chunk contained no '\n', advanced nothing, and
+    /// LIVELOCKED campd at 100% CPU (with `poll_timeout` = Some(ZERO) re-reading the
+    /// same chunk forever). A `Read`/`Bash`/`Grep` tool-result line routinely exceeds
+    /// 64 KiB. cp-0 solved this in `drain_one` with exactly the buffer below
+    /// (read_channel.rs:588, 613-624) and rev 3 did not copy it.
+    scan: u64,
+    /// The bytes of the in-progress line, [cursor, scan). BOUNDED BY THE CAP: once
+    /// the line's bytes would cross `subscriber_buffer_bytes` it can never be
+    /// delivered, so we stop buffering it (see `oversize`) rather than growing to
+    /// max_stream_bytes (256 MiB) on the event loop.
+    partial: Vec<u8>,
+    /// OVERSIZE SCAN (G1/C8): the in-progress line has already exceeded the cap.
+    /// `partial` is DROPPED (memory freed) and we merely COUNT bytes while scanning
+    /// for the terminating '\n'. At the newline a `skipped{reason:"over_cap"}` frame
+    /// is emitted with the true `bytes` — which is why the frame can carry a byte
+    /// count at all. Rev 3's `skipped` frame was STRUCTURALLY UNREACHABLE: it could
+    /// never lex a line it could not buffer.
+    oversize: Option<u64>,   // bytes counted so far
+
     /// What campd has actually DRAINED. Refreshed every wake from
-    /// `read_channel.tail_state`; PINNED to the final offset once the session is
-    /// disposed. `pump` reads ONLY [cursor, tail) — so it can never read bytes campd
-    /// has not drained (rev 2 could, and delivered them twice).
+    /// `read_channel.tail_state`; PINNED to the final offset at disposal. `pump`
+    /// reads ONLY [scan, tail) — so it can never read bytes campd has not drained.
     tail: u64,
-    /// C7: set at disposal (stopped | crashed | capped). A Closing subscriber keeps
-    /// pumping until `cursor == tail` AND `out` is empty; only THEN does the `end`
+    /// C7: set at disposal (`stopped` | `crashed`). A Closing subscriber keeps
+    /// pumping until `scan == tail` AND `out` is empty; only THEN does the `end`
     /// frame go out, and the connection closes when that flush completes.
     closing: Option<String>,
-    /// Bytes queued for this socket. HARD-capped: a frame that would cross
-    /// `subscriber_buffer_bytes` drops the subscriber BEFORE it is appended (B10).
+
+    /// Bytes queued for this socket. HARD-capped, and — G3 — REFILLED EVEN WHILE
+    /// NON-EMPTY, which is what makes the cap reachable and the drop real.
     out: Vec<u8>,
     /// The largest `out` WOULD have reached — `buffered_bytes` in
     /// `subscriber.dropped` (§4.4: "naming the session and the high-water mark").
@@ -826,21 +1058,27 @@ struct Subscriber {
 
 - [ ] **Step 1: Write the failing tests.**
 
-**Unit (`control.rs`, 4):**
-1. **`event_frame_splices_verbatim_and_refuses_a_non_object_line`** (C2's new-failure test) — `event_frame("t/dev/1", 123, r#"{"type":"system","subtype":"init"}"#)` produces **exactly** `{"frame":"event","session":"t/dev/1","offset":123,"event":{"type":"system","subtype":"init"}}\n` — **key order preserved, because the line is SPLICED, not re-serialized.** And `event_frame(_, _, "not json")` ⇒ `None` (so the history path agrees with cp-0's `Ok(_v)` arm).
-2. `subscribe_frame_shapes_are_pinned` — all three frames (`event`, `skipped`, `end`).
-3. `a_frame_that_would_cross_the_cap_drops_the_subscriber_before_it_is_appended` (B10) — the HARD cap; `buffered_bytes` is the ATTEMPTED size.
-4. **`a_line_larger_than_the_cap_is_skipped_not_fatal`** (C8) — a single line bigger than the whole cap yields a `skipped` frame, the cursor advances past it, and the subscriber SURVIVES.
+**Unit (`control.rs`, 7):**
+1. **`event_frame_splices_verbatim_and_refuses_a_non_object_line`** (C2) — `event_frame(b"t/dev/1", 123, br#"{"type":"system","subtype":"init"}"#)` produces **exactly** `{"frame":"event","session":"t/dev/1","offset":123,"event":{"type":"system","subtype":"init"}}\n` — **key order preserved, because the line is SPLICED, not re-serialized.** And `event_frame(_, _, b"not json")` ⇒ `None` (the caller emits `skipped{reason:"not_a_json_object"}`).
+2. `subscribe_frame_shapes_are_pinned` — the hello (**with `"v":1`**) and all three frames; `skipped` in **both** reason flavours.
+3. **`pump_lexes_a_line_that_spans_many_chunks`** (G1) — a **100 KiB** line (> `HISTORY_CHUNK_BYTES`) is buffered across chunks and delivered as ONE `event` frame; the cursor advances exactly past it. *Rev 3 livelocked here at 100 % CPU — the ordinary case on the ordinary session.*
+4. **`pump_skips_an_over_cap_line_without_buffering_it`** (G1/C8) — a line **larger than the cap** switches to OVERSIZE SCAN: `partial` stays bounded (assert `partial.len() <= cap` throughout), a `skipped{reason:"over_cap", bytes:<true length>}` frame is emitted at the newline, and the cursor advances past it. *This is only reachable because the scan can lex a line it refuses to buffer — rev 3 could not, so its `skipped` frame was structurally unreachable.*
+5. **`a_frame_that_would_cross_the_cap_drops_the_subscriber_before_it_is_appended`** (B10) — the HARD cap; `buffered_bytes` is the ATTEMPTED size.
+6. **`out_keeps_filling_while_non_empty_so_the_cap_is_reachable`** (G3) — with a non-draining socket, `out` grows across MANY chunks up to the cap and the drop fires **at the default 1 MiB**, not only at a toy 512 B cap. *Rev 3 refilled only when `out` was empty, so `out` never passed ~64 KiB and the drop was dead code.*
+7. **`poll_timeout_never_arms_on_a_wouldblock_alone`** (G2) — a subscriber with a non-empty `out` and `scan == tail` contributes **`None`**; one with an empty `out` and `scan < tail` contributes `Some(ZERO)`. *Rev 3 armed ZERO on a non-empty `out`, which spun campd for the duration of every stream.*
 
-**Integration (`tests/control.rs`, 7):**
+**Integration (`tests/control.rs`, 11 — items 5–15):**
 5. **`a_wedged_campd_fails_the_subscribe_hello_fast`** — the EXIT CRITERION. A bare bound `UnixListener` is the wedge simulator (socket.rs:751). `SubClient::open` returns `Err` (`WouldBlock`/`TimedOut`) **inside REQUEST_TIMEOUT**; assert elapsed < 15 s.
 6. **`a_subscription_survives_a_quiet_period_longer_than_request_timeout`** (B13) — open at the tail, sleep **6 s** (> the 5 s `REQUEST_TIMEOUT`), then interrupt and assert a frame still arrives.
-7. **`a_subscriber_catching_up_across_a_live_burst_gets_every_line_exactly_once_in_order`** — **C6's test: the window rev 2 never exercised.** A session with **>64 KiB** of history (more than one `HISTORY_CHUNK_BYTES`, so catch-up spans several pumps); subscribe at **cursor 0**; the worker appends **live lines DURING catch-up** (a second `send_turn` fired immediately after the hello). Assert every line arrives **exactly once**, **in file order**, with **strictly increasing `offset`s**. *Rev 2's design silently dropped a burst here and could double-deliver.*
-8. **`a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends`** (B12/C7) — `FAKE_AGENT_EXIT_AFTER_CONTROL`; assert **every** line arrives BEFORE the `end` frame (not a truncated prefix), the `end` frame names the session and a `reason`, its `offset` equals the session's final offset, and **EOF never arrives without an `end` frame**.
-9. **`a_closing_subscriber_that_stops_reading_is_still_dropped_at_the_cap`** (C7's new-failure test) — a Closing subscriber gets NO backpressure exemption, so it can never hold an fd forever.
-10. **`a_hung_up_subscriber_is_forgotten_and_is_never_libeled_as_backpressure`** (B7) — drop the subscription, drive three wakes, assert campd still answers `status` promptly and **no `subscriber.dropped` exists**. A normal detach is not a fault (§5.2).
-11. **`a_subscriber_that_stops_reading_is_dropped_loudly_and_campd_keeps_serving`** (§8/B8) — `FAKE_AGENT_SPAM_ON_TURN=8000` (≈720 KB, chosen to exceed *kernel socket buffer + app cap* on both platforms: macOS `net.local.stream.sendspace` ≈ 8 KiB, Linux ≈ 200 KiB — **a smaller spam is absorbed entirely by the kernel and the test becomes theatre**), `CAMP_SUBSCRIBER_BUFFER_BYTES=512`. Subscribe at the **tail** (clean hello), read NOTHING, `send_turn` to trigger the spam. Assert `subscriber.dropped{session, cap_bytes:512, buffered_bytes>512}`, then that campd answers `status` on a FRESH connection in < 5 s.
-12. **`a_cursor_into_a_reaped_stream_or_past_the_tail_is_an_explicit_error`** (§9) — both, both explicit.
+7. **`a_subscriber_catching_up_across_a_live_burst_gets_every_line_exactly_once_in_order`** (C6) — a session with **> 256 KiB** of history (**not 64 KiB**: `MAX_PUMP_BYTES_PER_WAKE` is 256 KiB, so a smaller history is consumed in ONE wake and **the live-burst window never opens** — rev 3's ">64 KiB" would not have exercised the thing it exists for); subscribe at **cursor 0**; the worker appends **live lines DURING catch-up**. Assert every line arrives **exactly once**, **in file order**, with **strictly increasing `offset`s**.
+8. **`a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends`** (B12/C7) — `FAKE_AGENT_EXIT_AFTER_CONTROL`; assert **every** line arrives BEFORE the `end` frame (not a truncated prefix), its `offset` equals the session's final offset, and **EOF never arrives without an `end` frame**.
+9. **`a_subscriber_caught_up_at_the_tail_still_gets_an_end_frame_on_the_reap_wake`** (**G4/A2 — the case NO rev-3 test reached**) — subscribe, **drain every frame until the subscriber is fully caught up** (`out` empty, `scan == tail`, `poll_timeout` = `None` for it: the steady state of every long-lived `camp watch`), and only THEN let the worker exit. Assert the `end` frame arrives, **within one wake**, and that EOF follows it. *Rev 3 blocked forever here — and what would have "rescued" it is the `remove_file` notify event, i.e. correctness depending on a delivered event, which cp-0's law forbids. To make that dependence impossible to hide, this test also asserts the end frame arrives with the notify path unable to help: it is the ORDERING that must deliver it.*
+10. **`a_closing_subscriber_that_stops_reading_is_still_dropped_at_the_cap`** (C7's new-failure test) — a Closing subscriber gets NO backpressure exemption, so it can never hold an fd forever.
+11. **`a_hung_up_subscriber_is_forgotten_and_is_never_libeled_as_backpressure`** (B7) — drop the subscription, drive three wakes, assert campd still answers `status` promptly and **no `subscriber.dropped` exists**. A normal detach is not a fault (§5.2).
+12. **`a_subscriber_that_stops_reading_is_dropped_loudly_and_campd_keeps_serving`** (§8/B8/**G3**) — **at the DEFAULT 1 MiB cap** (`CAMP_SUBSCRIBER_BUFFER_BYTES` is NOT set): `FAKE_AGENT_SPAM_ON_TURN=30000` (≈ 2.7 MB — enough to exceed *kernel socket buffer + the real 1 MiB cap*; macOS `net.local.stream.sendspace` ≈ 8 KiB, Linux ≈ 200 KiB). Subscribe at the **tail** (clean hello), read NOTHING, `send_turn` to trigger the spam. Assert `subscriber.dropped{session, cap_bytes: 1048576, buffered_bytes > 1048576}`, then that campd answers `status` on a FRESH connection in < 5 s. ***This test is the one rev 3 could not have passed:*** *its 512 B cap was smaller than one chunk, which was the ONLY regime where rev 3's drop path fired at all — so it went green while the shipped 1 MiB configuration had no working backpressure.*
+13. **`a_line_larger_than_the_cap_is_skipped_and_campd_does_not_livelock`** (**G1 — the test the suite structurally could not contain**) — a NEW fake-agent mode emits **one genuinely huge line** (see below). Assert: a `skipped{reason:"over_cap", bytes:…}` frame arrives; **the NEXT line still arrives** (the subscriber survived and its cursor advanced past the monster); campd answers `status` on a fresh connection **in < 5 s** (it did not livelock); and no `subscriber.dropped` was appended. **Bound the whole test with a hard deadline** — a livelock manifests as a hang, and a hanging test that "passes by timing out the harness" is the failure mode this test exists to make impossible.
+14. **`a_non_json_line_yields_a_skipped_frame_and_no_second_patrol_degraded`** (G11) — cp-0 already reports the line; campd must not report it twice from the file side.
+15. **`a_cursor_into_a_reaped_stream_or_past_the_tail_is_an_explicit_error`** (§9) — both, both explicit.
 
 **`SubClient` — real bodies** (non-blocking note, adopted). `camp` is a binary crate, so there is no `socket::subscribe` (B2); this is the harness's own idiom.
 ```rust
@@ -928,47 +1166,138 @@ fn event_frame(session: &str, offset: u64, raw_line: &str) -> Option<Vec<u8>> {
 1. `subscribers.len() >= MAX_SUBSCRIBERS` ⇒ explicit error naming the cap.
 2. `read_channel.tail_state(session)` is `None` ⇒ **not tailed** (never existed, or reaped and disposed) ⇒ explicit error citing §9.
 3. `cursor > tail` ⇒ explicit error ("past the N bytes campd has consumed"). **Ordinary history is NOT an error** (B10/D6″).
-4. Open the file; insert `Subscriber { cursor: cursor.unwrap_or(tail), tail, closing: None, out: Vec::new(), high_water: 0, … }`; return the hello. **It registers; it never writes** — the hello must be the FIRST bytes on the socket (`respond()` uses `write_all` on a NON-BLOCKING stream, event_loop.rs:997, and a WouldBlock there drops the connection — B11).
+4. Open the file; insert `Subscriber { cursor: c, scan: c, partial: Vec::new(), oversize: None, tail, closing: None, out: Vec::new(), high_water: 0, … }` where `c = cursor.unwrap_or(tail)` (**`scan` starts AT `cursor`** — the invariant `cursor <= scan <= tail` holds from birth); return the hello `{"ok":true,"v":1,"subscription":…,"cursor":c}`. **It registers; it never writes** — the hello must be the FIRST bytes on the socket (`respond()` uses `write_all` on a NON-BLOCKING stream, event_loop.rs:997, and a WouldBlock there drops the connection — B11).
 
-**`pump(token, conn) -> PumpOutcome` — the ONE data path (D6″) and the only place bytes reach a socket (B11):**
-```
-pumped = 0
-loop {
-    if out.is_empty() && cursor < tail {
-        if pumped >= MAX_PUMP_BYTES_PER_WAKE { return Ok }        // C6: bounded on the loop
-        read <= min(HISTORY_CHUNK_BYTES, tail - cursor) bytes at `cursor`
-        for each COMPLETE line in the chunk:
-            frame = event_frame(...) or (skipped_frame if the line is not a JSON object)
-            if frame.len() > cap  => append skipped_frame; record patrol.degraded ONCE
-                                     per (session, offset)                       // C8
-            else if out.len() + frame.len() > cap
-                                  => return Drop(subscriber.dropped{ high_water }) // B10
-            else                  => append frame
-            cursor = offset_after; pumped += line.len()
-    }
-    if out.is_empty() {
-        if closing.is_some() && cursor == tail {
-            append end_frame(session, tail, reason)                 // C7: history FIRST
-            keep flushing; when `out` drains => return Gone (close the connection)
-        }
-        return Ok                                                   // nothing to send
-    }
-    match write(out) {
-        Ok(n) => drain n,
-        Ok(0) | EPIPE | ECONNRESET => return Gone,
-        WouldBlock => return Ok,          // the kernel is full; the WRITABLE edge re-arms
-    }
+**`pump(&mut self, token, conn) -> PumpOutcome` — the ONE data path (D6″), and the only place bytes reach a socket (B11). Rewritten line by line (G1/G2/G3), because it carries the phase.**
+
+```rust
+pub enum PumpOutcome {
+    Ok,                  // nothing more to do RIGHT NOW (see poll_timeout for continuation)
+    Drop(EventInput),    // the hard cap was crossed: subscriber.dropped (B10/G3)
+    Gone,                // the peer is gone, or the end frame has flushed (C7)
 }
 ```
-Called at **three** sites: right after the hello is written; on every WRITABLE readiness; after every `fanout`.
+```
+pump(sub, conn):
+  scanned = 0                                   // G1: bounds the SCAN, not the output
 
-**`poll_timeout` (extended, C6):** `min(earliest pending control deadline, ZERO if any subscriber has cursor < tail OR a non-empty out)`. **`None` when neither holds** — so an idle campd with idle subscribers still blocks forever (invariant 1; Task 9's perf gate is what proves it).
+  loop {
+    // ---- (A) FILL: turn file bytes into frames, up to the cap ------------------
+    // G3: this runs even while `out` is NON-EMPTY. Rev 3 gated it on out.is_empty(),
+    // so `out` never exceeded one chunk (~64 KiB), the 1 MiB cap was unreachable, and
+    // §4.4's "drop loudly" was DEAD CODE.
+    while sub.out.len() < cap
+       && sub.scan < sub.tail
+       && scanned < MAX_PUMP_BYTES_PER_WAKE {
 
-**`fanout(read_channel, conns)`** (D6″ — it no longer touches `lines` at all): for each subscriber, refresh `tail` from `read_channel.tail_state(session)` (leaving it PINNED when `closing`), then `pump`. Returns the tokens to close and the `subscriber.dropped` events.
+        n = min(HISTORY_CHUNK_BYTES, sub.tail - sub.scan)
+        chunk = read n bytes from sub.file at offset sub.scan      // bounded by `tail`:
+        sub.scan += chunk.len()                                    // never reads undrained bytes
+        scanned  += chunk.len()
 
-**`close_disposed(disposed: Vec<Disposed>, ledger, conns)`** (B12/C7): for each disposed session, every subscriber gets `closing = Some(reason)` (from `ledger.session_status(name)`: stopped / crashed / capped) and `tail = final_offset` (**C7's defined offset source, produced by Task 4's `dispose_pending`**), then `pump`. It does **not** close the connection — `pump` does, once the history is finished and the `end` frame has flushed. It also calls `control.forget_session(session)` to prune `answered`.
+        for each byte b in chunk:                                  // a byte scan; no UTF-8 decode
+            if sub.oversize is Some(count):
+                // G1: the line already exceeded the cap. COUNT, do not buffer.
+                count += 1
+                if b == b'\n':
+                    off = sub.cursor + count                       // one past the line
+                    append_frame(skipped_frame(session, off, count, "over_cap"))
+                    emit_once_per(session, sub.cursor) -> patrol.degraded  // G11
+                    sub.cursor = off; sub.oversize = None
+            else:
+                sub.partial.push(b)
+                // G1: bound `partial` BEFORE it can grow to max_stream_bytes (256 MiB).
+                if sub.partial.len() > cap:
+                    sub.oversize = Some(sub.partial.len())
+                    sub.partial.clear()                            // free the memory
+                    continue
+                if b == b'\n':
+                    line = sub.partial.drain(..)                   // INCLUDING the '\n'
+                    off  = sub.cursor + line.len()
+                    body = line without the trailing '\n' (and a trailing '\r')
+                    if body.trim().is_empty():
+                        sub.cursor = off                           // G11: blank lines are
+                        continue                                   // silent no-ops (cp-0 parity)
+                    frame = event_frame(session, off, body)        // &[u8] in, verbatim splice
+                             or skipped_frame(session, off, body.len(), "not_a_json_object")
+                    if sub.out.len() + frame.len() > cap:
+                        // B10/G3: the HARD cap. Drop BEFORE appending; report the
+                        // ATTEMPTED size as the high-water mark (§4.4).
+                        sub.high_water = max(sub.high_water, sub.out.len() + frame.len())
+                        return Drop(subscriber_dropped(sub))
+                    sub.out.extend(frame)
+                    sub.high_water = max(sub.high_water, sub.out.len())
+                    sub.cursor = off
+    }
+
+    // ---- (B) TERMINAL: history first, THEN the end frame (C7) ------------------
+    if sub.out.is_empty()
+       && sub.closing.is_some()
+       && sub.scan == sub.tail
+       && sub.partial.is_empty()
+       && sub.oversize.is_none() {
+        sub.out.extend(end_frame(session, sub.tail, reason))
+        // fall through to FLUSH; when `out` drains we return Gone.
+    }
+
+    // ---- (C) FLUSH -------------------------------------------------------------
+    if sub.out.is_empty() {
+        // Nothing buffered. Either we are done, or the per-wake scan budget ran out
+        // (poll_timeout arms the continuation), or `tail` has not advanced yet.
+        return if end_frame_was_sent { Gone } else { Ok }
+    }
+    match conn.stream.write(&sub.out) {
+        Ok(0)                       => return Gone,
+        Ok(n)                       => sub.out.drain(..n),
+        Err(WouldBlock)             => return Ok,   // G2: the WRITABLE EDGE re-arms us.
+                                                    // Do NOT arm a timeout here.
+        Err(Interrupted)            => continue,
+        Err(EPIPE | ECONNRESET | _) => return Gone,
+    }
+    // Loop: the socket took bytes, so there may be room to FILL more.
+  }
+```
+
+**Termination, per call** (the property rev 3 lacked): FILL is bounded by `MAX_PUMP_BYTES_PER_WAKE`; FLUSH either drains `out`, returns on `WouldBlock`, or returns `Gone`. Every iteration either advances `scan` or drains `out`, and both are bounded — so `pump` always returns.
+
+**Progress, across calls:** a subscriber that is behind with an empty `out` has no fd that will signal it, so `poll_timeout` arms the continuation. A subscriber with a non-empty `out` is waiting on writability, which **is** an fd event. Those are the only two states, and each has exactly one wakeup source.
+
+**`poll_timeout` (extended) — G2, and the disjunct rev 3 got wrong:**
+```rust
+// ZERO iff some subscriber has PUMPABLE FILE WORK and no fd will signal it.
+let subscriber_work = self.subscribers.values()
+    .any(|s| s.out.is_empty() && s.scan < s.tail);
+min(earliest_pending_control_due_at, if subscriber_work { Some(ZERO) } else { None })
+```
+**A non-empty `out` must NOT arm anything.** It means the last write returned `WouldBlock`, and the correct wakeup for that is the **WRITABLE edge** — already registered (Step 4), already relied on by C7. Rev 3 armed `ZERO` on it, which turned every blocked write into a spin: `poll(0)` → `pump` → `WouldBlock` → `poll(0)` … re-running `apply_tracking`, `drain_all` over every tailed file, and `persist_offsets` on each pass. **And this was the COMMON case, not the pathological one:** macOS's unix-socket send buffer is ≈ 8 KiB (the very number test 11's rationale cites) while one chunk yields up to ~64 KiB of frames — so **every healthy subscriber WouldBlocks on essentially every chunk**, and campd would have spun for the duration of any stream. Invariant 1, §4.3.
+
+`None` when neither holds — so an idle campd with idle subscribers still blocks forever.
+
+**`pump` cannot take `&mut Ledger`** (it is called from the token arm with a `&mut Conn` already borrowed), so its durable events ride a **`pending_events: Vec<EventInput>` collector on `ControlRuntime`** — cp-0's `cap_breaches`/`parse_errors` mold — drained by the caller and appended there. The `over_cap` `patrol.degraded` dedupe (`HashSet<(String, u64)>`, G11) lives on the runtime for the same reason: N subscribers hit the same over-cap line and must not append N events.
+
+**UTF-8 (non-blocking note, adopted).** `pump` operates on **BYTES, end to end**: it scans for `b'\n'` in the byte buffer and hands `&[u8]` to `event_frame`, which validates with `serde_json::from_slice` and splices the raw bytes. **It must NOT `from_utf8_lossy`** — cp-0 does (read_channel.rs:629) because it only needs a `Display`able line for a fault message, but a lossy decode **silently rewrites the very bytes C2's design exists to preserve.**
+
+Called at **three** sites: right after the hello is written (B11); on every WRITABLE readiness; after every `fanout`.
+
+**`fanout(read_channel, conns) -> (Vec<Token>, Vec<EventInput>)`** (D6″ — it no longer touches `lines` at all): for each subscriber, refresh `tail` from `read_channel.tail_state(session)`, then `pump`. Returns the tokens to close and the durable events (`subscriber.dropped` + any `over_cap` `patrol.degraded` from the collector).
+
+**The `tail` refresh, specified for all three cases (G4's new-failure guard):**
+- `Some((_, t))` and **not** `closing` ⇒ `tail = t`.
+- **`None`** (the session is no longer tailed) ⇒ **leave `tail` UNCHANGED.** Never zero it, never panic. This is the window between `dispose_pending` and `close_disposed` within one wake; `close_disposed` immediately pins the authoritative value.
+- **`closing.is_some()`** ⇒ **leave `tail` PINNED** at the final offset, whatever `tail_state` says.
+
+**`close_disposed(&[Disposed], ledger, conns) -> (Vec<Token>, Vec<EventInput>)`** (B12/C7/G4) — **called from the event loop AFTER `dispose_pending`, not from inside `control_step`.** For each `Disposed { session, final_offset }`:
+1. every subscriber of that session gets `closing = Some(reason)` — where `reason` comes from `ledger.session_status(name)` and is **`stopped` or `crashed`** (never `capped`: that value does not exist in the column) — and **`tail = final_offset`**, the authoritative end (Task 4's `dispose_pending` is what recorded it);
+2. `pump` each one. A **caught-up** subscriber (`out` empty, `scan == tail`) hits the TERMINAL branch immediately and its `end` frame goes out **on this wake** — the case rev 3 blocked forever on;
+3. `control.forget_session(session, now)` (G7) — its still-`pending` control requests are expired LOUDLY as `control.failed{cause:"session_ended"}`, and its `answered`/`timed_out` ids are pruned. Those events are returned to the caller.
+
+It does **not** close a connection itself — `pump` returns `Gone` once the `end` frame has flushed, and the event loop deregisters then.
 
 **`forget(token)`** — drop the subscription (every close path calls it). **`is_subscriber(token)`**; **`subscriber_count()`** (PERMANENT test-observable allow).
+
+**The ordering inversion, SANCTIONED IN WRITING (non-blocking note, adopted).** `pump` runs inside `control_step`, which is **before** the cap-breach/parse-fault appends and **before** `persist_offsets` — so **a subscriber sees a line's bytes before that line's ledger effect commits.** cp-0's stated law (*"offsets persist only after the line's ledger effect commits"*) is about **campd's own durable offset**, which still holds: the subscriber's cursor is the CLIENT's, held by the client, and a client that reconnects after a campd crash simply re-reads from a cursor it owns. This is a deliberate, stated divergence — not an oversight.
+
+**Accepted cost (non-blocking note, named).** Each subscriber re-parses each line it delivers (`from_slice` in `event_frame`), duplicating work `drain_one` already did — O(subscribers × bytes) on the event loop. It is bounded by `MAX_PUMP_BYTES_PER_WAKE × MAX_SUBSCRIBERS` (2 MiB/wake worst case) and is accepted for cp-1; the alternative (sharing parsed lines from the drain) cannot serve a history read, which is a file read by construction.
 
 - [ ] **Step 4: Wire the event loop — B7's fix stays.**
 - `struct Conn` → `pub(super)` (fields too).
@@ -978,12 +1307,43 @@ Called at **three** sites: right after the hello is written; on every WRITABLE r
 - The new `drain_lines` arm: `serve_subscribe` → `respond(hello)` → `pump`.
 - `control_step` gains `fanout` + `close_disposed` (Task 6 Step 5).
 
-`tests/fake-agent.sh` — `FAKE_AGENT_SPAM_ON_TURN=N`: on a USER TURN, emit N stream-json lines. **The spam must come after the subscriber is registered** (B8); test 7 fires a second turn during catch-up.
+`tests/fake-agent.sh` — **two modes, and the second is mandatory (G1).**
+
+```bash
+#   FAKE_AGENT_SPAM_ON_TURN=N   cp-1 (B8): on a USER TURN, emit N stream-json lines.
+#                               The spam must come AFTER the subscriber is registered,
+#                               or the backpressure gate tests nothing.
+#
+#   FAKE_AGENT_HUGE_LINE=N      cp-1 (G1): emit ONE stream-json line whose `text`
+#                               field is N bytes — a SINGLE line far larger than
+#                               HISTORY_CHUNK_BYTES (64 KiB) and, at N >= 1 MiB,
+#                               larger than the whole subscriber cap.
+#
+#   WHY THIS EXISTS: **every other fixture in this repo emits SHORT lines** —
+#   `emit_stream()` is `printf '%s\n' "$1"` and nothing anywhere produces a line
+#   bigger than a few hundred bytes. That is precisely WHY G1 (pump livelocking on
+#   any line > 64 KiB) was invisible to the entire suite, and why a real
+#   Read/Bash/Grep tool-result line — which routinely exceeds 64 KiB — would have
+#   hung campd in production while CI stayed green. Without this mode no gate in
+#   this phase can see the phase's worst bug.
+huge_line() {
+  # A valid stream-json object with an N-byte payload, on ONE line.
+  local n="$1"
+  local pad
+  pad="$(head -c "$n" /dev/zero | tr '\0' 'x')"
+  printf '{"type":"assistant","message":{"role":"assistant","content":"%s"}}\n' "$pad"
+}
+if [[ -n "${FAKE_AGENT_HUGE_LINE:-}" ]]; then
+  huge_line "$FAKE_AGENT_HUGE_LINE"
+  emit_stream '{"type":"assistant","message":{"role":"assistant","content":"after the monster"}}'
+fi
+```
+Test 13 drives it with `FAKE_AGENT_HUGE_LINE=2097152` (2 MiB — over the 1 MiB cap, so it exercises the OVERSIZE SCAN *and* the `skipped` frame) and asserts the `"after the monster"` line still arrives, which is the proof the cursor advanced past a line campd refused to buffer.
 
 - [ ] **Step 5: Run.**
 
 Run: `cargo test -p camp --bins daemon::control && cargo test -p camp --test control 2>&1 | tail -40`
-Expected: PASS — unit **18** (7 + 7 + 4); integration **14** (6 from Task 6 + 1 from Task 7 + 7 here).
+Expected: PASS — unit **24** (7 from Task 1 + 10 from Task 3 + 7 here); integration **18** (6 from Task 6 + 1 from Task 7 + 11 here). *(G9: if an observed count differs, RECONCILE THE LIST against the enumerations above — never delete a test to satisfy a gate.)*
 
 - [ ] **Step 6: Full suite + commit.**
 ```bash
@@ -1019,7 +1379,29 @@ Spec: §4.3. cp-0 built the M-workers half; its gate deferred the N-subscribers 
     // IDLE bound, stated plainly in the PR body rather than implied away.
 ```
 
-- [ ] **Step 2: Run it (LOCAL-ONLY, per AGENTS.md).** `make perf 2>&1 | tail -30` → PASS.
+- [ ] **Step 1b: ADD THE LOADED ARM — the gate that would have caught G1 and G2** (non-blocking note, adopted, and it is the most valuable of them).
+
+**The rev-3 idle gate was constructed to be blind to the two worst bugs this phase can ship.** G2's spin requires a **non-empty** buffer; G1's livelock requires a **large line**. The idle arm holds N subscribers with **empty** buffers on **quiescent** sessions — it can observe **neither**. A gate that cannot see the failure mode the phase introduces is not a gate.
+
+```rust
+    // cp-1 (G1/G2): the LOADED arm. N subscribers, ONE session actively streaming
+    // (FAKE_AGENT_SPAM_ON_TURN), each subscriber READING normally. Assert:
+    //
+    //   (a) campd's CPU over the streaming window is BOUNDED — well under a
+    //       busy-loop's 100%. G2's spin (poll(0) -> pump -> WouldBlock -> poll(0))
+    //       pegs a core for the whole stream, because macOS's ~8 KiB socket buffer
+    //       means EVERY healthy subscriber WouldBlocks on essentially every chunk.
+    //   (b) the stream COMPLETES within a hard deadline. G1's livelock hangs
+    //       forever on the first line > 64 KiB, so a deadline is what turns it from
+    //       "the suite hangs" into "the gate fails".
+    //   (c) every subscriber received every line, exactly once (D6"'s guarantee, at
+    //       load rather than in a unit test).
+    //
+    // Run this arm ALSO with FAKE_AGENT_HUGE_LINE set, so the loaded gate covers a
+    // line larger than a chunk — the ordinary case on any session that reads a file.
+```
+
+- [ ] **Step 2: Run it (LOCAL-ONLY, per AGENTS.md).** `make perf 2>&1 | tail -30` → PASS: the idle arm's 0.0 % CPU / <20 MB RSS, **and** the loaded arm's bounded-CPU / completes-within-deadline / exactly-once assertions.
 
 - [ ] **Step 3: Commit.**
 ```bash
@@ -1092,7 +1474,16 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
-Confirm the counts: `daemon::control` **18** unit tests; `tests/control.rs` **14**.
+**Confirm the counts (G9 — and a gate that is itself wrong is worse than no gate, so these are recomputed from the enumerated lists, not carried forward):**
+
+| filter | expected | made of |
+|---|---|---|
+| `cargo test -p camp --bins daemon::control` | **24** | Task 1: 7 · Task 3: 10 · Task 8: 7 |
+| `cargo test -p camp --test control` | **18** | Task 6: 6 · Task 7: 1 · Task 8: 11 |
+| `cargo test -p camp --bins daemon::read_channel` | 3 new + **every cp-0 test** | Task 4 |
+| `cargo test -p camp --bins daemon::dispatch` | 2 new + every existing | Task 5 |
+
+**THE RULE (G9):** if an observed count differs from the plan's, **RECONCILE THE LIST** — find the test the plan enumerates that you did not write, or the one you wrote that it does not list. **NEVER delete a test to satisfy a count**, and never record a false failure because a count was stale. The count is a cross-check, not an authority.
 
 - [ ] **Step 4: The local-only gates.** `make perf` and `make compat`.
 
