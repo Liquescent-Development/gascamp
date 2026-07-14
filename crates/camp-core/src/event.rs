@@ -53,6 +53,34 @@ pub enum EventType {
     /// re-hooks via the patrol restart path. The event NAMES the cap
     /// (greppable, invariant 3: the ledger tells the whole story).
     SessionStreamCapped,
+    /// cp-1 (§4.1): campd delivered an `interrupt` control request into a
+    /// session's held stdin. `{session, request_id}`. The ACK half of D1's
+    /// ack-then-async: the worker's answer arrives later as
+    /// `control.responded`, and THIS event is what a restart rebuilds the
+    /// pending table from (B6).
+    SessionInterrupted,
+    /// cp-1 (§2.1): a worker answered one of camp's control requests.
+    /// `{session, request_id, verb, ok, detail, late}`. `late: true` is C11's
+    /// CORRECTION: the answer arrived after campd had already declared the
+    /// request unanswered, so that `control.failed` was PREMATURE — and
+    /// saying so is the difference between a self-repairing fault and a lie.
+    ControlResponded,
+    /// cp-1 (§2.1): "a control response that never arrives is an evented,
+    /// operator-visible fault — never a swallowed timeout."
+    /// `{session?, request_id?, verb?, cause, reason}`.
+    ///
+    /// `cause` is a MACHINE-READABLE DISCRIMINANT, not decoration: rehydration
+    /// ROUTES on it. `silence_timeout`/`ceiling_timeout` mean an answer may
+    /// still arrive and must still correct; every other cause is TERMINAL.
+    /// Prose cannot carry that distinction, and a prose-matching contract is
+    /// not one to hand a later phase (invariant 3).
+    ControlFailed,
+    /// cp-1 (§4.4): a subscriber's peer stopped reading — its socket accepted
+    /// ZERO bytes for `SUBSCRIBER_STALL_TIMEOUT` with data buffered — so campd
+    /// dropped it. `{session, subscription, buffered_bytes, cap_bytes}`.
+    /// Loud, naming the high-water mark: campd never blocks and never
+    /// silently discards a stream.
+    SubscriberDropped,
     /// compat §7: a pack import was added (audit-only — no state fold).
     ImportAdded,
     /// compat §5.4: a pack/agent key was refused (audit-only — no state fold).
@@ -90,6 +118,10 @@ impl EventType {
         EventType::AgentStalled,
         EventType::PatrolDegraded,
         EventType::SessionStreamCapped,
+        EventType::SessionInterrupted,
+        EventType::ControlResponded,
+        EventType::ControlFailed,
+        EventType::SubscriberDropped,
         EventType::ImportAdded,
         EventType::ImportRefused,
     ];
@@ -125,6 +157,10 @@ impl EventType {
             EventType::AgentStalled => "agent.stalled",
             EventType::PatrolDegraded => "patrol.degraded",
             EventType::SessionStreamCapped => "session.stream_capped",
+            EventType::SessionInterrupted => "session.interrupted",
+            EventType::ControlResponded => "control.responded",
+            EventType::ControlFailed => "control.failed",
+            EventType::SubscriberDropped => "subscriber.dropped",
             EventType::ImportAdded => "import.added",
             EventType::ImportRefused => "import.refused",
         }

@@ -1299,6 +1299,126 @@ mod tests {
         );
     }
 
+    /// cp-1 (§2.1/§4.4): every control-plane event shape folds, refolds, and
+    /// REFUSES a typo.
+    ///
+    /// G5 — why EVERY `cause` is appended here, from the first commit: the
+    /// payload structs are `deny_unknown_fields`, so a `cause` VALUE added in a
+    /// later phase is fine, but a `cause` FIELD added later would break every
+    /// event already in every ledger. The field ships with the variant, and
+    /// this test appends one event per legal cause to prove the whole closed
+    /// set folds today. An unknown cause is a HARD ERROR, never a default —
+    /// rehydration routes on this value, and an unroutable cause is a
+    /// swallowed fault waiting to happen.
+    #[test]
+    fn control_plane_event_shapes_round_trip_through_the_fold() {
+        let (_dir, mut l) = temp_ledger();
+
+        l.append(EventInput {
+            kind: EventType::SessionInterrupted,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"session": "t/dev/1", "request_id": "camp-1"}),
+        })
+        .unwrap();
+
+        l.append(EventInput {
+            kind: EventType::ControlResponded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "session": "t/dev/1", "request_id": "camp-1",
+                "verb": "session.interrupt", "ok": true,
+                "detail": "{\"still_queued\":[]}", "late": false,
+            }),
+        })
+        .unwrap();
+
+        // C11: the CORRECTION shape — an answer that arrived after campd had
+        // already declared the request unanswered.
+        l.append(EventInput {
+            kind: EventType::ControlResponded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "session": "t/dev/1", "request_id": "camp-2",
+                "verb": "session.interrupt", "ok": true,
+                "detail": "arrived after control.failed declared it unanswered",
+                "late": true,
+            }),
+        })
+        .unwrap();
+
+        // ONE control.failed per legal cause (G5).
+        for cause in crate::ledger::fold::CONTROL_FAILURE_CAUSES {
+            l.append(EventInput {
+                kind: EventType::ControlFailed,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "t/dev/1", "request_id": "camp-3",
+                    "verb": "session.interrupt",
+                    "cause": cause,
+                    "reason": format!("the control request failed: {cause}"),
+                }),
+            })
+            .unwrap();
+        }
+
+        l.append(EventInput {
+            kind: EventType::SubscriberDropped,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "session": "t/dev/1", "subscription": "sub-1",
+                "buffered_bytes": 1_048_576u64, "cap_bytes": 1_048_576u64,
+            }),
+        })
+        .unwrap();
+
+        // A typo'd key is REFUSED AT APPEND — never stored and replayed forever.
+        let typo = l.append(EventInput {
+            kind: EventType::SessionInterrupted,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"session": "t/dev/1", "requestId": "camp-1"}),
+        });
+        assert!(
+            typo.is_err(),
+            "deny_unknown_fields must refuse `requestId` at append"
+        );
+
+        // An unknown cause is a hard error, not a default (invariant 5).
+        let bogus = l.append(EventInput {
+            kind: EventType::ControlFailed,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "cause": "vibes", "reason": "a cause nothing can route",
+            }),
+        });
+        assert!(bogus.is_err(), "an unknown control.failed cause must fail");
+
+        // All audit-only: durable truth, zero state drift.
+        assert_eq!(
+            count(&l, "SELECT count(*) FROM events"),
+            4 + crate::ledger::fold::CONTROL_FAILURE_CAUSES.len() as i64
+        );
+        assert_eq!(count(&l, "SELECT count(*) FROM beads"), 0);
+        assert_eq!(count(&l, "SELECT count(*) FROM sessions"), 0);
+        assert!(
+            l.refold_check().unwrap().drift.is_empty(),
+            "refold is clean"
+        );
+    }
+
     #[test]
     fn session_crashed_accepts_an_audit_cause_seq() {
         let (_dir, mut l) = temp_ledger();
