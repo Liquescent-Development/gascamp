@@ -1271,7 +1271,28 @@ fn a_line_larger_than_the_cap_is_skipped_and_campd_does_not_livelock() {
         worst
     });
 
-    let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
+    // THE HELLO ITSELF CAN BE THE CASUALTY — and the DIAGNOSTIC is the value of this
+    // gate. A campd frozen inside the drain cannot answer `session.subscribe` either,
+    // so a bare `.unwrap()` here dies with an opaque `WouldBlock` and the operator
+    // never sees WHY. Retry across the freeze; if it never comes back, SAY WHAT
+    // HAPPENED.
+    let hello_deadline = Instant::now() + Duration::from_secs(60);
+    let mut sub = loop {
+        match SubClient::open(&root, &session, Some(0)) {
+            Ok(c) => break c,
+            Err(e) => {
+                assert!(
+                    Instant::now() < hello_deadline,
+                    "campd could not even answer the SUBSCRIBE HELLO ({e}) — it is \
+                     WEDGED INSIDE THE DRAIN of a single large line, answering nothing \
+                     at all: not the socket, not SIGCHLD, not a patrol timer. An O(n²) \
+                     newline scan in the drain does exactly this (invariant 1, §4.3)"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut skipped: Option<serde_json::Value> = None;
     let mut after: Option<serde_json::Value> = None;

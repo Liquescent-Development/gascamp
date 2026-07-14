@@ -31,10 +31,34 @@ strings -a "$CLI" | grep -o 'sendResponse(r,n).\{0,120\}'
 **Re-validated 2026-07-14 against the PINNED `claude` 2.1.208**
 (`ci/claude-compat/CLAUDE_VERSION`), which is what `make compat` now runs green.
 
-The shapes were first recovered from 2.1.207. **Every one of them is BYTE-IDENTICAL
-in 2.1.208** — the control protocol did not move. The only differences between the
-two bundles are minified identifiers (`s1e` → `fMe`), which never reach the wire.
-That was checked, not assumed: the pin bump re-ran all six probes above.
+The shapes were first recovered from 2.1.207. **Every shape pinned in this
+directory is BYTE-IDENTICAL in 2.1.208** — that was checked, not assumed: the pin
+bump re-ran all six probes above.
+
+**BUT THE BUNDLES ARE NOT OTHERWISE IDENTICAL, AND THIS DOC WILL NOT PRETEND THEY
+ARE.** Diffing the two:
+
+- **2.1.208 ADDS FOUR NEW `control_response` ERROR CONSTRUCTION SITES** that do not
+  exist in 2.1.207 — for `set_model`, `set_max_thinking_tokens`, `rename_session`
+  and `update_environment_variables`. Reproduce with:
+  ```bash
+  V=~/.local/share/claude/versions
+  strings -a $V/2.1.207 | grep -o 'type:"control_response",response:{subtype:"error".\{0,60\}' | sort -u
+  strings -a $V/2.1.208 | grep -o 'type:"control_response",response:{subtype:"error".\{0,60\}' | sort -u
+  ```
+- There is also ordinary minifier churn (`s1e` → `fMe`, `Yto` → `hno`, `ne` → `ie`).
+
+**Why that does not affect camp, stated precisely rather than waved away:** the four
+new sites are *senders* of errors for control verbs **camp never sends** (camp sends
+exactly one: `interrupt`). The error **ENVELOPE** — the only part camp parses —
+is unchanged: `response:{subtype:"error",request_id:…,error:…}`. So no fixture
+changed, and none needed to.
+
+An earlier revision of this file claimed the *only* difference between the two
+bundles was identifier churn. **That was FALSE**, and a provenance document that
+overstates what was verified is precisely the failure this phase exists to hunt.
+The claim is now the one the evidence actually supports: **the PINNED SHAPES are
+byte-identical; the BUNDLE is not.**
 
 **THE METHOD CANNOT PROVE KEY-COMPLETENESS.** A fixed-width window on a
 minified bundle shows what is at the construction site it matched — never

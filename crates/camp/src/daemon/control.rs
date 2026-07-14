@@ -794,6 +794,21 @@ impl ControlRuntime {
                 // this camp does not know means the ledger was written by a NEWER
                 // camp, and guessing its meaning is exactly the silent divergence
                 // invariant 5 forbids.
+                //
+                // ⚠ BD-1 WIDENED THIS `bail!`'s BLAST RADIUS, DELIBERATELY. Before
+                // BD-1 a DEAD session's requests were skipped BEFORE this match ran,
+                // so an unknown cause on a long-dead session was never even looked at.
+                // They now fall THROUGH the match (that is the whole fix — a
+                // never-answered request on a dead session must still get a terminal
+                // event), so an unknown cause on a session that died months ago now
+                // PREVENTS CAMPD FROM STARTING.
+                //
+                // That is the right trade and it is invariant-5-consistent: the only
+                // way to reach it is a ledger written by a NEWER camp, the remedy is
+                // named in the message ("Upgrade camp"), and the alternative —
+                // silently ignoring a cause we cannot route — is precisely the
+                // swallowed fault BD-1 exists to close. But it IS a widening, and it
+                // is written down rather than discovered by an operator.
                 Some(unknown) => {
                     anyhow::bail!(
                         "control.failed for request_id {id} carries cause {unknown:?}, which \

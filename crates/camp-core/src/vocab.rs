@@ -131,6 +131,27 @@ pub enum ControlFailureCause {
 }
 
 impl ControlFailureCause {
+    /// Every cause, in ordinal order.
+    ///
+    /// **WHAT IS COMPILE-ENFORCED, EXACTLY — and this comment claims nothing more:**
+    /// - the **PARTITION** (terminal vs correctable): `is_terminal` and `as_str` are
+    ///   exhaustive matches, so a new variant CANNOT be added without classifying it.
+    ///   That is the guarantee that matters, and it holds.
+    /// - `ALL`'s **internal consistency**: the `const` block below proves every entry
+    ///   sits at its own `ordinal()`, so `ALL` cannot be reordered, duplicated, or
+    ///   have an entry swapped under an index.
+    ///
+    /// **WHAT IS *NOT* COMPILE-ENFORCED: MEMBERSHIP.** A new variant classified in
+    /// both matches but never added to `ALL` still compiles. Rust cannot enumerate
+    /// variants at compile time without `strum` or the unstable `variant_count`, and
+    /// this crate takes no new dependencies — so this is a real, named limit, not an
+    /// oversight.
+    ///
+    /// **The consequence of forgetting is LOUD, not silent** (invariant 5): the fold
+    /// refuses an event whose cause will not `parse`, and `rehydrate` `bail!`s rather
+    /// than guess. You find out at the first append or the next campd start — not
+    /// three phases later, and never by silent misrouting. That is why this is
+    /// acceptable, and it is why the failure mode is written down here.
     pub const ALL: &'static [ControlFailureCause] = &[
         ControlFailureCause::SilenceTimeout,
         ControlFailureCause::CeilingTimeout,
@@ -141,6 +162,22 @@ impl ControlFailureCause {
         ControlFailureCause::DialogRefused,
         ControlFailureCause::PermissionUnanswerable,
     ];
+
+    /// Each variant's index in `ALL`. EXHAUSTIVE on purpose: a new variant does not
+    /// compile until it is given an ordinal, and the assertion below then forces
+    /// `ALL` to actually contain it at that index.
+    const fn ordinal(self) -> usize {
+        match self {
+            ControlFailureCause::SilenceTimeout => 0,
+            ControlFailureCause::CeilingTimeout => 1,
+            ControlFailureCause::SessionEnded => 2,
+            ControlFailureCause::WriteFailed => 3,
+            ControlFailureCause::UnknownRequest => 4,
+            ControlFailureCause::Unparsable => 5,
+            ControlFailureCause::DialogRefused => 6,
+            ControlFailureCause::PermissionUnanswerable => 7,
+        }
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -183,3 +220,25 @@ impl ControlFailureCause {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `ControlFailureCause::ALL` is INTERNALLY CONSISTENT, at compile time.
+//
+// Every entry sits at its own `ordinal()`, so ALL cannot be reordered, duplicated,
+// or have an entry swapped out from under an index.
+//
+// **THIS DOES NOT PROVE MEMBERSHIP** — a variant classified in `as_str`/`is_terminal`
+// but never added to ALL still compiles, because Rust cannot enumerate variants at
+// compile time without `strum` or the unstable `variant_count`, and this crate takes
+// no new dependencies. That limit is stated on `ALL` itself rather than papered over:
+// forgetting is LOUD (the fold refuses the cause; `rehydrate` bails), never silent.
+const _: () = {
+    let mut i = 0;
+    while i < ControlFailureCause::ALL.len() {
+        assert!(
+            ControlFailureCause::ALL[i].ordinal() == i,
+            "ControlFailureCause::ALL is out of ordinal order"
+        );
+        i += 1;
+    }
+};
