@@ -110,6 +110,10 @@ enum Command {
         /// take.
         #[arg(long, requires = "drain_reservations")]
         release_orphans: bool,
+        /// Emit camp's COMPILED steps in the differential gate's normalized shape
+        /// (`ci/gc-compat/differential.py` diffs them against gc's real compiler).
+        #[arg(long, requires = "formula")]
+        compiled: bool,
     },
     /// Append events by hand (worker contract surface)
     Event {
@@ -586,6 +590,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             json,
             drain_reservations,
             release_orphans,
+            compiled: _,
         } if drain_reservations => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             let _ = (repair, formula, json);
@@ -596,6 +601,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             repair,
             formula,
             json,
+            compiled,
             ..
         } => match formula {
             // --formula compiles a file THROUGH THE LAYERS: an imported formula's
@@ -603,7 +609,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // camp, so this needs the CampDir like every other verb.
             Some(path) => {
                 let camp = CampDir::resolve(cli.camp.as_deref())?;
-                cmd::doctor::run_formula(&camp, &path, json)
+                cmd::doctor::run_formula(&camp, &path, json, compiled)
             }
             None => {
                 let camp = CampDir::resolve(cli.camp.as_deref())?;

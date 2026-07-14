@@ -128,15 +128,6 @@ pub fn compile(
         }),
     }
 
-    // ---- stage 4: description_file (rung 2a).
-    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    if let Err(e) = inline_description_files(layers, &mut walked.raw, base_dir, &vars) {
-        walked.violations.push(Violation {
-            construct: "description_file".to_owned(),
-            message: e.to_string(),
-        });
-    }
-
     // ---- stage 5: condition pruning (rung 2b).
     prune_conditions(
         &mut walked.raw,
@@ -217,6 +208,29 @@ fn chain(
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     for step in &mut me.raw.steps {
         step.base_dir = Some(base.to_path_buf());
+    }
+    for step in &mut me.raw.template {
+        step.base_dir = Some(base.to_path_buf());
+    }
+
+    // ---- stage 4, HERE — at PARSE, per formula, BEFORE the merge and BEFORE
+    // expansion. That is where gc does it (`Parser.resolveDescriptionFiles`), and
+    // the ordering is load-bearing: a TEMPLATE step's description must already be
+    // INLINED when expansion runs, because the asset CONTENT carries `{target}`
+    // tokens that `expandStep` substitutes. Inline after expansion and those
+    // tokens survive into the worker's prose.
+    let own_vars = me.raw.vars.clone();
+    if let Err(e) = inline_description_files(layers, &mut me.raw.steps, base, &own_vars) {
+        me.violations.push(Violation {
+            construct: "description_file".to_owned(),
+            message: e.to_string(),
+        });
+    }
+    if let Err(e) = inline_description_files(layers, &mut me.raw.template, base, &own_vars) {
+        me.violations.push(Violation {
+            construct: "description_file".to_owned(),
+            message: e.to_string(),
+        });
     }
     if me.raw.extends.is_empty() {
         return Ok(me);
@@ -538,6 +552,16 @@ fn expand_steps(
         for tmpl in walked.raw.template {
             expanded.push(substitute_template_step(tmpl, &step, &vars));
         }
+        // ⭐ gc's `propagateTargetDeps` (expand.go:558-598). The target step is
+        // REPLACED, so its `needs` would simply VANISH — and the expansion's root
+        // steps would dispatch immediately, BEFORE the work they depend on exists.
+        // (`bmad-build.review.gather-bmad-review-context` needs
+        // `summarize-implementation`; without this it would review an
+        // implementation that had not happened.)
+        //
+        // gc prepends the target's needs to the ROOT steps of the expansion — the
+        // ones whose own needs reference nothing else INSIDE the expansion.
+        propagate_target_deps(&step, &mut expanded);
         // A template step may itself carry an `expand` — recurse, bounded.
         let expanded = expand_steps(
             layers,
@@ -552,6 +576,35 @@ fn expand_steps(
         out.extend(expanded);
     }
     Ok(out)
+}
+
+/// gc's `propagateTargetDeps` (`expand.go:558-598`): copy the TARGET's `needs`
+/// onto the ROOT steps of the expansion that replaced it.
+///
+/// A root step is one whose own `needs` reference nothing else inside the
+/// expansion. Without this the target's dependency edges are lost with the target,
+/// and the expansion's roots become immediately ready — the run does the review
+/// before the implementation.
+fn propagate_target_deps(target: &parse::RawStep, expanded: &mut [parse::RawStep]) {
+    if target.needs.is_empty() {
+        return;
+    }
+    let inside: BTreeSet<&str> = expanded
+        .iter()
+        .filter_map(|s| s.id.as_deref())
+        .collect::<BTreeSet<_>>();
+    // Collect first: `inside` borrows `expanded`.
+    let roots: Vec<usize> = expanded
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.needs.iter().any(|n| inside.contains(n.as_str())))
+        .map(|(i, _)| i)
+        .collect();
+    for i in roots {
+        let mut needs = target.needs.clone();
+        needs.append(&mut expanded[i].needs);
+        expanded[i].needs = needs;
+    }
 }
 
 /// Flatten a step's `children` into the flat list, PRESERVING POSITION: the step
@@ -748,11 +801,11 @@ fn prune_conditions(
 /// the highest-value key on rung 2a.
 fn inline_description_files(
     layers: &FormulaLayers,
-    raw: &mut parse::RawFormula,
+    steps: &mut [parse::RawStep],
     base_dir: &Path,
     vars: &BTreeMap<String, Option<String>>,
 ) -> Result<(), CoreError> {
-    for step in &mut raw.steps {
+    for step in steps.iter_mut() {
         let Some(rel) = step.description_file.clone() else {
             continue;
         };

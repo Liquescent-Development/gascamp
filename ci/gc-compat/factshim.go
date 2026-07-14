@@ -324,6 +324,7 @@ type AuthoredStep struct {
 	Kind        string            `json:"kind"`
 	Title       string            `json:"title"`
 	DescSHA256  string            `json:"description_sha256"`
+	DescSHA256N string            `json:"description_sha256_norm"`
 	Assignee    string            `json:"assignee"`
 	Metadata    map[string]string `json:"metadata"`
 	Needs       []string          `json:"needs"`        // comparable dep edges (both endpoints authored)
@@ -349,6 +350,21 @@ func synthesized(s *formula.RecipeStep) bool {
 
 func stripPrefix(fname, id string) string {
 	return strings.TrimPrefix(id, fname+".")
+}
+
+// normalizeDescription blanks the one line of gc's >4096 pointer prompt that is
+// ENVIRONMENT-DEPENDENT: the absolute path of the resolved asset. gc resolves it
+// inside the corpus checkout, camp inside its own import tree, so the raw hashes
+// can never agree on those 8 steps — and the rest of the prompt (which is the
+// part a mis-transcription would corrupt) still hashes exactly.
+func normalizeDescription(d string) string {
+	lines := strings.Split(d, "\n")
+	for i, l := range lines {
+		if strings.HasPrefix(l, "- Resolved prompt file: ") {
+			lines[i] = "- Resolved prompt file: <normalized>"
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func authoredProjection(all map[string]*formula.Recipe) []AuthoredStep {
@@ -391,6 +407,7 @@ func authoredProjection(all map[string]*formula.Recipe) []AuthoredStep {
 				Kind:        s.Metadata["gc.kind"],
 				Title:       s.Title,
 				DescSHA256:  fmt.Sprintf("%x", sha256.Sum256([]byte(s.Description))),
+				DescSHA256N: fmt.Sprintf("%x", sha256.Sum256([]byte(normalizeDescription(s.Description)))),
 				Assignee:    s.Assignee,
 				Metadata:    md,
 				Needs:       n,

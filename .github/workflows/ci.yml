@@ -97,3 +97,28 @@ jobs:
         run: cargo build --bin camp
       - name: phase-1 corpus-load gate (pack/agent/transitive + camp loader)
         run: python3 ci/gc-compat/load_corpus_packs.py gcpacks-src target/debug/camp
+      - name: the arbiter (independent of camp; predicts the rung ladder)
+        run: python3 ci/gc-compat/rungs.py gcpacks-src
+      - name: phase-2 formula gate (the rungs, the ceiling, RUNNABLE)
+        run: python3 ci/gc-compat/formula_gate.py gcpacks-src target/debug/camp
+      - name: phase-2 END-TO-END gate (BD8: an imported corpus formula cooks AND RUNS)
+        run: python3 ci/gc-compat/e2e_corpus.py gcpacks-src target/debug/camp
+      - name: read pinned gascity ref
+        id: gc-ref
+        run: echo "ref=$(cat ci/gc-compat/GASCITY_REF)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: gastownhall/gascity
+          ref: ${{ steps.gc-ref.outputs.ref }}
+          path: gascity-src
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gascity-src/go.mod
+      - name: build the gc oracle (factshim — gc's REAL compiler)
+        run: |
+          mkdir -p gascity-src/cmd/factshim
+          cp ci/gc-compat/factshim.go gascity-src/cmd/factshim/main.go
+          cd gascity-src
+          go build -o "$RUNNER_TEMP/factshim" ./cmd/factshim
+      - name: phase-2 DIFFERENTIAL gate (camp's compiler diffed against gc's real one)
+        run: python3 ci/gc-compat/differential.py gcpacks-src target/debug/camp "$RUNNER_TEMP/factshim"

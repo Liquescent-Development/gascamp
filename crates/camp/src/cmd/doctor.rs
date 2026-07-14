@@ -37,11 +37,53 @@ pub fn run_formula(
     camp: &crate::campdir::CampDir,
     path: &std::path::Path,
     json: bool,
+    compiled_shape: bool,
 ) -> Result<()> {
     let config = camp_core::config::CampConfig::load(&camp.config_path())?;
     let layers = camp_core::formula::FormulaLayers::from_config(&config, &camp.root)?;
     let verdict =
         camp_core::formula::compile(&layers, &config, path, &std::collections::BTreeMap::new());
+
+    // --compiled: camp's COMPILED steps in the differential gate's normalized
+    // shape. It is the SAME projection `factshim --authored-json` emits for gc, so
+    // the oracle can diff them field for field.
+    if compiled_shape {
+        let steps = match &verdict {
+            Ok(c) => c
+                .formula
+                .steps
+                .iter()
+                .map(|s| {
+                    let description = s.description.clone().unwrap_or_default();
+                    serde_json::json!({
+                        "id": s.id,
+                        "kind": s.metadata.get("gc.kind"),
+                        "title": s.title,
+                        "description_sha256": sha256_hex(&description),
+                        // The >4096 pointer prompt embeds an ABSOLUTE resolved
+                        // path — environment-dependent by construction, since gc
+                        // resolves inside the corpus checkout and camp inside its
+                        // import tree. Both sides blank that ONE line and hash the
+                        // rest, which is the part a mis-transcription corrupts.
+                        "description_sha256_norm": sha256_hex(&normalize_description(&description)),
+                        "assignee": s.assignee.clone().unwrap_or_default(),
+                        "metadata": s.metadata,
+                        "needs": s.needs,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "formula": camp_core::formula::formula_stem(path),
+                "ok": verdict.is_ok(),
+                "steps": steps,
+            })
+        );
+        return Ok(());
+    }
 
     if json {
         // The VERDICT is the output, and it EXITS 0 even when the formula does
@@ -159,4 +201,32 @@ pub fn run_drain_reservations(camp: &CampDir, release: bool) -> Result<()> {
         println!("  {member} (was held by {anchor})");
     }
     Ok(())
+}
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Blank the ONE environment-dependent line of gc's >4096 pointer prompt. See
+/// `factshim.go::normalizeDescription` — the two must agree exactly.
+fn normalize_description(d: &str) -> String {
+    // `split('\n')`, NOT `lines()`: `lines()` DROPS a trailing newline, so every
+    // description would hash differently from gc's — which uses Go's
+    // `strings.Split`/`Join`, and that round-trips the trailing newline exactly.
+    // The differential gate caught this as 294 false divergences before it caught
+    // any real one; a normalizer that is not byte-identical on both sides is not a
+    // normalizer.
+    d.split('\n')
+        .map(|l| {
+            if l.starts_with("- Resolved prompt file: ") {
+                "- Resolved prompt file: <normalized>"
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
