@@ -27,6 +27,31 @@
 #   FAKE_AGENT_TOUCH_TRANSCRIPT_LOOP  Phase 11: N iterations of appending
 #                              to $CAMP_TRANSCRIPT every 250 ms after the
 #                              claim — a working agent's heartbeat
+#   FAKE_AGENT_CONTROL_LOOP    cp-1 (§2.1): read stdin forever; ANSWER every
+#                              control_request with the pinned control_response
+#                              (request_id echoed back); a plain user turn ends
+#                              the loop and closes the bead. The interrupt
+#                              round-trip's worker half.
+#   FAKE_AGENT_EXIT_AFTER_CONTROL  cp-1: answer ONE control_request and EXIT
+#                              IMMEDIATELY — the reap-races-the-drain shape.
+#                              The answer is the worker's LAST stdout bytes, so
+#                              a reap-before-drain bug destroys it unread.
+#   FAKE_AGENT_SPAM_ON_TURN=N  cp-1 (§4.4 backpressure): on a USER TURN, emit N
+#                              stream-json lines. The spam must come AFTER the
+#                              subscriber is registered, or the backpressure gate
+#                              tests nothing.
+#   FAKE_AGENT_HUGE_LINE=N     cp-1 (G1): emit ONE stream-json line whose payload
+#                              is N bytes — a SINGLE line far larger than
+#                              HISTORY_CHUNK_BYTES (64 KiB) and, at N >= 1 MiB,
+#                              larger than the whole subscriber cap.
+#
+#     WHY HUGE_LINE EXISTS: **every other fixture in this repo emits SHORT lines**
+#     — `emit_stream` is `printf '%s\n'` and nothing anywhere produces a line
+#     bigger than a few hundred bytes. That is precisely WHY a pump that livelocks
+#     on any line > 64 KiB was invisible to the entire suite, and why a real
+#     Read/Bash/Grep tool-result line — which routinely exceeds 64 KiB — would have
+#     hung campd in production while CI stayed green. Without this mode no gate in
+#     this phase can see the phase's worst bug.
 #   FAKE_AGENT_DELIVERY   Phase 3 delivery modes (obligations i/ii/vi):
 #                         "ship" = commit on the dispatched branch, close
 #                         pass+shipped with the real commit/branch facts;
@@ -148,6 +173,112 @@ if [[ -n "${FAKE_AGENT_NUDGE_CLOSE:-}" ]]; then
   # fall through to the close — the revival the master plan demands.
   read -r _task_line
   read -r _nudge_line
+fi
+
+# cp-1: answer camp's control_requests, exactly as the real CLI does. The
+# request_id is echoed back verbatim — that correlation IS the protocol, and
+# the response shape is the one pinned in tests/fixtures/control/.
+answer_control() {
+  local line="$1"
+  local id
+  id="$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')"
+  [[ -n "$id" ]] || return 0
+  printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"still_queued":[]}}}\n' "$id"
+}
+
+if [[ -n "${FAKE_AGENT_CONTROL_LOOP:-}" ]]; then
+  # cp-1: campd wrote the TASK as the first stdin line at spawn (the HeldStream
+  # contract) — consume it, exactly as FAKE_AGENT_NUDGE_CLOSE does. THEN read
+  # forever: a control_request is ANSWERED; a plain user turn ends the loop and
+  # falls through to the close.
+  #
+  # This is the shape every interrupt round-trip test drives: campd writes a
+  # control line into the held stdin, and the answer comes back out on stdout —
+  # which IS campd's read channel (spec §2.3). The whole cp-1 loop, in a worker.
+  read -r _task_line
+  while IFS= read -r _control_line; do
+    case "$_control_line" in
+      *'"type":"control_request"'*)
+        # cp-1 (B6): FAKE_AGENT_CONTROL_ANSWER_DELAY makes the answer land at a
+        # time the TEST chooses. The restart proof needs campd to die BEFORE the
+        # answer exists — otherwise campd may ingest it first and rehydration is
+        # never exercised. The line is already READ, so campd's death during this
+        # sleep does not stop the answer from being written.
+        sleep "${FAKE_AGENT_CONTROL_ANSWER_DELAY:-0}"
+        answer_control "$_control_line"
+        ;;
+      *) break ;;  # a user turn: stop listening and close the bead
+    esac
+  done
+  # stdin hit EOF (campd released the pipe — or DIED). FAKE_AGENT_LINGER_ON_EOF
+  # makes the worker OUTLIVE campd instead of exiting, which is what B6's restart
+  # proof needs: the session must still be LIVE when the new campd starts, or
+  # adoption crashes it, it is never re-tailed, and the worker's answer — already
+  # sitting in its stdout file — is never read. (A worker that exits with campd is
+  # B6's NAMED residual, not its happy path.)
+  if [[ -n "${FAKE_AGENT_LINGER_ON_EOF:-}" ]]; then
+    sleep "$FAKE_AGENT_LINGER_ON_EOF"
+    exit 0
+  fi
+fi
+
+# cp-1: ONE genuinely huge line, on one line, valid stream-json.
+huge_line() {
+  local n="$1" pad
+  pad="$(head -c "$n" /dev/zero | tr '\0' 'x')"
+  printf '{"type":"assistant","message":{"role":"assistant","content":"%s"}}\n' "$pad"
+}
+
+if [[ -n "${FAKE_AGENT_HUGE_LINE:-}" ]]; then
+  huge_line "$FAKE_AGENT_HUGE_LINE"
+  emit_stream '{"type":"assistant","message":{"role":"assistant","content":"after the monster"}}'
+  # Stay alive so the session keeps being tailed while the subscriber catches up.
+  sleep "${FAKE_AGENT_HUGE_LINE_LINGER:-30}"
+  exit 0
+fi
+
+if [[ -n "${FAKE_AGENT_SPAM_ON_TURN:-}" ]]; then
+  # cp-1 (§4.4): the spam lands AFTER a user turn, so a test can register its
+  # subscriber first and THEN make the worker produce a backlog.
+  read -r _task_line
+  read -r _turn_line
+  i=0
+  while [ "$i" -lt "$FAKE_AGENT_SPAM_ON_TURN" ]; do
+    printf '{"type":"assistant","message":{"role":"assistant","content":"spam %d"}}\n' "$i"
+    i=$((i + 1))
+  done
+  sleep "${FAKE_AGENT_SPAM_LINGER:-30}"
+  exit 0
+fi
+
+if [[ -n "${FAKE_AGENT_CLOSE_STDIN:-}" ]]; then
+  # cp-1 (C12): the worker CLOSES its stdin read end and stays alive. campd still
+  # holds the WRITE end, so its next write into that pipe gets EPIPE — a write
+  # that is ATTEMPTED and FAILS, which is a different thing from "no pipe" and
+  # must be loud in BOTH channels (an error to the caller AND a durable fault).
+  #
+  # This is the deterministic way to drive ControlWrite::Failed: a FULL pipe
+  # cannot be used, because the first write that fails TEARS the pipe down, so
+  # any later interrupt would report NoPipe instead.
+  exec 0<&-
+  # The HAPPENS-BEFORE marker. The test waits for this line in the stdout file
+  # before interrupting — without it, campd can deliver the interrupt while the
+  # pipe is still open, the write SUCCEEDS, and the test flakes.
+  emit_stream '{"type":"system","subtype":"stdin_closed"}'
+  sleep "${FAKE_AGENT_CLOSE_STDIN}"
+  exit 0
+fi
+
+if [[ -n "${FAKE_AGENT_EXIT_AFTER_CONTROL:-}" ]]; then
+  # cp-1: consume the task line, answer exactly ONE control_request, and EXIT
+  # IMMEDIATELY — the reap-races-the-drain shape. The answer is the worker's LAST
+  # stdout bytes, written a breath before the process dies, so it is precisely
+  # the line a reap-before-drain bug destroys. If campd's harvest ordering is
+  # wrong, this answer is unlinked unread and the interrupt looks unanswered
+  # forever.
+  read -r _task_line
+  IFS= read -r _control_line || true
+  answer_control "$_control_line"
 fi
 
 # Phase 3 delivery modes (dispatch-lifecycle §9 obligations i/ii/vi).

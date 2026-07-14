@@ -45,11 +45,29 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::SessionStreamCapped => Ok(()),
         // Log-only events: no state effect.
         EventType::CampdStarted | EventType::CampdStopped => Ok(()),
+        // cp-1 (§2.1/§4.4): the control plane's four events are AUDIT-ONLY —
+        // durable truth with no state fold. Each is parsed against a
+        // `deny_unknown_fields` struct and DISCARDED: the parse is the
+        // validation. A typo'd key is refused AT APPEND, so a malformed event
+        // can never reach the ledger and be replayed forever.
+        EventType::SessionInterrupted => audit::<SessionInterrupted>(event),
+        EventType::ControlResponded => audit::<ControlResponded>(event),
+        EventType::ControlFailed => control_failed(event),
+        EventType::SubscriberDropped => audit::<SubscriberDropped>(event),
         // compat §7/§5.4: import audit events — durable in the ledger, no
         // state fold (the materialized tree under <root>/imports/ is the
         // state, owned by `camp import`).
         EventType::ImportAdded | EventType::ImportRefused => Ok(()),
     }
+}
+
+/// cp-1: parse-and-discard. The payload struct exists to VALIDATE the shape
+/// (`deny_unknown_fields`) at append time, never to be read back — the
+/// fold.rs:541 precedent. An event whose shape is wrong is REFUSED, not
+/// stored and hoped over.
+fn audit<T: DeserializeOwned>(event: &Event) -> Result<(), CoreError> {
+    let _validated: T = payload(event)?;
+    Ok(())
 }
 
 fn payload<T: DeserializeOwned>(event: &Event) -> Result<T, CoreError> {
@@ -1194,6 +1212,96 @@ fn config_changed(event: &Event) -> Result<(), CoreError> {
         }
     } else if p.error.as_deref().is_none_or(str::is_empty) {
         return Err(bad("a rejected change requires the error".into()));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// cp-1 (control-plane spec §2.1, §4.4): the control plane's four events.
+//
+// All four are AUDIT-ONLY: they carry durable truth and fold no state. The
+// structs below exist so `deny_unknown_fields` REFUSES a malformed payload at
+// append time (the fold.rs:541 precedent) — the fields are never read back,
+// hence the PERMANENT allows.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // PERMANENT: audit-only — the fields exist to VALIDATE the
+// shape (deny_unknown_fields), never to be read (the fold.rs:541 precedent).
+struct SessionInterrupted {
+    session: String,
+    request_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // PERMANENT: audit-only — see SessionInterrupted.
+struct ControlResponded {
+    session: String,
+    request_id: String,
+    verb: String,
+    ok: bool,
+    #[serde(default)]
+    detail: String,
+    /// C11: the answer arrived AFTER campd declared the request unanswered.
+    /// That `control.failed` was premature, and this event is the correction.
+    #[serde(default)]
+    late: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // PERMANENT: audit-only — see SessionInterrupted.
+struct ControlFailed {
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    verb: Option<String>,
+    /// G5: REQUIRED, and it is the root fix, not a decoration. Rehydration
+    /// ROUTES on this: without it, campd cannot tell "timed out — an answer
+    /// may still come" from "the pipe write failed — no answer can ever come",
+    /// and it collapses both, SILENTLY SWALLOWING a late answer across a
+    /// restart. Prose is not a cause (invariant 3).
+    cause: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // PERMANENT: audit-only — see SessionInterrupted.
+struct SubscriberDropped {
+    session: String,
+    subscription: String,
+    buffered_bytes: u64,
+    cap_bytes: u64,
+}
+
+/// `control.failed` (§2.1): a control request campd could not complete.
+/// Audit-only, but `cause` is validated against the closed set — an event
+/// carrying a cause nothing can route is worse than no event at all.
+fn control_failed(event: &Event) -> Result<(), CoreError> {
+    let p: ControlFailed = payload(event)?;
+    non_empty(event, "reason", &p.reason)?;
+    // The cause is validated through the SHARED enum (`vocab::ControlFailureCause`),
+    // which is also what the daemon routes on — so the fold and the routing cannot
+    // drift apart. An event carrying a cause nothing can route is worse than no
+    // event at all.
+    if crate::vocab::ControlFailureCause::parse(&p.cause).is_none() {
+        let known: Vec<&str> = crate::vocab::ControlFailureCause::ALL
+            .iter()
+            .map(|c| c.as_str())
+            .collect();
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: format!(
+                "unknown cause {:?} (one of {known:?}). Rehydration ROUTES on this value: \
+                 an unroutable cause is a swallowed fault waiting to happen",
+                p.cause
+            ),
+        });
     }
     Ok(())
 }

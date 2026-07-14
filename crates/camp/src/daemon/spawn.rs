@@ -186,7 +186,8 @@ pub fn build_spec(
             }
             StdinMode::HeldStream => {
                 // P2: stream in requires stream out. The shipped CLI
-                // (2.1.205–2.1.207) hard-rejects `--print` + stream-json
+                // (2.1.205–2.1.208; re-verified against the 2.1.208 pin by
+                // `make compat`'s negative control) hard-rejects `--print` + stream-json
                 // output UNLESS `--verbose` is passed (#86): `verbose`
                 // resolves flag -> settings -> false, so without the flag
                 // dispatch dies at argv validation on every machine whose

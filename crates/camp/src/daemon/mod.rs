@@ -4,6 +4,7 @@
 //! readiness on stdout, and sleeps on the socket.
 
 pub mod bounded;
+pub mod control;
 pub mod cursor;
 pub mod dispatch;
 pub mod event_loop;
@@ -257,6 +258,37 @@ pub fn run(camp: &CampDir) -> Result<()> {
         }
     }
 
+    // cp-1 (control-plane spec §2.1): the control runtime — the pending-request
+    // table, the subscriber registry, and every socket-verb handler body.
+    //
+    // B6: REHYDRATE from the ledger, after adoption. A campd restart with an
+    // interrupt in flight must neither LIE (invent a fault for a request the
+    // worker actually answered) nor FORGET (drop one it never did). The ledger
+    // is the only thing that survives a kill -9, so it is the only honest source.
+    let mut control = control::ControlRuntime::with_stall_timeout(
+        control::subscriber_buffer_bytes_from_env(control::SUBSCRIBER_BUFFER_BYTES_DEFAULT)?,
+        control::subscriber_stall_timeout_from_env(control::SUBSCRIBER_STALL_TIMEOUT_DEFAULT)?,
+    );
+    let rehydrated = control.rehydrate(&ledger, jiff::Timestamp::now())?;
+    if rehydrated.restored > 0 {
+        eprintln!(
+            "campd: restored {} in-flight control request(s) from the ledger",
+            rehydrated.restored
+        );
+    }
+    // BD-1 (§2.1): a request whose SESSION DIED while campd was down can never be
+    // disposed — it was never registered, so `forget_session` never runs for it.
+    // `rehydrate` is the only thing left that can speak for it, and a request with
+    // no terminal event, forever, is precisely the swallowed fault §2.1 forbids.
+    for input in rehydrated.events {
+        eprintln!(
+            "campd: an in-flight control request died with its session while campd was \
+             down: {}",
+            input.data["reason"].as_str().unwrap_or_default()
+        );
+        ledger.append(input)?;
+    }
+
     let mut stdout = std::io::stdout();
     writeln!(stdout, "{READY_PREFIX}{}", socket_path.display()).context("announcing readiness")?;
     stdout.flush().context("flushing the readiness line")?;
@@ -279,6 +311,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
         &mut patrol_receiver,
         &mut read_channel,
         &mut read_receiver,
+        &mut control,
     );
     drop(watcher);
     // The stream watcher lives inside `read_channel` (set_watcher) and is

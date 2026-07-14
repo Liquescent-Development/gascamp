@@ -90,6 +90,25 @@ pub enum NudgeOutcome {
     Failed(String),
 }
 
+/// cp-1 (§2): how a control-message write went.
+///
+/// `NoPipe` is a caller-visible FAILURE here, NOT a designed degrade — and that
+/// is the difference from `NudgeOutcome`. A turn has a resume path
+/// (`claude --resume`); an interrupt does not. A worker campd holds no pipe to
+/// simply CANNOT be interrupted, and answering `{"ok":true}` to that would be a
+/// silent no-op dressed as success.
+#[derive(Debug)]
+pub enum ControlWrite {
+    /// The control line is in the worker's stdin pipe.
+    Delivered,
+    /// campd holds no stdin pipe for that session.
+    NoPipe,
+    /// The write was ATTEMPTED and FAILED — so bytes may already have reached
+    /// the pipe, and it has been torn down. The caller must be loud in BOTH
+    /// channels: an error to the operator AND a durable fault (§2.1).
+    Failed(String),
+}
+
 /// A reap failure, typed for the caller's retry decision (PR #14 fix-pass
 /// NEW MEDIUM): ledger failures are retry-worthy (SQLite contention is
 /// transient and bounded by busy_timeout); a try_wait failure is an OS
@@ -218,6 +237,36 @@ impl Dispatcher {
             Err(e) => {
                 worker.stdin = None; // torn pipe: never write after a failed line
                 NudgeOutcome::Failed(format!("stdin write failed: {e}"))
+            }
+        }
+    }
+
+    /// cp-1 (§2): write ONE control line into the session's held stdin — the
+    /// same pipe a turn goes down, because campd already holds it and building
+    /// a second transport to the same process would be a second thing to get
+    /// wrong.
+    ///
+    /// BOUNDED, for the same reason `nudge_via_stdin` is (PR #51 finding 2):
+    /// `session.interrupt` is operator-triggerable over the socket, and an
+    /// unbounded blocking write into the full pipe of a worker that has stopped
+    /// reading would wedge campd's single-threaded event loop — no dispatch, no
+    /// SIGCHLD reaping — until it drained. That is issue #55's wedge class.
+    ///
+    /// On failure the pipe may hold a TORN PARTIAL LINE, so it is dropped: no
+    /// later turn or control message may interleave garbage behind it. The
+    /// worker sees EOF after draining (the release shape).
+    pub fn write_control(&mut self, session: &str, line: &str) -> ControlWrite {
+        let Some(worker) = self.children.values_mut().find(|w| w.session == session) else {
+            return ControlWrite::NoPipe;
+        };
+        let Some(stdin) = worker.stdin.as_mut() else {
+            return ControlWrite::NoPipe;
+        };
+        match bounded::write_bounded(stdin, line.as_bytes(), STDIN_WRITE_TIMEOUT) {
+            Ok(()) => ControlWrite::Delivered,
+            Err(e) => {
+                worker.stdin = None; // torn pipe: never write after a failed line
+                ControlWrite::Failed(format!("stdin control write failed: {e}"))
             }
         }
     }
@@ -4042,6 +4091,90 @@ mod tests {
                 .contains("nudge-resume"),
             "{}",
             degraded[0].data
+        );
+    }
+    // ======== cp-1 Task 5: write_control — the write half ==================
+
+    /// cp-1 (§2): a control line goes into the SAME held stdin pipe a turn does
+    /// — campd already holds it, so there is no new transport to build.
+    #[test]
+    fn write_control_delivers_into_the_held_stdin_pipe() {
+        let (dir, mut ledger) = temp_ledger();
+        wake_session(&mut ledger, "t/dev/1");
+        let mut dispatcher = test_dispatcher(dir.path());
+        dispatcher.test_insert_held_cat(dir.path(), "t/dev/1", "gc-1");
+
+        let line = crate::daemon::control::ParentMessage::Interrupt {
+            request_id: "camp-1".into(),
+        }
+        .to_line()
+        .unwrap();
+        assert!(matches!(
+            dispatcher.write_control("t/dev/1", &line),
+            ControlWrite::Delivered
+        ));
+
+        // An unknown session has no pipe. Unlike a turn, an interrupt has NO
+        // resume path — so this is a caller-visible FAILURE, not a degrade.
+        assert!(matches!(
+            dispatcher.write_control("ghost", &line),
+            ControlWrite::NoPipe
+        ));
+
+        // Drop the pipe (the release path) so `cat` exits, then read what it saw.
+        for w in dispatcher.children.values_mut() {
+            w.stdin = None;
+        }
+        for w in dispatcher.children.values_mut() {
+            let _ = w.child.wait();
+        }
+        let captured = std::fs::read_to_string(dir.path().join("gc-1.out")).unwrap();
+        assert_eq!(
+            captured, line,
+            "the worker must see EXACTLY the control line camp built — the bytes \
+             are pinned by the fixtures, and this is the path they travel"
+        );
+    }
+
+    /// PR #51's finding-2 wedge shape, applied to the control write.
+    ///
+    /// THIS IS THE WHOLE JUSTIFICATION FOR THE METHOD EXISTING. `session.interrupt`
+    /// is operator-triggerable over the socket, and an UNBOUNDED blocking write
+    /// into the full pipe of a worker that has stopped reading would wedge
+    /// campd's single-threaded event loop — no dispatch, no SIGCHLD reaping —
+    /// until it drained. It must fail, and fail FAST.
+    #[test]
+    fn write_control_is_bounded_and_drops_the_torn_pipe() {
+        let (dir, mut ledger) = temp_ledger();
+        wake_session(&mut ledger, "t/dev/1");
+        let mut dispatcher = test_dispatcher(dir.path());
+        // A worker that NEVER reads its pipe.
+        dispatcher.test_insert_held_sleeper(dir.path(), "t/dev/1", "gc-1");
+
+        // Far more than any pipe buffer will take.
+        let big = format!("{}\n", "x".repeat(2 * 1024 * 1024));
+        let started = std::time::Instant::now();
+        let outcome = dispatcher.write_control("t/dev/1", &big);
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, ControlWrite::Failed(_)),
+            "a full pipe must FAIL the control write, never block campd: {outcome:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the write must be BOUNDED — it took {elapsed:?}. An unbounded write \
+             here is issue #55's wedge class, on the event loop"
+        );
+
+        // The pipe may hold a TORN partial line, so it is dropped: no later
+        // turn or control message may interleave garbage behind it.
+        assert!(
+            matches!(
+                dispatcher.write_control("t/dev/1", "{}\n"),
+                ControlWrite::NoPipe
+            ),
+            "after a failed write the torn pipe must be DROPPED"
         );
     }
 }

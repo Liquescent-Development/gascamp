@@ -80,9 +80,12 @@ fn should_self_raise(retryable: bool, budget: &mut u32) -> bool {
 /// within each order's catch-up window fire once.
 const JUMP_TOLERANCE: SignedDuration = SignedDuration::from_secs(30);
 
-struct Conn {
-    stream: UnixStream,
-    buf: Vec<u8>,
+/// One accepted connection. `pub(super)` because cp-1's `control.rs` owns the
+/// subscriber write path (`pump` is the ONLY place bytes reach a subscriber's
+/// socket) and must be handed the stream.
+pub struct Conn {
+    pub(super) stream: UnixStream,
+    pub(super) buf: Vec<u8>,
 }
 
 enum ConnState {
@@ -108,6 +111,7 @@ pub fn run(
     patrol_rx: &mut mio::unix::pipe::Receiver,
     read_channel: &mut super::read_channel::ReadChannelRuntime,
     read_rx: &mut mio::unix::pipe::Receiver,
+    control: &mut super::control::ControlRuntime,
 ) -> Result<()> {
     let mut poll = Poll::new().context("creating the poller")?;
     let mut events = Events::with_capacity(64);
@@ -152,10 +156,17 @@ pub fn run(
         let poll_now = Timestamp::now();
         let timeout = min_deadline(
             min_deadline(
-                runtime.poll_timeout(poll_now),
-                graph.poll_timeout(Instant::now()),
+                min_deadline(
+                    runtime.poll_timeout(poll_now),
+                    graph.poll_timeout(Instant::now()),
+                ),
+                patrol.poll_timeout(poll_now),
             ),
-            patrol.poll_timeout(poll_now),
+            // cp-1: the control plane's deadlines — a pending control request's
+            // silence/ceiling bound, and (Task 8) the subscriber continuation
+            // and stall timer. `None` when nothing is pending, so an idle campd
+            // still blocks forever (invariant 1).
+            control.poll_timeout(poll_now),
         );
         let wall_before = Timestamp::now();
         let mono_before = Instant::now();
@@ -209,8 +220,20 @@ pub fn run(
                         Ok((mut stream, _addr)) => {
                             let token = Token(next_token);
                             next_token += 1;
+                            // cp-1: WRITABLE too — a subscriber's socket blocks,
+                            // and the WRITABLE edge is what re-arms its pump (G2:
+                            // arming a zero poll timeout on a blocked write would
+                            // SPIN campd for the duration of every stream).
+                            // Edge-triggered poll reports writability ONCE at
+                            // registration: an accept-time cost, not an idle one —
+                            // and that already-consumed edge is exactly why the
+                            // hello's first bytes need an explicit pump (B11).
                             poll.registry()
-                                .register(&mut stream, token, Interest::READABLE)
+                                .register(
+                                    &mut stream,
+                                    token,
+                                    Interest::READABLE | Interest::WRITABLE,
+                                )
                                 .context("registering a connection")?;
                             conns.insert(
                                 token,
@@ -349,6 +372,32 @@ pub fn run(
                     let Some(mut conn) = conns.remove(&token) else {
                         continue; // already dropped this cycle
                     };
+                    // cp-1 (B7): a subscriber's WRITABLE wake is why we are here —
+                    // pump it. But there is NO SHORT-CIRCUIT: we then fall through
+                    // into `serve_connection` like any other connection, so cp-0's
+                    // `ReadStop::Eof => ConnState::Closed` still detects a hangup.
+                    // A subscriber that simply detaches is NOT a fault and appends
+                    // NO event (§5.2).
+                    if control.is_subscriber(token) {
+                        let outcome = control.pump(token, &mut conn, Timestamp::now());
+                        for input in control.take_pending_events() {
+                            ledger.append(input)?;
+                        }
+                        match outcome {
+                            super::control::PumpOutcome::Ok => {}
+                            super::control::PumpOutcome::Gone => {
+                                control.forget(token);
+                                let _ = poll.registry().deregister(&mut conn.stream);
+                                continue;
+                            }
+                            super::control::PumpOutcome::Drop(event) => {
+                                ledger.append(event)?;
+                                control.forget(token);
+                                let _ = poll.registry().deregister(&mut conn.stream);
+                                continue;
+                            }
+                        }
+                    }
                     match serve_connection(
                         &mut conn,
                         ledger,
@@ -359,12 +408,15 @@ pub fn run(
                         graph,
                         patrol,
                         read_channel,
+                        control,
+                        token,
                         MAX_REQUEST_BYTES,
                     ) {
                         Ok(ConnState::Open) => {
                             conns.insert(token, conn);
                         }
                         Ok(ConnState::Closed) => {
+                            control.forget(token);
                             poll.registry().deregister(&mut conn.stream)?;
                         }
                         Ok(ConnState::Stop) => {
@@ -378,6 +430,7 @@ pub fn run(
                             // A broken client must not take campd down; the
                             // error is reported, the connection dropped.
                             eprintln!("campd: connection error: {error:#}");
+                            control.forget(token);
                             let _ = poll.registry().deregister(&mut conn.stream);
                         }
                     }
@@ -428,6 +481,22 @@ pub fn run(
         if let Err(e) = read_channel.drain_all(ledger) {
             eprintln!("campd: read-channel drain_all failed: {e:#}");
         }
+        // cp-1 — HARVEST 1: the lines `drain_all` just consumed.
+        //
+        // Under MERGED LAW this is the harvest that gets an answer-and-exit
+        // worker's `control_response`: the reap appends
+        // session.stopped/session.crashed BEFORE settle, so the unregister is
+        // queued before `drain_all`, and `drain_all` reads the worker's final
+        // bytes while the session is still in `tailed` (read_channel.rs's fix-1
+        // ordering, and the merged test that pins it).
+        let mut appended_control_events = control_step(
+            ledger,
+            control,
+            dispatcher,
+            read_channel,
+            &mut conns,
+            &mut poll,
+        )?;
         // cp-0 (§2.3): a max_stream_bytes breach is a loud session failure —
         // append the named cause event FIRST (the agent.stalled → kill →
         // session.crashed mold), then kill the worker. The reap appends
@@ -554,7 +623,11 @@ pub fn run(
         // event. It returns `true` when it appended anything, so the campd
         // cursor is advanced past those events in this same wake rather than
         // waiting for a wake that an idle campd may never take.
-        if read_channel.apply_pending_unregisters(ledger)?
+        // cp-1 (C5): the final drain is now SEPARATE from disposal, so the
+        // control-plane harvest sits BETWEEN them — BEFORE the unlink. A reaped
+        // worker's last line carries the `control_response` to an interrupt, and
+        // it must be INGESTED before its file is gone, not merely read.
+        if read_channel.final_drain_pending(ledger)?
             && let Err(e) = settle(
                 ledger,
                 processor,
@@ -568,7 +641,139 @@ pub fn run(
         {
             eprintln!("campd: read-channel disposal settle failed: {e:#}");
         }
+        // cp-1 — HARVEST 2: the lines the DISPOSAL-TIME final drain consumed.
+        //
+        // DEFENSE IN DEPTH, honestly labelled. Under merged law the final drain
+        // yields ZERO lines (harvest 1 already read them), so this is normally a
+        // no-op. It exists because `drain_one` has two callers and a future phase
+        // could append session.stopped from INSIDE settle, which would move a
+        // worker's last bytes onto this path. It is idempotent (the hand-over is
+        // `mem::take`-drained): no double-ingest, no double-append.
+        //
+        // DO NOT claim that deleting it turns a test red — it does not.
+        //
+        // (The lines themselves are already SAFE at this point: the final drain
+        // read them into memory BEFORE `dispose_pending` unlinked the file. What
+        // this harvest does is INGEST them — which must happen before
+        // `expire_pending` below, or campd could declare an interrupt unanswered
+        // while its answer sat un-ingested in a Vec.)
+        appended_control_events |= control_step(
+            ledger,
+            control,
+            dispatcher,
+            read_channel,
+            &mut conns,
+            &mut poll,
+        )?;
+
+        // ---- G4/A2: THE DISPOSAL HAND-OFF, IN THE ONLY ORDER THAT WORKS ------
+        //
+        // Consuming `take_disposed()` INSIDE `control_step` — i.e. BEFORE
+        // `dispose_pending` has produced anything — leaves the list EMPTY on the
+        // disposal wake: `closing` is never set, and a subscriber that is exactly
+        // CAUGHT UP (poll_timeout == None — the steady state of every long-lived
+        // watch) gets NO end frame and NO EOF, forever.
+        //
+        // A2 is why that cannot be papered over: what "rescues" it in practice is
+        // that `unregister`'s remove_file fires a notify event and `on_watch_event`
+        // always signals — so the end frame's delivery would DEPEND ON A DELIVERED
+        // NOTIFY EVENT, which cp-0's law in this very block forbids ("correctness
+        // never depends on a delivered event"). It is also why a test would pass
+        // while the design was broken.
+        //
+        // So: DISPOSE FIRST (which is what RECORDS Disposed{session, final_offset}),
+        // and only THEN hand the list to the subscriber registry.
+        //
+        // `close_disposed` is NOT reachable from `control_step`, and it CANNOT be:
+        // it needs a `Vec<Disposed>`, and only `dispose_pending` can mint one.
+        // The disposed list is the RETURN VALUE of `dispose_pending` — there is no
+        // way to obtain one without having disposed. That is the ordering guarantee,
+        // made structural rather than conventional (no black-box test can gate it:
+        // the stream watch always delivers another wake, so a broken ordering only
+        // makes the end frame LATE, never absent).
+        let disposed = read_channel.dispose_pending(ledger)?;
+        if !disposed.is_empty() {
+            let (gone, events) =
+                control.close_disposed(&disposed, ledger, &mut conns, Timestamp::now());
+            for input in events {
+                ledger.append(input)?;
+                appended_control_events = true;
+            }
+            for token in gone {
+                if let Some(mut conn) = conns.remove(&token) {
+                    let _ = poll.registry().deregister(&mut conn.stream);
+                }
+                control.forget(token);
+            }
+        }
+        // ----------------------------------------------------------------------
+
+        // cp-1 (B5): ONLY NOW may a control deadline expire — AFTER every
+        // ingest this wake. A `control_response` sitting in the stream file
+        // because its notify was coalesced must be READ and INGESTED before
+        // campd may declare that it never arrived. That is cp-0's law, in the
+        // very block above: correctness never depends on a delivered event.
+        for input in control.expire_pending(Timestamp::now()) {
+            ledger.append(input)?;
+            appended_control_events = true;
+        }
+        if appended_control_events
+            && let Err(e) = settle(
+                ledger,
+                processor,
+                runtime,
+                clock,
+                dispatcher,
+                graph,
+                patrol,
+                read_channel,
+            )
+        {
+            eprintln!("campd: control settle failed: {e:#}");
+        }
     }
+}
+
+/// cp-1: ingest whatever the read channel just handed over, and append what it
+/// produced. ONE helper, called at every harvest point, so a line's control
+/// effect can never depend on WHICH drain path read it.
+///
+/// Returns whether it appended anything (the caller settles to advance the campd
+/// cursor past those events).
+fn control_step(
+    ledger: &mut Ledger,
+    control: &mut super::control::ControlRuntime,
+    dispatcher: &mut Dispatcher,
+    read_channel: &mut super::read_channel::ReadChannelRuntime,
+    conns: &mut HashMap<Token, Conn>,
+    poll: &mut Poll,
+) -> Result<bool> {
+    let now = Timestamp::now();
+    let mut appended = false;
+
+    let lines = read_channel.take_stream_lines();
+    if !lines.is_empty() {
+        for input in control.ingest(&lines, dispatcher, now) {
+            ledger.append(input)?;
+            appended = true;
+        }
+    }
+
+    // D6": refresh every subscriber's `tail` and pump. A "live" line is just
+    // `tail` advancing — `fanout` never touches `lines` at all, which is what
+    // makes truncation and duplication structurally impossible.
+    let (gone, events) = control.fanout(read_channel, conns, now);
+    for input in events {
+        ledger.append(input)?;
+        appended = true;
+    }
+    for token in gone {
+        if let Some(mut conn) = conns.remove(&token) {
+            let _ = poll.registry().deregister(&mut conn.stream);
+        }
+        control.forget(token);
+    }
+    Ok(appended)
 }
 
 /// Drain the watch pipe (the byte content is meaningless — the signal
@@ -617,6 +822,8 @@ fn serve_connection(
     graph: &mut GraphRuntime,
     patrol: &mut PatrolRuntime,
     read_channel: &mut super::read_channel::ReadChannelRuntime,
+    control: &mut super::control::ControlRuntime,
+    token: Token,
     max_request_bytes: usize,
 ) -> Result<ConnState> {
     let mut chunk = [0u8; 4096];
@@ -647,6 +854,8 @@ fn serve_connection(
             graph,
             patrol,
             read_channel,
+            control,
+            token,
         )?;
         if let Some(terminal) = drained {
             return Ok(terminal);
@@ -691,6 +900,8 @@ fn drain_lines(
     graph: &mut GraphRuntime,
     patrol: &mut PatrolRuntime,
     read_channel: &mut super::read_channel::ReadChannelRuntime,
+    control: &mut super::control::ControlRuntime,
+    token: Token,
 ) -> Result<Option<ConnState>> {
     while let Some(newline) = conn.buf.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = conn.buf.drain(..=newline).collect();
@@ -793,53 +1004,46 @@ fn drain_lines(
                     eprintln!("campd: adopt settle failed: {e:#}");
                 }
             }
-            Ok(Request::Nudge { session, text }) => {
-                // The converse verb's live path (dispatch-lifecycle Phase 1,
-                // #29). Deliver → record → respond: the injected turn is a
-                // ledger fact (invariant 3), and a post-delivery append
-                // failure surfaces to the caller (invariant 5) — the ledger
-                // must not claim what was not delivered, and the caller must
-                // not believe what the ledger does not hold. No held pipe is
-                // NOT an error: via="none" routes the caller to the resume
-                // path (A4).
-                use super::dispatch::NudgeOutcome;
-                let response = match dispatcher.nudge_via_stdin(&session, &text) {
-                    NudgeOutcome::Delivered => {
-                        let (rig, bead) = dispatcher
-                            .child_info(&session)
-                            .map(|(r, b)| (Some(r), Some(b)))
-                            .unwrap_or((None, None));
-                        match ledger.append(EventInput {
-                            kind: EventType::SessionNudged,
-                            rig,
-                            actor: "campd".into(),
-                            bead,
-                            data: serde_json::json!({
-                                "session": session, "via": "stdin", "text": text,
-                            }),
-                        }) {
-                            Ok(_) => Response::Nudge {
-                                ok: true,
-                                via: "stdin".into(),
-                            },
-                            Err(e) => Response::Error {
-                                ok: false,
-                                error: format!(
-                                    "turn delivered into {session} but recording \
-                                     session.nudged failed: {e}"
-                                ),
-                            },
+            // cp-1 (§4.1). Every body lives in `control.rs` — the ONE module
+            // that owns the control plane — so these arms are delegations.
+            Ok(Request::SessionsList) => {
+                let response = control.serve_sessions_list(ledger, patrol, read_channel);
+                respond(&mut conn.stream, &response)?;
+            }
+            // cp-1 (§4.4): subscribe turns this connection into a STREAM. The hello
+            // goes out FIRST (it must be the first bytes on the socket), and only
+            // then does `pump` start writing frames — B11.
+            Ok(Request::SessionSubscribe { session, cursor }) => {
+                let response = control.serve_subscribe(token, &session, cursor, read_channel);
+                let subscribed = matches!(response, Response::Subscribed { .. });
+                respond(&mut conn.stream, &response)?;
+                if subscribed {
+                    // The accept-time WRITABLE edge is already consumed, so the
+                    // first frames need an explicit pump — nothing else will fire.
+                    match control.pump(token, conn, Timestamp::now()) {
+                        super::control::PumpOutcome::Ok => {}
+                        super::control::PumpOutcome::Gone => {
+                            control.forget(token);
+                            return Ok(Some(ConnState::Closed));
+                        }
+                        super::control::PumpOutcome::Drop(event) => {
+                            ledger.append(event)?;
+                            control.forget(token);
+                            return Ok(Some(ConnState::Closed));
                         }
                     }
-                    NudgeOutcome::NoPipe => Response::Nudge {
-                        ok: true,
-                        via: "none".into(),
-                    },
-                    NudgeOutcome::Failed(e) => Response::Error {
-                        ok: false,
-                        error: format!("stdin nudge of {session} failed: {e}"),
-                    },
-                };
+                    for input in control.take_pending_events() {
+                        ledger.append(input)?;
+                    }
+                }
+            }
+            Ok(Request::SessionSendTurn { session, text }) => {
+                let response = control.serve_send_turn(&session, &text, ledger, dispatcher);
+                respond(&mut conn.stream, &response)?;
+            }
+            Ok(Request::SessionInterrupt { session }) => {
+                let response =
+                    control.serve_interrupt(&session, ledger, dispatcher, Timestamp::now());
                 respond(&mut conn.stream, &response)?;
             }
             Err(e) => {
@@ -1249,6 +1453,8 @@ mod tests {
             &mut graph,
             &mut test_patrol(),
             &mut read_channel,
+            &mut crate::daemon::control::ControlRuntime::new(1024),
+            Token(6),
             1024,
         )
         .expect("a dead poker must not error the connection loop");
@@ -1459,6 +1665,8 @@ mod tests {
             &mut graph,
             &mut test_patrol(),
             &mut read_channel,
+            &mut crate::daemon::control::ControlRuntime::new(1024),
+            Token(6),
             TEST_CAP,
         )
         .unwrap();
