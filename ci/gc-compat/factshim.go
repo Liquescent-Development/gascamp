@@ -299,7 +299,6 @@ func sortedKeys(m map[string]int) []string {
 	return ks
 }
 
-
 // ---------------------------------------------------------------------------
 // THE AUTHORED PROJECTION — the differential gate's join key.
 //
@@ -327,7 +326,7 @@ type AuthoredStep struct {
 	DescSHA256  string            `json:"description_sha256"`
 	Assignee    string            `json:"assignee"`
 	Metadata    map[string]string `json:"metadata"`
-	Needs       []string          `json:"needs"` // comparable dep edges (both endpoints authored)
+	Needs       []string          `json:"needs"`        // comparable dep edges (both endpoints authored)
 	GCCorrupted bool              `json:"gc_corrupted"` // D7: gc's {{var}} bug hit this description
 }
 
