@@ -609,8 +609,25 @@ pub fn run_members(conn: &Connection, ctx: &RunContext) -> Result<Vec<BeadRow>, 
             crate::readiness::row_to_bead(r)
         })?
         .collect::<rusqlite::Result<_>>()?;
-    // The LIKEs are a PREFILTER only. Re-parse the labels Rust-side and drop the
-    // decoys — a bead whose title merely CONTAINS `"bond:` is not a bond child.
+    // The `NOT LIKE`s above are NOT a prefilter — they are the OPERATIVE exclusion, and
+    // they are BROADER than this re-parse. That is the opposite of `bond_children` /
+    // `drain_children`, where a POSITIVE `LIKE` selects candidates and the re-parse
+    // narrows them; inverting the LIKE inverts the relationship, and this comment used
+    // to claim the `bond_children` shape here. It was wrong, and expensively so — a test
+    // harness read it, reproduced the label rule as "call the two parsers", and shipped
+    // a hole (see `close_member_REFUSES_a_MALFORMED_LABELLED_nonroot` in
+    // `camp/tests/daemon_drain.rs`).
+    //
+    // Concretely: a MALFORMED label like `drain:gc-999` (no index) is EXCLUDED by the
+    // SQL — labels serialize as a JSON array, so it appears as `"drain:` — while
+    // `parse_drain_label` returns `None` for it and would ADMIT it. The SQL drops beads
+    // the parsers accept as members.
+    //
+    // So this filter cannot drop a row the SQL kept: every label a parser accepts starts
+    // with `bond:`/`drain:`, hence appears as `"bond:`/`"drain:` in the column, hence was
+    // already excluded. Verified by deleting it — the workspace suite stays green. It is
+    // kept as belt-and-braces: if the SQL exclusion is ever narrowed, correctness must
+    // not silently depend on the LIKE alone.
     Ok(rows
         .into_iter()
         .filter(|row| {

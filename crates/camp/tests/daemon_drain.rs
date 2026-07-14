@@ -171,10 +171,12 @@ impl Camp {
     /// fold. V-6 needs it: the money-invariant assertion must key on the STEP, not on
     /// a title `create_attempt` happens to copy.
     ///
-    /// `None` means the row EXISTS and its `step_id` is NULL — the property that makes
-    /// a bead a run MEMBER. A MISSING row is a hard failure, not a `None`: the old
-    /// `.unwrap_or(None)` collapsed those two into one answer, and `close_member`'s
-    /// guard now rests on this distinction (invariant 5 — no silenced errors).
+    /// `None` means the row EXISTS and its `step_id` is NULL — one NECESSARY but NOT
+    /// sufficient condition of membership (`run_members` ANDs five more). This helper
+    /// serves TEST PRECONDITIONS and V-6; `close_member`'s guard does NOT call it, and
+    /// must not be "simplified" to. A MISSING row is a hard failure, not a `None`: the
+    /// old `.unwrap_or(None)` collapsed those two into one answer (invariant 5 — no
+    /// silenced errors).
     fn step_id_of(&self, id: &str) -> Option<String> {
         self.conn()
             .query_row("SELECT step_id FROM beads WHERE id = ?1", [id], |r| {
@@ -183,10 +185,20 @@ impl Camp {
             .unwrap_or_else(|e| panic!("bead {id} has no row, so it has no step_id: {e}"))
     }
 
-    /// The bead's `run_id`. The OTHER half of the membership predicate — see
-    /// `close_member`, which needs BOTH columns because `dispatchable_beads` is a
-    /// CONJUNCTION. Same fail-fast contract as `step_id_of`: a missing row is a hard
-    /// failure, never a `None`.
+    /// The bead's `run_id` — the ONE column `close_member` reads, and it reads it only to
+    /// know WHICH RUN to load. Membership itself is not decided here and must never be:
+    /// `close_member` asks `run_members` (`formula/runtime.rs:597-621`), which ANDs six
+    /// conditions plus a re-parse.
+    ///
+    /// This docstring used to say the guard "needs BOTH columns because
+    /// `dispatchable_beads` is a CONJUNCTION". That described the round-5 guard — the one
+    /// that let a MAIL bead, a run ROOT, and both label families through — and it named
+    /// the wrong predicate besides (`run_members`, not `dispatchable_beads`, is the
+    /// membership rule). Anyone who "simplifies" the guard back to two columns on the
+    /// strength of that sentence reopens those holes verbatim.
+    ///
+    /// Same fail-fast contract as `step_id_of`: a missing row is a hard failure, never a
+    /// `None`.
     fn run_id_of(&self, id: &str) -> Option<String> {
         self.conn()
             .query_row("SELECT run_id FROM beads WHERE id = ?1", [id], |r| {
