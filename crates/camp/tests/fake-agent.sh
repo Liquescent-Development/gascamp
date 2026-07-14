@@ -198,7 +198,15 @@ if [[ -n "${FAKE_AGENT_CONTROL_LOOP:-}" ]]; then
   read -r _task_line
   while IFS= read -r _control_line; do
     case "$_control_line" in
-      *'"type":"control_request"'*) answer_control "$_control_line" ;;
+      *'"type":"control_request"'*)
+        # cp-1 (B6): FAKE_AGENT_CONTROL_ANSWER_DELAY makes the answer land at a
+        # time the TEST chooses. The restart proof needs campd to die BEFORE the
+        # answer exists — otherwise campd may ingest it first and rehydration is
+        # never exercised. The line is already READ, so campd's death during this
+        # sleep does not stop the answer from being written.
+        sleep "${FAKE_AGENT_CONTROL_ANSWER_DELAY:-0}"
+        answer_control "$_control_line"
+        ;;
       *) break ;;  # a user turn: stop listening and close the bead
     esac
   done

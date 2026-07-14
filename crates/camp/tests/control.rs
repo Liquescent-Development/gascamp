@@ -12,7 +12,7 @@
 //! tests/read_channel.rs — `camp` is a BINARY-only crate, so an integration test
 //! cannot link `daemon::*` and each suite carries its own harness.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -523,17 +523,19 @@ fn interrupting_a_session_with_no_held_pipe_fails_loudly() {
 fn a_campd_restart_across_an_in_flight_interrupt_invents_no_fault() {
     let dir = tempfile::tempdir().unwrap();
     let (root, _rig) = scaffold(dir.path(), 4);
-    // LINGER_ON_EOF: the worker must OUTLIVE campd. campd holds the write end of
-    // its stdin, so a kill -9 EOFs it — and a worker that exits there is B6's
-    // NAMED residual (the session is adopted as crashed, never re-tailed, and its
-    // answer is never read), not the case under test here.
-    let campd = Daemon::spawn(
-        &root,
-        &[
-            ("FAKE_AGENT_CONTROL_LOOP", "1"),
-            ("FAKE_AGENT_LINGER_ON_EOF", "30"),
-        ],
-    );
+    // LINGER_ON_EOF: the worker must OUTLIVE campd (campd holds the write end of
+    // its stdin, so a kill -9 EOFs it — and a worker that exits there is B6's NAMED
+    // residual, not the case under test).
+    //
+    // ANSWER_DELAY: the worker holds its answer for 3 s. That makes the race
+    // DETERMINISTIC — campd is killed while the answer DOES NOT YET EXIST, so it
+    // cannot possibly have ingested it, and rehydration is genuinely what reads it.
+    let envs = [
+        ("FAKE_AGENT_CONTROL_LOOP", "1"),
+        ("FAKE_AGENT_LINGER_ON_EOF", "60"),
+        ("FAKE_AGENT_CONTROL_ANSWER_DELAY", "3"),
+    ];
+    let campd = Daemon::spawn(&root, &envs);
     let mut stream = connect(&root);
     let (_bead, session) = dispatch_one(&root);
 
@@ -543,12 +545,25 @@ fn a_campd_restart_across_an_in_flight_interrupt_invents_no_fault() {
     );
     assert_eq!(resp["ok"], true, "{resp}");
     let request_id = resp["request_id"].as_str().unwrap().to_owned();
+    wait_until(&root, "session.interrupted", |e| {
+        e.iter().any(|ev| {
+            ev["type"] == "session.interrupted" && ev["data"]["request_id"] == request_id.as_str()
+        })
+    });
 
-    // Wait for the answer to reach the worker's STDOUT FILE — NOT the ledger.
-    // That is the whole point: the bytes exist, and campd dies before it ever
-    // reads them. (campd is not poked here, so it does not wake and ingest.)
+    // The worker is still holding its answer. campd CANNOT have ingested it.
+    assert!(
+        events_of(&root, "control.responded").is_empty(),
+        "the answer does not exist yet — this test's whole point is that campd dies \
+         BEFORE it can ingest one"
+    );
+
+    // kill -9: no goodbye, no flush. Crash-only.
+    campd.kill9();
+
+    // The worker now writes its answer into its stdout file, with NO campd running.
     let stdout = stdout_path(&root, &session);
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let content = std::fs::read_to_string(&stdout).unwrap_or_default();
         if content.contains(&request_id) && content.contains("control_response") {
@@ -556,32 +571,18 @@ fn a_campd_restart_across_an_in_flight_interrupt_invents_no_fault() {
         }
         assert!(
             Instant::now() < deadline,
-            "the worker never answered; its stdout was: {}",
+            "the worker never answered while campd was down: {}",
             std::fs::read_to_string(&stdout).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(25));
     }
-    // The answer is on disk and campd has NOT ingested it.
-    assert!(
-        events_of(&root, "control.responded").is_empty(),
-        "this test is only meaningful if campd dies BEFORE ingesting the answer"
-    );
-
-    // kill -9: no goodbye, no flush. Crash-only.
-    campd.kill9();
 
     // A FRESH campd. It has never seen this request_id in memory — only in the
-    // LEDGER, which is the only thing that survives a kill -9. It rebuilds the
-    // pending table from `session.interrupted`, re-tails the (still live) worker's
-    // stdout from its persisted byte offset, reads the answer that was already
-    // sitting there, and correlates it.
-    let campd = Daemon::spawn(
-        &root,
-        &[
-            ("FAKE_AGENT_CONTROL_LOOP", "1"),
-            ("FAKE_AGENT_LINGER_ON_EOF", "30"),
-        ],
-    );
+    // LEDGER, the one thing that survives a kill -9. It rebuilds the pending table
+    // from `session.interrupted`, re-tails the (still live) worker's stdout from its
+    // persisted byte offset, reads the answer that was already sitting there, and
+    // correlates it.
+    let campd = Daemon::spawn(&root, &envs);
 
     wait_until(&root, "control.responded after the restart", |e| {
         e.iter().any(|ev| {
@@ -655,10 +656,19 @@ fn sessions_list_reports_live_sessions_by_name() {
 
 /// A subscribe connection. `camp` is a BINARY crate, so there is no
 /// `socket::subscribe` to reuse — this is the harness's own idiom.
+///
+/// IT OWNS ITS BYTE BUFFER, AND THAT IS LOAD-BEARING. The obvious
+/// implementation — `BufReader::read_line` under a socket read timeout — SILENTLY
+/// LOSES DATA: when the timeout fires mid-line, the bytes already consumed are
+/// discarded with the `Err`, and the next call resumes mid-frame. Under load that
+/// eats whole frames (it ate `end` frames), and it makes a green test a coin
+/// flip. Buffering the bytes HERE means a timeout costs nothing: the bytes stay
+/// put and the next poll picks up where it left off.
 #[derive(Debug)]
 struct SubClient {
-    reader: BufReader<UnixStream>,
     stream: UnixStream,
+    buf: Vec<u8>,
+    eof: bool,
     #[allow(dead_code)]
     subscription: String,
     cursor: u64,
@@ -668,56 +678,145 @@ impl SubClient {
     fn open(root: &Path, session: &str, cursor: Option<u64>) -> std::io::Result<SubClient> {
         let stream = UnixStream::connect(root.join("campd.sock"))?;
         // The HELLO is bounded by REQUEST_TIMEOUT (5 s) — a WEDGED campd fails
-        // HERE, which is the exit criterion.
+        // HERE, and that is the exit criterion.
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let req = serde_json::json!({
             "op": "session.subscribe", "session": session, "cursor": cursor,
         });
         (&stream).write_all(format!("{req}\n").as_bytes())?;
-        // try_clone: the BufReader owns one handle; `stream` keeps the other so the
-        // read deadline can be CLEARED after the hello.
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut hello = String::new();
-        reader.read_line(&mut hello)?; // times out on a wedge
+
+        // Read the hello into OUR buffer, one byte at a time, so a timeout can
+        // never swallow half of it.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = (&stream).read(&mut byte)?; // times out on a wedge
+            if n == 0 {
+                return Err(std::io::Error::other("campd closed before the hello"));
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        let hello = String::from_utf8_lossy(&buf).into_owned();
         let v: serde_json::Value = serde_json::from_str(hello.trim_end())
             .map_err(|e| std::io::Error::other(format!("bad hello {hello:?}: {e}")))?;
         if v["ok"] != true {
             return Err(std::io::Error::other(format!("subscribe refused: {v}")));
         }
         assert_eq!(v["v"], 1, "the hello carries the protocol version");
+
         // §4.4: TIMEOUT-EXEMPT after the hello — a quiet stream is not a wedged
-        // daemon. THIS LINE is the exemption.
+        // daemon. From here the socket is NON-BLOCKING and we poll it ourselves.
         stream.set_read_timeout(None)?;
+        stream.set_nonblocking(true)?;
         Ok(SubClient {
             subscription: v["subscription"].as_str().unwrap_or_default().to_owned(),
             cursor: v["cursor"].as_u64().unwrap_or(0),
-            reader,
             stream,
+            buf: Vec::new(),
+            eof: false,
         })
     }
 
-    /// The next frame, or None at EOF. `end` frames ARE returned — a test must be
-    /// able to SEE one.
+    /// Pop one complete line out of the owned buffer, if there is one.
+    fn take_line(&mut self) -> Option<String> {
+        let pos = self.buf.iter().position(|&b| b == b'\n')?;
+        let line: Vec<u8> = self.buf.drain(..=pos).collect();
+        Some(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned())
+    }
+
+    /// Read whatever is available into the owned buffer. Never loses a byte.
+    fn fill(&mut self) {
+        let mut chunk = [0u8; 65536];
+        loop {
+            match self.stream.read(&mut chunk) {
+                Ok(0) => {
+                    self.eof = true;
+                    return;
+                }
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(_) => {
+                    self.eof = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The next frame, EOF, or nothing-yet — the three states a test must tell
+    /// apart. "EOF" and "quiet" are the difference between "campd truncated the
+    /// stream" and "nothing has happened yet", and conflating them is how a
+    /// truncation test passes.
+    fn read_frame_or_eof(&mut self, within: Duration) -> FrameOrEof {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(line) = self.take_line() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                return match serde_json::from_str(&line) {
+                    Ok(v) => FrameOrEof::Frame(v),
+                    Err(e) => panic!("campd put a NON-JSON line on the wire: {line:?}: {e}"),
+                };
+            }
+            if self.eof {
+                return FrameOrEof::Eof;
+            }
+            if Instant::now() > deadline {
+                return FrameOrEof::Timeout;
+            }
+            self.fill();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The next frame, or None at EOF/quiet. `end` frames ARE returned — a test
+    /// must be able to SEE one.
     ///
     /// EVERY subscriber test carries a HARD DEADLINE, because the §4.4 timeout
     /// exemption clears the read deadline: without one, a test that should FAIL
     /// would HANG instead, and a hang that "passes by timing out the harness" is
     /// exactly the failure mode these tests exist to make impossible.
     fn next_frame_within(&mut self, dur: Duration) -> Option<serde_json::Value> {
-        self.stream.set_read_timeout(Some(dur)).ok()?;
-        let mut line = String::new();
-        let out = match self.reader.read_line(&mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => serde_json::from_str(line.trim_end()).ok(),
-        };
-        let _ = self.stream.set_read_timeout(None);
-        out
+        match self.read_frame_or_eof(dur) {
+            FrameOrEof::Frame(v) => Some(v),
+            _ => None,
+        }
     }
 
-    fn next_frame(&mut self) -> Option<serde_json::Value> {
-        self.next_frame_within(Duration::from_secs(20))
+    /// The next frame, POKING campd while it waits.
+    ///
+    /// This is not belt-and-braces: campd only pumps a subscriber on a WAKE, and
+    /// the stream watch is latency-only (§2.3) — on macOS it does not fire at all
+    /// for a worker's appends through its inherited stdout fd. A subscriber whose
+    /// session has produced bytes campd has not yet drained will therefore sit
+    /// silent until something wakes campd. A poke IS that wake.
+    fn next_frame_poking(&mut self, root: &Path, within: Duration) -> Option<serde_json::Value> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(f) = self.next_frame_within(Duration::from_millis(250)) {
+                return Some(f);
+            }
+            if self.eof || Instant::now() > deadline {
+                return None;
+            }
+            if let Ok(mut s) = UnixStream::connect(root.join("campd.sock")) {
+                let _ = s.write_all(b"{\"op\":\"poke\",\"seq\":1}\n");
+                let mut line = String::new();
+                let _ = BufReader::new(s).read_line(&mut line);
+            }
+        }
     }
+}
+
+enum FrameOrEof {
+    Frame(serde_json::Value),
+    Eof,
+    Timeout,
 }
 
 /// THE EXIT CRITERION: a WEDGED campd fails the subscribe hello FAST.
@@ -781,7 +880,7 @@ fn a_subscription_survives_a_quiet_period_longer_than_request_timeout() {
     });
 
     let frame = sub
-        .next_frame()
+        .next_frame_poking(&root, Duration::from_secs(30))
         .expect("the subscription must survive a quiet period longer than REQUEST_TIMEOUT");
     assert_eq!(frame["frame"], "event");
     drop(campd);
@@ -830,11 +929,17 @@ fn a_client_that_resubscribes_from_a_delivered_offset_resumes_exactly_there() {
     let mut first = SubClient::open(&root, &session, Some(0)).unwrap();
     let mut frames = Vec::new();
     for _ in 0..12 {
-        frames.push(first.next_frame().expect("a frame"));
+        frames.push(
+            first
+                .next_frame_poking(&root, Duration::from_secs(30))
+                .expect("a frame"),
+        );
     }
     let k = frames.len() - 1;
     let resume_at = frames[k]["offset"].as_u64().unwrap();
-    let expected_next = first.next_frame().expect("frame K+1");
+    let expected_next = first
+        .next_frame_poking(&root, Duration::from_secs(30))
+        .expect("frame K+1");
     drop(first);
 
     // SECOND subscription, resuming from the offset campd itself handed us.
@@ -843,7 +948,9 @@ fn a_client_that_resubscribes_from_a_delivered_offset_resumes_exactly_there() {
         second.cursor, resume_at,
         "the hello echoes the cursor it was given"
     );
-    let got = second.next_frame().expect("a frame after resuming");
+    let got = second
+        .next_frame_poking(&root, Duration::from_secs(30))
+        .expect("a frame after resuming");
 
     assert_eq!(
         got, expected_next,
@@ -1211,20 +1318,34 @@ fn a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends() 
     );
     assert_eq!(resp["ok"], true, "{resp}");
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut events: Vec<serde_json::Value> = Vec::new();
     let mut end: Option<serde_json::Value> = None;
     while end.is_none() {
-        assert!(Instant::now() < deadline, "the end frame never arrived");
+        assert!(
+            Instant::now() < deadline,
+            "the end frame never arrived ({} events seen)",
+            events.len()
+        );
         let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
-        while let Some(f) = sub.next_frame_within(Duration::from_millis(500)) {
-            match f["frame"].as_str() {
-                Some("end") => {
-                    end = Some(f);
-                    break;
-                }
-                Some("event") => events.push(f),
-                _ => {}
+        loop {
+            match sub.read_frame_or_eof(Duration::from_millis(500)) {
+                FrameOrEof::Frame(f) => match f["frame"].as_str() {
+                    Some("end") => {
+                        end = Some(f);
+                        break;
+                    }
+                    Some("event") => events.push(f),
+                    _ => {}
+                },
+                // §9: EOF must NEVER arrive without an `end` frame first — that is a
+                // silently truncated stream, and it is exactly what this test forbids.
+                FrameOrEof::Eof => panic!(
+                    "the subscription was CLOSED with NO end frame — a silently \
+                     truncated stream (§9). {} events seen",
+                    events.len()
+                ),
+                FrameOrEof::Timeout => break,
             }
         }
     }
@@ -1298,7 +1419,7 @@ fn a_subscriber_caught_up_at_the_tail_gets_an_end_frame_when_its_session_is_reap
     );
     assert_eq!(resp["ok"], true, "{resp}");
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut end: Option<serde_json::Value> = None;
     while end.is_none() {
         assert!(
@@ -1407,7 +1528,7 @@ fn a_subscription_dies_with_campd_and_the_client_resumes_from_its_own_cursor() {
 
     let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
     let first = sub
-        .next_frame_within(Duration::from_secs(20))
+        .next_frame_poking(&root, Duration::from_secs(30))
         .expect("the init line");
     assert_eq!(first["frame"], "event");
     let resume_at = first["offset"].as_u64().unwrap();
@@ -1435,8 +1556,7 @@ fn a_subscription_dies_with_campd_and_the_client_resumes_from_its_own_cursor() {
     let mut resumed = SubClient::open(&root, &session, Some(resume_at)).unwrap();
     assert_eq!(resumed.cursor, resume_at);
     // Everything from that byte on is still there — no loss, no duplication.
-    let _ = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
-    if let Some(f) = resumed.next_frame_within(Duration::from_secs(10)) {
+    if let Some(f) = resumed.next_frame_poking(&root, Duration::from_secs(30)) {
         assert_ne!(
             f["frame"], "skipped",
             "the client's own cursor must still land on a line boundary after a \
