@@ -237,6 +237,17 @@ impl PatrolRuntime {
             .count() as u64
     }
 
+    /// cp-1 (§4.1): is THIS session stalled?
+    ///
+    /// It uses the SAME `tracked` intersection `stalled_count` applies (*"a
+    /// missed clear can never inflate the count"*). Divergent semantics between
+    /// the fleet count and the per-session answer would be a bug, not a shortcut:
+    /// an operator who sees `red: 1` in `status` and no stalled session in
+    /// `sessions.list` has been told two different stories by one daemon.
+    pub fn is_stalled(&self, session: &str) -> bool {
+        self.stalled.contains(session) && self.tracked.contains_key(session)
+    }
+
     /// Swap patrol's config on an applied hot reload (issue #81). Patrol
     /// resolves agents, rig lookups, the dispatch command, and stall/
     /// release thresholds against the config it holds; an applied reload

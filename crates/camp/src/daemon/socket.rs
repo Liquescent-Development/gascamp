@@ -50,6 +50,11 @@ pub enum Request {
         session: String,
         text: String,
     },
+    /// cp-1 (§4.1/§4.3): every live session, by name. Answered from the
+    /// LEDGER's registry, not campd's child map — an ADOPTED worker from a
+    /// previous campd life is a live session too.
+    #[serde(rename = "sessions.list")]
+    SessionsList,
     /// cp-1 (§4.1): interrupt a live worker's turn.
     ///
     /// D1 — ACK-then-ASYNC. campd answers with the `request_id` as soon as the
@@ -63,11 +68,45 @@ pub enum Request {
     },
 }
 
+/// cp-1 (§4.1): one live session, as the control plane speaks of it.
+///
+/// DECLARATION ORDER IS WIRE ORDER (a struct, never a `json!` map).
+///
+/// §4.2 — THERE IS NO `pid`, AND THAT IS THE DESIGN: *"a protocol that hands out
+/// pids cannot cross a machine boundary."* Sessions are named; names are what
+/// travel. A pid would be a shortcut that silently welds this protocol to one host.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub name: String,
+    pub agent: String,
+    pub rig: Option<String>,
+    pub bead: Option<String>,
+    /// EXACTLY TWO VALUES IN cp-1: `stalled` | `working`. This doc comment
+    /// promises no third — a phase that adds one is changing the protocol.
+    pub state: String,
+    /// RFC3339. The last complete line the session produced, else the moment it
+    /// woke.
+    pub last_activity: String,
+    /// §5.3: waiting on a permission decision. Its PRODUCER is phase 3, and the
+    /// flow is structurally unreachable in cp-1 — a `can_use_tool` that arrives
+    /// anyway is a LOUD `control.failed`, never a quietly-flipped bit. The field
+    /// is in the shape because §4.1's shape requires it: a protocol field awaiting
+    /// its producer, not a guess.
+    pub blocked: bool,
+}
+
 /// One response line. Untagged: variant order matters for deserialization
 /// (Status needs its fields, Error needs `error`, Ok is the fallback).
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Response {
+    /// cp-1 (§4.1) `sessions.list`. FIRST among the untagged variants: its
+    /// `sessions` key is what distinguishes it, and an earlier variant that also
+    /// matched `{"ok":true,...}` would shadow it.
+    SessionsList {
+        ok: bool,
+        sessions: Vec<SessionInfo>,
+    },
     Status {
         ok: bool,
         #[serde(flatten)]
@@ -692,6 +731,48 @@ mod tests {
     #[test]
     fn unknown_op_is_rejected() {
         assert!(serde_json::from_str::<Request>(r#"{"op":"dance"}"#).is_err());
+    }
+
+    /// cp-1 (§4.1/§4.2/§4.3): `sessions.list`'s wire, pinned.
+    ///
+    /// §4.2 IS THE POINT OF THE ASSERTION ABOUT `pid`: *"a protocol that hands
+    /// out pids cannot cross a machine boundary."* Sessions are named, and
+    /// NAMES are what the protocol speaks. A pid would be a shortcut that
+    /// silently welds the control plane to one host.
+    #[test]
+    fn sessions_list_wire_format_is_pinned() {
+        assert_eq!(
+            serde_json::to_string(&Request::SessionsList).unwrap(),
+            r#"{"op":"sessions.list"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"op":"sessions.list"}"#).unwrap(),
+            Request::SessionsList
+        );
+
+        // Declaration order IS wire order (these are structs, not json! maps).
+        let line = serde_json::to_string(&Response::SessionsList {
+            ok: true,
+            sessions: vec![SessionInfo {
+                name: "camp/dev/1".into(),
+                agent: "dev".into(),
+                rig: Some("gc".into()),
+                bead: Some("gc-1".into()),
+                state: "working".into(),
+                last_activity: "2026-07-13T12:00:00Z".into(),
+                blocked: false,
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            line,
+            r#"{"ok":true,"sessions":[{"name":"camp/dev/1","agent":"dev","rig":"gc","bead":"gc-1","state":"working","last_activity":"2026-07-13T12:00:00Z","blocked":false}]}"#
+        );
+        // §4.2: NO pid. Not anywhere, not ever.
+        assert!(
+            !line.contains("pid"),
+            "sessions.list must never hand out a pid (§4.2): {line}"
+        );
     }
 
     /// cp-1 (§4.1): the control-plane verbs' wire, pinned in BOTH directions.

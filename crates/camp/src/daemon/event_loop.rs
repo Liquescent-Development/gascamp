@@ -887,8 +887,12 @@ fn drain_lines(
                     eprintln!("campd: adopt settle failed: {e:#}");
                 }
             }
-            // cp-1 (§4.1). Both bodies live in `control.rs` — the ONE module
+            // cp-1 (§4.1). Every body lives in `control.rs` — the ONE module
             // that owns the control plane — so these arms are delegations.
+            Ok(Request::SessionsList) => {
+                let response = control.serve_sessions_list(ledger, patrol, read_channel);
+                respond(&mut conn.stream, &response)?;
+            }
             Ok(Request::SessionSendTurn { session, text }) => {
                 let response = control.serve_send_turn(&session, &text, ledger, dispatcher);
                 respond(&mut conn.stream, &response)?;

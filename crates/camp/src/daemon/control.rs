@@ -35,8 +35,9 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use super::dispatch::{ControlWrite, Dispatcher, NudgeOutcome};
-use super::read_channel::StreamLine;
-use super::socket::Response;
+use super::patrol::PatrolRuntime;
+use super::read_channel::{ReadChannelRuntime, StreamLine};
+use super::socket::{Response, SessionInfo};
 
 /// Every request id camp mints carries this prefix. It is what lets campd
 /// tell its OWN request apart from one the CLI minted for itself (a
@@ -1030,6 +1031,55 @@ impl ControlRuntime {
                 error: format!("stdin turn delivery to {session} failed: {e}"),
             },
         }
+    }
+
+    /// §4.1/§4.2/§4.3 `sessions.list`: every live session, BY NAME.
+    ///
+    /// Answered from the LEDGER's registry (`live_sessions`), NOT campd's child
+    /// map: an ADOPTED worker from a previous campd life is a live session too,
+    /// and a fleet view that could not see it would be lying by omission (§4.3).
+    pub fn serve_sessions_list(
+        &self,
+        ledger: &Ledger,
+        patrol: &PatrolRuntime,
+        read_channel: &ReadChannelRuntime,
+    ) -> Response {
+        let rows = match ledger.live_sessions() {
+            Ok(rows) => rows,
+            Err(e) => {
+                return Response::Error {
+                    ok: false,
+                    error: format!("listing live sessions: {e}"),
+                };
+            }
+        };
+        let sessions = rows
+            .into_iter()
+            .map(|row| SessionInfo {
+                // `last_activity` is the last complete line the session produced;
+                // a session that has produced none has still WOKEN, and the wake
+                // is the honest answer — never a zero or a null.
+                last_activity: read_channel
+                    .last_activity(&row.name)
+                    .map(|t| t.to_string())
+                    .unwrap_or(row.spawned_ts),
+                // EXACTLY TWO VALUES in cp-1. The doc comment on SessionInfo
+                // promises no third.
+                state: if patrol.is_stalled(&row.name) {
+                    "stalled".into()
+                } else {
+                    "working".into()
+                },
+                // §5.3: phase 3 owns the producer. cp-1 never flips this quietly
+                // — a can_use_tool that arrives is a LOUD control.failed.
+                blocked: false,
+                name: row.name,
+                agent: row.agent,
+                rig: row.rig,
+                bead: row.bead,
+            })
+            .collect();
+        Response::SessionsList { ok: true, sessions }
     }
 
     /// The INBOUND half: everything the read channel drained this wake.

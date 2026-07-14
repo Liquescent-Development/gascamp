@@ -568,3 +568,57 @@ fn a_campd_restart_across_an_in_flight_interrupt_invents_no_fault() {
     );
     drop(campd);
 }
+
+// ===== Task 7: sessions.list ==============================================
+
+/// §4.1/§4.2/§4.3: every live session, BY NAME.
+///
+/// It answers from the LEDGER's registry, not campd's child map — an ADOPTED
+/// worker from a previous campd life is a live session too, and a fleet view
+/// that could not see it would be lying by omission.
+#[test]
+fn sessions_list_reports_live_sessions_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_NUDGE_CLOSE", "1")]);
+    let mut stream = connect(&root);
+    let (bead, session) = dispatch_one(&root);
+
+    let resp = request(&mut stream, r#"{"op":"sessions.list"}"#);
+    assert_eq!(resp["ok"], true, "{resp}");
+    let sessions = resp["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "one live session: {resp}");
+    let s = &sessions[0];
+
+    assert_eq!(s["name"], session.as_str());
+    assert!(
+        s["name"].as_str().unwrap().contains("/dev/"),
+        "the NAME is the identity: {s}"
+    );
+    assert_eq!(s["agent"], "dev");
+    assert_eq!(s["rig"], "gc");
+    assert_eq!(s["bead"], bead.as_str());
+    assert!(s["bead"].as_str().unwrap().starts_with("gc-"));
+    assert_eq!(
+        s["state"], "working",
+        "cp-1's state is exactly two values: stalled | working"
+    );
+    assert_eq!(
+        s["blocked"], false,
+        "`blocked`'s producer is phase 3 (§5.3); cp-1 never flips it quietly"
+    );
+
+    // An RFC3339 timestamp campd can actually parse back.
+    let ts = s["last_activity"].as_str().unwrap();
+    assert!(
+        ts.parse::<jiff::Timestamp>().is_ok(),
+        "last_activity must be RFC3339: {ts:?}"
+    );
+
+    // §4.2: a protocol that hands out pids cannot cross a machine boundary.
+    assert!(
+        s.get("pid").is_none(),
+        "sessions.list must NEVER carry a pid: {s}"
+    );
+    drop(campd);
+}
