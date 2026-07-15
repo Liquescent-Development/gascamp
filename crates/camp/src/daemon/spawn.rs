@@ -126,6 +126,15 @@ pub struct ResumePins {
 /// nudge-resume): `-p --resume <sid> <text> --output-format json` plus the
 /// recorded F7 pins. NOT --append-system-prompt: the conversation already
 /// embodies the role prompt.
+///
+/// cp-3 (§5.3.1): a resume is a ONE-SHOT `--output-format json` turn whose stdin
+/// is `Stdio::null()` (both callers — `cmd/nudge.rs` and patrol nudge-resume).
+/// It has NO campd-held control plane, so it deliberately gets NO
+/// `--permission-prompt-tool stdio`: routing a permission ask to a stdio control
+/// plane that does not exist would make a resumed turn that hits a permission
+/// prompt block forever waiting for a `control_response` on null stdin — the
+/// exact "blocked forever" failure §5.3 exists to eliminate. The flag is a
+/// HeldStream-only (dispatch) affordance; §5.3.1 scopes it to the spawn path.
 pub fn resume_argv(sid: &str, text: &str, pins: &ResumePins) -> Vec<OsString> {
     let mut argv: Vec<OsString> = ["-p", "--resume", sid, text, "--output-format", "json"]
         .iter()
@@ -1467,6 +1476,30 @@ mod tests {
                 "json"
             ]
         );
+    }
+
+    /// cp-3 (§5.3.1): a resume is a null-stdin one-shot with NO campd control
+    /// plane, so `resume_argv` must NEVER carry `--permission-prompt-tool` — not
+    /// even for an askable mode. Routing a permission ask to a stdio control
+    /// plane that does not exist would hang a resumed turn forever on null stdin
+    /// (the very failure §5.3 eliminates). The flag is HeldStream-only.
+    #[test]
+    fn resume_argv_never_carries_the_permission_prompt_flag() {
+        for mode in [None, Some("default"), Some("acceptEdits"), Some("plan")] {
+            let pins = ResumePins {
+                model: None,
+                permission_mode: mode.map(str::to_owned),
+                allowed_tools: None,
+            };
+            let argv: Vec<String> = resume_argv("sid-1", "go", &pins)
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !argv.iter().any(|a| a == "--permission-prompt-tool"),
+                "a resume ({mode:?}) has no stdio control plane — the flag would hang it: {argv:?}"
+            );
+        }
     }
 
     /// PR #52 review finding 1 (defense-in-depth): the REUSE path checks
