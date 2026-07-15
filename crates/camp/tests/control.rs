@@ -2065,3 +2065,72 @@ fn fleet_subscribe_pushes_a_gone_on_session_end() {
     );
     drop(campd);
 }
+
+/// cp-3 §5.3 EXIT CRITERION, end to end: a fake worker's can_use_tool BLOCKS,
+/// SURFACES as BLOCKED, is ANSWERED over the socket, and the decision is a ledger
+/// event with its cause — and the worker CONTINUES. The whole permission plane in
+/// one round trip against a real campd.
+#[test]
+fn a_worker_blocks_on_can_use_tool_is_answered_and_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_CAN_USE_TOOL", "1")]);
+    let (bead, session) = dispatch_one(&root);
+
+    // (1) it surfaces: sessions.list shows blocked:true, and a permission.pending
+    // event carries its cause. (`wait_until` pokes campd — the drain that surfaces
+    // the worker's notify-suppressed can_use_tool append on macOS.)
+    wait_until(&root, "the worker BLOCKED", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "permission.pending" && ev["data"]["tool_name"] == "Bash")
+    });
+    let req = events_json(&root)
+        .into_iter()
+        .find(|e| e["type"] == "permission.pending")
+        .unwrap()["data"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut stream = connect(&root);
+    let list = request(&mut stream, r#"{"op":"sessions.list"}"#);
+    assert!(
+        list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == session.as_str() && s["blocked"] == true),
+        "the fleet shows the worker BLOCKED: {list}"
+    );
+
+    // (2) a permission.pending event exists with its cause (asserted above via req)
+
+    // (3) answer it over the socket
+    let dec = request(
+        &mut stream,
+        &format!(
+            r#"{{"op":"session.permission_decision","session":"{session}","request_id":"{req}","decision":"allow"}}"#
+        ),
+    );
+    assert_eq!(dec["ok"], true, "{dec}");
+    assert_eq!(dec["decision"], "allow", "{dec}");
+
+    // (4) the decision is a ledger event with who/what
+    wait_until(&root, "the permission.decided", |e| {
+        e.iter().any(|ev| ev["type"] == "permission.decided")
+    });
+    let decided = events_json(&root)
+        .into_iter()
+        .rev()
+        .find(|e| e["type"] == "permission.decided")
+        .unwrap();
+    assert_eq!(decided["data"]["decision"], "allow");
+    assert_eq!(decided["data"]["decided_by"], "operator");
+    assert_eq!(decided["data"]["request_id"], req.as_str());
+
+    // (5) the worker CONTINUED and unblocked — it received the allow and closed
+    wait_until(&root, "the worker continued past the permission", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "bead.closed" && ev["bead"] == bead.as_str())
+    });
+    drop(campd);
+}
