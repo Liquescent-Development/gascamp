@@ -336,6 +336,22 @@ impl PatrolRuntime {
                 }
                 return;
             }
+            // compat §6.2 — drain-ack is the PROMPT KILL trigger. bead-close
+            // only drops stdin + arms the grace (Release, above); drain-ack now
+            // reaps the already-released worker IMMEDIATELY via kill_released,
+            // instead of waiting the full release_grace. Idempotent: the grace
+            // timer stays armed as the backstop for a worker that never acks,
+            // and its later fire finds the already-reaped worker and no-ops
+            // (kill_released's `released.is_some()` guard). If the ack somehow
+            // precedes the release, kill_released no-ops too — safe either way.
+            EventType::WorkerDrainAcked => {
+                if let Some(session) = event.data["session"].as_str() {
+                    self.pending.push(PendingAction::KillReleased {
+                        session: session.to_owned(),
+                    });
+                }
+                return;
+            }
             _ => {}
         }
         if event.actor == "campd" {
@@ -1531,6 +1547,40 @@ mod tests {
             })
             .unwrap();
         ledger.events_range(seq, Some(seq)).unwrap().remove(0)
+    }
+
+    /// Close a tracked bead (open → closed) — the event `observe` turns into a
+    /// Release. No prior claim needed: `bead.closed` accepts any non-closed
+    /// status.
+    fn close_bead(ledger: &mut Ledger, bead: &str) {
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some(bead.into()),
+                data: serde_json::json!({ "outcome": "pass" }),
+            })
+            .unwrap();
+    }
+
+    /// The worker's drain-ack (as the shim appends it: actor `gc-shim`,
+    /// `{session}`) — the event `observe` turns into a prompt KillReleased.
+    fn drain_ack(ledger: &mut Ledger, session: &str) {
+        ledger
+            .append(EventInput {
+                kind: EventType::WorkerDrainAcked,
+                rig: None,
+                actor: "gc-shim".into(),
+                bead: None,
+                data: serde_json::json!({ "session": session }),
+            })
+            .unwrap();
+    }
+
+    fn last_event(ledger: &Ledger) -> Event {
+        let mut all = ledger.events_range(1, None).unwrap();
+        all.pop().unwrap()
     }
 
     #[test]
@@ -2896,6 +2946,251 @@ mod tests {
                 .filter(|e| e.kind.as_str() == "session.crashed")
                 .count(),
             0
+        );
+    }
+
+    /// compat §6.2 — a released worker's drain-ack reaps it PROMPTLY, at
+    /// ack time, without the release_grace timer having fired. Mutation
+    /// caught: removing the `WorkerDrainAcked` arm in `observe` (the ack no
+    /// longer queues KillReleased; the worker only dies at the full grace).
+    #[test]
+    fn drain_ack_kills_the_released_worker_promptly_before_the_grace() {
+        let (dir, mut ledger, config, _p) = fixture();
+        let patrol_config = camp_core::patrol::PatrolConfig {
+            stall_after: jiff::SignedDuration::from_mins(10),
+            restart_budget: 2,
+            release_grace: jiff::SignedDuration::from_secs(30),
+        };
+        let mut patrol = PatrolRuntime::new(patrol_config, &config);
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        track(&mut patrol, &mut ledger, &event, "2026-07-07T07:00:00Z");
+        let pid = dispatcher.test_insert_held_cat(dir.path(), "t/dev/1", "gc-1");
+
+        // close → release (grace armed, worker released but LIVE)
+        close_bead(&mut ledger, "gc-1");
+        let closed = last_event(&ledger);
+        patrol.observe(&closed);
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:00Z"))
+            .unwrap();
+
+        // drain-ack → prompt KillReleased queued
+        drain_ack(&mut ledger, "t/dev/1");
+        let dack = last_event(&ledger);
+        patrol.observe(&dack);
+        assert!(
+            patrol.pending.iter().any(|a| matches!(
+                a,
+                PendingAction::KillReleased { session } if session == "t/dev/1"
+            )),
+            "drain-ack must queue a prompt KillReleased: {:?}",
+            patrol.pending
+        );
+        // execute ONE SECOND after release — WELL before the 30s grace
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:01Z"))
+            .unwrap();
+        dispatcher.test_child_wait(pid);
+        dispatcher.reap(&mut ledger).unwrap();
+
+        let events = ledger.events_range(1, None).unwrap();
+        let stopped = events
+            .iter()
+            .find(|e| e.kind.as_str() == "session.stopped")
+            .expect("the ack reaps the worker");
+        assert!(
+            stopped.data["reason"].as_str().unwrap().contains("released"),
+            "{}",
+            stopped.data
+        );
+
+        // the grace timer still fires later, but the worker is already gone —
+        // idempotent no-op, exactly one stop, no crash.
+        let fires = patrol.fire_due(ts("2026-07-07T07:20:30Z"));
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:20:30Z"))
+            .unwrap();
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:30Z"))
+            .unwrap();
+        dispatcher.reap(&mut ledger).unwrap();
+        let events = ledger.events_range(1, None).unwrap();
+        assert_eq!(
+            events.iter().filter(|e| e.kind.as_str() == "session.stopped").count(),
+            1,
+            "exactly one reap — the grace fire is a no-op"
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.kind.as_str() == "session.crashed").count(),
+            0
+        );
+    }
+
+    /// compat §6.2 — the race guard: between close and the ack, NOTHING kills
+    /// the live-but-released worker early; the ack is what reaps it. (A worker
+    /// SIGKILLed mid-handshake is §6.2's race; camp's continuation truncation
+    /// keeps the post-close path to a couple of shim calls, so the ack always
+    /// beats the grace.)
+    #[test]
+    fn a_slow_drain_that_acks_before_the_grace_is_not_killed_early() {
+        let (dir, mut ledger, config, _p) = fixture();
+        let patrol_config = camp_core::patrol::PatrolConfig {
+            stall_after: jiff::SignedDuration::from_mins(10),
+            restart_budget: 2,
+            release_grace: jiff::SignedDuration::from_secs(30),
+        };
+        let mut patrol = PatrolRuntime::new(patrol_config, &config);
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        track(&mut patrol, &mut ledger, &event, "2026-07-07T07:00:00Z");
+        let pid = dispatcher.test_insert_held_cat(dir.path(), "t/dev/1", "gc-1");
+
+        close_bead(&mut ledger, "gc-1");
+        let closed = last_event(&ledger);
+        patrol.observe(&closed);
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:00Z"))
+            .unwrap();
+
+        // 15s later — still inside the 30s grace — nothing has fired, so the
+        // worker was NOT killed early.
+        assert!(
+            patrol.fire_due(ts("2026-07-07T07:20:15Z")).is_empty(),
+            "no timer fires before the grace"
+        );
+        dispatcher.reap(&mut ledger).unwrap();
+        assert_eq!(
+            ledger
+                .events_range(1, None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind.as_str() == "session.stopped")
+                .count(),
+            0,
+            "the released worker is still live before its ack"
+        );
+
+        // now it acks (at t=15s < grace) → reaped by the ack path.
+        drain_ack(&mut ledger, "t/dev/1");
+        let dack = last_event(&ledger);
+        patrol.observe(&dack);
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:15Z"))
+            .unwrap();
+        dispatcher.test_child_wait(pid);
+        dispatcher.reap(&mut ledger).unwrap();
+        assert!(
+            ledger
+                .events_range(1, None)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind.as_str() == "session.stopped"),
+            "the ack reaps the slow-draining worker"
+        );
+    }
+
+    /// compat §6.2 — the backstop: a worker that NEVER acks (crashed mid-drain,
+    /// or a native non-gc worker) is still reaped by the release_grace timer.
+    /// Mutation caught: removing the bead-close Release arm (a crashed-mid-drain
+    /// worker would then leak forever).
+    #[test]
+    fn a_worker_that_never_acks_is_killed_by_the_grace_backstop() {
+        let (dir, mut ledger, config, _p) = fixture();
+        let patrol_config = camp_core::patrol::PatrolConfig {
+            stall_after: jiff::SignedDuration::from_mins(10),
+            restart_budget: 2,
+            release_grace: jiff::SignedDuration::from_secs(30),
+        };
+        let mut patrol = PatrolRuntime::new(patrol_config, &config);
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        track(&mut patrol, &mut ledger, &event, "2026-07-07T07:00:00Z");
+        let pid = dispatcher.test_insert_held_cat(dir.path(), "t/dev/1", "gc-1");
+
+        close_bead(&mut ledger, "gc-1");
+        let closed = last_event(&ledger);
+        patrol.observe(&closed);
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:00Z"))
+            .unwrap();
+
+        // no ack ever arrives; the grace fires and reaps.
+        let fires = patrol.fire_due(ts("2026-07-07T07:20:30Z"));
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].kind, TimerKind::Release);
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:20:30Z"))
+            .unwrap();
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:30Z"))
+            .unwrap();
+        dispatcher.test_child_wait(pid);
+        dispatcher.reap(&mut ledger).unwrap();
+        assert!(
+            ledger
+                .events_range(1, None)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind.as_str() == "session.stopped"),
+            "the grace backstop reaps a worker that never acks"
+        );
+    }
+
+    /// compat §6.2 (NB2) — at the grace boundary, the ack and the grace fire
+    /// land in the same wake; the worker is reaped EXACTLY ONCE (no double
+    /// kill_released, no panic). Pins the "post-close drain ≪ grace" claim by
+    /// forcing the boundary with a short grace.
+    #[test]
+    fn a_drain_ack_at_the_grace_boundary_still_reaps_via_the_ack_not_a_double_kill() {
+        let (dir, mut ledger, config, _p) = fixture();
+        let patrol_config = camp_core::patrol::PatrolConfig {
+            stall_after: jiff::SignedDuration::from_mins(10),
+            restart_budget: 2,
+            release_grace: jiff::SignedDuration::from_secs(1), // SHORT, to force the boundary
+        };
+        let mut patrol = PatrolRuntime::new(patrol_config, &config);
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        track(&mut patrol, &mut ledger, &event, "2026-07-07T07:00:00Z");
+        let pid = dispatcher.test_insert_held_cat(dir.path(), "t/dev/1", "gc-1");
+
+        close_bead(&mut ledger, "gc-1");
+        let closed = last_event(&ledger);
+        patrol.observe(&closed);
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:00Z"))
+            .unwrap();
+
+        // the ack AND the 1s-grace fire both land at t=+1s. Process the ack's
+        // KillReleased AND the grace's KillReleased in one execute pass.
+        drain_ack(&mut ledger, "t/dev/1");
+        let dack = last_event(&ledger);
+        patrol.observe(&dack);
+        let fires = patrol.fire_due(ts("2026-07-07T07:20:01Z"));
+        patrol
+            .declare_stalls(&mut ledger, &fires, ts("2026-07-07T07:20:01Z"))
+            .unwrap();
+        // both KillReleased actions are now queued; executing them must not
+        // panic and must reap the worker exactly once.
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, ts("2026-07-07T07:20:01Z"))
+            .unwrap();
+        dispatcher.test_child_wait(pid);
+        dispatcher.reap(&mut ledger).unwrap();
+        assert_eq!(
+            ledger
+                .events_range(1, None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind.as_str() == "session.stopped")
+                .count(),
+            1,
+            "the boundary reaps exactly once — idempotent, no double kill"
         );
     }
 
