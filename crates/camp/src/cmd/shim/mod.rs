@@ -133,13 +133,14 @@ mod tests {
     fn refusal_records_binding_and_agent_fields_even_when_unattributed() {
         // With no GC_AGENT in the env, binding/agent are null — but the event
         // still records them (the shape is stable for downstream readers).
+        // `mol` is a genuinely-refused verb (prime/mail are now SERVED, compat-4).
         let (_d, camp) = temp_camp();
-        let _ = gc_shim(&camp, vec!["prime".into()]);
+        let _ = gc_shim(&camp, vec!["mol".into()]);
         let ev = read_events(&camp)
             .into_iter()
             .find(|e| e.kind == EventType::ShimRefused)
             .unwrap();
-        assert_eq!(ev.data["verb"], "prime");
+        assert_eq!(ev.data["verb"], "mol");
         assert!(ev.data.get("binding").is_some(), "binding key present");
         assert!(ev.data.get("agent").is_some(), "agent key present");
     }

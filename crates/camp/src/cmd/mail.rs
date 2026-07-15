@@ -24,7 +24,9 @@ pub fn send(
 ) -> Result<()> {
     let recipient = recipient.trim();
     if !(recipient.is_empty() || recipient == HUMAN) {
-        bail!("camp mail send: recipient {recipient:?} is not `human` — agent-to-agent mail is gastown/v2");
+        bail!(
+            "camp mail send: recipient {recipient:?} is not `human` — agent-to-agent mail is gastown/v2"
+        );
     }
     if subject.as_deref().unwrap_or_default().is_empty() && body.is_empty() {
         bail!("camp mail send: a subject (-s) or body is required");
@@ -147,7 +149,14 @@ mod tests {
     #[test]
     fn send_then_read_marks_read_and_drops_unread_count() {
         let (_d, camp) = camp_gc();
-        send(&camp, "human", Some("Approve?".into()), "the spec".into(), None).unwrap();
+        send(
+            &camp,
+            "human",
+            Some("Approve?".into()),
+            "the spec".into(),
+            None,
+        )
+        .unwrap();
         let ledger = Ledger::open(&camp.db_path()).unwrap();
         let id = ledger.unread_mail().unwrap()[0].id.clone();
         assert_eq!(ledger.unread_mail_count().unwrap(), 1);
@@ -169,7 +178,7 @@ mod tests {
         let ledger = Ledger::open(&camp.db_path()).unwrap();
         let id = ledger.unread_mail().unwrap()[0].id.clone();
         drop(ledger);
-        archive(&camp, &[id.clone()]).unwrap();
+        archive(&camp, std::slice::from_ref(&id)).unwrap();
         let row = Ledger::open(&camp.db_path())
             .unwrap()
             .bead_row(&id)

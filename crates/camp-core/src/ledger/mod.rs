@@ -2711,7 +2711,9 @@ mod tests {
             .append(created("gc-1", serde_json::json!({ "title": "work" })))
             .unwrap();
         ledger
-            .append(crate::mail::mail_bead_event("gc", "hi", "body", "from", "cli", "gc-2"))
+            .append(crate::mail::mail_bead_event(
+                "gc", "hi", "body", "from", "cli", "gc-2",
+            ))
             .unwrap();
         let s = ledger.status_summary().unwrap();
         assert_eq!(s.open, 1, "mail is NOT a task and must not inflate open");

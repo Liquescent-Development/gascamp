@@ -42,15 +42,17 @@ fn run_with_env(
 }
 
 /// Name resolution mirrors gc (A5): args[0], else $GC_ALIAS, else $GC_AGENT.
-fn invocation_agent_name(args: &[String], gc_alias: Option<&str>, gc_agent: Option<&str>) -> String {
+fn invocation_agent_name(
+    args: &[String],
+    gc_alias: Option<&str>,
+    gc_agent: Option<&str>,
+) -> String {
     if let Some(first) = args.iter().find(|a| !a.starts_with('-')) {
         return first.trim().to_owned();
     }
-    for var in [gc_alias, gc_agent] {
-        if let Some(v) = var {
-            if !v.trim().is_empty() {
-                return v.trim().to_owned();
-            }
+    for v in [gc_alias, gc_agent].into_iter().flatten() {
+        if !v.trim().is_empty() {
+            return v.trim().to_owned();
         }
     }
     String::new()
@@ -138,7 +140,10 @@ mod tests {
             invocation_agent_name(&["arg".to_owned()], Some("alias"), Some("agent")),
             "arg"
         );
-        assert_eq!(invocation_agent_name(&[], Some("alias"), Some("agent")), "alias");
+        assert_eq!(
+            invocation_agent_name(&[], Some("alias"), Some("agent")),
+            "alias"
+        );
         assert_eq!(invocation_agent_name(&[], None, Some("agent")), "agent");
     }
 

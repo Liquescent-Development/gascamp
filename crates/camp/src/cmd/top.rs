@@ -33,7 +33,12 @@ pub fn statusline(camp: &CampDir) -> Result<()> {
         Ok(Response::Status { summary, red, .. }) => {
             println!(
                 "{}",
-                badge(summary.live_sessions.len(), summary.ready, red, summary.unread_mail)
+                badge(
+                    summary.live_sessions.len(),
+                    summary.ready,
+                    red,
+                    summary.unread_mail
+                )
             );
             Ok(())
         }

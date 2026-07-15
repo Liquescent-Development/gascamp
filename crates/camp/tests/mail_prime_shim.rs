@@ -38,7 +38,10 @@ fn mail_check_exit_code_follows_the_gc_contract() {
         Some(1),
         "empty inbox = exit 1 (A2)"
     );
-    let sent = camp(&root, &["mail", "send", "human", "-s", "Approve?", "-m", "the spec"]);
+    let sent = camp(
+        &root,
+        &["mail", "send", "human", "-s", "Approve?", "-m", "the spec"],
+    );
     assert!(
         sent.status.success(),
         "{}",
@@ -95,14 +98,46 @@ fn every_corpus_send_human_shape_creates_one_human_mail_bead() {
     let shapes: &[&[&str]] = &[
         &["send", "human", "Review needed for PR #42"],
         &["send", "human", "please", "review", "the", "spec"],
-        &["send", "human", "-s", "Spec approval", "-m", "review please"],
+        &[
+            "send",
+            "human",
+            "-s",
+            "Spec approval",
+            "-m",
+            "review please",
+        ],
         &["send", "human", "-s", "Build is green"],
         &["send", "--to", "human", "Status update"],
-        &["send", "--to", "human", "-s", "Gate", "-m", "approve/reject?"],
+        &[
+            "send",
+            "--to",
+            "human",
+            "-s",
+            "Gate",
+            "-m",
+            "approve/reject?",
+        ],
         &["send", "human", "-m", "body only, no subject"],
-        &["send", "human", "--from", "t/gc.run-operator/1", "escalation"],
-        &["send", "human", "multi word body with punctuation, and commas"],
-        &["send", "human", "-s", "Human gate", "-m", "options: approve, request changes, reject"],
+        &[
+            "send",
+            "human",
+            "--from",
+            "t/gc.run-operator/1",
+            "escalation",
+        ],
+        &[
+            "send",
+            "human",
+            "multi word body with punctuation, and commas",
+        ],
+        &[
+            "send",
+            "human",
+            "-s",
+            "Human gate",
+            "-m",
+            "options: approve, request changes, reject",
+        ],
     ];
     for shape in shapes {
         let dir = tempfile::tempdir().unwrap();
@@ -150,7 +185,10 @@ fn mail_check_inject_is_refused_keeping_invariant_1() {
     let root = scaffold(dir.path());
     let bead = worker_bead_id(&root);
     let out = gc_shim_mail(&root, &bead, &["check", "--inject"]);
-    assert!(!out.status.success(), "--inject is the withdrawn hook (§11.2)");
+    assert!(
+        !out.status.success(),
+        "--inject is the withdrawn hook (§11.2)"
+    );
 }
 
 #[test]

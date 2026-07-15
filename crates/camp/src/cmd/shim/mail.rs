@@ -124,7 +124,9 @@ fn send_with_context(
         .rig;
     let prefix = rig_prefix(camp, &rig)?;
     let id = ledger.next_bead_id(&prefix)?;
-    let seq = ledger.append(mail_bead_event(&rig, &subject, &body, &sender, "gc-shim", &id))?;
+    let seq = ledger.append(mail_bead_event(
+        &rig, &subject, &body, &sender, "gc-shim", &id,
+    ))?;
     crate::daemon::socket::poke_best_effort(camp, seq);
     Ok(ShimExit(0))
 }
@@ -142,7 +144,11 @@ pub(super) fn check(camp: &CampDir, args: &[String]) -> Result<ShimExit> {
                 );
             }
             "--hook-format" => {
-                return refuse(camp, "mail check", "`--hook-format` is a v2 injection concern");
+                return refuse(
+                    camp,
+                    "mail check",
+                    "`--hook-format` is a v2 injection concern",
+                );
             }
             flag if flag.starts_with('-') => {
                 return refuse(camp, "mail check", &format!("unknown flag {flag:?}"));
@@ -234,7 +240,10 @@ mod tests {
     #[test]
     fn send_human_dash_s_dash_m_maps_subject_and_body() {
         let (_d, camp) = worker_camp();
-        send_ok(&camp, &["human", "-s", "Spec approval", "-m", "please review"]);
+        send_ok(
+            &camp,
+            &["human", "-s", "Spec approval", "-m", "please review"],
+        );
         let l = Ledger::open(&camp.db_path()).unwrap();
         let inbox = l.unread_mail().unwrap();
         assert_eq!(inbox[0].subject, "Spec approval");
@@ -326,7 +335,15 @@ mod tests {
         let (_d, camp) = worker_camp();
         send_ok(
             &camp,
-            &["human", "--json", "--notify", "-s", "Green", "-m", "build passed"],
+            &[
+                "human",
+                "--json",
+                "--notify",
+                "-s",
+                "Green",
+                "-m",
+                "build passed",
+            ],
         );
         let l = Ledger::open(&camp.db_path()).unwrap();
         let inbox = l.unread_mail().unwrap();
