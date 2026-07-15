@@ -78,6 +78,7 @@ mod tests {
             ready: 0,
             open: 0,
             stuck: 0,
+            unread_mail: 0,
         };
         assert_eq!(
             render(&empty, 0, 4242),
@@ -88,6 +89,7 @@ mod tests {
             ready: 1,
             open: 3,
             stuck: 0,
+            unread_mail: 0,
         };
         assert_eq!(
             render(&busy, 1, 7),

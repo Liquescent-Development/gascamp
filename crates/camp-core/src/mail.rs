@@ -19,13 +19,16 @@ pub const MAIL_FROM_KEY: &str = "mail.from_display";
 pub const MAIL_TO_KEY: &str = "mail.to_display";
 /// The only v1 recipient (compat §8.2 — every corpus call is `send human`).
 pub const HUMAN: &str = "human";
-/// The synthetic title for a subjectless mail. gc allows an empty Title
-/// (`beadmail.go`, subject==""); camp's `bead.created` fold rejects an empty
-/// title (`fold.rs:153`, PR #18 — an empty title is unusable downstream). So
-/// the ONE confined constructor substitutes this placeholder when the sender
-/// gave no subject (gc's positional `send human <body>` grammar, A1). The raw
-/// body is preserved verbatim in `description`; only the missing subject is
-/// filled. Projected as `MailMessage.subject` for subjectless mail.
+/// The synthetic title for a subjectless mail. This is a DOCUMENTED camp-side
+/// divergence from gc, not a match: gc's message bead sets `Title=subject`
+/// verbatim (measured, A3 — `beadmail.go:169-179`), so a subjectless send gives
+/// gc an EMPTY Title. gc has no title guard; camp's `bead.created` fold hard-
+/// rejects an empty title (`fold.rs:153`, PR #18 — an empty title is unusable
+/// downstream), so camp CANNOT store gc's empty Title and MUST substitute
+/// something. The ONE confined constructor fills this placeholder when the
+/// sender gave no subject (gc's positional `send human <body>` grammar, A1).
+/// The raw body is preserved verbatim in `description`; only the missing
+/// subject is filled. Projected as `MailMessage.subject` for subjectless mail.
 pub const MAIL_NO_SUBJECT: &str = "(no subject)";
 
 /// One unread/read mail message projected from a `type="mail"` bead row.
