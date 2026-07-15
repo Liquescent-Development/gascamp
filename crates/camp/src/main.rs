@@ -29,6 +29,7 @@ mod cmd {
     pub mod search;
     pub mod service;
     pub mod session;
+    pub mod sessions;
     pub mod shim;
     pub mod show;
     pub mod sling;
@@ -336,6 +337,15 @@ enum Command {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+    /// List every live session by name — the overseer's one-shot snapshot of
+    /// the fleet (control-plane §5.4), sourced only from the socket's
+    /// `sessions.list` verb. `--json` emits the raw SessionInfo array. campd
+    /// must be running (a pure client — no file reads, no pids).
+    Sessions {
+        /// Emit the live-session array as one JSON line (machine read).
+        #[arg(long)]
+        json: bool,
     },
     /// One campd status snapshot as plain text (campd must be running)
     Top {
@@ -911,6 +921,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     if_registered,
                 ),
             }
+        }
+        Command::Sessions { json } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::sessions::run(&camp, json)
         }
         Command::Top { statusline } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
