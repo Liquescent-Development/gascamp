@@ -1250,9 +1250,9 @@ impl ControlRuntime {
         // won.
         let decided = ledger.append(EventInput {
             kind: EventType::PermissionDecided,
-            rig,
+            rig: rig.clone(),
             actor: "campd".into(),
-            bead,
+            bead: bead.clone(),
             data: serde_json::json!({
                 "session": session,
                 "request_id": request_id,
@@ -1305,6 +1305,17 @@ impl ControlRuntime {
             // answerable — its re-armed stall timer (Task 8) fires, the ladder
             // drains, finds NO pending (it is decided), and walks its normal
             // bounded restart. Loud to the caller; the ledger truth is correct.
+            //
+            // F3 (inv-3): NoPipe is NOT additionally evented — and this is the
+            // deliberate, principled choice, mirroring the sibling interrupt
+            // handler's own NoPipe reasoning. Nothing reached the pipe (no bytes,
+            // no torn channel), so there is no NEW campd action to record beyond
+            // the `permission.decided` already durably appended above; and the
+            // §5.3.4 inverse-window reconciliation that follows (re-armed stall
+            // timer → ladder drain → session.crashed on restart) is ITSELF
+            // evented. A "delivery skipped" event here would be redundant with
+            // both the recorded decision and that evented downstream — exactly
+            // the speculative box-check to avoid.
             ControlWrite::NoPipe => Response::Error {
                 ok: false,
                 error: format!(
@@ -1312,10 +1323,48 @@ impl ControlRuntime {
                      released) — the worker cannot receive it; the stall ladder now owns it"
                 ),
             },
-            ControlWrite::Failed(e) => Response::Error {
-                ok: false,
-                error: format!("decision recorded, but delivering it to {session} failed: {e}"),
-            },
+            // F3 (inv-3): unlike NoPipe, a Failed write was ATTEMPTED and TORN
+            // DOWN — bytes may already have reached the pipe and `write_control`
+            // dropped it, so the worker just lost its write channel. That IS a
+            // campd action WITH a consequence, so — exactly as the interrupt
+            // handler does — it is BOTH an error to the caller AND a durable
+            // `control.failed{cause:"write_failed"}`, keyed by the permission
+            // request_id. (Harmless to rehydration: that request_id is the CLI's,
+            // never one of camp's minted control requests, so the `failed` map
+            // built in `rehydrate` never consults it.)
+            ControlWrite::Failed(e) => {
+                let reason = format!(
+                    "decision recorded, but delivering it to {session} failed: {e}. The pipe may \
+                     hold a torn partial line, so campd dropped it — the worker can no longer be \
+                     sent turns or control messages; the stall ladder (§5.3.4) now owns it"
+                );
+                match ledger.append(EventInput {
+                    kind: EventType::ControlFailed,
+                    rig,
+                    actor: "campd".into(),
+                    bead,
+                    data: serde_json::json!({
+                        "session": session,
+                        "request_id": request_id,
+                        "verb": "session.permission_decision",
+                        // TERMINAL: the answer never reached the worker.
+                        "cause": "write_failed",
+                        "reason": reason,
+                    }),
+                }) {
+                    Ok(_) => Response::Error {
+                        ok: false,
+                        error: reason,
+                    },
+                    // A failing append must not MASK the write failure — carry both.
+                    Err(append_err) => Response::Error {
+                        ok: false,
+                        error: format!(
+                            "{reason} (and recording control.failed ALSO failed: {append_err})"
+                        ),
+                    },
+                }
+            }
         }
     }
 
@@ -2531,6 +2580,57 @@ mod tests {
             led.blocked_sessions().unwrap().is_empty(),
             "and the session is no longer BLOCKED"
         );
+        // F3 (inv-3): NoPipe is deliberately NOT additionally evented — nothing
+        // reached the pipe, the decision is already durable, and the §5.3.4
+        // inverse-window reconciliation is itself evented. Pin that no
+        // control.failed is minted for the NoPipe case (so the F3 Failed-branch
+        // event below is not a blanket "always event delivery failures").
+        assert!(
+            led.events_of_type(EventType::ControlFailed)
+                .unwrap()
+                .is_empty(),
+            "NoPipe records no control.failed — the decision event already stands"
+        );
+    }
+
+    /// F3 (inv-3 completeness): when the decision is DURABLE but the pipe write
+    /// FAILS (a torn pipe — a campd action WITH a consequence: the worker lost
+    /// its write channel), campd records a durable `control.failed`
+    /// (cause `write_failed`), mirroring the sibling interrupt handler — the
+    /// undelivered-but-recorded decision is not left visible only to the
+    /// ephemeral socket caller. Contrast the NoPipe case above, which touches no
+    /// pipe and needs no new event.
+    #[test]
+    fn an_undeliverable_decision_with_a_torn_pipe_records_control_failed() {
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (dir, mut led) = temp_ledger();
+        seed_pending(&mut led, "t-dev-1", "cli-7");
+        let mut disp = test_dispatcher(dir.path());
+        // A held pipe whose reader we then KILL: the small allow line gets EPIPE
+        // → ControlWrite::Failed (a torn pipe), not NoPipe.
+        let pid = disp.test_insert_held_cat(dir.path(), "t-dev-1", "gc-1");
+        disp.test_kill_and_wait(pid);
+
+        let r =
+            rt.serve_permission_decision("t-dev-1", "cli-7", "allow", None, &mut led, &mut disp);
+        assert!(
+            matches!(r, Response::Error { .. }),
+            "the caller is told delivery failed: {r:?}"
+        );
+        // ledger-before-pipe: the decision is durable regardless.
+        assert_eq!(
+            led.permission_decider("cli-7").unwrap().as_deref(),
+            Some("operator")
+        );
+        // AND the undelivered delivery is on the record durably (inv-3).
+        let failed = led.events_of_type(EventType::ControlFailed).unwrap();
+        let f = failed
+            .iter()
+            .find(|e| e.data["request_id"] == "cli-7")
+            .expect("a control.failed records the torn-pipe delivery failure");
+        assert_eq!(f.data["cause"], "write_failed");
+        assert_eq!(f.data["verb"], "session.permission_decision");
+        assert_eq!(f.data["session"], "t-dev-1");
     }
 
     /// D3: the transparent stream surface. A non-control line is handed back

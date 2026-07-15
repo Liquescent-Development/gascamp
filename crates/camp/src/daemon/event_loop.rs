@@ -493,8 +493,28 @@ pub fn run(
         // draining the other tailed sessions and stays up; a `?` here would
         // let one bad stream crash the whole wake — invariant 1). The
         // collector is surfaced as durable patrol.degraded events below.
+        // Set by the read-channel block below (cap breaches, fault-event
+        // flushes, and the F2 fatal-drain append) to trigger the one settle at
+        // the end of the block that advances the campd cursor past them.
+        let mut appended_read_channel_events = false;
+        // F2 (inv-5): a fatal `drain_all` is durable, never eprintln-only — on
+        // a detached daemon the stderr line is invisible. Per-stream I/O faults
+        // are already captured non-fatally (fix 8) and surface as
+        // `patrol.degraded` below; the OUTER error is a structural failure and
+        // takes the same durable shape. This harvest declares no stall (the
+        // ladder ran in `stall_step` at the top of the wake) and the failed
+        // drain advances no offset, so the next wake re-reads and self-heals.
         if let Err(e) = read_channel.drain_all(ledger) {
-            eprintln!("campd: read-channel drain_all failed: {e:#}");
+            ledger.append(EventInput {
+                kind: EventType::PatrolDegraded,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "error": format!("read-channel drain_all failed: {e:#}"),
+                }),
+            })?;
+            appended_read_channel_events = true;
         }
         // cp-1 — HARVEST 1: the lines `drain_all` just consumed.
         //
@@ -525,7 +545,6 @@ pub fn run(
         // bead re-hooks via the patrol restart path (fix 6: the kill reason
         // starts with "patrol restart" so patrol::observe queues a Respawn).
         // The kill triggers SIGCHLD → the next wake reaps.
-        let mut appended_read_channel_events = false;
         for breach in read_channel.take_cap_breaches() {
             let (rig, bead) = dispatcher
                 .child_info(&breach.session)
@@ -816,21 +835,43 @@ fn stall_step(
     now: Timestamp,
 ) -> Result<bool> {
     let stall_fires = patrol.fire_due(now);
-    if !stall_fires.is_empty() {
-        if let Err(e) = read_channel.drain_all(ledger) {
-            eprintln!("campd: pre-ladder drain failed: {e:#}");
-        }
-        control_step(
-            ledger,
-            control,
-            dispatcher,
-            patrol,
-            read_channel,
-            conns,
-            poll,
-        )?;
-        patrol.reconcile_blocked(ledger, now)?;
+    if stall_fires.is_empty() {
+        return patrol.declare_stalls(ledger, &stall_fires, now);
     }
+    // §5.3.3: the ladder's FIRST act is to drain the read channel so a lost
+    // `can_use_tool` surfaces as BLOCKED before any stall is declared. If that
+    // drain FAILS fatally we cannot tell a waiting (BLOCKED) worker from a
+    // silent one — declaring a stall here would nudge/restart/kill a worker
+    // that is only waiting on us, past the §5.3.3 disarm. Fail CLOSED (F2,
+    // inv-5): record a durable `patrol.degraded` (a detached daemon's stderr is
+    // invisible — never eprintln-and-proceed) and SKIP the stall declaration
+    // this wake, re-arming the fired timers so the next wake retries.
+    if let Err(e) = read_channel.drain_all(ledger) {
+        ledger.append(EventInput {
+            kind: EventType::PatrolDegraded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "error": format!(
+                    "pre-ladder drain_all failed; skipping the stall declaration this \
+                     wake (fail-closed, §5.3.3): {e:#}"
+                ),
+            }),
+        })?;
+        patrol.requeue_fires_without_declaring(&stall_fires, now);
+        return Ok(true);
+    }
+    control_step(
+        ledger,
+        control,
+        dispatcher,
+        patrol,
+        read_channel,
+        conns,
+        poll,
+    )?;
+    patrol.reconcile_blocked(ledger, now)?;
     patrol.declare_stalls(ledger, &stall_fires, now)
 }
 
@@ -1640,6 +1681,127 @@ mod tests {
             "no stall was declared against the waiting worker"
         );
         assert!(!patrol.is_armed("s"));
+    }
+
+    /// cp-3 §5.3.3 (F2, inv-5): a FATAL `drain_all` error in `stall_step` must
+    /// fail CLOSED — record a durable `patrol.degraded` and declare NO stall
+    /// this wake — never eprintln-and-proceed. If the pre-ladder drain fails we
+    /// cannot tell a BLOCKED worker (which must not be stalled) from a silent
+    /// one, so proceeding to `declare_stalls` would stall a waiting worker past
+    /// the §5.3.3 disarm; on a detached daemon the swallowed stderr line is
+    /// invisible. The fired timer is RE-ARMED (not leaked): the next wake
+    /// retries. Reddens on the old fail-open: it declared `agent.stalled`.
+    #[test]
+    fn stall_step_fails_closed_on_a_fatal_drain_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents/dev.md"),
+            "---\nname: dev\n---\nWork.\n",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "t"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "name": "s", "agent": "dev",
+                    "transcript_path": dir.path().join("projects/-p/sid.jsonl"),
+                    "bead": "gc-1",
+                }),
+            })
+            .unwrap();
+
+        let config = camp_core::config::CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let mut dispatcher = Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            config.clone(),
+        );
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config);
+        let mut control = crate::daemon::control::ControlRuntime::new(1024);
+        let mut read_channel = test_read_channel(dir.path());
+        read_channel.register(&mut ledger, "s").unwrap();
+
+        // Arm the stall timer at t0 (session is NOT blocked in the ledger).
+        let woke = ledger
+            .events_of_type(EventType::SessionWoke)
+            .unwrap()
+            .remove(0);
+        let t0 = Timestamp::now();
+        patrol.observe(&woke);
+        patrol.apply_tracking(&mut ledger, t0).unwrap();
+        assert!(
+            patrol.is_armed("s"),
+            "precondition: the stall timer is armed"
+        );
+
+        // The pre-ladder drain will fail fatally this wake.
+        read_channel.arm_drain_all_failure();
+
+        let mut conns: HashMap<Token, Conn> = HashMap::new();
+        let mut poll = Poll::new().unwrap();
+        let now = t0.checked_add(jiff::SignedDuration::from_mins(11)).unwrap();
+
+        let appended = stall_step(
+            &mut ledger,
+            &mut patrol,
+            &mut control,
+            &mut dispatcher,
+            &mut read_channel,
+            &mut conns,
+            &mut poll,
+            now,
+        )
+        .unwrap();
+
+        // THE LOAD-BEARING falsifying assertion: no stall was declared when the
+        // drain could not confirm the worker was not blocked.
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::AgentStalled)
+                .unwrap()
+                .len(),
+            0,
+            "fail-closed: a fatal drain must NOT lead to a stall declaration"
+        );
+        // The fatal drain is on the record durably, not swallowed to stderr.
+        let drain_degraded: Vec<_> = ledger
+            .events_of_type(EventType::PatrolDegraded)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.data["error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("drain_all failed"))
+            })
+            .collect();
+        assert_eq!(
+            drain_degraded.len(),
+            1,
+            "a fatal drain_all is recorded as exactly one durable patrol.degraded (inv-5)"
+        );
+        assert!(appended, "the wake did ledger work (the degraded append)");
+        // Not leaked: the fired timer is re-armed so the next wake retries.
+        assert!(
+            patrol.is_armed("s"),
+            "the fired stall timer is re-armed, not dropped — the worker is still patrolled"
+        );
     }
 
     /// PR #14 fix-pass NEW MEDIUM: the self-raise retry budget must bound

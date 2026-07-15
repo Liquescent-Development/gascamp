@@ -799,6 +799,31 @@ impl PatrolRuntime {
         self.timers.arm(session, TimerKind::Stall, effective, at);
     }
 
+    /// cp-3 (F2, §5.3.3): the pre-ladder drain FAILED this wake, so a lost
+    /// `can_use_tool` may be sitting unread and campd cannot tell a BLOCKED
+    /// worker (which must NOT be stalled) from a genuinely silent one. Fail
+    /// CLOSED: declare NO `agent.stalled` this wake. But `fire_due` already
+    /// POPPED these timers — dropping a `Stall` fire would leak the session out
+    /// of the ladder forever, so re-arm it and let the NEXT wake retry
+    /// drain-then-declare. A `Release` fire is the bead-closed grace kill, which
+    /// does not depend on the read channel, so it still takes its queued action.
+    pub fn requeue_fires_without_declaring(&mut self, fires: &[StallFire], now: Timestamp) {
+        for fire in fires {
+            match fire.kind {
+                TimerKind::Release => {
+                    self.pending.push(PendingAction::KillReleased {
+                        session: fire.session.clone(),
+                    });
+                }
+                TimerKind::Stall => {
+                    if let Some(t) = self.tracked.get(&fire.session).cloned() {
+                        self.rearm(&fire.session, &t, fire.deadline.max(now));
+                    }
+                }
+            }
+        }
+    }
+
     /// Execute the queued ladder actions. Every action's declaration is
     /// already durable (declare_stalls); failures here append their own
     /// records (nudge_failed / patrol.degraded) — never silent, never
@@ -3043,6 +3068,154 @@ mod tests {
         );
         assert_eq!(summary.crashed, 0);
         assert_eq!(summary.rearmed, 1, "{summary:?}");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// F1 (§10 never-kill-in-the-TUI): the adopt-arm kill guard
+    /// `row.woke_actor == "campd"` (this file, in `adopt`) is the ONLY thing
+    /// that stops campd SIGKILLing an ATTENDED (non-campd-woke) session that
+    /// carries a folded `permission.pending`. In practice an attended session
+    /// never gets `--permission-prompt-tool` so never folds a pending (§5.3.1
+    /// flag-suppression) — but if that suppression ever regressed, only this
+    /// guard stands between the operator's live TUI worker and a kill. Build
+    /// exactly that regressed shape — a LIVE, non-child, non-campd session with
+    /// a real pid AND a pending permission — and pin that `adopt` leaves it
+    /// ALIVE (0 crashed). Mutation caught: turning the guard always-true (drop
+    /// the `woke_actor == "campd"` clause) kills the live process — RED.
+    #[test]
+    fn adopt_never_kills_an_attended_session_with_a_pending_permission() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        // a live, non-child process campd can probe alive by pid.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = i64::from(child.id());
+        // An ATTENDED session: woke by a HOOK (actor != "campd"), carrying a
+        // real pid so `adopt` does NOT skip it at the no-pid attended gate — it
+        // reaches the kill arm, where only the `woke_actor` guard protects it.
+        // No claude_session_id, so probe_alive uses the pid branch (`ps -p`).
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: None,
+                actor: "hook:session-start".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "name": "attended/S-1", "agent": "attended", "pid": pid,
+                    "transcript_path": "/tmp/attended-S-1.jsonl",
+                }),
+            })
+            .unwrap();
+        // the regressed shape: an attended session that somehow folded a pending.
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionPending,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "attended/S-1", "request_id": "cli-9", "tool_name": "Bash",
+                }),
+            })
+            .unwrap();
+        // sanity: the attended session IS blocked (so the kill arm would fire
+        // if the guard let it through).
+        assert_eq!(
+            ledger.blocked_sessions().unwrap(),
+            vec!["attended/S-1".to_owned()]
+        );
+
+        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher).unwrap();
+        assert_eq!(
+            summary.crashed, 0,
+            "§10: adopt must never kill an attended session, even one carrying a pending permission"
+        );
+        assert!(
+            !ledger
+                .events_of_type(EventType::SessionCrashed)
+                .unwrap()
+                .iter()
+                .any(|e| e.data["reason"] == ADOPTION_PERMISSION_REASON),
+            "no unanswerable-permission kill against an attended session"
+        );
+        assert_eq!(
+            ledger.session_status("attended/S-1").unwrap().as_deref(),
+            Some("live"),
+            "the attended session stays live across adopt"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// F1 (§10 never-kill-in-the-TUI): the discovered-path guard
+    /// `row.woke_actor != "campd"` in `kill_discovered_unanswerable_permissions`
+    /// is the ONLY thing that stops the steady-state sweep SIGKILLing an
+    /// ATTENDED session that carries a folded `permission.pending`. Pin that the
+    /// sweep leaves it ALIVE (0 killed). Mutation caught: removing the
+    /// `!= "campd"` continue lets the sweep probe and kill the live process —
+    /// RED.
+    #[test]
+    fn kill_discovered_unanswerable_never_kills_an_attended_session() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, config, patrol) = fixture();
+        let dispatcher = dispatcher_for(dir.path(), &config);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = i64::from(child.id());
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: None,
+                actor: "hook:session-start".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "name": "attended/S-1", "agent": "attended", "pid": pid,
+                    "transcript_path": "/tmp/attended-S-1.jsonl",
+                }),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionPending,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "attended/S-1", "request_id": "cli-9", "tool_name": "Bash",
+                }),
+            })
+            .unwrap();
+        // sanity: the attended session IS in the blocked set the sweep scans.
+        assert_eq!(
+            ledger.blocked_sessions().unwrap(),
+            vec!["attended/S-1".to_owned()]
+        );
+
+        let killed =
+            kill_discovered_unanswerable_permissions(&mut ledger, &patrol, &dispatcher).unwrap();
+        assert_eq!(
+            killed, 0,
+            "§10: the discovered-permission sweep must never kill an attended (non-campd) session"
+        );
+        assert!(
+            !ledger
+                .events_of_type(EventType::SessionCrashed)
+                .unwrap()
+                .iter()
+                .any(|e| e.data["reason"] == ADOPTION_PERMISSION_REASON),
+            "no unanswerable-permission kill against an attended session"
+        );
+        assert_eq!(
+            ledger.session_status("attended/S-1").unwrap().as_deref(),
+            Some("live"),
+            "the attended session stays live across the sweep"
+        );
         child.kill().unwrap();
         child.wait().unwrap();
     }
