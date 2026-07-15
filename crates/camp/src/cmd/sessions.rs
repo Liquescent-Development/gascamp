@@ -42,9 +42,14 @@ fn render(sessions: &[SessionInfo]) -> String {
     if sessions.is_empty() {
         return "no live sessions\n".to_owned();
     }
-    let mut out = String::from("NAME                 AGENT            RIG        BEAD          STATE\n");
+    let mut out =
+        String::from("NAME                 AGENT            RIG        BEAD          STATE\n");
     for s in sessions {
-        let state = if s.blocked { "BLOCKED" } else { s.state.as_str() };
+        let state = if s.blocked {
+            "BLOCKED"
+        } else {
+            s.state.as_str()
+        };
         out.push_str(&format!(
             "{:<20} {:<16} {:<10} {:<13} {}\n",
             s.name,
@@ -86,7 +91,10 @@ mod tests {
         assert!(out.contains("t3/dev/2"));
         assert!(out.contains("t3/dev/3"));
         // BLOCKED overrides the working/stalled state and is spelled loudly
-        assert!(out.contains("BLOCKED"), "blocked session must render BLOCKED: {out}");
+        assert!(
+            out.contains("BLOCKED"),
+            "blocked session must render BLOCKED: {out}"
+        );
         // the non-blocked states survive
         assert!(out.contains("working"));
         assert!(out.contains("stalled"));

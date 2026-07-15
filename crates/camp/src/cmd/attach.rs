@@ -151,10 +151,7 @@ pub fn render_event(ev: &serde_json::Value) -> Vec<Rendered> {
                 // such field. Render it, and name the real answer path: the
                 // one-shot `camp decide` (cp-3 shipped). Attach's INTERACTIVE
                 // /allow-//deny loop is still cp-4's deferral - not wired here.
-                let request_id = ev
-                    .get("request_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
+                let request_id = ev.get("request_id").and_then(|v| v.as_str()).unwrap_or("?");
                 vec![Rendered {
                     kind: EventKind::Permission,
                     line: format!(
@@ -895,8 +892,14 @@ mod tests {
         // cp-5 (§5.4): the operator's answer path needs the request_id, and the
         // only socket surface that carries it is this stream frame. Render it.
         let line = &r[0].line;
-        assert!(line.contains("r1"), "the BLOCKED line must render the request_id: {line}");
-        assert!(line.contains("camp decide"), "the BLOCKED line must name the answer path: {line}");
+        assert!(
+            line.contains("r1"),
+            "the BLOCKED line must render the request_id: {line}"
+        );
+        assert!(
+            line.contains("camp decide"),
+            "the BLOCKED line must name the answer path: {line}"
+        );
         assert!(
             !line.contains("cp-3"),
             "the BLOCKED line must not claim cp-3 is unshipped: {line}"

@@ -223,12 +223,19 @@ fn camp_sessions_lists_the_whole_fleet_by_name_over_the_socket() {
     camp_ok(&root, &["sling", "second", "--agent", "dev"]);
     // Wait until the ledger shows two live sessions (both woke).
     wait_until(&root, "two live sessions", |events| {
-        events.iter().filter(|e| e["type"] == "session.woke").count() >= 2
+        events
+            .iter()
+            .filter(|e| e["type"] == "session.woke")
+            .count()
+            >= 2
     });
 
     let out = camp_ok(&root, &["sessions", "--json"]);
     let sessions: Vec<Value> = serde_json::from_str(out.trim()).unwrap();
-    assert!(sessions.len() >= 2, "expected >=2 live sessions, got: {out}");
+    assert!(
+        sessions.len() >= 2,
+        "expected >=2 live sessions, got: {out}"
+    );
     // Every row is addressed BY NAME (§4.2, `SessionInfo`'s doc comment).
     for s in &sessions {
         assert!(s["name"].as_str().is_some_and(|n| !n.is_empty()));
@@ -238,7 +245,10 @@ fn camp_sessions_lists_the_whole_fleet_by_name_over_the_socket() {
     // RED the day someone adds a `pid` field to the frozen wire (§4.2 rule 1) —
     // labelled so a reviewer does not count it as behavioural evidence.
     for s in &sessions {
-        assert!(s.get("pid").is_none(), "SessionInfo must never carry a pid: {s}");
+        assert!(
+            s.get("pid").is_none(),
+            "SessionInfo must never carry a pid: {s}"
+        );
     }
 }
 
@@ -284,9 +294,9 @@ fn camp_interrupt_stops_the_turn_over_the_socket() {
     assert!(out.contains("interrupt"), "interrupt did not ack: {out}");
     // The worker answers on the read channel -> control.responded, verb=session.interrupt.
     wait_until(&root, "control.responded for interrupt", |events| {
-        events.iter().any(|e| {
-            e["type"] == "control.responded" && e["data"]["verb"] == "session.interrupt"
-        })
+        events
+            .iter()
+            .any(|e| e["type"] == "control.responded" && e["data"]["verb"] == "session.interrupt")
     });
 }
 
@@ -528,7 +538,11 @@ fn socket_is_sufficient_unreadable_private_paths_do_not_stop_any_verb() {
     // Every verb still works — over the socket alone.
     let listed: Vec<Value> =
         serde_json::from_str(camp_ok(&root, &["sessions", "--json"]).trim()).unwrap();
-    assert!(listed.iter().any(|s| s["name"] == session.as_str() && s["blocked"] == true));
+    assert!(
+        listed
+            .iter()
+            .any(|s| s["name"] == session.as_str() && s["blocked"] == true)
+    );
     camp_ok(&root, &["nudge", &session, "still here?"]); // live send_turn path
     camp_ok(&root, &["decide", &session, req_id, "allow"]);
 
