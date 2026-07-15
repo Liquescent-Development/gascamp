@@ -137,6 +137,15 @@ pub struct ReadChannelRuntime {
     /// The notify watcher on `sessions/` (held for liveness; the drain-
     /// all-on-every-wake rule makes it latency-only — §2.3).
     watcher: Option<notify::RecommendedWatcher>,
+    /// cp-3 (F2 test seam): force the NEXT `drain_all` to return a fatal Err.
+    /// `drain_all`'s OUTER error is otherwise unreachable in a unit test —
+    /// every per-stream I/O fault is captured non-fatally into `drain_errors`
+    /// (fix 8) — so this is the only way to pin `stall_step`'s fail-closed
+    /// discipline (a fatal drain must record a durable `patrol.degraded` and
+    /// SKIP the stall declaration past the §5.3.3 disarm, never eprintln-and-
+    /// proceed). Compiled out of production entirely.
+    #[cfg(test)]
+    fail_next_drain_all: bool,
 }
 
 /// cp-0 §2.3: a stream file that crossed `max_stream_bytes` this drain —
@@ -223,7 +232,18 @@ impl ReadChannelRuntime {
             stream_lines: Vec::new(),
             last_activity: HashMap::new(),
             watcher: None,
+            #[cfg(test)]
+            fail_next_drain_all: false,
         })
+    }
+
+    /// cp-3 (F2 test seam): arm the next `drain_all` to fail fatally. See the
+    /// `fail_next_drain_all` field — this is the only way a unit test can drive
+    /// `stall_step`'s fail-closed path, since real drain faults are per-stream
+    /// and non-fatal.
+    #[cfg(test)]
+    pub fn arm_drain_all_failure(&mut self) {
+        self.fail_next_drain_all = true;
     }
 
     /// cp-1: harvest the complete lines the drains consumed. `mem::take`-drained
@@ -602,6 +622,10 @@ impl ReadChannelRuntime {
     /// after the drain block; phase 1+ reorders to after the
     /// `permission.pending` event's transaction).
     pub fn drain_all(&mut self, ledger: &mut Ledger) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_drain_all) {
+            anyhow::bail!("injected fatal drain_all failure (F2 test seam)");
+        }
         let sessions: Vec<String> = self.tailed.keys().cloned().collect();
         for session in sessions {
             self.drain_one(ledger, &session)?;

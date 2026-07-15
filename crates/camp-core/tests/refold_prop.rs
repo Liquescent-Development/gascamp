@@ -54,6 +54,21 @@ enum Op {
     Release {
         id: u8,
     },
+    /// cp-3 (§5.3): a worker's permission request. `req` is drawn from a SMALL
+    /// range so two pendings WILL contend for one request_id — the PK conflict
+    /// the fold must reject (append nothing). A pending against a non-live
+    /// session is also refused; both exercise the rejection-appends-nothing arm.
+    PermissionPending {
+        session: u8,
+        req: u8,
+    },
+    /// cp-3 (§9): a decision on a request. A decide against an unknown or
+    /// already-decided request_id changes zero rows → refused (first-answer-
+    /// wins), and the harness tolerates the `Err` exactly like other rejections.
+    PermissionDecide {
+        req: u8,
+        deny: bool,
+    },
 }
 
 fn bead_id(i: u8) -> String {
@@ -131,6 +146,35 @@ fn to_input(op: &Op) -> EventInput {
                 "metadata": { camp_core::readiness::EXCLUSIVE_DRAIN_RESERVATION: serde_json::Value::Null }
             }),
         ),
+        Op::PermissionPending { session, req } => (
+            EventType::PermissionPending,
+            None,
+            serde_json::json!({
+                "session": session_name(*session),
+                "request_id": format!("req-{req}"),
+                "tool_name": "Bash",
+            }),
+        ),
+        Op::PermissionDecide { req, deny } => (
+            EventType::PermissionDecided,
+            None,
+            if *deny {
+                serde_json::json!({
+                    "session": session_name(0),
+                    "request_id": format!("req-{req}"),
+                    "decision": "deny",
+                    "decided_by": "op",
+                    "reason": "denied by prop",
+                })
+            } else {
+                serde_json::json!({
+                    "session": session_name(0),
+                    "request_id": format!("req-{req}"),
+                    "decision": "allow",
+                    "decided_by": "op",
+                })
+            },
+        ),
     };
     EventInput {
         kind,
@@ -154,6 +198,11 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         // 2 drains over 8 beads: conflicts are frequent, not incidental.
         (0u8..8, 0u8..2).prop_map(|(id, drain)| Op::Reserve { id, drain }),
         (0u8..8).prop_map(|id| Op::Release { id }),
+        // req over 0..8: two pendings contend for a request_id (PK conflict),
+        // and a decide often lands on an already-decided/unknown id (first-
+        // answer-wins refusal) — both rejection arms are exercised.
+        (0u8..4, 0u8..8).prop_map(|(session, req)| Op::PermissionPending { session, req }),
+        (0u8..8, any::<bool>()).prop_map(|(req, deny)| Op::PermissionDecide { req, deny }),
     ]
 }
 
@@ -183,6 +232,10 @@ const DUMPS: &[(&str, &str)] = &[
     ),
     ("search", "bead_id, kind, content"),
     ("counters", "prefix, high"),
+    (
+        "permissions",
+        "request_id, session, tool_name, status, decision, decided_by, requested_ts, decided_ts",
+    ),
     ("events", "seq, ts, type, rig, actor, bead, data"),
 ];
 

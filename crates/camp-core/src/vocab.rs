@@ -65,6 +65,11 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     //     neither a gc name nor a prefix-truncation of one.
     "shim.refused",
     "worker.drain_acked",
+    // cp-3 (control-plane §5.3): the permission plane. gc has no `permission.*`
+    // event, so all three are additive, never redefinitions.
+    "permission.pending",
+    "permission.decided",
+    "permission.saturated",
 ];
 
 /// Values `bead.closed` accepts for `outcome` — a strict subset of gc's

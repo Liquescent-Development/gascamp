@@ -146,6 +146,30 @@ fn count(events: &[serde_json::Value], kind: &str) -> usize {
     events.iter().filter(|e| e["type"] == kind).count()
 }
 
+/// Like `wait_until`, but POKES campd (a socket round-trip) each iteration so it
+/// wakes and drains tailed stream files — on macOS a worker's stdout append
+/// through its inherited fd is notify-suppressed, so an explicit wake surfaces
+/// it. Ignores poke failures (campd may be momentarily unavailable).
+fn wait_until_poking(root: &Path, what: &str, pred: impl Fn(&[serde_json::Value]) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let _ = Command::new(BIN)
+            .env_remove("CAMP_DIR")
+            .arg("--camp")
+            .arg(root)
+            .arg("top")
+            .output();
+        let events = events_json(root);
+        if pred(&events) {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("timed out waiting for {what}; events: {events:#?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn stalled_actions(events: &[serde_json::Value]) -> Vec<String> {
     events
         .iter()
@@ -359,6 +383,145 @@ fn ladder_exhaustion_emits_and_stops() {
         .to_owned();
     std::fs::write(hold.join(bead), "go").unwrap();
     drop(campd);
+}
+
+/// cp-3 §5.3.3 — THE HEART, integration CONFIRM (macOS-genuine; a CONFIRM, not
+/// the falsifying guard — that is the platform-independent component test on
+/// `stall_step`). A fake worker emits a `can_use_tool` through its OWN long-lived
+/// inherited stdout fd — genuinely notify-suppressed on macOS (surfaced only by
+/// the ladder's pre-ladder drain), and surfaced via inotify on Linux. Either way
+/// it reaches BLOCKED, and past the stall threshold it is NEVER nudged,
+/// restarted, or killed. (Do NOT inject the can_use_tool with a test-side
+/// open+write+close — that fires notify and defeats the point; the worker
+/// self-emits through its inherited fd.)
+#[test]
+fn a_blocked_worker_is_never_nudged_restarted_or_killed_past_the_stall_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(
+        dir.path(),
+        "stall_after = \"1s\"",
+        &[("dev", "isolation: none\n")],
+    );
+    let campd = Daemon::spawn(
+        &root,
+        &dir.path().join("claude-home"),
+        &[("FAKE_AGENT_CAN_USE_TOOL", "1")],
+    );
+    camp_ok(&root, &["sling", "ask permission"]);
+
+    // BLOCKED reached: a permission.pending event carries its cause.
+    wait_until(&root, "the permission.pending (BLOCKED)", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "permission.pending" && ev["data"]["tool_name"] == "Bash")
+    });
+    let before = events_json(&root);
+    let session = before.iter().find(|e| e["type"] == "session.woke").unwrap()["data"]["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Deltas measured FROM the BLOCKED point: a pre-BLOCKED nudge (possible if
+    // worker startup outran the first 1s fire) is not a violation — the HEART is
+    // that a worker that IS blocked takes no further ladder action.
+    let stalled_before = count(&before, "agent.stalled");
+
+    // 3× stall_after of real time: a BLOCKED worker takes NO ladder action.
+    std::thread::sleep(Duration::from_millis(3000));
+    let events = events_json(&root);
+    assert_eq!(
+        count(&events, "agent.stalled"),
+        stalled_before,
+        "a BLOCKED worker is never declared stalled past the threshold: {events:#?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "session.crashed" && e["data"]["name"] == session.as_str())
+            .count(),
+        0,
+        "a BLOCKED worker is never killed"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "session.woke" && e["data"]["name"] == session.as_str())
+            .count(),
+        1,
+        "a BLOCKED worker is never respawned"
+    );
+    assert!(
+        !events.iter().any(|e| e["type"] == "permission.decided"),
+        "no decision was made, so it is still blocked"
+    );
+    // campd is unharmed and responsive (not wedged).
+    let out = camp_ok(&root, &["top"]);
+    assert!(out.contains("live"), "top output: {out}");
+    drop(campd);
+}
+
+/// cp-3 §5.3.4 (CP3-B4): a permission DISCOVERED after adoption takes the NAMED
+/// kill, not the stall ladder. campd1 spawns a worker that delays its
+/// can_use_tool; campd1 is kill -9'd BEFORE the request exists; campd2 adopts the
+/// still-live worker (non-child, no held stdin); the worker then emits its
+/// can_use_tool, campd2 surfaces it, and the steady-state event-loop branch gives
+/// it the SAME named kill — with its bead re-hooked, and NO agent.stalled.
+/// Mutation caught: routing a discovered pending to the generic ladder.
+#[test]
+fn a_pending_discovered_after_adoption_takes_the_named_kill_not_the_stall_ladder() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(
+        dir.path(),
+        "stall_after = \"30s\"", // long: the ladder must not interfere
+        &[("dev", "isolation: none\n")],
+    );
+    let claude_home = dir.path().join("claude-home");
+    let campd1 = Daemon::spawn(
+        &root,
+        &claude_home,
+        &[
+            ("FAKE_AGENT_CAN_USE_TOOL", "1"),
+            ("FAKE_AGENT_CAN_USE_TOOL_DELAY", "6"), // emit only AFTER campd2 adopts
+            ("FAKE_AGENT_LINGER_ON_EOF", "30"),     // outlive campd1
+        ],
+    );
+    camp_ok(&root, &["sling", "ask later"]);
+    // the worker claimed but has NOT yet emitted its can_use_tool (delayed)
+    wait_until(&root, "the claim", |e| count(e, "bead.claimed") == 1);
+    let session = events_json(&root)
+        .into_iter()
+        .find(|e| e["type"] == "session.woke")
+        .unwrap()["data"]["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // kill -9 campd1 while the worker lingers with NO pending recorded yet
+    campd1.kill9();
+    let _campd2 = Daemon::spawn(&root, &claude_home, &[]);
+
+    // campd2 adopts the live worker (non-child); when its delay expires it emits
+    // the can_use_tool, campd2 surfaces it, and the steady-state branch kills it
+    // with the named cause.
+    wait_until_poking(&root, "the named adoption kill", |e| {
+        e.iter().any(|ev| {
+            ev["type"] == "session.crashed"
+                && ev["data"]["name"] == session.as_str()
+                && ev["data"]["reason"] == "adoption: unanswerable permission request"
+        })
+    });
+    let events = events_json(&root);
+    assert_eq!(
+        count(&events, "agent.stalled"),
+        0,
+        "the discovered pending took the NAMED kill, NOT the stall ladder: {events:#?}"
+    );
+    // the bead re-hooked via the fold crash-reopen
+    let bead = events.iter().find(|e| e["type"] == "bead.claimed").unwrap()["bead"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let show = camp_ok(&root, &["show", &bead, "--json"]);
+    let show: serde_json::Value = serde_json::from_str(&show).unwrap();
+    assert_eq!(show["status"], "open", "the bead re-hooked: {show}");
 }
 
 /// Master plan: "kill -9 campd mid-run → restart → adopt reconciles

@@ -205,6 +205,12 @@ impl Dispatcher {
         self.children.values().any(|w| w.session == session)
     }
 
+    /// cp-3 (§5.3.2): the `[dispatch].max_blocked` saturation threshold. Read by
+    /// the event loop's saturation check; follows a hot reload like `max_workers`.
+    pub fn max_blocked(&self) -> usize {
+        self.config.dispatch.max_blocked
+    }
+
     /// (rig, bead) of a live child by session — the nudge handler's
     /// session.nudged enrichment (dispatch-lifecycle Phase 1); None when
     /// the session is not our child.
@@ -508,10 +514,25 @@ impl Dispatcher {
     /// (invariant 3), not an in-memory set — a marked bead leaves
     /// `dispatchable_beads`, so the loop advances and never hot-loops the
     /// same failure.
+    /// cp-3 (§5.3.2): the number of children NOT blocked on a permission
+    /// decision. A BLOCKED worker is WAITING ON THE OPERATOR, not holding a
+    /// dispatch slot — so it does not count against `max_workers`, and ten
+    /// blocked workers can never deadlock dispatch. The blocked set is folded
+    /// ledger truth (`blocked_sessions`), the single source both gates read.
+    fn nonblocked_child_count(&self, ledger: &Ledger) -> Result<usize> {
+        let blocked: std::collections::HashSet<String> =
+            ledger.blocked_sessions()?.into_iter().collect();
+        Ok(self
+            .children
+            .values()
+            .filter(|w| !blocked.contains(&w.session))
+            .count())
+    }
+
     pub fn converge(&mut self, ledger: &mut Ledger) -> Result<()> {
         self.retry_pending_respawns(ledger)?;
         loop {
-            if self.children.len() >= self.config.dispatch.max_workers {
+            if self.nonblocked_child_count(ledger)? >= self.config.dispatch.max_workers {
                 return Ok(());
             }
             let Some(bead) = ledger.dispatchable_beads()?.into_iter().next() else {
@@ -547,7 +568,7 @@ impl Dispatcher {
         if bead.status != "open" {
             return Ok(()); // closed or re-claimed since the kill
         }
-        if self.children.len() >= self.config.dispatch.max_workers {
+        if self.nonblocked_child_count(ledger)? >= self.config.dispatch.max_workers {
             // Queue for retry on the next freed slot. Event ONCE per
             // deferral episode — a retry that is still capped re-queues
             // silently (no dispatch.failed spam). The reason carries the
@@ -654,6 +675,9 @@ impl Dispatcher {
         };
         let claude_root = spawn::claude_config_root().map_err(|e| format!("{e:#}"))?;
         let transcript = spawn::transcript_path_under(&claude_root, &cwd, &session_id);
+        // cp-3 (§5.3.1): build_spec refuses an unclassifiable --permission-mode
+        // (it cannot tell whether the mode can ask), and that refusal rides this
+        // `?` into the dispatch.failed reason — the evented refusal seam.
         let spec = spawn::build_spec(
             &self.config.dispatch.command,
             &agent,
@@ -667,7 +691,7 @@ impl Dispatcher {
             // (the live nudge path; fake agents tolerate it, C3). NOT
             // command-sniffed — a mode fallback would be a hidden branch.
             spawn::StdinMode::HeldStream,
-        );
+        )?;
         Ok(Prep {
             spec,
             agent_name: agent.name,

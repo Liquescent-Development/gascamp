@@ -67,6 +67,11 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         // event is refused at append, not stored and replayed forever.
         EventType::ShimRefused => audit::<ShimRefused>(event),
         EventType::WorkerDrainAcked => audit::<WorkerDrainAcked>(event),
+        // cp-3 (§5.3/§9): the permission plane. `pending`/`decided` fold the
+        // `permissions` table; `saturated` is audit-only (validated, discarded).
+        EventType::PermissionPending => permission_pending(conn, event),
+        EventType::PermissionDecided => permission_decided(conn, event),
+        EventType::PermissionSaturated => audit::<PermissionSaturated>(event),
     }
 }
 
@@ -1476,6 +1481,102 @@ fn control_failed(event: &Event) -> Result<(), CoreError> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionPending {
+    session: String,
+    request_id: String,
+    tool_name: String,
+}
+
+/// cp-3 (§5.3): a worker asked to use a tool its allowlist does not cover.
+/// Folds a `pending` row so the session renders BLOCKED. The named session
+/// must be LIVE — a pending for a dead/unknown session is a fold error (fail
+/// fast). The PK on `request_id` makes a duplicate pending a LOUD append
+/// failure (invariant 5); the producer (`ingest`) dedups upstream via
+/// `permission_exists`, so the PK is the belt-and-braces invariant, not the
+/// dedup itself.
+fn permission_pending(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let p: PermissionPending = payload(event)?;
+    let live: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE name = ?1 AND status = 'live')",
+        [&p.session],
+        |r| r.get(0),
+    )?;
+    if !live {
+        return Err(CoreError::UnknownSession(p.session));
+    }
+    conn.execute(
+        "INSERT INTO permissions (request_id, session, tool_name, status, requested_ts)
+         VALUES (?1, ?2, ?3, 'pending', ?4)",
+        params![p.request_id, p.session, p.tool_name, event.ts],
+    )?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionDecided {
+    #[allow(dead_code)] // validated for shape; the row keys on request_id
+    session: String,
+    request_id: String,
+    decision: String,
+    decided_by: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+const PERMISSION_DECISIONS: &[&str] = &["allow", "allow_always", "deny"];
+
+/// cp-3 (§5.3/§9): an operator answered a pending request. FIRST-ANSWER-WINS
+/// is a FOLD INVARIANT: the `UPDATE … WHERE status='pending'` is the
+/// serialization point — zero rows changed means the request was already
+/// decided (a losing decider) or never pending (unknown id), so the append
+/// rolls back and stores nothing. A `deny` must carry a non-empty reason (the
+/// operator's message).
+fn permission_decided(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let p: PermissionDecided = payload(event)?;
+    if !PERMISSION_DECISIONS.contains(&p.decision.as_str()) {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: format!(
+                "unknown decision {:?} (allow|allow_always|deny)",
+                p.decision
+            ),
+        });
+    }
+    if p.decision == "deny" && p.reason.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: "a deny decision must carry a non-empty reason".to_owned(),
+        });
+    }
+    let changed = conn.execute(
+        "UPDATE permissions
+            SET status = 'decided', decision = ?1, decided_by = ?2, decided_ts = ?3
+          WHERE request_id = ?4 AND status = 'pending'",
+        params![p.decision, p.decided_by, event.ts, p.request_id],
+    )?;
+    if changed == 0 {
+        return Err(CoreError::InvalidEventData {
+            event_type: event.kind.as_str().to_owned(),
+            reason: format!(
+                "no PENDING permission request {:?} to decide — already decided, or never pending",
+                p.request_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // audit-only: validated at append, never read back.
+struct PermissionSaturated {
+    blocked: u64,
+    max_blocked: u64,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1643,5 +1744,161 @@ mod tests {
             Some("camp/pre"),
             "COALESCE must not clobber a pre-existing work_branch with NULL"
         );
+    }
+
+    // ---- cp-3 (§5.3/§9): the permission plane fold + read queries ----
+
+    /// Register a live session (mirrors dispatch's session.woke).
+    fn woke_session(led: &mut Ledger, name: &str) {
+        led.append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": name, "agent": "t-dev"}),
+        })
+        .unwrap();
+    }
+
+    /// End a live session (session.stopped).
+    fn end_session(led: &mut Ledger, name: &str) {
+        led.append(EventInput {
+            kind: EventType::SessionStopped,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": name}),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn permission_pending_then_decided_folds_and_first_answer_wins() {
+        let (_tmp, mut led) = temp_ledger();
+        woke_session(&mut led, "t-dev-1");
+
+        // pending → a row appears, session is blocked
+        led.append(EventInput {
+            kind: EventType::PermissionPending,
+            rig: None,
+            actor: "campd".into(),
+            bead: Some("b-1".into()),
+            data: serde_json::json!({"session":"t-dev-1","request_id":"cli-7","tool_name":"Bash"}),
+        })
+        .unwrap();
+        assert_eq!(led.blocked_sessions().unwrap(), vec!["t-dev-1".to_owned()]);
+
+        // FIRST answer wins: allow succeeds, unblocks
+        led.append(EventInput {
+            kind: EventType::PermissionDecided,
+            rig: None,
+            actor: "campd".into(),
+            bead: Some("b-1".into()),
+            data: serde_json::json!({"session":"t-dev-1","request_id":"cli-7","decision":"allow","decided_by":"operator"}),
+        })
+        .unwrap();
+        assert!(led.blocked_sessions().unwrap().is_empty());
+        assert_eq!(
+            led.permission_decider("cli-7").unwrap().as_deref(),
+            Some("operator")
+        );
+
+        // SECOND answer for the same id is REFUSED (nothing pending to decide)
+        let loser = led.append(EventInput {
+            kind: EventType::PermissionDecided,
+            rig: None,
+            actor: "campd".into(),
+            bead: Some("b-1".into()),
+            data: serde_json::json!({"session":"t-dev-1","request_id":"cli-7","decision":"deny","decided_by":"overseer","reason":"too late"}),
+        });
+        assert!(
+            loser.is_err(),
+            "first answer wins — a decision for an already-decided request is refused"
+        );
+        // loser appended nothing
+        assert_eq!(
+            led.permission_decider("cli-7").unwrap().as_deref(),
+            Some("operator")
+        );
+    }
+
+    #[test]
+    fn a_deny_decision_must_carry_a_reason() {
+        let (_tmp, mut led) = temp_ledger();
+        woke_session(&mut led, "t-dev-1");
+        led.append(EventInput {
+            kind: EventType::PermissionPending,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"session":"t-dev-1","request_id":"cli-9","tool_name":"Bash"}),
+        })
+        .unwrap();
+        let denied = led.append(EventInput {
+            kind: EventType::PermissionDecided,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"session":"t-dev-1","request_id":"cli-9","decision":"deny","decided_by":"op"}),
+        });
+        assert!(denied.is_err(), "a deny with no reason is refused");
+    }
+
+    #[test]
+    fn permission_pending_payload_rejects_unknown_fields() {
+        let (_tmp, mut led) = temp_ledger();
+        woke_session(&mut led, "t-dev-1");
+        let bad = led.append(EventInput {
+            kind: EventType::PermissionPending,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"session":"t-dev-1","request_id":"cli-9","tool_name":"Bash","surprise":1}),
+        });
+        assert!(
+            bad.is_err(),
+            "deny_unknown_fields refuses an unexpected key"
+        );
+    }
+
+    #[test]
+    fn permission_pending_against_a_dead_session_is_refused() {
+        let (_tmp, mut led) = temp_ledger();
+        // no woke — the session is unknown
+        let bad = led.append(EventInput {
+            kind: EventType::PermissionPending,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"session":"ghost","request_id":"cli-1","tool_name":"Bash"}),
+        });
+        assert!(bad.is_err(), "a pending for a non-live session is refused");
+    }
+
+    #[test]
+    fn blocked_sessions_lists_only_live_pending_and_permission_exists_dedups() {
+        let (_tmp, mut led) = temp_ledger();
+        woke_session(&mut led, "t-dev-1");
+        led.append(EventInput {
+            kind: EventType::PermissionPending,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"session":"t-dev-1","request_id":"cli-7","tool_name":"Bash"}),
+        })
+        .unwrap();
+        assert!(led.permission_exists("cli-7").unwrap());
+        assert!(!led.permission_exists("cli-nope").unwrap());
+        assert_eq!(led.blocked_sessions().unwrap(), vec!["t-dev-1".to_owned()]);
+        assert_eq!(
+            led.pending_permission_for_session("t-dev-1")
+                .unwrap()
+                .as_deref(),
+            Some("cli-7")
+        );
+
+        // ending the session drops it from the blocked set (the live join)
+        end_session(&mut led, "t-dev-1");
+        assert!(led.blocked_sessions().unwrap().is_empty());
     }
 }

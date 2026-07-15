@@ -78,8 +78,8 @@ reads only the keys it actually needs. A fixture is a pin, not a schema.
 | `can_use_tool_request.json` | **derived-from-CLI-2.1.208** | KEYS from the bundle (400-char window); VALUES illustrative. The conditional `permission_suggestions` / `blocked_path` spreads are OMITTED, and a second construction site adds four more keys. **Completeness is NOT claimed** — see the method's limits above. |
 | `request_user_dialog_request.json` | **KEYS derived-from-CLI-2.1.208; `dialog_kind`'s VALUE is camp-invented** | `dialog_kind`'s value set is a minified variable and was NOT recovered. **camp must never key on it** — it refuses every dialog and reads only `request_id`. |
 | `dialog_refusal_response.json` | **camp-authored**, shape mirrored from the CLI's own error-response construction | **STILL UNVALIDATED against the real CLI, even at 2.1.208.** camp sends it only under `--permission-prompt-tool stdio`, which is phase 3, so no $0 gate here can exercise it — bumping the pin did NOT change that. **PHASE-3 OBLIGATION:** if the shape is wrong the CLI ignores it and the worker hangs forever — the outcome §9 exists to prevent. |
-| `permission_allow_response.json` | **derived-from-CLI-2.1.208** | **For phase 3 (cp-3). cp-1 does not send it**, so it is pinned but not exercised. The CLI's own validator names the contract: `Expected {behavior: 'allow', updatedInput?: object} or {behavior: 'deny', message: string}.` cp-3 inherits recovered bytes instead of a guess. |
-| `permission_deny_response.json` | **derived-from-CLI-2.1.208** | as above. |
+| `permission_allow_response.json` | **derived-from-CLI-2.1.208** | cp-3 SENDS these bytes: `daemon/control.rs`'s `parent_messages_serialize_to_the_pinned_fixture_bytes` pins that camp produces them byte-for-byte, and the PAID `tests/e2e.rs::e2e_can_use_tool_round_trip` (`make e2e`) drives the real CLI to ACCEPT the `allow` form (the worker continues past the permission). The CLI's own validator names the contract: `Expected {behavior: 'allow', updatedInput?: object} or {behavior: 'deny', message: string}.` |
+| `permission_deny_response.json` | **derived-from-CLI-2.1.208** | as above; cp-3 sends the `deny` form. Its acceptance rides the same `make e2e` gate (a `deny` decision path). |
 | `user_turn.json` | **camp-authored** | the bytes `spawn::user_message` ACTUALLY produces (`serde_json::json!` sorts keys — serde_json 1.0.150 has no `preserve_order`). **ACCEPTED by the CLI**: this exact envelope is probe P2 and has shipped since Phase 8. The key order is ugly and it is CORRECT — do not "tidy" `user_message` into a struct to make it prettier; that would change the bytes every production dispatch sends, and this pin is what catches such a change. |
 | `stream_assistant.json` | **camp-authored** | a representative NON-control stream line. camp never interprets it (D3: the transparent stream surface) — it exists so the passthrough test can assert the bytes are handed on unchanged. |
 
@@ -99,9 +99,20 @@ reads only the keys it actually needs. A fixture is a pin, not a schema.
   the configuration camp actually ships;
 - the success `control_response` camp parses is byte-for-byte what the CLI emits.
 
+**EXERCISED BY THE PAID `make e2e` GATE** (cp-3; real-CLI, OPERATOR-GATED, NOT $0):
+- `permission_allow_response.json` — `tests/e2e.rs::e2e_can_use_tool_round_trip` drives the
+  real CLI to ASK (an askable agent, restricted allowlist), answers `allow`, and asserts the
+  worker CONTINUES — acceptance the $0 `make compat` tier structurally cannot prove (a real
+  turn spends API money, so it lives in `make e2e`, never `claude_compat.rs`). Built and
+  `#[ignore]`d; CI compiles it and never runs it.
+
 **PINNED BUT NOT EXERCISED** — nothing in this repo proves the CLI agrees:
-- `dialog_refusal_response.json` (phase 3 owns it; a wrong shape hangs a worker forever);
-- `permission_allow_response.json` / `permission_deny_response.json` (cp-3 sends them, not cp-1);
+- `dialog_refusal_response.json` (a wrong shape hangs a worker forever; reachable only under
+  `--permission-prompt-tool stdio` on a real turn — an additive `make e2e` follow-up);
+- `permission_deny_response.json` — cp-3 SENDS it (byte-pinned that camp produces it), and the
+  `make e2e` gate can drive a `deny` path, but the round-trip test above exercises the `allow`
+  form; a `deny`-form real-turn assertion is the additive follow-up;
 - `can_use_tool_request.json`'s **completeness** (a fixed-window grep cannot prove a key set).
 
-The gate moves fixtures from the second list to the first. It has moved two.
+The gate moves fixtures from the last list to the first. `make compat` ($0) moved two;
+`make e2e` (paid) exercises the `allow` bytes.

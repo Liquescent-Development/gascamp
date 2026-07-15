@@ -90,6 +90,35 @@ struct ErrorResponseBody<'a> {
     error: &'a str,
 }
 
+// cp-3 (§5.3 step 5): the permission answer. `{type:"control_response",
+// response:{subtype:"success", request_id, response:{behavior:"allow"|"deny",
+// message?}}}` — declaration order pins the fixture bytes (permission_*_
+// response.json), exactly as the interrupt/error structs above.
+#[derive(Serialize)]
+struct PermissionResponseEnvelope<'a, D: Serialize> {
+    #[serde(rename = "type")]
+    kind: &'static str, // "control_response"
+    response: PermissionSuccessBody<'a, D>,
+}
+
+#[derive(Serialize)]
+struct PermissionSuccessBody<'a, D: Serialize> {
+    subtype: &'static str, // "success"
+    request_id: &'a str,
+    response: D, // the decision object
+}
+
+#[derive(Serialize)]
+struct AllowDecision {
+    behavior: &'static str, // {"behavior":"allow"}
+}
+
+#[derive(Serialize)]
+struct DenyDecision<'a> {
+    behavior: &'static str, // "deny"
+    message: &'a str,
+}
+
 /// A message campd sends INTO a worker's stdin.
 pub enum ParentMessage {
     /// §4.1 `session.interrupt`. The CLI acks it with a `control_response`
@@ -100,6 +129,13 @@ pub enum ParentMessage {
     /// alternative is a worker blocked forever waiting for an answer that
     /// can never come, holding a dispatch slot.
     DialogRefusal { request_id: String },
+    /// §5.3 step 5: answer a `can_use_tool` with `{behavior:"allow"}`. Both
+    /// `allow` and `allow_always` send these bytes (scoping decision 1) — the
+    /// CLI validator names no `allow_always` on the wire.
+    PermissionAllow { request_id: String },
+    /// §5.3 step 5: answer with `{behavior:"deny", message:…}`. The message is
+    /// the operator's reason and is REQUIRED (the CLI validator demands it).
+    PermissionDeny { request_id: String, message: String },
 }
 
 impl ParentMessage {
@@ -126,6 +162,30 @@ impl ParentMessage {
                     },
                 })?
             }
+            ParentMessage::PermissionAllow { request_id } => {
+                serde_json::to_string(&PermissionResponseEnvelope {
+                    kind: "control_response",
+                    response: PermissionSuccessBody {
+                        subtype: "success",
+                        request_id,
+                        response: AllowDecision { behavior: "allow" },
+                    },
+                })?
+            }
+            ParentMessage::PermissionDeny {
+                request_id,
+                message,
+            } => serde_json::to_string(&PermissionResponseEnvelope {
+                kind: "control_response",
+                response: PermissionSuccessBody {
+                    subtype: "success",
+                    request_id,
+                    response: DenyDecision {
+                        behavior: "deny",
+                        message,
+                    },
+                },
+            })?,
         };
         line.push('\n');
         Ok(line)
@@ -161,6 +221,12 @@ pub enum WorkerMessage<'a> {
     CanUseTool {
         request_id: String,
         tool_name: String,
+        /// The CLI's own id for the tool-use block. Optional — the envelope
+        /// stays permissive (C9). Parsed for completeness (the fixture test
+        /// reads it); cp-3 records `permission.pending` from `request_id` +
+        /// `tool_name` only (scoping decision 2), so production never reads it.
+        #[allow(dead_code)]
+        tool_use_id: Option<String>,
     },
     /// §9: the CLI wants to show a human a dialog. camp refuses, every time.
     RequestUserDialog { request_id: String },
@@ -268,6 +334,7 @@ pub fn parse_worker_line(line: &str) -> Result<WorkerMessage<'_>, ControlWireErr
                 Some("can_use_tool") => Ok(WorkerMessage::CanUseTool {
                     request_id,
                     tool_name: body["tool_name"].as_str().unwrap_or_default().to_owned(),
+                    tool_use_id: body["tool_use_id"].as_str().map(str::to_owned),
                 }),
                 // `dialog_kind`'s VALUE SET was not recoverable from the
                 // bundle (it is a minified variable), so camp NEVER keys on
@@ -1138,6 +1205,169 @@ impl ControlRuntime {
         }
     }
 
+    /// §5.3.4 `session.permission_decision`: answer a worker's `can_use_tool`.
+    ///
+    /// LEDGER FIRST, then the pipe. The `permission.decided` append is the
+    /// serialization point: first-answer-wins is enforced by the fold
+    /// (`UPDATE … WHERE status='pending'`), so a losing decider's append FAILS
+    /// and we read who won. The decision is DURABLE before it is delivered — so
+    /// a worker whose stdin campd no longer holds still shows ANSWERED in the
+    /// ledger, and the stall ladder (Task 8) owns its silence (§5.3.4 inverse
+    /// window). Re-arm of the stall timer is NOT done here — Task 8's
+    /// `reconcile_blocked` re-arms on the blocked→working edge this same wake,
+    /// keeping this handler free of a `patrol` dependency (layering).
+    pub fn serve_permission_decision(
+        &mut self,
+        session: &str,
+        request_id: &str,
+        decision: &str,
+        message: Option<&str>,
+        ledger: &mut Ledger,
+        dispatcher: &mut Dispatcher,
+    ) -> Response {
+        // Validate the wire shape BEFORE touching the ledger (a bad verb is the
+        // caller's error, not a campd action to record).
+        if !matches!(decision, "allow" | "allow_always" | "deny") {
+            return Response::Error {
+                ok: false,
+                error: format!("unknown decision {decision:?} (allow|allow_always|deny)"),
+            };
+        }
+        let reason = message.map(str::trim).unwrap_or("");
+        if decision == "deny" && reason.is_empty() {
+            return Response::Error {
+                ok: false,
+                error: "a deny decision must carry a message (the operator's reason)".into(),
+            };
+        }
+        let (rig, bead) = dispatcher
+            .child_info(session)
+            .map(|(r, b)| (Some(r), Some(b)))
+            .unwrap_or((None, None));
+
+        // (1) LEDGER FIRST — the serialization point. First-answer-wins is
+        // enforced by the fold; a losing decider's append FAILS and we read who
+        // won.
+        let decided = ledger.append(EventInput {
+            kind: EventType::PermissionDecided,
+            rig: rig.clone(),
+            actor: "campd".into(),
+            bead: bead.clone(),
+            data: serde_json::json!({
+                "session": session,
+                "request_id": request_id,
+                "decision": decision,
+                "decided_by": "operator",
+                "reason": (!reason.is_empty()).then_some(reason),
+            }),
+        });
+        if let Err(e) = decided {
+            return match ledger.permission_decider(request_id) {
+                Ok(Some(who)) => Response::Error {
+                    ok: false,
+                    error: format!("already decided by {who}"),
+                },
+                _ => Response::Error {
+                    ok: false,
+                    error: format!("recording the decision failed: {e}"),
+                },
+            };
+        }
+
+        // (2) THEN the pipe. allow_always sends the allow bytes (scoping
+        // decision 1).
+        let msg = match decision {
+            "deny" => ParentMessage::PermissionDeny {
+                request_id: request_id.to_owned(),
+                message: reason.to_owned(),
+            },
+            _ => ParentMessage::PermissionAllow {
+                request_id: request_id.to_owned(),
+            },
+        };
+        let line = match msg.to_line() {
+            Ok(l) => l,
+            Err(e) => {
+                return Response::Error {
+                    ok: false,
+                    error: format!("building the permission response: {e}"),
+                };
+            }
+        };
+        match dispatcher.write_control(session, &line) {
+            ControlWrite::Delivered => Response::PermissionDecided {
+                ok: true,
+                request_id: request_id.to_owned(),
+                decision: decision.to_owned(),
+            },
+            // The decision is DURABLE (answered) but we could not hand it to the
+            // worker. §5.3.4's inverse window: the worker is no longer
+            // answerable — its re-armed stall timer (Task 8) fires, the ladder
+            // drains, finds NO pending (it is decided), and walks its normal
+            // bounded restart. Loud to the caller; the ledger truth is correct.
+            //
+            // F3 (inv-3): NoPipe is NOT additionally evented — and this is the
+            // deliberate, principled choice, mirroring the sibling interrupt
+            // handler's own NoPipe reasoning. Nothing reached the pipe (no bytes,
+            // no torn channel), so there is no NEW campd action to record beyond
+            // the `permission.decided` already durably appended above; and the
+            // §5.3.4 inverse-window reconciliation that follows (re-armed stall
+            // timer → ladder drain → session.crashed on restart) is ITSELF
+            // evented. A "delivery skipped" event here would be redundant with
+            // both the recorded decision and that evented downstream — exactly
+            // the speculative box-check to avoid.
+            ControlWrite::NoPipe => Response::Error {
+                ok: false,
+                error: format!(
+                    "decision recorded, but campd holds no stdin pipe for {session} (adopted or \
+                     released) — the worker cannot receive it; the stall ladder now owns it"
+                ),
+            },
+            // F3 (inv-3): unlike NoPipe, a Failed write was ATTEMPTED and TORN
+            // DOWN — bytes may already have reached the pipe and `write_control`
+            // dropped it, so the worker just lost its write channel. That IS a
+            // campd action WITH a consequence, so — exactly as the interrupt
+            // handler does — it is BOTH an error to the caller AND a durable
+            // `control.failed{cause:"write_failed"}`, keyed by the permission
+            // request_id. (Harmless to rehydration: that request_id is the CLI's,
+            // never one of camp's minted control requests, so the `failed` map
+            // built in `rehydrate` never consults it.)
+            ControlWrite::Failed(e) => {
+                let reason = format!(
+                    "decision recorded, but delivering it to {session} failed: {e}. The pipe may \
+                     hold a torn partial line, so campd dropped it — the worker can no longer be \
+                     sent turns or control messages; the stall ladder (§5.3.4) now owns it"
+                );
+                match ledger.append(EventInput {
+                    kind: EventType::ControlFailed,
+                    rig,
+                    actor: "campd".into(),
+                    bead,
+                    data: serde_json::json!({
+                        "session": session,
+                        "request_id": request_id,
+                        "verb": "session.permission_decision",
+                        // TERMINAL: the answer never reached the worker.
+                        "cause": "write_failed",
+                        "reason": reason,
+                    }),
+                }) {
+                    Ok(_) => Response::Error {
+                        ok: false,
+                        error: reason,
+                    },
+                    // A failing append must not MASK the write failure — carry both.
+                    Err(append_err) => Response::Error {
+                        ok: false,
+                        error: format!(
+                            "{reason} (and recording control.failed ALSO failed: {append_err})"
+                        ),
+                    },
+                }
+            }
+        }
+    }
+
     /// §4.1 `session.send_turn` (D4 — the `nudge` socket verb's replacement).
     /// Deliver -> record (`session.nudged`) -> respond. `NoPipe` is NOT an error
     /// here — unlike an interrupt, a turn HAS a resume path, and `via:"none"`
@@ -1221,6 +1451,10 @@ impl ControlRuntime {
         read_channel: &ReadChannelRuntime,
     ) -> anyhow::Result<Vec<SessionInfo>> {
         let rows = ledger.live_sessions()?;
+        // §5.3: BLOCKED is folded ledger truth — a live session with a pending
+        // permission. Computed once for the whole fleet.
+        let blocked: std::collections::HashSet<String> =
+            ledger.blocked_sessions()?.into_iter().collect();
         Ok(rows
             .into_iter()
             .map(|row| SessionInfo {
@@ -1238,9 +1472,9 @@ impl ControlRuntime {
                 } else {
                     "working".into()
                 },
-                // §5.3: phase 3 owns the producer. cp-1 never flips this quietly
-                // — a can_use_tool that arrives is a LOUD control.failed.
-                blocked: false,
+                // §5.3: a live session with an undecided permission renders
+                // BLOCKED — cp-3 lights this bit from folded ledger truth.
+                blocked: blocked.contains(&row.name),
                 name: row.name,
                 agent: row.agent,
                 rig: row.rig,
@@ -1311,6 +1545,7 @@ impl ControlRuntime {
         &mut self,
         lines: &[StreamLine],
         dispatcher: &mut Dispatcher,
+        ledger: &Ledger,
         now: Timestamp,
     ) -> Vec<EventInput> {
         let mut events: Vec<EventInput> = Vec::new();
@@ -1386,35 +1621,56 @@ impl ControlRuntime {
                 Ok(WorkerMessage::CanUseTool {
                     request_id,
                     tool_name,
+                    tool_use_id: _,
                 }) => {
-                    // §5.3.1: STRUCTURALLY UNREACHABLE in cp-1 — camp does not
-                    // pass `--permission-prompt-tool`. If it arrives anyway,
-                    // something is badly wrong, and camp says so plainly rather
-                    // than quietly flipping a `blocked` bit. cp-1 takes NO
-                    // automatic action: phase 3 owns both the answer and §5.3.2's
-                    // slot rule.
-                    let input = EventInput {
-                        kind: EventType::ControlFailed,
-                        rig: None,
-                        actor: "campd".into(),
-                        bead: None,
-                        data: serde_json::json!({
-                            "session": sl.session,
-                            "request_id": request_id,
-                            "cause": "permission_unanswerable",
-                            "reason": format!(
-                                "the worker asked permission to use {tool_name:?}, and cp-1 \
-                                 CANNOT answer a can_use_tool (the permission plane is phase 3). \
-                                 This flow should be structurally unreachable — camp does not \
-                                 pass --permission-prompt-tool — so its arrival is itself the \
-                                 fault. The worker is now BLOCKED FOREVER waiting for an answer \
-                                 that will never come, holding a dispatch slot: stop it with \
-                                 `camp stop {}`",
-                                sl.session
-                            ),
-                        }),
-                    };
-                    push_fault(&mut events, &mut faults, &sl.session, input);
+                    // §5.3: the worker is asking to run a tool its allowlist
+                    // does not cover. Mark it BLOCKED by appending
+                    // `permission.pending` (which folds the `permissions` row).
+                    // §2.3 dedup: a re-read line whose pending already committed
+                    // must NOT append a second — the ledger is the guard, never
+                    // a swallowed UNIQUE conflict.
+                    match ledger.permission_exists(&request_id) {
+                        Ok(true) => {} // already recorded (a re-drain after restart) — skip
+                        Ok(false) => {
+                            let (rig, bead) = dispatcher
+                                .child_info(&sl.session)
+                                .map(|(r, b)| (Some(r), Some(b)))
+                                .unwrap_or((None, None));
+                            events.push(EventInput {
+                                kind: EventType::PermissionPending,
+                                rig,
+                                actor: "campd".into(),
+                                bead,
+                                data: serde_json::json!({
+                                    "session": sl.session,
+                                    "request_id": request_id,
+                                    "tool_name": tool_name,
+                                }),
+                            });
+                        }
+                        Err(e) => {
+                            // A ledger read failing here is a real fault — surface
+                            // it, never silently drop a permission request
+                            // (invariant 5). The worker stays BLOCKED and the
+                            // fault names why campd could not record it.
+                            let input = EventInput {
+                                kind: EventType::ControlFailed,
+                                rig: None,
+                                actor: "campd".into(),
+                                bead: None,
+                                data: serde_json::json!({
+                                    "session": sl.session,
+                                    "request_id": request_id,
+                                    "cause": "permission_unanswerable",
+                                    "reason": format!(
+                                        "checking whether the permission request is already \
+                                         recorded failed: {e}"
+                                    ),
+                                }),
+                            };
+                            push_fault(&mut events, &mut faults, &sl.session, input);
+                        }
+                    }
                 }
                 // D6": subscribers are fed from the FILE by `pump`, never from
                 // here. A stream line has no control-plane effect beyond the
@@ -2051,6 +2307,30 @@ mod tests {
             "the dialog refusal camp sends must be byte-equal to its fixture"
         );
 
+        // cp-3 (§5.3 step 5): the permission answers camp sends are byte-equal
+        // to their recovered fixtures. `allow_always` sends the allow bytes.
+        let allow = ParentMessage::PermissionAllow {
+            request_id: "cli-fixture-2".into(),
+        }
+        .to_line()
+        .unwrap();
+        assert_eq!(
+            allow,
+            format!("{PERMISSION_ALLOW_RESPONSE}\n"),
+            "the allow answer camp sends must be byte-equal to its recovered fixture"
+        );
+        let deny = ParentMessage::PermissionDeny {
+            request_id: "cli-fixture-2".into(),
+            message: "denied by the operator".into(),
+        }
+        .to_line()
+        .unwrap();
+        assert_eq!(
+            deny,
+            format!("{PERMISSION_DENY_RESPONSE}\n"),
+            "the deny answer camp sends must be byte-equal to its recovered fixture"
+        );
+
         // C1: the fixture is the ACTUAL output of the shipped code path.
         assert_eq!(
             crate::daemon::spawn::user_message("status?"),
@@ -2121,9 +2401,12 @@ mod tests {
             WorkerMessage::CanUseTool {
                 request_id,
                 tool_name,
+                tool_use_id,
             } => {
                 assert_eq!(request_id, "cli-fixture-2");
                 assert_eq!(tool_name, "Bash");
+                // The fixture carries tool_use_id — the permissive envelope reads it.
+                assert_eq!(tool_use_id.as_deref(), Some("toolu_fixture"));
             }
             other => panic!("expected a CanUseTool, got {other:?}"),
         }
@@ -2149,12 +2432,205 @@ mod tests {
             WorkerMessage::CanUseTool {
                 request_id,
                 tool_name,
+                tool_use_id: _,
             } => {
                 assert_eq!(request_id, "cli-fixture-2");
                 assert_eq!(tool_name, "Bash");
             }
             other => panic!("unknown keys must not break the parse; got {other:?}"),
         }
+    }
+
+    /// A test Dispatcher with no children (`child_info` returns None).
+    fn test_dispatcher(dir: &std::path::Path) -> Dispatcher {
+        Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.to_path_buf(),
+            },
+            camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
+        )
+    }
+
+    /// cp-3 Task 4: a `can_use_tool` becomes a `permission.pending` EventInput,
+    /// and a re-drain of the same line whose pending already committed does NOT
+    /// re-emit (§2.3 ledger-backed dedup).
+    #[test]
+    fn a_can_use_tool_becomes_a_permission_pending_and_dedups() {
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (dir, mut ledger) = temp_ledger();
+        seed_live_session(&mut ledger, "t-dev-1");
+        let mut disp = test_dispatcher(dir.path());
+        let line = StreamLine {
+            session: "t-dev-1".into(),
+            line: r#"{"type":"control_request","request_id":"cli-2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo publish"}}}"#.into(),
+        };
+
+        let events = rt.ingest(std::slice::from_ref(&line), &mut disp, &ledger, t0());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventType::PermissionPending);
+        assert_eq!(events[0].data["request_id"], "cli-2");
+        assert_eq!(events[0].data["tool_name"], "Bash");
+        assert_eq!(events[0].data["session"], "t-dev-1");
+
+        // Commit it, then re-ingest the SAME line: no duplicate (§2.3).
+        ledger.append(events[0].clone()).unwrap();
+        let again = rt.ingest(std::slice::from_ref(&line), &mut disp, &ledger, t0());
+        assert!(
+            again.is_empty(),
+            "a request_id the ledger already carries never re-emits pending"
+        );
+    }
+
+    /// Seed a live session with a pending permission for `request_id`.
+    fn seed_pending(ledger: &mut Ledger, session: &str, request_id: &str) {
+        seed_live_session(ledger, session);
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionPending,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": session, "request_id": request_id, "tool_name": "Bash",
+                }),
+            })
+            .unwrap();
+    }
+
+    /// Poll a held-cat worker's stdout capture (`<dir>/<bead>.out`) until it
+    /// contains `needle` — cat echoes what campd wrote into its stdin. Bounded,
+    /// so a non-delivery is a loud failure, not a hang.
+    fn wait_for_capture(dir: &std::path::Path, bead: &str, needle: &str) -> String {
+        let path = dir.join(format!("{bead}.out"));
+        for _ in 0..300 {
+            if let Ok(s) = std::fs::read_to_string(&path)
+                && s.contains(needle)
+            {
+                return s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the capture file never contained {needle:?}");
+    }
+
+    /// cp-3 Task 7: the decision is appended to the ledger BEFORE the pipe write,
+    /// it is delivered, and a SECOND decider loses (first-answer-wins).
+    #[test]
+    fn permission_decision_appends_decided_before_writing_and_first_answer_wins() {
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (dir, mut led) = temp_ledger();
+        seed_pending(&mut led, "t-dev-1", "cli-2");
+        let mut disp = test_dispatcher(dir.path());
+        disp.test_insert_held_cat(dir.path(), "t-dev-1", "gc-1");
+
+        let r =
+            rt.serve_permission_decision("t-dev-1", "cli-2", "allow", None, &mut led, &mut disp);
+        assert!(
+            matches!(r, Response::PermissionDecided { ok: true, .. }),
+            "{r:?}"
+        );
+        // durable
+        assert_eq!(
+            led.permission_decider("cli-2").unwrap().as_deref(),
+            Some("operator")
+        );
+        // delivered (cat echoed the allow bytes to its capture)
+        let capture = wait_for_capture(dir.path(), "gc-1", r#""behavior":"allow""#);
+        assert!(capture.contains(r#""behavior":"allow""#));
+
+        // a SECOND decider loses — no second write, an explicit refusal
+        let r2 = rt.serve_permission_decision(
+            "t-dev-1",
+            "cli-2",
+            "deny",
+            Some("no"),
+            &mut led,
+            &mut disp,
+        );
+        match r2 {
+            Response::Error { error, .. } => {
+                assert!(error.contains("already decided by operator"), "{error}")
+            }
+            other => panic!("expected already-decided error, got {other:?}"),
+        }
+    }
+
+    /// cp-3 Task 7 (§5.3.4 inverse window): the decision is recorded FIRST, so a
+    /// worker whose stdin campd no longer holds still shows ANSWERED in the
+    /// ledger — and the caller is told delivery failed.
+    #[test]
+    fn a_decision_is_durable_even_when_the_pipe_is_gone_inverse_window() {
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (dir, mut led) = temp_ledger();
+        seed_pending(&mut led, "t-dev-1", "cli-5");
+        let mut disp = test_dispatcher(dir.path()); // NO child → write_control returns NoPipe
+
+        let r =
+            rt.serve_permission_decision("t-dev-1", "cli-5", "allow", None, &mut led, &mut disp);
+        assert!(
+            matches!(r, Response::Error { .. }),
+            "delivery failed, so the caller is told so: {r:?}"
+        );
+        assert_eq!(
+            led.permission_decider("cli-5").unwrap().as_deref(),
+            Some("operator"),
+            "but the decision is DURABLE — ledger-before-pipe means answered even when undelivered"
+        );
+        assert!(
+            led.blocked_sessions().unwrap().is_empty(),
+            "and the session is no longer BLOCKED"
+        );
+        // F3 (inv-3): NoPipe is deliberately NOT additionally evented — nothing
+        // reached the pipe, the decision is already durable, and the §5.3.4
+        // inverse-window reconciliation is itself evented. Pin that no
+        // control.failed is minted for the NoPipe case (so the F3 Failed-branch
+        // event below is not a blanket "always event delivery failures").
+        assert!(
+            led.events_of_type(EventType::ControlFailed)
+                .unwrap()
+                .is_empty(),
+            "NoPipe records no control.failed — the decision event already stands"
+        );
+    }
+
+    /// F3 (inv-3 completeness): when the decision is DURABLE but the pipe write
+    /// FAILS (a torn pipe — a campd action WITH a consequence: the worker lost
+    /// its write channel), campd records a durable `control.failed`
+    /// (cause `write_failed`), mirroring the sibling interrupt handler — the
+    /// undelivered-but-recorded decision is not left visible only to the
+    /// ephemeral socket caller. Contrast the NoPipe case above, which touches no
+    /// pipe and needs no new event.
+    #[test]
+    fn an_undeliverable_decision_with_a_torn_pipe_records_control_failed() {
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (dir, mut led) = temp_ledger();
+        seed_pending(&mut led, "t-dev-1", "cli-7");
+        let mut disp = test_dispatcher(dir.path());
+        // A held pipe whose reader we then KILL: the small allow line gets EPIPE
+        // → ControlWrite::Failed (a torn pipe), not NoPipe.
+        let pid = disp.test_insert_held_cat(dir.path(), "t-dev-1", "gc-1");
+        disp.test_kill_and_wait(pid);
+
+        let r =
+            rt.serve_permission_decision("t-dev-1", "cli-7", "allow", None, &mut led, &mut disp);
+        assert!(
+            matches!(r, Response::Error { .. }),
+            "the caller is told delivery failed: {r:?}"
+        );
+        // ledger-before-pipe: the decision is durable regardless.
+        assert_eq!(
+            led.permission_decider("cli-7").unwrap().as_deref(),
+            Some("operator")
+        );
+        // AND the undelivered delivery is on the record durably (inv-3).
+        let failed = led.events_of_type(EventType::ControlFailed).unwrap();
+        let f = failed
+            .iter()
+            .find(|e| e.data["request_id"] == "cli-7")
+            .expect("a control.failed records the torn-pipe delivery failure");
+        assert_eq!(f.data["cause"], "write_failed");
+        assert_eq!(f.data["verb"], "session.permission_decision");
+        assert_eq!(f.data["session"], "t-dev-1");
     }
 
     /// D3: the transparent stream surface. A non-control line is handed back
@@ -3231,8 +3707,53 @@ mod tests {
         assert_eq!(model[0].state, "working");
         assert!(
             !model[0].blocked,
-            "cp-2 never sets blocked — cp-3 owns the producer"
+            "no pending permission → the bit stays false (the baseline)"
         );
+    }
+
+    /// cp-3 Task 5: a live session with a pending permission renders
+    /// `blocked: true`; after the decision it flips back to `false`.
+    #[test]
+    fn fleet_model_blocked_reflects_a_live_pending_permission() {
+        let (_dir, mut ledger, patrol, read_channel) = fleet_fixture();
+        let control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionPending,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "t/dev/1", "request_id": "cli-7", "tool_name": "Bash",
+                }),
+            })
+            .unwrap();
+        let model = control
+            .fleet_model(&ledger, &patrol, &read_channel)
+            .unwrap();
+        assert!(
+            model[0].blocked,
+            "a live session with a pending permission renders BLOCKED"
+        );
+
+        // The decision unblocks it.
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionDecided,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "t/dev/1", "request_id": "cli-7",
+                    "decision": "allow", "decided_by": "operator",
+                }),
+            })
+            .unwrap();
+        let model = control
+            .fleet_model(&ledger, &patrol, &read_channel)
+            .unwrap();
+        assert!(!model[0].blocked, "a decided permission is not blocked");
     }
 
     /// Drive one fleet subscriber to a quiet point against a fixed model. ONE

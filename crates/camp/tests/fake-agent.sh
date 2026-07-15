@@ -36,6 +36,18 @@
 #                              IMMEDIATELY — the reap-races-the-drain shape.
 #                              The answer is the worker's LAST stdout bytes, so
 #                              a reap-before-drain bug destroys it unread.
+#   FAKE_AGENT_CAN_USE_TOOL    cp-3 (§5.3): consume the task line, then ask
+#                              permission to use a tool by emitting a
+#                              `can_use_tool` control_request through our OWN
+#                              inherited stdout fd (genuinely notify-suppressed
+#                              on macOS — the pre-ladder drain surfaces it there;
+#                              inotify surfaces it on Linux). Then BLOCK reading
+#                              stdin until campd delivers the control_response for
+#                              our request, then continue and fall through to the
+#                              close. With no answer the worker blocks forever —
+#                              BLOCKED, holding no dispatch slot, never killed by
+#                              the ladder. FAKE_AGENT_CAN_USE_TOOL_REQ overrides
+#                              the request id (default cli-2).
 #   FAKE_AGENT_SPAM_ON_TURN=N  cp-1 (§4.4 backpressure): on a USER TURN, emit N
 #                              stream-json lines. The spam must come AFTER the
 #                              subscriber is registered, or the backpressure gate
@@ -267,6 +279,45 @@ if [[ -n "${FAKE_AGENT_CLOSE_STDIN:-}" ]]; then
   emit_stream '{"type":"system","subtype":"stdin_closed"}'
   sleep "${FAKE_AGENT_CLOSE_STDIN}"
   exit 0
+fi
+
+if [[ -n "${FAKE_AGENT_CAN_USE_TOOL:-}" ]]; then
+  # cp-3 (§5.3): consume the task line, ask permission through our own inherited
+  # stdout fd, then block reading stdin until campd answers with a
+  # control_response for our request — then continue and close.
+  read -r _task_line
+  # FAKE_AGENT_CAN_USE_TOOL_DELAY: sleep BEFORE emitting the request. The
+  # post-adoption-discovered test (CP3-B4) uses this so campd1 can be kill -9'd
+  # (and campd2 adopt the worker) BEFORE the can_use_tool exists — the pending is
+  # then discovered only AFTER adoption, exercising the steady-state kill.
+  if [[ -n "${FAKE_AGENT_CAN_USE_TOOL_DELAY:-}" ]]; then
+    sleep "$FAKE_AGENT_CAN_USE_TOOL_DELAY"
+  fi
+  # Unique per worker by default (the CLI mints a fresh id per request): keying
+  # on the bead keeps concurrent workers from colliding on one request_id (which
+  # the ledger would dedup, leaving all but the first worker un-blocked).
+  req="${FAKE_AGENT_CAN_USE_TOOL_REQ:-cli-$CAMP_BEAD}"
+  printf '{"type":"control_request","request_id":"%s","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo publish"}}}\n' "$req"
+  _answered=""
+  while IFS= read -r _line; do
+    case "$_line" in
+      *'"type":"control_response"'*)
+        # our permission was answered — continue and fall through to the close
+        emit_stream '{"type":"assistant","message":{"role":"assistant","content":"continued after permission"}}'
+        _answered=1
+        break
+        ;;
+      *) : ;; # ignore anything else (e.g. a nudge that arrived before BLOCKED)
+    esac
+  done
+  # stdin hit EOF (campd released the pipe — or DIED) with no answer. When
+  # FAKE_AGENT_LINGER_ON_EOF is set, OUTLIVE campd instead of closing: the worker
+  # stays live and BLOCKED so a new campd can adopt it and discover the pending
+  # (CP3-B4). Otherwise fall through to the close.
+  if [[ -z "$_answered" && -n "${FAKE_AGENT_LINGER_ON_EOF:-}" ]]; then
+    sleep "$FAKE_AGENT_LINGER_ON_EOF"
+    exit 0
+  fi
 fi
 
 if [[ -n "${FAKE_AGENT_EXIT_AFTER_CONTROL:-}" ]]; then

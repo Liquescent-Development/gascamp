@@ -80,6 +80,20 @@ pub enum Request {
     SessionInterrupt {
         session: String,
     },
+    /// cp-3 (§5.3/§9): answer a worker's `can_use_tool`. `decision` is one of
+    /// `allow` / `allow_always` / `deny`; `message` is the operator's reason,
+    /// REQUIRED for `deny` (the CLI validator demands it), optional otherwise.
+    /// The handler appends `permission.decided` to the ledger BEFORE writing the
+    /// `control_response` — ledger-before-pipe (§5.3.4), so first-answer-wins is
+    /// a fold invariant, not handler logic that could race.
+    #[serde(rename = "session.permission_decision")]
+    SessionPermissionDecision {
+        session: String,
+        request_id: String,
+        decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     /// cp-2 (§4.1): SUBSCRIBE to the fleet — the aggregate stream of session
     /// state transitions, stalls, permission requests, and completions. A
     /// connection MODE like `session.subscribe`, but LEDGER/model-sourced: no
@@ -174,6 +188,19 @@ pub enum Response {
         ok: bool,
         v: u8,
         subscription: String,
+    },
+    /// cp-3 (§5.3/§9) `session.permission_decision`: the decision was recorded
+    /// (and, on success, delivered). Placed BEFORE `Interrupt` in this untagged
+    /// enum (CP3-B1): `Interrupt` is `{ok, request_id}`, so a bare
+    /// `{ok, request_id}` would shadow this. The REQUIRED `decision` field is the
+    /// discriminant — an interrupt ack `{"ok":..,"request_id":..}` has no
+    /// `decision` and falls through to `Interrupt`, while a decision reply
+    /// `{"ok":..,"request_id":..,"decision":".."}` matches here first. `decision`
+    /// also echoes what was recorded — useful, not a bare marker.
+    PermissionDecided {
+        ok: bool,
+        request_id: String,
+        decision: String,
     },
     /// cp-1 (§4.1) `session.interrupt`: D1's ACK. The interrupt is IN THE PIPE;
     /// the worker's answer lands in the ledger as `control.responded`, keyed by
@@ -918,6 +945,69 @@ mod tests {
             serde_json::from_str::<Response>(r#"{"ok":true,"via":"none"}"#).unwrap(),
             Response::SendTurn { via, .. } if via == "none"
         ));
+
+        // cp-3 (§5.3): the permission-decision verb, outbound + inbound.
+        assert_eq!(
+            serde_json::to_string(&Request::SessionPermissionDecision {
+                session: "camp/dev/1".into(),
+                request_id: "cli-2".into(),
+                decision: "allow".into(),
+                message: None,
+            })
+            .unwrap(),
+            r#"{"op":"session.permission_decision","session":"camp/dev/1","request_id":"cli-2","decision":"allow"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"op":"session.permission_decision","session":"s","request_id":"cli-2","decision":"deny","message":"no"}"#
+            )
+            .unwrap(),
+            Request::SessionPermissionDecision {
+                session: "s".into(),
+                request_id: "cli-2".into(),
+                decision: "deny".into(),
+                message: Some("no".into()),
+            }
+        );
+    }
+
+    /// CP3-B1: the interrupt ack `{ok, request_id}` and the decision reply
+    /// `{ok, request_id, decision}` are byte-adjacent in the untagged `Response`
+    /// enum. `PermissionDecided` is placed BEFORE `Interrupt`, and its REQUIRED
+    /// `decision` field is the discriminant — so neither shadows the other.
+    #[test]
+    fn interrupt_and_permission_decided_do_not_shadow_each_other() {
+        // the interrupt ack bytes must round-trip to Interrupt, not PermissionDecided
+        let ack: Response = serde_json::from_str(r#"{"ok":true,"request_id":"camp-1"}"#).unwrap();
+        assert!(
+            matches!(ack, Response::Interrupt { .. }),
+            "an interrupt ack must not be captured by PermissionDecided"
+        );
+        // the decision reply bytes must round-trip to PermissionDecided
+        let dec: Response =
+            serde_json::from_str(r#"{"ok":true,"request_id":"cli-2","decision":"allow"}"#).unwrap();
+        assert!(
+            matches!(dec, Response::PermissionDecided { .. }),
+            "the decision reply must resolve to its own variant"
+        );
+        // and each serializes back to exactly its own bytes (the pin)
+        assert_eq!(
+            serde_json::to_string(&Response::Interrupt {
+                ok: true,
+                request_id: "camp-1".into(),
+            })
+            .unwrap(),
+            r#"{"ok":true,"request_id":"camp-1"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::PermissionDecided {
+                ok: true,
+                request_id: "cli-2".into(),
+                decision: "allow".into(),
+            })
+            .unwrap(),
+            r#"{"ok":true,"request_id":"cli-2","decision":"allow"}"#
+        );
     }
 
     /// Review finding 1 (PR #51): liveness must be judged on the SAME

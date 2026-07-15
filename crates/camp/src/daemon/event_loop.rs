@@ -145,6 +145,10 @@ pub fn run(
     // read-channel watch — the layout above); connections start at 6.
     let mut next_token = 6usize;
     let mut self_raise_budget = SELF_RAISE_BUDGET;
+    // cp-3 (§5.3.2): dedup the loud `permission.saturated` fault to the crossing
+    // edge — emit once when the BLOCKED count crosses `max_blocked`, clear when
+    // it drops back, never once per wake.
+    let mut saturated = false;
 
     let mut last_seen = Timestamp::now();
     loop {
@@ -210,9 +214,20 @@ pub fn run(
         let mut wake_ledger_work = orders::declare_cron_fires(ledger, &fires)?;
         // Patrol stall fires: same declare-then-act shape (Phase 11).
         // agent.stalled lands durably here; the settle executes the
-        // queued ladder actions.
-        let stall_fires = patrol.fire_due(now);
-        wake_ledger_work |= patrol.declare_stalls(ledger, &stall_fires, now)?;
+        // queued ladder actions. §5.3.3: the ladder's FIRST act each due wake is
+        // to drain the read channel, so a `can_use_tool` whose notify was lost
+        // surfaces as BLOCKED before any stall is declared against a worker that
+        // is only waiting on us (`stall_step`).
+        wake_ledger_work |= stall_step(
+            ledger,
+            patrol,
+            control,
+            dispatcher,
+            read_channel,
+            &mut conns,
+            &mut poll,
+            now,
+        )?;
         for event in events.iter() {
             match event.token() {
                 LISTENER => loop {
@@ -478,8 +493,28 @@ pub fn run(
         // draining the other tailed sessions and stays up; a `?` here would
         // let one bad stream crash the whole wake — invariant 1). The
         // collector is surfaced as durable patrol.degraded events below.
+        // Set by the read-channel block below (cap breaches, fault-event
+        // flushes, and the F2 fatal-drain append) to trigger the one settle at
+        // the end of the block that advances the campd cursor past them.
+        let mut appended_read_channel_events = false;
+        // F2 (inv-5): a fatal `drain_all` is durable, never eprintln-only — on
+        // a detached daemon the stderr line is invisible. Per-stream I/O faults
+        // are already captured non-fatally (fix 8) and surface as
+        // `patrol.degraded` below; the OUTER error is a structural failure and
+        // takes the same durable shape. This harvest declares no stall (the
+        // ladder ran in `stall_step` at the top of the wake) and the failed
+        // drain advances no offset, so the next wake re-reads and self-heals.
         if let Err(e) = read_channel.drain_all(ledger) {
-            eprintln!("campd: read-channel drain_all failed: {e:#}");
+            ledger.append(EventInput {
+                kind: EventType::PatrolDegraded,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "error": format!("read-channel drain_all failed: {e:#}"),
+                }),
+            })?;
+            appended_read_channel_events = true;
         }
         // cp-1 — HARVEST 1: the lines `drain_all` just consumed.
         //
@@ -498,6 +533,11 @@ pub fn run(
             &mut conns,
             &mut poll,
         )?;
+        // §5.3.3: reconcile patrol's timers with the ledger's BLOCKED set every
+        // wake — a `can_use_tool` that surfaced in the harvest above disarms its
+        // stall timer, and a `permission.decided` from a socket wake re-arms it,
+        // both SAME-WAKE. Idempotent with stall_step's own reconcile.
+        patrol.reconcile_blocked(ledger, now)?;
         // cp-0 (§2.3): a max_stream_bytes breach is a loud session failure —
         // append the named cause event FIRST (the agent.stalled → kill →
         // session.crashed mold), then kill the worker. The reap appends
@@ -505,7 +545,6 @@ pub fn run(
         // bead re-hooks via the patrol restart path (fix 6: the kill reason
         // starts with "patrol restart" so patrol::observe queues a Respawn).
         // The kill triggers SIGCHLD → the next wake reaps.
-        let mut appended_read_channel_events = false;
         for breach in read_channel.take_cap_breaches() {
             let (rig, bead) = dispatcher
                 .child_info(&breach.session)
@@ -719,6 +758,39 @@ pub fn run(
             ledger.append(input)?;
             appended_control_events = true;
         }
+        // cp-3 (§5.3.4): the steady-state adoption kill. A BLOCKED session that
+        // is NOT a live child is a worker campd holds no stdin pipe for — a
+        // can_use_tool that arrived via tailing for an adopted worker (surfaced
+        // this wake). It can never be answered, so it takes the SAME named kill
+        // as the startup adoption path, NOT the generic stall ladder. The
+        // `crashed` session leaves `blocked_sessions` next wake (the live-join),
+        // so the set-shrink dedups a re-kill.
+        if super::patrol::kill_discovered_unanswerable_permissions(ledger, patrol, dispatcher)? > 0
+        {
+            appended_control_events = true;
+        }
+        // cp-3 (§5.3.2): a loud saturation fault when the BLOCKED count crosses
+        // `max_blocked` — the operator has more unanswered permission questions
+        // than campd will let pile up silently. Edge-deduped: emitted only on the
+        // <=max → >max transition, cleared on the way back. Audit-only (no fold).
+        {
+            let n_blocked = ledger.blocked_sessions()?.len();
+            let over = n_blocked > dispatcher.max_blocked();
+            if over && !saturated {
+                ledger.append(camp_core::event::EventInput {
+                    kind: EventType::PermissionSaturated,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: None,
+                    data: serde_json::json!({
+                        "blocked": n_blocked as u64,
+                        "max_blocked": dispatcher.max_blocked() as u64,
+                    }),
+                })?;
+                appended_control_events = true;
+            }
+            saturated = over;
+        }
         if appended_control_events
             && let Err(e) = settle(
                 ledger,
@@ -734,6 +806,73 @@ pub fn run(
             eprintln!("campd: control settle failed: {e:#}");
         }
     }
+}
+
+/// §5.3.3: pop due stall fires, and — the ladder's FIRST act — drain the read
+/// channel so a `can_use_tool` whose notify event was lost surfaces as BLOCKED
+/// before any stall is declared against a worker that is only waiting on us.
+/// Then reconcile patrol's timers (the newly-surfaced BLOCKED session disarms)
+/// and declare the remaining fires. A blocked session's fire is swallowed by
+/// `declare_stalls`, so it is never nudged/restarted/killed by the ladder.
+///
+/// Returns whether ledger work was appended (drives `wake_ledger_work`). Guarded
+/// on `!is_empty` so the idle path pays nothing (invariant 1): the drain runs
+/// only when a stall fire is actually due.
+///
+/// Acknowledged (non-blocking): on a stall-fire wake the `control_step` here
+/// re-runs the full harvest INCLUDING subscriber fanout, so fanout runs twice
+/// this wake. It is idempotent — fanout pumps only NEW file bytes and the second
+/// call finds none (the byte cursor advanced) — so there is no double-delivery.
+#[allow(clippy::too_many_arguments)]
+fn stall_step(
+    ledger: &mut Ledger,
+    patrol: &mut PatrolRuntime,
+    control: &mut super::control::ControlRuntime,
+    dispatcher: &mut Dispatcher,
+    read_channel: &mut super::read_channel::ReadChannelRuntime,
+    conns: &mut HashMap<Token, Conn>,
+    poll: &mut Poll,
+    now: Timestamp,
+) -> Result<bool> {
+    let stall_fires = patrol.fire_due(now);
+    if stall_fires.is_empty() {
+        return patrol.declare_stalls(ledger, &stall_fires, now);
+    }
+    // §5.3.3: the ladder's FIRST act is to drain the read channel so a lost
+    // `can_use_tool` surfaces as BLOCKED before any stall is declared. If that
+    // drain FAILS fatally we cannot tell a waiting (BLOCKED) worker from a
+    // silent one — declaring a stall here would nudge/restart/kill a worker
+    // that is only waiting on us, past the §5.3.3 disarm. Fail CLOSED (F2,
+    // inv-5): record a durable `patrol.degraded` (a detached daemon's stderr is
+    // invisible — never eprintln-and-proceed) and SKIP the stall declaration
+    // this wake, re-arming the fired timers so the next wake retries.
+    if let Err(e) = read_channel.drain_all(ledger) {
+        ledger.append(EventInput {
+            kind: EventType::PatrolDegraded,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({
+                "error": format!(
+                    "pre-ladder drain_all failed; skipping the stall declaration this \
+                     wake (fail-closed, §5.3.3): {e:#}"
+                ),
+            }),
+        })?;
+        patrol.requeue_fires_without_declaring(&stall_fires, now);
+        return Ok(true);
+    }
+    control_step(
+        ledger,
+        control,
+        dispatcher,
+        patrol,
+        read_channel,
+        conns,
+        poll,
+    )?;
+    patrol.reconcile_blocked(ledger, now)?;
+    patrol.declare_stalls(ledger, &stall_fires, now)
 }
 
 /// cp-1: ingest whatever the read channel just handed over, and append what it
@@ -757,7 +896,11 @@ fn control_step(
 
     let lines = read_channel.take_stream_lines();
     if !lines.is_empty() {
-        for input in control.ingest(&lines, dispatcher, now) {
+        // The immutable borrow for `ingest` (it reads the ledger to dedup a
+        // permission.pending) ends when it returns the owned Vec, before the
+        // `&mut` append loop below.
+        let inputs = control.ingest(&lines, dispatcher, ledger, now);
+        for input in inputs {
             ledger.append(input)?;
             appended = true;
         }
@@ -1048,6 +1191,26 @@ fn drain_lines(
             Ok(Request::SessionInterrupt { session }) => {
                 let response =
                     control.serve_interrupt(&session, ledger, dispatcher, Timestamp::now());
+                respond(&mut conn.stream, &response)?;
+            }
+            // cp-3 (§5.3.4): answer a worker's can_use_tool. The handler appends
+            // `permission.decided` to the ledger FIRST (the serialization point),
+            // then writes the control_response. The blocked→working re-arm rides
+            // `reconcile_blocked` in the post-harvest path (Task 8), same wake.
+            Ok(Request::SessionPermissionDecision {
+                session,
+                request_id,
+                decision,
+                message,
+            }) => {
+                let response = control.serve_permission_decision(
+                    &session,
+                    &request_id,
+                    &decision,
+                    message.as_deref(),
+                    ledger,
+                    dispatcher,
+                );
                 respond(&mut conn.stream, &response)?;
             }
             // cp-2 (§4.1): fleet.subscribe turns this connection into the aggregate
@@ -1403,6 +1566,388 @@ mod tests {
             ledger.cursor(cursor::CAMPD_CURSOR).unwrap() as usize,
             events.len(),
             "the settle fixpoint consumed every patrol event"
+        );
+    }
+
+    /// cp-3 §5.3.3 — THE HEART, platform-independent (CP3-R2-B1): `stall_step`'s
+    /// FIRST act drains the read channel, so a `can_use_tool` sitting UNREAD in
+    /// the stream file — with NO watcher running here, it is unread BY
+    /// CONSTRUCTION on every platform, no dependence on FSEvents vs inotify —
+    /// surfaces as BLOCKED before any stall is declared against a worker that is
+    /// only waiting on us.
+    ///
+    /// THE LOAD-BEARING falsifying assertion is `agent.stalled == 0`: removing
+    /// the pre-ladder drain from `stall_step` makes `declare_stalls` see a
+    /// not-blocked session and append `agent.stalled` — RED on every platform.
+    /// (The `!is_armed` assertion is trivially true regardless — `fire_due` pops
+    /// the fired timer before the drain — so it is documentation, not the guard.)
+    #[test]
+    fn stall_step_drains_the_read_channel_before_declaring_a_stall() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents/dev.md"),
+            "---\nname: dev\n---\nWork.\n",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "t"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "name": "s", "agent": "dev",
+                    "transcript_path": dir.path().join("projects/-p/sid.jsonl"),
+                    "bead": "gc-1",
+                }),
+            })
+            .unwrap();
+
+        let config = camp_core::config::CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let mut dispatcher = Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            config.clone(),
+        );
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config);
+        let mut control = crate::daemon::control::ControlRuntime::new(1024);
+        let mut read_channel = test_read_channel(dir.path());
+        read_channel.register(&mut ledger, "s").unwrap();
+
+        // Arm the stall timer: observe the woke row + apply_tracking at t0.
+        let woke = ledger
+            .events_of_type(EventType::SessionWoke)
+            .unwrap()
+            .remove(0);
+        let t0 = Timestamp::now();
+        patrol.observe(&woke);
+        patrol.apply_tracking(&mut ledger, t0).unwrap();
+        assert!(
+            patrol.is_armed("s"),
+            "precondition: the stall timer is armed"
+        );
+
+        // A can_use_tool sits UNREAD in the stream file — no watcher, no drain yet.
+        let stdout = dir.path().join("sessions").join("s.json");
+        std::fs::write(
+            &stdout,
+            b"{\"type\":\"control_request\",\"request_id\":\"cli-9\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\"}}\n",
+        )
+        .unwrap();
+
+        let mut conns: HashMap<Token, Conn> = HashMap::new();
+        let mut poll = Poll::new().unwrap();
+        // past the armed deadline (10m default threshold)
+        let now = t0.checked_add(jiff::SignedDuration::from_mins(11)).unwrap();
+
+        stall_step(
+            &mut ledger,
+            &mut patrol,
+            &mut control,
+            &mut dispatcher,
+            &mut read_channel,
+            &mut conns,
+            &mut poll,
+            now,
+        )
+        .unwrap();
+
+        // The ladder's FIRST act drained the channel: the pending surfaced.
+        assert!(
+            ledger.blocked_sessions().unwrap().contains(&"s".to_owned()),
+            "the unread can_use_tool surfaced as BLOCKED"
+        );
+        // THE LOAD-BEARING falsifying assertion.
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::AgentStalled)
+                .unwrap()
+                .len(),
+            0,
+            "no stall was declared against the waiting worker"
+        );
+        assert!(!patrol.is_armed("s"));
+    }
+
+    /// cp-3 §5.3.3 (F2, inv-5): a FATAL `drain_all` error in `stall_step` must
+    /// fail CLOSED — record a durable `patrol.degraded` and declare NO stall
+    /// this wake — never eprintln-and-proceed. If the pre-ladder drain fails we
+    /// cannot tell a BLOCKED worker (which must not be stalled) from a silent
+    /// one, so proceeding to `declare_stalls` would stall a waiting worker past
+    /// the §5.3.3 disarm; on a detached daemon the swallowed stderr line is
+    /// invisible. The fired timer is RE-ARMED (not leaked): the next wake
+    /// retries. Reddens on the old fail-open: it declared `agent.stalled`.
+    #[test]
+    fn stall_step_fails_closed_on_a_fatal_drain_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents/dev.md"),
+            "---\nname: dev\n---\nWork.\n",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "t"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "name": "s", "agent": "dev",
+                    "transcript_path": dir.path().join("projects/-p/sid.jsonl"),
+                    "bead": "gc-1",
+                }),
+            })
+            .unwrap();
+
+        let config = camp_core::config::CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let mut dispatcher = Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            config.clone(),
+        );
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config);
+        let mut control = crate::daemon::control::ControlRuntime::new(1024);
+        let mut read_channel = test_read_channel(dir.path());
+        read_channel.register(&mut ledger, "s").unwrap();
+
+        // Arm the stall timer at t0 (session is NOT blocked in the ledger).
+        let woke = ledger
+            .events_of_type(EventType::SessionWoke)
+            .unwrap()
+            .remove(0);
+        let t0 = Timestamp::now();
+        patrol.observe(&woke);
+        patrol.apply_tracking(&mut ledger, t0).unwrap();
+        assert!(
+            patrol.is_armed("s"),
+            "precondition: the stall timer is armed"
+        );
+
+        // The pre-ladder drain will fail fatally this wake.
+        read_channel.arm_drain_all_failure();
+
+        let mut conns: HashMap<Token, Conn> = HashMap::new();
+        let mut poll = Poll::new().unwrap();
+        let now = t0.checked_add(jiff::SignedDuration::from_mins(11)).unwrap();
+
+        let appended = stall_step(
+            &mut ledger,
+            &mut patrol,
+            &mut control,
+            &mut dispatcher,
+            &mut read_channel,
+            &mut conns,
+            &mut poll,
+            now,
+        )
+        .unwrap();
+
+        // THE LOAD-BEARING falsifying assertion: no stall was declared when the
+        // drain could not confirm the worker was not blocked.
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::AgentStalled)
+                .unwrap()
+                .len(),
+            0,
+            "fail-closed: a fatal drain must NOT lead to a stall declaration"
+        );
+        // The fatal drain is on the record durably, not swallowed to stderr.
+        let drain_degraded: Vec<_> = ledger
+            .events_of_type(EventType::PatrolDegraded)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.data["error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("drain_all failed"))
+            })
+            .collect();
+        assert_eq!(
+            drain_degraded.len(),
+            1,
+            "a fatal drain_all is recorded as exactly one durable patrol.degraded (inv-5)"
+        );
+        assert!(appended, "the wake did ledger work (the degraded append)");
+        // Not leaked: the fired timer is re-armed so the next wake retries.
+        assert!(
+            patrol.is_armed("s"),
+            "the fired stall timer is re-armed, not dropped — the worker is still patrolled"
+        );
+    }
+
+    /// cp-3 §5.3.3 (F2 follow-up): the RELEASE arm of the fail-closed requeue.
+    /// A bead-closed grace kill does NOT depend on the read channel, so when a
+    /// fatal pre-ladder drain skips the stall declaration on the SAME wake a
+    /// Release timer is due, the grace kill must STILL fire — otherwise a
+    /// released (bead-closed) worker leaks alive. Arms a Release timer, injects
+    /// a fatal drain, drives one wake through `stall_step`, and asserts the
+    /// released worker's `KillReleased` executes (the held `sleep` child is
+    /// SIGKILLed) while no stall is declared and the fatal drain is durable.
+    /// Reddens if `requeue_fires_without_declaring` drops the Release
+    /// `KillReleased` push (the worker survives — `test_child_wait` sees a
+    /// natural, successful `sleep` exit, not a signal).
+    #[test]
+    fn stall_step_fail_closed_still_fires_a_due_release_grace_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents/dev.md"),
+            "---\nname: dev\n---\nWork.\n",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "t"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "name": "s", "agent": "dev",
+                    "transcript_path": dir.path().join("projects/-p/sid.jsonl"),
+                    "bead": "gc-1",
+                }),
+            })
+            .unwrap();
+
+        let config = camp_core::config::CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let mut dispatcher = Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            config.clone(),
+        );
+        // A held worker that IGNORES its stdin (`sleep`): dropping its pipe on
+        // release does not end it, so only `kill_released` can — the clean
+        // discriminator for "did the grace kill fire?".
+        let pid = dispatcher.test_insert_held_sleeper(dir.path(), "s", "gc-1");
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config);
+        let mut control = crate::daemon::control::ControlRuntime::new(1024);
+        let mut read_channel = test_read_channel(dir.path());
+        read_channel.register(&mut ledger, "s").unwrap();
+
+        // Track + arm at t0.
+        let woke = ledger
+            .events_of_type(EventType::SessionWoke)
+            .unwrap()
+            .remove(0);
+        let t0 = Timestamp::now();
+        patrol.observe(&woke);
+        patrol.apply_tracking(&mut ledger, t0).unwrap();
+
+        // Close the bead → observe queues Release → execute_pending releases the
+        // worker and arms the Release grace timer (replacing the stall timer).
+        let close_seq = ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"outcome": "pass"}),
+            })
+            .unwrap();
+        let closed = ledger
+            .events_range(close_seq, Some(close_seq))
+            .unwrap()
+            .remove(0);
+        patrol.observe(&closed);
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, t0)
+            .unwrap();
+
+        // The fatal drain hits THIS wake, well past the 30s release grace.
+        read_channel.arm_drain_all_failure();
+        let mut conns: HashMap<Token, Conn> = HashMap::new();
+        let mut poll = Poll::new().unwrap();
+        let now = t0
+            .checked_add(jiff::SignedDuration::from_mins(120))
+            .unwrap();
+
+        let appended = stall_step(
+            &mut ledger,
+            &mut patrol,
+            &mut control,
+            &mut dispatcher,
+            &mut read_channel,
+            &mut conns,
+            &mut poll,
+            now,
+        )
+        .unwrap();
+
+        // Fail closed: no stall declared, the fatal drain is durable.
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::AgentStalled)
+                .unwrap()
+                .len(),
+            0,
+            "no stall declared on the fatal-drain wake"
+        );
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::PatrolDegraded)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.data["error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("drain_all failed")))
+                .count(),
+            1,
+            "the fatal drain is a durable patrol.degraded (inv-5)"
+        );
+        assert!(appended, "the wake did ledger work (the degraded append)");
+
+        // Execute the queued action: the grace kill — NOT read-channel-dependent
+        // — still fires despite the skipped stall declaration.
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, now)
+            .unwrap();
+        let status = dispatcher.test_child_wait(pid);
+        assert!(
+            !status.success(),
+            "the due release grace kill still fired on the fail-closed wake — the \
+             released worker was SIGKILLed, not left leaking: {status:?}"
         );
     }
 

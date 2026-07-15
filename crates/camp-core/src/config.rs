@@ -58,6 +58,12 @@ pub struct DispatchConfig {
     /// Concurrency cap (spec §8.3); master plan Phase 8 default.
     #[serde(default = "default_max_workers")]
     pub max_workers: usize,
+    /// cp-3 (§5.3.2): the count of BLOCKED (permission-waiting) sessions past
+    /// which campd raises a loud `permission.saturated` fault. A blocked worker
+    /// does NOT hold a dispatch slot, so this bounds operator attention, not
+    /// concurrency. Rejected at 0.
+    #[serde(default = "default_max_blocked")]
+    pub max_blocked: usize,
     /// Worker executable. Tests point this at fake-agent.sh — visible
     /// config, not a fallback (master plan Phase 8).
     #[serde(default = "default_command")]
@@ -79,6 +85,10 @@ fn default_max_workers() -> usize {
     10
 }
 
+fn default_max_blocked() -> usize {
+    10
+}
+
 fn default_command() -> PathBuf {
     PathBuf::from("claude")
 }
@@ -91,6 +101,7 @@ impl Default for DispatchConfig {
     fn default() -> Self {
         DispatchConfig {
             max_workers: default_max_workers(),
+            max_blocked: default_max_blocked(),
             command: default_command(),
             default_agent: None,
             exec_timeout: default_exec_timeout(),
@@ -371,6 +382,15 @@ impl CampConfig {
                     .to_owned(),
             ));
         }
+        if cfg.dispatch.max_blocked == 0 {
+            // cp-3 (§5.3.2): 0 would mean campd saturates on the first blocked
+            // worker — a typo, not an intent. Refuse it like max_workers.
+            return Err(CoreError::Config(
+                "[dispatch] max_blocked must be at least 1 (0 would saturate on the first \
+                 blocked worker)"
+                    .to_owned(),
+            ));
+        }
         // Same law for [patrol]: a typo'd threshold must not become dead
         // config (validation only; campd resolves the typed values later).
         crate::patrol::PatrolConfig::from_section(&cfg.patrol)?;
@@ -521,6 +541,20 @@ prefix = "gc"
     fn missing_rig_is_unknown_rig() {
         let cfg = CampConfig::parse("[camp]\nname=\"d\"\n").unwrap();
         assert!(matches!(cfg.rig("nope"), Err(CoreError::UnknownRig(n)) if n == "nope"));
+    }
+
+    /// cp-3 (§5.3.2): `max_blocked` defaults to 10 (the same order as the
+    /// dispatch cap) and a 0 is refused like `max_workers` — a typo must not
+    /// saturate on the first blocked worker.
+    #[test]
+    fn dispatch_max_blocked_defaults_to_ten_and_rejects_zero() {
+        let cfg = CampConfig::parse("[camp]\nname=\"d\"\n").unwrap();
+        assert_eq!(cfg.dispatch.max_blocked, 10);
+        let cfg = CampConfig::parse("[camp]\nname=\"d\"\n[dispatch]\nmax_blocked = 3\n").unwrap();
+        assert_eq!(cfg.dispatch.max_blocked, 3);
+        let err =
+            CampConfig::parse("[camp]\nname=\"d\"\n[dispatch]\nmax_blocked = 0\n").unwrap_err();
+        assert!(matches!(err, CoreError::Config(_)), "got {err:?}");
     }
 
     /// Issue #55: every subprocess campd runs inline on its event loop is

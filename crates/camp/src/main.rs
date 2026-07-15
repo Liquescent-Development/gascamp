@@ -10,6 +10,7 @@ mod cmd {
     pub mod claim;
     pub mod close;
     pub mod create;
+    pub mod decide;
     pub mod doctor;
     pub mod event_emit;
     pub mod events;
@@ -240,6 +241,20 @@ enum Command {
         session: String,
         /// The message to deliver
         text: String,
+    },
+    /// Answer a worker's permission request (control-plane §5.3): `camp watch`
+    /// shows the BLOCKED row and its request id; this records and delivers the
+    /// decision
+    Decide {
+        /// Session registry name (see `camp watch`)
+        session: String,
+        /// The CLI-minted permission request id (see `camp watch`)
+        request_id: String,
+        /// One of allow | allow_always | deny
+        decision: String,
+        /// The operator's reason — required for `deny` (the worker sees it)
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Show a bead's current state and full event history
     Show {
@@ -762,6 +777,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Nudge { session, text } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::nudge::run(&camp, session, text)
+        }
+        Command::Decide {
+            session,
+            request_id,
+            decision,
+            reason,
+        } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::decide::run(&camp, session, request_id, decision, reason)
         }
         Command::Show {
             bead,
