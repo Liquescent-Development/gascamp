@@ -9,8 +9,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use camp_core::clock::FixedClock;
-use camp_core::event::{EventInput, EventType};
 use camp_core::config::RigConfig;
+use camp_core::event::{EventInput, EventType};
 use camp_core::formula::{Formula, Step, cook};
 use camp_core::ledger::Ledger;
 
@@ -84,8 +84,14 @@ fn claim_stamps_session_and_work_branch_and_leaves_the_cooked_route_intact() {
 
     // The projection reads back the cooked route AND the claim-stamped branch.
     let meta = ledger.bead_metadata("gc-2").unwrap();
-    assert_eq!(meta.get("gc.routed_to").map(String::as_str), Some("gc.publisher"));
-    assert_eq!(meta.get("gc.work_branch").map(String::as_str), Some("camp/gc-2"));
+    assert_eq!(
+        meta.get("gc.routed_to").map(String::as_str),
+        Some("gc.publisher")
+    );
+    assert_eq!(
+        meta.get("gc.work_branch").map(String::as_str),
+        Some("camp/gc-2")
+    );
 
     assert!(ledger.refold_check().unwrap().drift.is_empty());
 }
@@ -110,7 +116,10 @@ fn claim_without_work_branch_leaves_the_column_untouched() {
         .unwrap();
 
     let meta = ledger.bead_metadata("gc-2").unwrap();
-    assert_eq!(meta.get("gc.routed_to").map(String::as_str), Some("gc.publisher"));
+    assert_eq!(
+        meta.get("gc.routed_to").map(String::as_str),
+        Some("gc.publisher")
+    );
     assert!(
         !meta.contains_key("gc.work_branch"),
         "a claim with no work_branch must not stamp the column"

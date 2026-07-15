@@ -18,3 +18,16 @@
 .claude/settings.local.json
 # Ephemeral agent worktrees (isolation mode) — never part of the repo.
 .claude/worktrees/
+
+# Gas Camp runtime state (camp.toml is the tracked source of truth)
+/ci/gc-compat/.worker-contract-happy/.camp/camp.db
+/ci/gc-compat/.worker-contract-happy/.camp/camp.db-wal
+/ci/gc-compat/.worker-contract-happy/.camp/camp.db-shm
+/ci/gc-compat/.worker-contract-happy/.camp/campd.sock
+/ci/gc-compat/.worker-contract-happy/.camp/campd.sock.lock
+/ci/gc-compat/.worker-contract-happy/.camp/campd.log
+/ci/gc-compat/.worker-contract-happy/.camp/runs/
+/ci/gc-compat/.worker-contract-happy/.camp/sessions/
+/ci/gc-compat/.worker-contract-happy/.camp/worktrees/
+/ci/gc-compat/.worker-contract-happy/.camp/imports/
+/ci/gc-compat/.worker-contract-happy/.camp/bin/

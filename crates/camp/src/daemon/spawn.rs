@@ -767,7 +767,11 @@ mod tests {
         for k in ["GC_AGENT", "GC_TEMPLATE"] {
             assert_eq!(env[k], "gc.run-operator", "{k}");
         }
-        assert!(env["PATH"].starts_with("/camps/dev/bin:"), "PATH: {}", env["PATH"]);
+        assert!(
+            env["PATH"].starts_with("/camps/dev/bin:"),
+            "PATH: {}",
+            env["PATH"]
+        );
         assert_eq!(env["CAMP_BEAD"], "gc-142"); // the four CAMP_* still present
         assert_eq!(env["CAMP_SESSION"], "dev/gc.run-operator/1");
     }

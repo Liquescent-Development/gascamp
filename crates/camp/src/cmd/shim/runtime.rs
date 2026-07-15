@@ -21,7 +21,8 @@ use crate::campdir::CampDir;
 pub fn run_runtime(camp: &CampDir, args: &[String]) -> Result<ShimExit> {
     match args.first().map(String::as_str) {
         Some("drain-ack") => {
-            let session = std::env::var("CAMP_SESSION").context("CAMP_SESSION not set in worker env")?;
+            let session =
+                std::env::var("CAMP_SESSION").context("CAMP_SESSION not set in worker env")?;
             let mut ledger = Ledger::open(&camp.db_path())?;
             drain_ack(camp, &mut ledger, &session)
         }

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! THE §14 unskippable gate (hermetic Rust half).
 //!
 //! A fixture camp (real ledger, real shims installed by `launch`, a fake claude
@@ -187,7 +188,11 @@ fn hook_bd_show_and_env_project_the_same_bead_row() {
         .env("GC_TEMPLATE", "gc.WRONG")
         .output()
         .unwrap();
-    assert!(hook.status.success(), "hook: {}", String::from_utf8_lossy(&hook.stderr));
+    assert!(
+        hook.status.success(),
+        "hook: {}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
     let hook_json: serde_json::Value =
         serde_json::from_slice(&hook.stdout).expect("hook prints one JSON object");
     assert_eq!(hook_json["action"], "work");
@@ -203,7 +208,11 @@ fn hook_bd_show_and_env_project_the_same_bead_row() {
         .env("GC_AGENT", "gc.WRONG")
         .output()
         .unwrap();
-    assert!(show.status.success(), "bd show: {}", String::from_utf8_lossy(&show.stderr));
+    assert!(
+        show.status.success(),
+        "bd show: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
     let bd_json: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
     assert_eq!(bd_json["assignee"], hook_json["assignee"]); // same session
     assert_eq!(bd_json["metadata"]["gc.routed_to"], hook_json["route"]); // same route

@@ -3001,7 +3001,10 @@ mod tests {
             .find(|e| e.kind.as_str() == "session.stopped")
             .expect("the ack reaps the worker");
         assert!(
-            stopped.data["reason"].as_str().unwrap().contains("released"),
+            stopped.data["reason"]
+                .as_str()
+                .unwrap()
+                .contains("released"),
             "{}",
             stopped.data
         );
@@ -3018,12 +3021,18 @@ mod tests {
         dispatcher.reap(&mut ledger).unwrap();
         let events = ledger.events_range(1, None).unwrap();
         assert_eq!(
-            events.iter().filter(|e| e.kind.as_str() == "session.stopped").count(),
+            events
+                .iter()
+                .filter(|e| e.kind.as_str() == "session.stopped")
+                .count(),
             1,
             "exactly one reap — the grace fire is a no-op"
         );
         assert_eq!(
-            events.iter().filter(|e| e.kind.as_str() == "session.crashed").count(),
+            events
+                .iter()
+                .filter(|e| e.kind.as_str() == "session.crashed")
+                .count(),
             0
         );
     }

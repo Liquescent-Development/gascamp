@@ -305,7 +305,10 @@ fn a_dispatch_installs_the_absolute_path_shims_into_camp_bin() {
 
     let gc = root.join("bin/gc");
     let bd = root.join("bin/bd");
-    assert!(gc.exists() && bd.exists(), "launch must install .camp/bin/{{gc,bd}}");
+    assert!(
+        gc.exists() && bd.exists(),
+        "launch must install .camp/bin/{{gc,bd}}"
+    );
     let body = std::fs::read_to_string(&gc).unwrap();
     // Absolute path (an installed campd binary lives at an absolute path), and
     // NOT a bare `exec camp` (§6.3): a bare name would find the shim itself.
@@ -313,7 +316,10 @@ fn a_dispatch_installs_the_absolute_path_shims_into_camp_bin() {
         body.starts_with("#!/bin/sh\nexec /") && body.contains(" gc-shim \"$@\""),
         "shim must exec camp's absolute path: {body:?}"
     );
-    assert!(!body.contains("exec camp "), "no bare-name exec (§6.3): {body:?}");
+    assert!(
+        !body.contains("exec camp "),
+        "no bare-name exec (§6.3): {body:?}"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

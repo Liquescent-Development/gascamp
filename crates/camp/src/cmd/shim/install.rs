@@ -89,7 +89,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = prepend_bin_path(dir.path(), Some("/usr/bin:/bin"));
         assert!(
-            p.starts_with(&format!("{}/bin:", dir.path().display())) && p.ends_with("/usr/bin:/bin"),
+            p.starts_with(&format!("{}/bin:", dir.path().display()))
+                && p.ends_with("/usr/bin:/bin"),
             "{p}"
         );
     }

@@ -173,7 +173,10 @@ mod tests {
         assert_eq!(row.claimed_by.as_deref(), Some("t/gc.publisher/1"));
         assert_eq!(row.assignee.as_deref(), Some("gc.publisher")); // route intact
         let meta = ledger.bead_metadata("gc-2").unwrap();
-        assert_eq!(meta.get("gc.work_branch").map(String::as_str), Some("camp/gc-2"));
+        assert_eq!(
+            meta.get("gc.work_branch").map(String::as_str),
+            Some("camp/gc-2")
+        );
     }
 
     #[test]

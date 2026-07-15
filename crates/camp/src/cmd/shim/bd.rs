@@ -231,7 +231,11 @@ mod tests {
         .unwrap();
         let ledger = Ledger::open(&camp.db_path()).unwrap();
         assert_eq!(
-            ledger.bead_metadata("gc-2").unwrap().get("gc.custom").map(String::as_str),
+            ledger
+                .bead_metadata("gc-2")
+                .unwrap()
+                .get("gc.custom")
+                .map(String::as_str),
             Some("x")
         );
     }
