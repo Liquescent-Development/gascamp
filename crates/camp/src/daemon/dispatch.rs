@@ -683,6 +683,30 @@ impl Dispatcher {
     /// row committed appends session.crashed with the reason — the row
     /// must never dangle live (plan decision F).
     fn launch(&mut self, ledger: &mut Ledger, bead: &BeadRow, prep: Prep) -> Result<()> {
+        // compat §6.3 — the gc/bd shims must be on the worker's PATH
+        // (`.camp/bin`, set in build_spec) BEFORE it execs. Install them with
+        // camp's ABSOLUTE path (`current_exe`, NOT `[dispatch].command`, which
+        // is `claude`). A failure here is a dispatch failure, EVENTED — never a
+        // silent skip that would leave the worker's PATH pointing at missing
+        // shims. Idempotent (overwrites), so a per-dispatch install is cheap.
+        if let Err(reason) = std::env::current_exe()
+            .map_err(|e| format!("resolve camp exe for shim install: {e}"))
+            .and_then(|exe| {
+                crate::cmd::shim::install::write_shims(&self.camp.root, &exe).map_err(|e| {
+                    format!("install shims into {}/bin: {e:#}", self.camp.root.display())
+                })
+            })
+        {
+            ledger.append(EventInput {
+                kind: EventType::DispatchFailed,
+                rig: Some(bead.rig.clone()),
+                actor: "campd".into(),
+                bead: Some(bead.id.clone()),
+                data: serde_json::json!({ "reason": reason }),
+            })?;
+            return Ok(());
+        }
+
         let worktree = if prep.make_worktree {
             // ensure_worktree (Phase 11 Decision H): a patrol respawn
             // reuses the bead's own worktree; residue still fails fast.
