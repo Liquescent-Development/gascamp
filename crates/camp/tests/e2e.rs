@@ -891,3 +891,126 @@ fn e2e_full() {
     drop(campd);
     assert_no_orphans(&sids);
 }
+
+/// cp-3 §5.3 / §8 PAID gate: the `can_use_tool` round trip against the REAL CLI.
+/// This is the ONLY test that can prove `permission_allow_response.json`'s bytes
+/// are ACCEPTED by a binary camp does not control (PROVENANCE lists them "pinned
+/// but not exercised"). An ASKABLE agent (`permissionMode: default`) with a
+/// restricted allowlist is given a task that needs a tool the allowlist does not
+/// cover, so the CLI — spawned under `--permission-prompt-tool stdio` — asks camp
+/// for a decision. camp surfaces BLOCKED, the operator answers `allow` via
+/// `camp decide`, and the worker CONTINUES (its bead closes) — which it can only
+/// do if the CLI accepted camp's allow bytes. Run via `make e2e` (CAMP_E2E=1)
+/// ONLY after operator authorization for API spend.
+#[test]
+#[ignore = "real-claude e2e: run via `make e2e` (CAMP_E2E=1) — OPERATOR-GATED API spend"]
+fn e2e_can_use_tool_round_trip() {
+    let claude = require_e2e_env();
+    eprintln!("[e2e] claude binary: {claude}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(".camp");
+    std::fs::create_dir_all(&root).unwrap();
+    let fixture = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/toy-project"
+    ));
+    let rig = dir.path().join("rig");
+    copy_dir(&fixture, &rig);
+    git_init_commit(&rig);
+    std::fs::write(
+        root.join("camp.toml"),
+        format!(
+            "[camp]\nname = \"e2e-perm\"\n\n\
+             [[rigs]]\nname = \"toy\"\npath = \"{}\"\nprefix = \"toy\"\n\n\
+             [dispatch]\nmax_workers = 1\ncommand = \"{}\"\ndefault_agent = \"asker\"\n\n\
+             [patrol]\nstall_after = \"120s\"\n",
+            rig.display(),
+            claude,
+        ),
+    )
+    .unwrap();
+    // An ASKABLE agent: permissionMode default (can ask), a RESTRICTED allowlist
+    // that excludes Bash, so a task needing Bash forces a can_use_tool.
+    let agents = root.join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("asker.md"),
+        "---\nname: asker\nmodel: sonnet\npermissionMode: default\ntools: Read\n---\n\
+         You are a camp worker. Your bead REQUIRES running a shell command with the \
+         Bash tool (e.g. `echo camp-permission-ok`). Attempt it; if a permission \
+         decision is needed, wait for it, then proceed and close the bead pass.\n",
+    )
+    .unwrap();
+    camp_ok(&root, &["events", "--json"]);
+
+    let campd = Daemon::spawn(&root, &[]);
+    let bead = camp_ok(&root, &["sling", "run `echo camp-permission-ok` via Bash"])
+        .trim()
+        .to_owned();
+
+    // (1) the CLI asks: a permission.pending surfaces (poke to drain on macOS).
+    e2e_wait_poking(&root, "the worker BLOCKED on can_use_tool", |e| {
+        e.iter().any(|ev| ev["type"] == "permission.pending")
+    });
+    let pending = events_json(&root)
+        .into_iter()
+        .find(|e| e["type"] == "permission.pending")
+        .unwrap();
+    let session = pending["data"]["session"].as_str().unwrap().to_owned();
+    let req = pending["data"]["request_id"].as_str().unwrap().to_owned();
+    eprintln!(
+        "[e2e] BLOCKED: session={session} request_id={req} tool={}",
+        pending["data"]["tool_name"]
+    );
+
+    // (2) answer allow via the client verb (exercises camp decide end to end).
+    let out = camp_ok(&root, &["decide", &session, &req, "allow"]);
+    eprintln!("[e2e] camp decide: {}", out.trim());
+
+    // (3) the decision is a ledger event with its cause.
+    e2e_wait_poking(&root, "the permission.decided", |e| {
+        e.iter().any(|ev| ev["type"] == "permission.decided")
+    });
+    let decided = events_json(&root)
+        .into_iter()
+        .rev()
+        .find(|e| e["type"] == "permission.decided")
+        .unwrap();
+    assert_eq!(decided["data"]["decision"], "allow");
+    assert_eq!(decided["data"]["decided_by"], "operator");
+    assert_eq!(decided["data"]["request_id"], req.as_str());
+
+    // (4) THE PROOF: the worker CONTINUED past the permission — it could only do
+    // so if the real CLI ACCEPTED camp's `permission_allow_response.json` bytes.
+    // The bead closing is the continuation (the worker ran the tool and finished).
+    e2e_wait_poking(&root, "the worker continued and closed its bead", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "bead.closed" && ev["bead"] == bead.as_str())
+    });
+    eprintln!("[e2e] the allow bytes were ACCEPTED — the worker continued and closed");
+
+    let sids: Vec<String> = events_json(&root)
+        .iter()
+        .filter(|e| e["type"] == "session.woke")
+        .filter_map(|e| e["data"]["claude_session_id"].as_str().map(String::from))
+        .collect();
+    drop(campd);
+    assert_no_orphans(&sids);
+}
+
+/// Like `wait_until`, but POKES campd each pass so it drains tailed stream files
+/// — on macOS a worker's stdout append through its inherited fd is
+/// notify-suppressed, so an explicit wake surfaces the `can_use_tool` (§8
+/// read-on-wake). The paid round-trip must not race a watch that may never fire.
+fn e2e_wait_poking(root: &Path, what: &str, pred: impl Fn(&[serde_json::Value]) -> bool) {
+    let deadline = Instant::now() + REAL_CLAUDE_TIMEOUT;
+    loop {
+        let _ = camp(root, &["top"]); // poke → wake → drain_all
+        if pred(&events_json(root)) {
+            return;
+        }
+        assert!(Instant::now() <= deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
