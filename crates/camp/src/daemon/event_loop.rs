@@ -739,6 +739,17 @@ pub fn run(
             ledger.append(input)?;
             appended_control_events = true;
         }
+        // cp-3 (§5.3.4): the steady-state adoption kill. A BLOCKED session that
+        // is NOT a live child is a worker campd holds no stdin pipe for — a
+        // can_use_tool that arrived via tailing for an adopted worker (surfaced
+        // this wake). It can never be answered, so it takes the SAME named kill
+        // as the startup adoption path, NOT the generic stall ladder. The
+        // `crashed` session leaves `blocked_sessions` next wake (the live-join),
+        // so the set-shrink dedups a re-kill.
+        if super::patrol::kill_discovered_unanswerable_permissions(ledger, patrol, dispatcher)? > 0
+        {
+            appended_control_events = true;
+        }
         // cp-3 (§5.3.2): a loud saturation fault when the BLOCKED count crosses
         // `max_blocked` — the operator has more unanswered permission questions
         // than campd will let pile up silently. Edge-deduped: emitted only on the

@@ -1184,6 +1184,76 @@ pub struct AdoptSummary {
 /// AdoptedPid; alive with its bead closed/absent and campd-spawned →
 /// release (kill + reasoned stop; a finished stream worker lingers by P3).
 /// Then sweep <camp>/worktrees/ by the Decision G table.
+/// §5.3.4: the named, greppable cause when campd kills a worker it can no
+/// longer answer (an unanswered permission with no live stdin).
+pub(super) const ADOPTION_PERMISSION_REASON: &str = "adoption: unanswerable permission request";
+
+/// §5.3.4: a worker campd cannot answer (no live stdin) with an unanswered
+/// permission. Kill it and record the NAMED, greppable crash. The fold reopens
+/// the bead (session_ended-on-crash reopens `claimed_by` beads), so it becomes
+/// dispatchable to a fresh worker — no observe/Respawn is involved (the worker
+/// is not, or no longer, tracked for a Respawn; the fold crash-reopen is the
+/// mechanism). The key MUST be `"name"`: `SessionEnd` is `deny_unknown_fields`,
+/// so a `"session"` key would fail loud at append.
+pub(super) fn crash_unanswerable_permission(
+    ledger: &mut Ledger,
+    session: &str,
+    rig: Option<String>,
+    pid: i64,
+    exec_timeout: std::time::Duration,
+) -> Result<()> {
+    kill_pid(pid, exec_timeout)?;
+    ledger.append(EventInput {
+        kind: EventType::SessionCrashed,
+        rig,
+        actor: "campd".into(),
+        bead: None,
+        data: serde_json::json!({ "name": session, "reason": ADOPTION_PERMISSION_REASON }),
+    })?;
+    Ok(())
+}
+
+/// §5.3.4 steady state: kill any BLOCKED, campd-woke, NON-child worker campd can
+/// no longer answer — a `can_use_tool` discovered via tailing AFTER adoption (an
+/// adopted worker holds no campd stdin). It takes the SAME named kill as the
+/// startup adoption path (`crash_unanswerable_permission`), never the generic
+/// stall ladder; the fold re-hooks its bead. The pid is found by PROBE (the
+/// `session.woke` event carries none — it is appended before spawn), exactly as
+/// `adopt` does. Returns how many were killed (drives the wake's settle).
+pub(super) fn kill_discovered_unanswerable_permissions(
+    ledger: &mut Ledger,
+    patrol: &PatrolRuntime,
+    dispatcher: &Dispatcher,
+) -> Result<usize> {
+    let config = &patrol.camp_config;
+    let exec_timeout = config.dispatch.exec_timeout()?;
+    let mut killed = 0;
+    for session in ledger.blocked_sessions()? {
+        if dispatcher.is_child(&session) {
+            continue; // answerable — campd holds its stdin
+        }
+        let Some(row) = ledger.session_by_name(&session)? else {
+            continue;
+        };
+        if row.woke_actor != "campd" {
+            continue; // never kill an attended/hook-registered session (§10)
+        }
+        let Some(pid) = probe_alive(
+            row.claude_session_id.as_deref(),
+            row.pid,
+            &dispatcher.known_pids(),
+            &config.dispatch.command,
+            exec_timeout,
+        )?
+        else {
+            continue; // already dead/reaped — nothing to kill
+        };
+        crash_unanswerable_permission(ledger, &row.name, row.rig.clone(), pid, exec_timeout)?;
+        killed += 1;
+    }
+    Ok(killed)
+}
+
 pub fn adopt(
     ledger: &mut Ledger,
     patrol: &mut PatrolRuntime,
@@ -1252,6 +1322,29 @@ pub fn adopt(
                 summary.crashed += 1;
             }
             Some(pid) => {
+                // §5.3.4: a live adopted worker with an UNANSWERED permission is
+                // a worker campd can no longer answer — it holds no stdin pipe
+                // for this campd life, so its request would block forever. Kill
+                // it with the named cause and let the fold re-hook its bead. The
+                // `woke_actor == "campd"` guard mirrors the release-kill below
+                // (§10: never kill in the TUI — an attended session never gets
+                // --permission-prompt-tool, so it never folds a permission.pending,
+                // but the guard is the defensive belt-and-braces). The §5.3
+                // ledger-before-pipe ordering proves pending ⇒ the response was
+                // never sent, so this never kills an ANSWERED worker.
+                if row.woke_actor == "campd"
+                    && ledger.pending_permission_for_session(&row.name)?.is_some()
+                {
+                    crash_unanswerable_permission(
+                        ledger,
+                        &row.name,
+                        row.rig.clone(),
+                        pid,
+                        exec_timeout,
+                    )?;
+                    summary.crashed += 1;
+                    continue; // do NOT adopt_from_row: it is dead; the fold reopened its bead
+                }
                 let bead_open = match row.bead.as_deref() {
                     Some(bead) => ledger.get_bead(bead)?.is_some_and(|b| b.status != "closed"),
                     None => false,
@@ -2827,6 +2920,131 @@ mod tests {
         );
         live.kill().unwrap();
         live.wait().unwrap();
+    }
+
+    /// cp-3 §5.3.4: a LIVE adopted worker with an UNANSWERED permission is
+    /// killed with the named, greppable cause, and its bead re-hooks via the
+    /// fold crash-reopen. Mutation caught: dropping the pending check or the
+    /// named append; the bead assertions die if the append uses the wrong key
+    /// `"session"` (loud fold failure) or the fold reopen is bypassed.
+    #[test]
+    fn adoption_kills_a_worker_with_an_unanswered_permission_and_re_hooks_the_bead() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        use std::os::unix::process::CommandExt as _;
+        let uuid = "b10c0000-0000-4000-8000-00000000cccc";
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg0("claude")
+            .arg("-c")
+            .arg(format!("sleep 30 || true # {uuid}"));
+        let mut child = cmd.spawn().unwrap();
+        woke_row(
+            &mut ledger,
+            "t/dev/1",
+            "gc-1",
+            uuid,
+            &dir.path().join("projects/-p/x.jsonl"),
+            true,
+        );
+        // the worker asked permission and no one answered
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionPending,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "t/dev/1", "request_id": "cli-2", "tool_name": "Bash",
+                }),
+            })
+            .unwrap();
+
+        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher).unwrap();
+        assert_eq!(summary.crashed, 1);
+        assert_eq!(summary.rearmed, 0);
+        let crash = ledger
+            .events_of_type(EventType::SessionCrashed)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(crash.data["name"], "t/dev/1");
+        assert_eq!(
+            crash.data["reason"],
+            "adoption: unanswerable permission request"
+        );
+        // the bead is DISPATCHABLE AGAIN via the fold crash-reopen
+        let bead = ledger.get_bead("gc-1").unwrap().unwrap();
+        assert_eq!(bead.status, "open");
+        assert!(
+            bead.claimed_by.is_none(),
+            "reopened + unclaimed → the readiness processor re-dispatches it"
+        );
+        let _ = child.wait();
+    }
+
+    /// cp-3 §5.3.4 inverse window: an ANSWERED (decided) but quiet adopted worker
+    /// is NOT killed by adoption — it is re-armed like any living adopted worker,
+    /// and the stall ladder owns its silence. Mutation caught: killing on "has a
+    /// permission row" instead of "has a PENDING one".
+    #[test]
+    fn adoption_does_not_kill_an_answered_but_quiet_worker() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (dir, mut ledger, config, mut patrol) = fixture();
+        let mut dispatcher = dispatcher_for(dir.path(), &config);
+        use std::os::unix::process::CommandExt as _;
+        let uuid = "a1150000-0000-4000-8000-00000000dddd";
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg0("claude")
+            .arg("-c")
+            .arg(format!("sleep 30 || true # {uuid}"));
+        let mut child = cmd.spawn().unwrap();
+        woke_row(
+            &mut ledger,
+            "t/dev/1",
+            "gc-1",
+            uuid,
+            &dir.path().join("projects/-p/x.jsonl"),
+            true,
+        );
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionPending,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "t/dev/1", "request_id": "cli-2", "tool_name": "Bash",
+                }),
+            })
+            .unwrap();
+        // ANSWERED: the request is decided, so the session is no longer blocked.
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionDecided,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "t/dev/1", "request_id": "cli-2",
+                    "decision": "allow", "decided_by": "operator",
+                }),
+            })
+            .unwrap();
+
+        let summary = adopt(&mut ledger, &mut patrol, &mut dispatcher).unwrap();
+        assert!(
+            !ledger
+                .events_of_type(EventType::SessionCrashed)
+                .unwrap()
+                .iter()
+                .any(|e| e.data["reason"] == "adoption: unanswerable permission request"),
+            "an answered worker must not take the unanswerable kill"
+        );
+        assert_eq!(summary.crashed, 0);
+        assert_eq!(summary.rearmed, 1, "{summary:?}");
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
