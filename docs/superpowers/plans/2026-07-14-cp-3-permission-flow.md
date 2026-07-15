@@ -1,7 +1,20 @@
 # cp-3 — `can_use_tool` end to end, the permission flow — Implementation Plan
 
-## Plan-gate approval
-PENDING — round 1 REJECT (architecture ruled SOUND; 4 blocking findings, all test-design or wiring, fixed in this revision). A fresh 4-panel gate audits the revision. Do NOT begin implementation until this line reads APPROVED.
+## Plan-gate approval (2026-07-15)
+APPROVED by the adversarial 4-panelist plan gate. Rounds: R1 REJECT (4 blockers) → R2 REJECT (1: ladder-drains-first non-falsifiable) → R3 UNANIMOUS APPROVE. Cumulative lens clearance: contract (R1), interface (R2), execution (R1/R2/R3), completeness-critic (R3).
+Accepted rulings (architecture verified SOUND by the panels against real code):
+- BLOCKED is FOLDED durable ledger state: a new `permissions` table (SCHEMA_VERSION 3→4, the sanctioned bump), folded from permission.pending/permission.decided. First-answer-wins is a FOLD INVARIANT (UPDATE … WHERE status='pending', rollback-on-zero-rows → Err); no race (campd is single-threaded mio). The schema bump is justified because §5.3.4 adoption needs a DURABLE query.
+- Response::PermissionDecided { ok, request_id, decision } — `decision` is a REQUIRED untagged discriminant, placed BEFORE Interrupt, so it does not shadow cp-1's byte-identical Response::Interrupt (round-trip wire-pin proves both).
+- The §5.3.3 ladder-drains-first property is pinned by a PLATFORM-INDEPENDENT COMPONENT test on the extracted `stall_step` seam — which IS the real production path (event_loop.rs:214-215 is REPLACED with a `stall_step(...)` call; fire_due/declare_stalls MOVE INTO the seam, not duplicated). The fake-worker integration e2e is a macOS-only CONFIRM, explicitly NOT the falsifying guard (its notify-suppression is platform-dependent; inject via the worker's own inherited fd, NEVER a test-side open+write+close, which fires FSEvents).
+- Adoption re-hook rides the FOLD crash-reopen (session_ended on "crashed" reopens the bead unconditionally via claimed_by, fold.rs:1167); the `crash_unanswerable_permission` helper uses key "name" (a "session" key fails loud under deny_unknown_fields) and mirrors the existing "adopt: process not found" append; the adopt-arm kill carries the `woke_actor == "campd"` guard (patrol.rs:1200) for §10 "never kill in the TUI".
+Non-blocking notes to heed during execution:
+1. The component test's `!is_armed` assertion is trivially true regardless of the mutation (fire_due pops fired timers before the drain) — keep the LOAD-BEARING falsifying assertion as zero `agent.stalled`, and fix the imprecise "disarmed by reconcile_blocked/the skip" rationale.
+2. Add the integration-CONFIRM harness helpers (advance_and_pump, is_alive, append_can_use_tool, pump) to daemon_patrol.rs's per-file `impl Daemon`.
+3. The three disarm/skip/re-arm unit guards go INLINE in patrol.rs's `#[cfg(test)] mod tests` (is_armed is `#[cfg(test)] pub`); the two heart-tests + the CONFIRM belong in external daemon_patrol.rs.
+4. Preserve stall_step's loop call-position BEFORE settle (guarded by the pre-existing loop-driven `ladder_exhaustion_emits_and_stops`, not the component test).
+
+### Round 1 status (historical)
+Round 1 REJECT (architecture ruled SOUND; 4 blocking findings, all test-design or wiring, fixed below).
 
 ### Round-1 gate revisions (each verified against the code before fixing)
 - **CP3-B1 (real):** `Response::Interrupt` is `{ok, request_id}` (socket.rs:182-185) in the `#[serde(untagged)]` enum — a bare `PermissionDecided {ok, request_id}` shadows it. FIXED (Task 7): `PermissionDecided { ok, request_id, decision }` — the `decision` key disambiguates untagged resolution; placed BEFORE `Interrupt`; a new wire-pin test proves BOTH round-trip to their own variant.
