@@ -508,8 +508,9 @@ impl ControlRuntime {
         // history is never delivered.
         let subscriber_work = self.subscribers.values().any(|s| match &s.source {
             Source::File(fs) => s.out.is_empty() && (fs.held || fs.scan < fs.tail) && !fs.end_sent,
-            // Source::Fleet(_) added in Task 4 -> false (a fleet fill fully drains
-            // per pump loop or WouldBlocks — no empty-`out`-with-pending state).
+            // A fleet fill fully drains per pump loop or WouldBlocks — no
+            // empty-`out`-with-pending state persists, so no zero-arm is needed.
+            Source::Fleet(_) => false,
         });
 
         let earliest_stall = self
@@ -2601,7 +2602,7 @@ mod tests {
         sub.out.out.clear();
         match &mut sub.source {
             Source::File(fs) => fs.tail = fs.scan,
-            // Source::Fleet(_) => unreachable!() — added in Task 4.
+            Source::Fleet(_) => unreachable!("this test inserts a file subscriber"),
         }
 
         assert_eq!(
@@ -3173,6 +3174,249 @@ mod tests {
             "cp-2 never sets blocked — cp-3 owns the producer"
         );
     }
+
+    /// Drive one fleet subscriber to a quiet point against a fixed model.
+    fn pump_fleet_to_quiet(
+        rt: &mut ControlRuntime,
+        token: Token,
+        conn: &mut Conn,
+        model: &[SessionInfo],
+    ) {
+        for _ in 0..64 {
+            match rt.pump_with_model(token, conn, jiff::Timestamp::now(), model) {
+                PumpOutcome::Ok | PumpOutcome::Gone => break,
+                PumpOutcome::Drop(_) => panic!("unexpected drop"),
+            }
+        }
+    }
+
+    /// Read all currently-available newline JSON frames from a non-blocking client.
+    fn read_frames(client: &std::os::unix::net::UnixStream) -> Vec<serde_json::Value> {
+        use std::io::Read as _;
+        let mut c = client.try_clone().unwrap();
+        c.set_nonblocking(true).unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            match c.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// cp-2 (§4.1): a fresh fleet subscriber gets the SNAPSHOT (one `session` frame
+    /// per live row) then `synced`; a later state change pushes ONE delta frame; a
+    /// departed session pushes a `gone` frame. Driven with no daemon, no timing.
+    #[test]
+    fn fleet_source_emits_snapshot_then_deltas_then_gone() {
+        const T: Token = Token(1);
+        let mut control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (client, mut conn) = control.test_insert_fleet_subscriber(T);
+
+        let row = |name: &str, state: &str| SessionInfo {
+            name: name.into(),
+            agent: "dev".into(),
+            rig: Some("gc".into()),
+            bead: Some("gc-1".into()),
+            state: state.into(),
+            last_activity: "2026-07-14T00:00:00Z".into(),
+            blocked: false,
+        };
+
+        let model = vec![row("camp/dev/1", "working"), row("camp/dev/2", "working")];
+        pump_fleet_to_quiet(&mut control, T, &mut conn, &model);
+        let frames = read_frames(&client);
+        assert_eq!(frames.iter().filter(|f| f["frame"] == "session").count(), 2);
+        assert!(
+            frames.iter().any(|f| f["frame"] == "synced"),
+            "snapshot ends with synced"
+        );
+        assert!(frames.iter().any(|f| f["frame"] == "session"
+            && f["session"]["name"] == "camp/dev/1"
+            && f["session"]["state"] == "working"));
+
+        let model = vec![row("camp/dev/1", "stalled"), row("camp/dev/2", "working")];
+        pump_fleet_to_quiet(&mut control, T, &mut conn, &model);
+        let frames = read_frames(&client);
+        assert_eq!(frames.len(), 1, "only the changed row is pushed");
+        assert_eq!(frames[0]["frame"], "session");
+        assert_eq!(frames[0]["session"]["name"], "camp/dev/1");
+        assert_eq!(frames[0]["session"]["state"], "stalled");
+
+        let model = vec![row("camp/dev/1", "stalled")];
+        pump_fleet_to_quiet(&mut control, T, &mut conn, &model);
+        let frames = read_frames(&client);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["frame"], "gone");
+        assert_eq!(frames[0]["name"], "camp/dev/2");
+        drop(client);
+    }
+
+    /// cp-2 (§4.2): the fleet frame shapes, byte-exact. A rename/reorder in
+    /// FleetSessionFrame/FleetGoneFrame is a wire break and must turn this red.
+    #[test]
+    fn fleet_frame_shapes_are_pinned() {
+        let s = SessionInfo {
+            name: "camp/dev/1".into(),
+            agent: "dev".into(),
+            rig: Some("gc".into()),
+            bead: Some("gc-1".into()),
+            state: "working".into(),
+            last_activity: "2026-07-14T00:00:00Z".into(),
+            blocked: false,
+        };
+        assert_eq!(
+            String::from_utf8(fleet_session_frame(&s)).unwrap(),
+            "{\"frame\":\"session\",\"session\":{\"name\":\"camp/dev/1\",\"agent\":\"dev\",\
+             \"rig\":\"gc\",\"bead\":\"gc-1\",\"state\":\"working\",\
+             \"last_activity\":\"2026-07-14T00:00:00Z\",\"blocked\":false}}\n"
+        );
+        assert_eq!(
+            String::from_utf8(fleet_gone_frame("camp/dev/1")).unwrap(),
+            "{\"frame\":\"gone\",\"name\":\"camp/dev/1\"}\n"
+        );
+        assert_eq!(
+            String::from_utf8(fleet_synced_frame()).unwrap(),
+            "{\"frame\":\"synced\"}\n"
+        );
+    }
+
+    /// cp-2 (§4.4): the cap is a STOP, not a Drop. With the client NOT reading, the
+    /// socket fills and `flush` WouldBlocks; the ONLY thing keeping `out` bounded is
+    /// the `has_room` STOP. Removing it lets `fill` append the whole (unbounded)
+    /// model into `out`.
+    #[test]
+    fn fleet_cap_is_a_stop_and_out_never_exceeds_the_cap() {
+        const T: Token = Token(1);
+        let row = |i: usize| SessionInfo {
+            name: format!("camp/dev/{i}"),
+            agent: "dev".into(),
+            rig: Some("gc".into()),
+            bead: Some("gc-1".into()),
+            state: "working".into(),
+            last_activity: "2026-07-14T00:00:00Z".into(),
+            blocked: false,
+        };
+        let frame_len = fleet_session_frame(&row(1)).len();
+        let cap = frame_len * 2; // room for ~2 frames — far below the model's total
+        let mut control = ControlRuntime::new(cap);
+        let (client, mut conn) = control.test_insert_fleet_subscriber(T);
+        // 300 rows (~60 KiB of frames) >> socket send buffer (~8 KiB) and >> cap, so
+        // once the socket fills, `out` growth is bounded ONLY by the has_room STOP.
+        let model: Vec<SessionInfo> = (0..300).map(row).collect();
+        // DO NOT read the client. A few pumps, all within stall_timeout so no Drop.
+        for _ in 0..4 {
+            assert!(
+                !matches!(
+                    control.pump_with_model(T, &mut conn, jiff::Timestamp::now(), &model),
+                    PumpOutcome::Drop(_)
+                ),
+                "the cap is a STOP, never a Drop"
+            );
+            assert!(
+                control.test_sub(T).out.out.len() <= cap,
+                "out must never exceed the cap while the socket is full — the cap is a STOP \
+                 (out={}, cap={cap})",
+                control.test_sub(T).out.out.len()
+            );
+        }
+        drop(client);
+    }
+
+    /// cp-2 (§4.4): a stalled fleet subscriber is dropped LOUDLY, and the event
+    /// names `"(fleet)"`, not a worker.
+    #[test]
+    fn a_stalled_fleet_subscriber_is_dropped_loudly_naming_fleet() {
+        const T: Token = Token(1);
+        let stall = std::time::Duration::from_millis(50);
+        // cap small so `out` stays non-empty (blocked_since persists) while the
+        // socket is full; stall short so the window is crossed deterministically.
+        let mut control = ControlRuntime::with_stall_timeout(4096, stall);
+        let (client, mut conn) = control.test_insert_fleet_subscriber(T);
+        let row = |i: usize| SessionInfo {
+            name: format!("camp/dev/{i}"),
+            agent: "dev".into(),
+            rig: Some("gc".into()),
+            bead: Some("gc-1".into()),
+            state: "working".into(),
+            last_activity: "2026-07-14T00:00:00Z".into(),
+            blocked: false,
+        };
+        let model: Vec<SessionInfo> = (0..500).map(row).collect();
+        let t0 = jiff::Timestamp::now();
+        // First pump: fills the socket, stamps blocked_since at t0. Client NOT read.
+        let _ = control.pump_with_model(T, &mut conn, t0, &model);
+        // A pump 60ms later — past the 50ms window — drops the peer LOUDLY.
+        let later = t0 + jiff::SignedDuration::from_millis(60);
+        match control.pump_with_model(T, &mut conn, later, &model) {
+            PumpOutcome::Drop(ev) => {
+                assert_eq!(ev.kind, EventType::SubscriberDropped);
+                assert_eq!(
+                    ev.data["session"], "(fleet)",
+                    "a fleet drop names (fleet), not a worker"
+                );
+                assert!(
+                    ev.data["buffered_bytes"].as_u64().unwrap() > 0,
+                    "names the high-water mark"
+                );
+            }
+            _ => panic!("a fleet peer that stopped reading must be dropped loudly"),
+        }
+        drop(client);
+    }
+
+    /// cp-2 (§4.1): two subscribers at different points get different deltas from
+    /// the SAME model — no `sent` leakage, no dropped update for the second.
+    #[test]
+    fn two_fleet_subscribers_diverge_by_their_own_sent_state() {
+        const A: Token = Token(1);
+        const B: Token = Token(2);
+        let mut control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let row = |name: &str| SessionInfo {
+            name: name.into(),
+            agent: "dev".into(),
+            rig: Some("gc".into()),
+            bead: Some("gc-1".into()),
+            state: "working".into(),
+            last_activity: "2026-07-14T00:00:00Z".into(),
+            blocked: false,
+        };
+
+        // A catches up on a ONE-session model and drains its snapshot.
+        let (ca, mut conna) = control.test_insert_fleet_subscriber(A);
+        let m1 = vec![row("camp/dev/1")];
+        pump_fleet_to_quiet(&mut control, A, &mut conna, &m1);
+        let _ = read_frames(&ca);
+
+        // B subscribes now; BOTH pumped against a TWO-session model.
+        let (cb, mut connb) = control.test_insert_fleet_subscriber(B);
+        let m2 = vec![row("camp/dev/1"), row("camp/dev/2")];
+        pump_fleet_to_quiet(&mut control, A, &mut conna, &m2);
+        pump_fleet_to_quiet(&mut control, B, &mut connb, &m2);
+
+        let fa = read_frames(&ca);
+        let fb = read_frames(&cb);
+        // A already had dev/1 -> ONLY dev/2 is new (no re-send of dev/1).
+        assert_eq!(fa.iter().filter(|f| f["frame"] == "session").count(), 1);
+        assert_eq!(
+            fa.iter().find(|f| f["frame"] == "session").unwrap()["session"]["name"],
+            "camp/dev/2"
+        );
+        // B is fresh -> the FULL snapshot: both sessions + synced.
+        assert_eq!(fb.iter().filter(|f| f["frame"] == "session").count(), 2);
+        assert!(fb.iter().any(|f| f["frame"] == "synced"));
+        drop(ca);
+        drop(cb);
+    }
 }
 
 // ===========================================================================
@@ -3506,7 +3750,7 @@ impl OutBuf {
 /// `Fleet`. The `OutBuf` is source-agnostic; the SOURCE is what differs.
 pub enum Source {
     File(FileSource),
-    // Fleet(FleetSource) is added in Task 4.
+    Fleet(FleetSource),
 }
 
 /// cp-1's byte-cursor tailer, unchanged. One worker's stdout FILE, delivered
@@ -3592,7 +3836,7 @@ impl Subscriber {
     fn file(&self) -> &FileSource {
         match &self.source {
             Source::File(fs) => fs,
-            // Source::Fleet(_) => panic!("test_sub used on a non-file subscriber") — added in Task 4
+            Source::Fleet(_) => panic!("test_sub used on a non-file subscriber"),
         }
     }
 }
@@ -3825,6 +4069,122 @@ impl FileSource {
     }
 }
 
+#[derive(Serialize)]
+struct FleetSessionFrame<'a> {
+    frame: &'static str,
+    session: &'a SessionInfo,
+}
+#[derive(Serialize)]
+struct FleetGoneFrame<'a> {
+    frame: &'static str,
+    name: &'a str,
+}
+
+fn fleet_session_frame(s: &SessionInfo) -> Vec<u8> {
+    let mut line = serde_json::to_string(&FleetSessionFrame {
+        frame: "session",
+        session: s,
+    })
+    .unwrap_or_else(|_| String::from("{\"frame\":\"session\"}"));
+    line.push('\n');
+    line.into_bytes()
+}
+fn fleet_gone_frame(name: &str) -> Vec<u8> {
+    let mut line = serde_json::to_string(&FleetGoneFrame {
+        frame: "gone",
+        name,
+    })
+    .unwrap_or_else(|_| String::from("{\"frame\":\"gone\"}"));
+    line.push('\n');
+    line.into_bytes()
+}
+fn fleet_synced_frame() -> Vec<u8> {
+    b"{\"frame\":\"synced\"}\n".to_vec()
+}
+
+/// The LEDGER/model-sourced half of a subscription. It holds no file — its
+/// "cursor" is the by-name snapshot `sent` it last delivered, which is why the
+/// §4.4 cap-STOP here is "leave `sent` unchanged for an un-emitted row" (the
+/// model is recomputable next wake) rather than "hold the line in `partial`".
+pub struct FleetSource {
+    sent: HashMap<String, SessionInfo>,
+    synced: bool,
+}
+
+impl FleetSource {
+    fn new() -> FleetSource {
+        FleetSource {
+            sent: HashMap::new(),
+            synced: false,
+        }
+    }
+
+    /// Diff `model` against `sent`, emitting the delta into `out` and STOPPING at
+    /// the cap. NON-TERMINAL always — a fleet subscription only ends on client
+    /// detach or campd shutdown.
+    fn fill(
+        &mut self,
+        out: &mut OutBuf,
+        cap: usize,
+        model: &[SessionInfo],
+        pending_events: &mut Vec<EventInput>,
+    ) {
+        // (1) added / changed rows.
+        for s in model {
+            if self.sent.get(&s.name) == Some(s) {
+                continue;
+            }
+            let frame = fleet_session_frame(s);
+            // Fail LOUD, never silent-livelock: a single frame that cannot fit an
+            // EMPTY cap would stall forever (invariant 5). Unreachable in practice
+            // (a SessionInfo frame is < 1 KiB, cap default 1 MiB) — HANDLED, not
+            // assumed: report it and advance `sent` so the snapshot completes.
+            if frame.len() > cap {
+                pending_events.push(degraded_event(
+                    &s.name,
+                    format!(
+                        "fleet: a session frame of {} bytes exceeds the subscriber buffer cap \
+                         ({cap} bytes) and was SKIPPED for subscriber delivery",
+                        frame.len()
+                    ),
+                ));
+                self.sent.insert(s.name.clone(), s.clone());
+                continue;
+            }
+            if !out.has_room(frame.len(), cap) {
+                return; // R1 cap-STOP: `sent` unchanged; resumed next fill.
+            }
+            out.append(&frame);
+            self.sent.insert(s.name.clone(), s.clone());
+        }
+        // (2) departed rows: in `sent` but not in `model`.
+        let live: HashSet<&str> = model.iter().map(|s| s.name.as_str()).collect();
+        let goners: Vec<String> = self
+            .sent
+            .keys()
+            .filter(|n| !live.contains(n.as_str()))
+            .cloned()
+            .collect();
+        for name in goners {
+            let frame = fleet_gone_frame(&name);
+            if !out.has_room(frame.len(), cap) {
+                return;
+            }
+            out.append(&frame);
+            self.sent.remove(&name);
+        }
+        // (3) the snapshot terminator, once.
+        if !self.synced {
+            let frame = fleet_synced_frame();
+            if !out.has_room(frame.len(), cap) {
+                return;
+            }
+            out.append(&frame);
+            self.synced = true;
+        }
+    }
+}
+
 fn degraded_event(session: &str, error: String) -> EventInput {
     EventInput {
         kind: EventType::PatrolDegraded,
@@ -3841,7 +4201,7 @@ fn degraded_event(session: &str, error: String) -> EventInput {
 fn subscriber_dropped_event(sub: &Subscriber, cap: usize) -> EventInput {
     let session = match &sub.source {
         Source::File(fs) => fs.session.clone(),
-        // Source::Fleet(_) arm added in Task 4 -> "(fleet)".to_owned()
+        Source::Fleet(_) => "(fleet)".to_owned(),
     };
     EventInput {
         kind: EventType::SubscriberDropped,
@@ -3873,9 +4233,8 @@ fn pump_subscriber(
     stall_timeout: Duration,
     pending_events: &mut Vec<EventInput>,
     degraded_seen: &mut HashSet<(String, u64)>,
-    fleet_model: &[SessionInfo], // Task 4 uses it; File ignores it
+    fleet_model: &[SessionInfo], // the Fleet arm diffs against it; File ignores it
 ) -> PumpOutcome {
-    let _ = fleet_model; // Task 1: File-only; Task 4 wires the Fleet arm.
     // G1: the per-CALL scan budget. Reset ONCE here, PERSISTS across every
     // FILL→FLUSH→re-FILL below — this is what bounds work per wake. Making it
     // local to `fill` would reset it per re-fill and break the bound.
@@ -3890,7 +4249,10 @@ fn pump_subscriber(
                 pending_events,
                 degraded_seen,
             ),
-            // Source::Fleet(_) arm added in Task 4 (it ignores `scanned`).
+            Source::Fleet(fleet) => {
+                fleet.fill(&mut sub.out, cap, fleet_model, pending_events);
+                false // never terminal
+            }
         };
         if sub.out.is_empty() {
             // Nothing to write. A TERMINAL file source with an empty out has
@@ -4045,7 +4407,8 @@ impl ControlRuntime {
                     // the authoritative value immediately after.
                     None => {}
                 },
-                // Source::Fleet(_) => {} — no tail; added in Task 4.
+                // A fleet source has no tail to refresh.
+                Source::Fleet(_) => {}
             }
             let Some(conn) = conns.get_mut(&token) else {
                 gone.push(token);
@@ -4156,7 +4519,9 @@ impl ControlRuntime {
                         // two agree. It stays because the ordering it relies on is a property
                         // of the event loop, not of this function — but do not call it tested.
                         fs.tail = d.final_offset;
-                    } // Source::Fleet(_) => {} — not tied to a disposed session; added in Task 4.
+                    }
+                    // A fleet subscriber is not tied to a disposed session.
+                    Source::Fleet(_) => {}
                 }
                 let Some(conn) = conns.get_mut(&token) else {
                     gone.push(token);
@@ -4266,5 +4631,57 @@ impl ControlRuntime {
     #[cfg(test)]
     fn test_sub(&self, token: Token) -> &Subscriber {
         &self.subscribers[&token]
+    }
+
+    /// Insert a FLEET subscriber directly over a `UnixStream::pair()`, so the
+    /// model-diff pump can be driven with NO daemon and NO ledger.
+    pub fn test_insert_fleet_subscriber(
+        &mut self,
+        token: Token,
+    ) -> (std::os::unix::net::UnixStream, Conn) {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let conn = Conn {
+            stream: mio::net::UnixStream::from_std(server),
+            buf: Vec::new(),
+        };
+        self.next_subscription += 1;
+        self.subscribers.insert(
+            token,
+            Subscriber {
+                id: format!("fleet-{}", self.next_subscription),
+                out: OutBuf::new(),
+                source: Source::Fleet(FleetSource::new()),
+            },
+        );
+        (client, conn)
+    }
+
+    /// Drive ONE subscriber's pump against an explicit fleet model at an explicit
+    /// `now` (production supplies the model through `fanout`; this is the unit
+    /// entry, and `now` is explicit so stall-window tests are deterministic).
+    pub fn pump_with_model(
+        &mut self,
+        token: Token,
+        conn: &mut Conn,
+        now: Timestamp,
+        model: &[SessionInfo],
+    ) -> PumpOutcome {
+        let cap = self.subscriber_buffer_bytes;
+        let stall = self.stall_timeout;
+        let Some(sub) = self.subscribers.get_mut(&token) else {
+            return PumpOutcome::Gone;
+        };
+        pump_subscriber(
+            sub,
+            conn,
+            now,
+            cap,
+            stall,
+            &mut self.pending_events,
+            &mut self.degraded_seen,
+            model,
+        )
     }
 }
