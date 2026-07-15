@@ -460,6 +460,66 @@ impl Ledger {
         Ok(self.session_rows("s.name = ?1", [name])?.into_iter().next())
     }
 
+    /// cp-3 (§5.3): LIVE sessions with an undecided permission request — what
+    /// `BLOCKED` renders, what the dispatch-slot exemption subtracts, and what
+    /// the adoption kill scans. The join with `sessions.status='live'` keeps a
+    /// decided-then-ended session (whose pending row may linger for the record)
+    /// out.
+    pub fn blocked_sessions(&self) -> Result<Vec<String>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT p.session
+               FROM permissions p JOIN sessions s ON p.session = s.name
+              WHERE p.status = 'pending' AND s.status = 'live'
+              ORDER BY p.session",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// cp-3 (§2.3): any row (pending or decided) for `request_id`. The `ingest`
+    /// dedup guard — campd never appends a second `permission.pending` for a
+    /// request the ledger already carries.
+    pub fn permission_exists(&self, request_id: &str) -> Result<bool, CoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM permissions WHERE request_id = ?1)",
+            [request_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// cp-3 (§9): `decided_by` if the request is decided, else `None`. Drives
+    /// the "already decided by X" response a losing decider receives.
+    pub fn permission_decider(&self, request_id: &str) -> Result<Option<String>, CoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT decided_by FROM permissions WHERE request_id = ?1 AND status = 'decided'",
+                [request_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// cp-3 (§5.3.4): the `request_id` of a live pending permission for a
+    /// session — the adoption kill + steady-state non-child kill lookup. `None`
+    /// when the session has no undecided request.
+    pub fn pending_permission_for_session(
+        &self,
+        session: &str,
+    ) -> Result<Option<String>, CoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT request_id FROM permissions WHERE session = ?1 AND status = 'pending' LIMIT 1",
+                [session],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
     /// Shared body of `live_sessions` / `session_by_name`: registry rows
     /// matching `where_clause` (a fixed, camp-authored predicate — values
     /// always arrive through `params`, never interpolated), each joined

@@ -103,6 +103,17 @@ pub enum EventType {
     /// because camp truncates gc's continuation loop: one bead per session, no
     /// assigned work remaining at ack). Audit-only — no state fold. `{session}`.
     WorkerDrainAcked,
+    /// cp-3 (control-plane §5.3): a worker asked permission to use a tool and
+    /// is now BLOCKED awaiting an operator decision. Folds a `permissions` row
+    /// (`{session, request_id, tool_name}`).
+    PermissionPending,
+    /// cp-3 (§5.3/§9): an operator answered a `permission.pending`. Folds the
+    /// row to `decided`; a second decision for the same request is REFUSED
+    /// (first-answer-wins, a fold invariant). `decided_by` records who.
+    PermissionDecided,
+    /// cp-3 (§5.3.2): the count of BLOCKED sessions crossed `max_blocked` —
+    /// a loud, operator-visible saturation fault. Audit-only — no state fold.
+    PermissionSaturated,
 }
 
 impl EventType {
@@ -145,6 +156,9 @@ impl EventType {
         EventType::FormulaRefused,
         EventType::ShimRefused,
         EventType::WorkerDrainAcked,
+        EventType::PermissionPending,
+        EventType::PermissionDecided,
+        EventType::PermissionSaturated,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -187,6 +201,9 @@ impl EventType {
             EventType::FormulaRefused => "formula.refused",
             EventType::ShimRefused => "shim.refused",
             EventType::WorkerDrainAcked => "worker.drain_acked",
+            EventType::PermissionPending => "permission.pending",
+            EventType::PermissionDecided => "permission.decided",
+            EventType::PermissionSaturated => "permission.saturated",
         }
     }
 
@@ -341,6 +358,23 @@ mod tests {
         for (variant, name) in [
             (EventType::ShimRefused, "shim.refused"),
             (EventType::WorkerDrainAcked, "worker.drain_acked"),
+        ] {
+            assert_eq!(variant.as_str(), name);
+            assert_eq!(EventType::parse(name).unwrap(), variant);
+            assert!(EventType::ALL.contains(&variant));
+            assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&name));
+            assert!(!crate::vocab::GC_MIRRORED_EVENTS.contains(&name));
+        }
+    }
+
+    #[test]
+    fn permission_events_roundtrip_and_are_camp_specific() {
+        // cp-3 (control-plane §5.3/§9). gc's registry carries no `permission.*`
+        // event, so all three are additive (invariant 7).
+        for (variant, name) in [
+            (EventType::PermissionPending, "permission.pending"),
+            (EventType::PermissionDecided, "permission.decided"),
+            (EventType::PermissionSaturated, "permission.saturated"),
         ] {
             assert_eq!(variant.as_str(), name);
             assert_eq!(EventType::parse(name).unwrap(), variant);

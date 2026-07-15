@@ -66,6 +66,15 @@ const STATE_TABLES: &[TableSpec] = &[
         cols: "prefix, high",
         key: "prefix",
     },
+    // cp-3 (§5.3): the permission plane. No FK to sessions, so placement is
+    // free; every column is listed so the EXCEPT-both-ways diff observes a
+    // divergent decision/decided_by/status.
+    TableSpec {
+        name: "permissions",
+        cols: "request_id, session, tool_name, status, decision, decided_by, \
+               requested_ts, decided_ts",
+        key: "request_id",
+    },
 ];
 
 impl Ledger {

@@ -1,4 +1,4 @@
-//! Schema v3 for camp.db (spec §7.1/§7.4). One WAL-mode SQLite file: the
+//! Schema v4 for camp.db (spec §7.1/§7.4). One WAL-mode SQLite file: the
 //! append-only `events` table (history + bus) plus the state tables that are
 //! a fold of it. All tables are STRICT; opening a db with a different schema
 //! version is a hard error — no auto-upgrade in v1: the operator re-inits
@@ -11,7 +11,7 @@ use rusqlite::Connection;
 
 use crate::error::CoreError;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// State tables only — everything `refold` rebuilds from the event log.
 /// (`cursors` is consumer bookkeeping, `meta`/`events` are not fold-derived.)
@@ -85,6 +85,23 @@ CREATE TABLE counters (
   prefix TEXT PRIMARY KEY,
   high   INTEGER NOT NULL
 ) STRICT;
+
+-- cp-3 (control-plane §5.3): permission requests and their decisions.
+-- `status='pending'` on a LIVE session is what `BLOCKED` renders and what the
+-- adoption kill and the dispatch-slot exemption query. A `decided` row is the
+-- durable record of who allowed what (§9). request_id is the CLI-minted id
+-- (no `camp-` prefix), unique per request.
+CREATE TABLE permissions (
+  request_id   TEXT PRIMARY KEY,
+  session      TEXT NOT NULL,
+  tool_name    TEXT NOT NULL,
+  status       TEXT NOT NULL CHECK (status IN ('pending','decided')),
+  decision     TEXT CHECK (decision IN ('allow','allow_always','deny')),
+  decided_by   TEXT,
+  requested_ts TEXT NOT NULL,
+  decided_ts   TEXT
+) STRICT;
+CREATE INDEX permissions_session_status ON permissions(session, status);
 "#;
 
 const FULL_DDL_PREFIX: &str = r#"
@@ -92,7 +109,7 @@ CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 ) STRICT;
-INSERT INTO meta (key, value) VALUES ('schema_version', '3');
+INSERT INTO meta (key, value) VALUES ('schema_version', '4');
 
 CREATE TABLE events (
   seq   INTEGER PRIMARY KEY AUTOINCREMENT,
