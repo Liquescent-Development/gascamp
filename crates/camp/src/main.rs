@@ -6,6 +6,7 @@ mod gitignore;
 mod service;
 mod cmd {
     pub mod adopt;
+    pub mod attach;
     pub mod backup;
     pub mod claim;
     pub mod close;
