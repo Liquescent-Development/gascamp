@@ -164,20 +164,43 @@ fn gate_core_flags_match_build_spec_held_stream_arm() {
         "expected exactly one HeldStream match arm in spawn.rs"
     );
     let start = SPAWN_RS.find(ARM).unwrap() + ARM.len();
-    let body = &SPAWN_RS[start..];
-    let body = &body[..body.find('}').expect("HeldStream arm closes")];
-    // Truncating at the first '}' is only correct while the arm is brace-free:
-    // a nested block would end the scan early and silently drop trailing
-    // flags. Turn that future edit into a loud failure instead.
-    assert!(
-        !body.contains('{'),
-        "the HeldStream arm grew a nested block — teach this parser brace \
-         depth before trusting its flag extraction"
-    );
-    let builder_flags: Vec<&str> = body
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("arg(\"")?.strip_suffix("\");"))
-        .collect();
+    let after = &SPAWN_RS[start..];
+    // Brace-depth scan (the arm is no longer brace-free — cp-4 added a
+    // conditional `if include_partial_messages { arg("--include-partial-messages"); }`
+    // block). We collect the arm's UNCONDITIONAL CORE flags — `arg(..)` calls at
+    // depth 0 — and stop at the arm's matching close brace. A flag nested in a
+    // conditional block is spawn-time-optional (attach-only, §2.2), NOT part of
+    // the always-on core this differential gate validates against real claude, so
+    // depth-> 0 arg() calls are intentionally excluded.
+    let mut depth: i32 = 0;
+    let mut builder_flags: Vec<&str> = Vec::new();
+    for line in after.lines() {
+        let trimmed = line.trim();
+        if depth == 0
+            && let Some(flag) = trimmed
+                .strip_prefix("arg(\"")
+                .and_then(|s| s.strip_suffix("\");"))
+        {
+            builder_flags.push(flag);
+        }
+        let mut closed = false;
+        for c in line.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        closed = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if closed {
+            break; // the arm's matching close brace — stop the scan
+        }
+    }
     assert!(
         !builder_flags.is_empty(),
         "parsed no arg(..) calls from the HeldStream arm — parser drifted from the source shape"
