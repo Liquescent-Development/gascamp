@@ -1592,11 +1592,13 @@ mod tests {
 
     /// The `COALESCE(?2, work_branch)` in `bead_claimed` PROTECTS a pre-existing
     /// `work_branch` when a claim carries none (camp's own `camp claim`). This
-    /// is unreachable through `Ledger::append` alone — an OPEN bead never has a
-    /// `work_branch` (the only writers are the claim itself and a shipped close,
-    /// both of which leave the bead non-open), so the guard's job only shows on
-    /// a directly-seeded column. We seed it here (in-crate `conn` access) to
-    /// exercise the branch the integration test structurally cannot.
+    /// seeds the column directly (in-crate `conn` access) — the CLEAREST, most
+    /// direct way to exercise the guard in isolation, one event away from the
+    /// UPDATE. (The state is ALSO reachable through the public API via a
+    /// crash-reopen — claim-with-branch → SessionCrashed reopens the bead
+    /// WITHOUT clearing work_branch → branch-less re-claim — which the
+    /// integration test `claim_invariant::claim_after_crash_reopen_preserves_the_work_branch`
+    /// drives end to end.)
     ///
     /// Mutation caught: `work_branch = ?2` (drop the COALESCE) — it would write
     /// NULL over the seeded `camp/pre`, so `gc.work_branch` disappears → RED.

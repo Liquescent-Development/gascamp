@@ -104,11 +104,10 @@ fn claim_without_work_branch_succeeds_and_stamps_no_branch() {
     //
     // NOTE: this does NOT catch the `work_branch = ?2` (COALESCE-dropped)
     // mutation — on a FRESH bead the column is already NULL, so writing NULL is
-    // indistinguishable from leaving it absent. That mutant is EQUIVALENT on
-    // every state reachable through `Ledger::append` (an open bead never
-    // carries a work_branch), so it is killed only by the directly-seeded
-    // in-crate test `fold::tests::claim_with_no_branch_preserves_a_pre_existing_\
-    // work_branch_coalesce`. This test guards the no-error / no-stamp behavior.
+    // indistinguishable from leaving it absent. The mutation is killed by
+    // `claim_after_crash_reopen_preserves_the_work_branch` below (which reaches
+    // an open bead that ALREADY carries a work_branch) and by the seeded
+    // in-crate `fold::tests::claim_with_no_branch_preserves_a_pre_existing_work_branch_coalesce`.
     let (dir, mut ledger) = temp_ledger();
     cook_one_step_routed_to(dir.path(), &mut ledger, "gc.publisher");
 
@@ -131,6 +130,91 @@ fn claim_without_work_branch_succeeds_and_stamps_no_branch() {
         !meta.contains_key("gc.work_branch"),
         "a claim with no work_branch must not stamp the column"
     );
+}
+
+#[test]
+fn claim_after_crash_reopen_preserves_the_work_branch() {
+    // A REACHABLE public-API path to an open bead that already carries a
+    // work_branch: claim it WITH a branch, crash its session (SessionCrashed
+    // reopens the bead — status='open', claimed_by=NULL — but does NOT clear
+    // work_branch), then re-claim WITHOUT a branch. The COALESCE must preserve
+    // the surviving branch.
+    //
+    // Mutation caught: `work_branch = ?2` (COALESCE dropped) — the branch-less
+    // re-claim would then write NULL over the surviving `camp/gc-2` → the
+    // projection loses gc.work_branch → RED.
+    let (dir, mut ledger) = temp_ledger();
+    cook_one_step_routed_to(dir.path(), &mut ledger, "gc.publisher");
+
+    // A live session on the bead (SessionCrashed only reopens a session it can
+    // find as "live").
+    ledger
+        .append(EventInput {
+            kind: EventType::SessionWoke,
+            rig: Some("gascity".into()),
+            actor: "campd".into(),
+            bead: Some("gc-2".into()),
+            data: serde_json::json!({
+                "name": "t/gc.publisher/1",
+                "agent": "gc.publisher",
+                "rig": "gascity",
+                "bead": "gc-2",
+            }),
+        })
+        .unwrap();
+
+    // First claim carries the dispatch branch (the gc-shim/B1 path).
+    ledger
+        .append(EventInput {
+            kind: EventType::BeadClaimed,
+            rig: None,
+            actor: "gc-shim".into(),
+            bead: Some("gc-2".into()),
+            data: serde_json::json!({ "session": "t/gc.publisher/1", "work_branch": "camp/gc-2" }),
+        })
+        .unwrap();
+
+    // The worker crashes: the bead reopens, the branch SURVIVES the reopen.
+    ledger
+        .append(EventInput {
+            kind: EventType::SessionCrashed,
+            rig: None,
+            actor: "campd".into(),
+            bead: Some("gc-2".into()),
+            data: serde_json::json!({ "name": "t/gc.publisher/1", "reason": "worker exited" }),
+        })
+        .unwrap();
+    let reopened = ledger.get_bead("gc-2").unwrap().unwrap();
+    assert_eq!(reopened.status, "open", "crash reopens the bead");
+    assert!(reopened.claimed_by.is_none());
+    assert_eq!(
+        ledger
+            .bead_metadata("gc-2")
+            .unwrap()
+            .get("gc.work_branch")
+            .map(String::as_str),
+        Some("camp/gc-2"),
+        "the reopen must not clear work_branch (the premise of this test)"
+    );
+
+    // Re-dispatch: a fresh session re-claims the open bead WITHOUT a branch.
+    ledger
+        .append(EventInput {
+            kind: EventType::BeadClaimed,
+            rig: None,
+            actor: "cli".into(),
+            bead: Some("gc-2".into()),
+            data: serde_json::json!({ "session": "t/gc.publisher/2" }),
+        })
+        .unwrap();
+
+    let meta = ledger.bead_metadata("gc-2").unwrap();
+    assert_eq!(
+        meta.get("gc.work_branch").map(String::as_str),
+        Some("camp/gc-2"),
+        "COALESCE must preserve the surviving work_branch across a branch-less re-claim"
+    );
+    assert!(ledger.refold_check().unwrap().drift.is_empty());
 }
 
 #[test]
