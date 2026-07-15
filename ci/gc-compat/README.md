@@ -26,6 +26,8 @@ The corpus is **never vendored** (compat §10). CI fetches it at the ref.
 | `camp_corpus_validate.go` | Compiles camp's own `valid/` fixtures with the **real gc compiler**. | Camp accepting something gc rejects — invariant 6, broken. |
 | `check_vocab.sh` | Event names vs gc's vocabulary. | A camp event that silently redefines a gc one (invariant 7). |
 | `load_corpus_packs.py` | compat-1: the pack/agent/import loader. | A loader that refuses every real pack. |
+| `e2e_corpus.py` | compat-2: cooks and RUNS two imported corpus formulas against a fake agent. | A pinned-formula round-trip dead in every run; an unrouted or misrouted dispatch. |
+| `worker_contract.py` | compat-3 (§14): renders the **REAL `gc-role-worker` fragment** and runs its own bash claim protocol against camp's `.camp/bin/gc`/`bd` shims + a lingering fake claude. Asserts claim → close → drain-ack → **campd reaps the worker** within a deadline, on the happy AND fail-close branches. Also re-derives `fixtures/gc-role-worker.observed.json` and fails on drift. | A shim that refuses a verb the fragment needs (the worker HANGS — the deadline catches it); a drain-ack→KillReleased regression (the lingering worker sleeps past the deadline); a moved corpus that changed the fragment's contract. |
 
 ### `formula_gate.py`'s three assertions
 
@@ -62,6 +64,14 @@ of it in **ONE PR**:
 5. **Update the compat spec's §9 addendum** — it hard-codes 95 / 65 / the rung
    ladder into the spec as measured fact. A spec that disagrees with the gate is
    worse than no spec.
+6. **Re-run `worker_contract.py`** (compat-3 §14). It re-derives the
+   `gc-role-worker` fragment's static verb set + hook JSON fields from the moved
+   corpus and fails on drift against `fixtures/gc-role-worker.observed.json`. If
+   the fragment changed its verbs, its `python3` field parsing, or its exit
+   contract, **re-run Task 1's measurement** (build the shim, drive the fragment
+   on all branches) and update the fixture — do NOT hand-edit it to pass. A new
+   verb on the claim→close→drain path that phase-3 does not serve is a scope
+   escalation, not a chore (it would HANG a real worker).
 
 ## The counting rules (an ambiguous metric invites tuning until it agrees)
 

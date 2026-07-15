@@ -49,6 +49,22 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "import.added",
     "import.refused",
     "formula.refused",
+    // compat §6 (worker contract). Both additive; neither is a gc name nor a
+    // prefix-truncation of one (B4):
+    //   `shim.refused` — a shim was handed a verb/flag camp does not serve.
+    //     Follows the merged `import.refused`/`formula.refused` precedent; gc
+    //     has no `shim.*` name.
+    //   `worker.drain_acked` — camp's release trigger. gc's registry carries
+    //     `session.drain_acked_with_assigned_work`, `session.draining`,
+    //     `session.undrained`, but camp's is a DISTINCT concept: camp truncates
+    //     gc's continuation loop (§6.2), so a worker is one-bead-per-session and
+    //     has NO assigned work remaining at drain-ack — this is campd's internal
+    //     RELEASE TRIGGER, not gc's session-still-holding-work STATE. The
+    //     `worker.*` namespace is camp's (`worker.milestone`); gc's only
+    //     `worker.*` name is `worker.operation`, so `worker.drain_acked` is
+    //     neither a gc name nor a prefix-truncation of one.
+    "shim.refused",
+    "worker.drain_acked",
 ];
 
 /// Values `bead.closed` accepts for `outcome` — a strict subset of gc's

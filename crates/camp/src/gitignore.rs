@@ -33,7 +33,7 @@ const RUNTIME_FILES: &[&str] = &[
 /// capture, and camp-managed git worktrees (spec §7.1). All generated at
 /// runtime — never source. (`formulas/`, human-authored, is intentionally
 /// absent: it stays tracked alongside `camp.toml`.)
-const RUNTIME_DIRS: &[&str] = &["runs", "sessions", "worktrees", "imports"];
+const RUNTIME_DIRS: &[&str] = &["runs", "sessions", "worktrees", "imports", "bin"];
 
 /// Header line so a human reading `.gitignore` knows what the block is and why
 /// `camp.toml` is deliberately excluded from it.
@@ -206,6 +206,16 @@ mod tests {
             "existing entry not duplicated: {out}"
         );
         assert_eq!(out.matches("/.camp/campd.log\n").count(), 1);
+    }
+
+    #[test]
+    fn bin_is_a_runtime_dir() {
+        // compat §6.3: `.camp/bin` holds the generated gc/bd shims and must be
+        // gitignored like every other runtime dir.
+        assert!(
+            RUNTIME_DIRS.contains(&"bin"),
+            "the shim bindir must be gitignored (§6.3)"
+        );
     }
 
     #[test]

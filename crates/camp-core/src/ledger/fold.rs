@@ -61,6 +61,12 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         // state, owned by `camp import`).
         EventType::ImportAdded | EventType::ImportRefused => Ok(()),
         EventType::FormulaRefused => formula_refused(event),
+        // compat §6 (worker contract): AUDIT-ONLY — durable truth, no state
+        // fold. The `deny_unknown_fields` parse IS the append-time validation
+        // (never a bare `=> Ok(())` that would drop it, B7). A malformed shim
+        // event is refused at append, not stored and replayed forever.
+        EventType::ShimRefused => audit::<ShimRefused>(event),
+        EventType::WorkerDrainAcked => audit::<WorkerDrainAcked>(event),
     }
 }
 
@@ -268,6 +274,13 @@ use crate::vocab::{CAMP_FINAL_DISPOSITIONS, CAMP_OUTCOMES, CAMP_RUN_DISPOSITIONS
 #[serde(deny_unknown_fields)]
 struct BeadClaimed {
     session: String,
+    /// compat §6.1 — the dispatch branch, projected as `gc.work_branch`
+    /// (`beads.work_branch`). The route is NOT here: cook owns `beads.assignee`
+    /// (= `gc.routed_to`) and the claim must not re-derive it from `GC_AGENT`
+    /// env (round-1 B1). `None` (camp's own `camp claim`) leaves the column
+    /// untouched.
+    #[serde(default)]
+    work_branch: Option<String>,
 }
 
 fn bead_claimed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
@@ -276,10 +289,15 @@ fn bead_claimed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     match bead_status(conn, id)?.as_deref() {
         None => Err(CoreError::UnknownBead(id.to_owned())),
         Some("open") => {
+            // `assignee` (the cooked route → `gc.routed_to`) is deliberately
+            // NOT in this UPDATE — cook owns it. `COALESCE` leaves work_branch
+            // untouched when the claim carries none.
             conn.execute(
-                "UPDATE beads SET status = 'in_progress', claimed_by = ?1, updated_ts = ?2
-                 WHERE id = ?3",
-                params![p.session, event.ts, id],
+                "UPDATE beads SET status = 'in_progress', claimed_by = ?1,
+                                  work_branch = COALESCE(?2, work_branch),
+                                  updated_ts = ?3
+                 WHERE id = ?4",
+                params![p.session, p.work_branch, event.ts, id],
             )?;
             // Phase 3 (#48 finding 2): a claim means the work is under way
             // — the fail-fast dispatch marker no longer describes reality.
@@ -1407,6 +1425,30 @@ struct SubscriberDropped {
     cap_bytes: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // PERMANENT: audit-only — see SessionInterrupted.
+struct ShimRefused {
+    /// The pack binding + qualified agent the refusing worker belongs to, when
+    /// campd exported them (`$GC_TEMPLATE`/`$GC_AGENT`). Optional: an
+    /// unattributable refusal is still worth recording.
+    #[serde(default)]
+    binding: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+    /// The refused verb (e.g. `bd mol`) — NAMED so the ledger tells the whole
+    /// story (invariant 3, §6).
+    verb: String,
+    detail: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // PERMANENT: audit-only — see SessionInterrupted.
+struct WorkerDrainAcked {
+    session: String,
+}
+
 /// `control.failed` (§2.1): a control request campd could not complete.
 /// Audit-only, but `cause` is validated against the closed set — an event
 /// carrying a cause nothing can route is worse than no event at all.
@@ -1432,4 +1474,174 @@ fn control_failed(event: &Event) -> Result<(), CoreError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use crate::clock::FixedClock;
+    use crate::event::{EventInput, EventType};
+    use crate::ledger::Ledger;
+
+    fn temp_ledger() -> (tempfile::TempDir, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open_with_clock(
+            &dir.path().join("camp.db"),
+            Box::new(FixedClock::new("2026-07-05T21:14:03Z")),
+        )
+        .unwrap();
+        (dir, ledger)
+    }
+
+    /// The audit arm VALIDATES: an unknown field is refused AT APPEND
+    /// (`deny_unknown_fields`) and nothing is stored.
+    ///
+    /// Mutation caught: routing `EventType::ShimRefused` to a bare `=> Ok(())`
+    /// (which would accept the malformed event and replay it forever).
+    #[test]
+    fn shim_refused_with_an_unknown_field_is_refused_at_append() {
+        let (_dir, mut ledger) = temp_ledger();
+        let err = ledger
+            .append(EventInput {
+                kind: EventType::ShimRefused,
+                rig: None,
+                actor: "gc-shim".into(),
+                bead: None,
+                data: serde_json::json!({"verb": "x", "detail": "y", "bogus": 1}),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::CoreError::InvalidEventData { .. }),
+            "unexpected error: {err:?}"
+        );
+        // Rejections appended nothing: the transaction rolled back.
+        assert!(
+            ledger
+                .events_of_type(EventType::ShimRefused)
+                .unwrap()
+                .is_empty(),
+            "a refused event must not be stored"
+        );
+    }
+
+    /// A well-formed `shim.refused` (with the optional binding/agent absent)
+    /// appends; the arm is not rejecting valid events.
+    #[test]
+    fn shim_refused_well_formed_appends() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(EventInput {
+                kind: EventType::ShimRefused,
+                rig: None,
+                actor: "gc-shim".into(),
+                bead: None,
+                data: serde_json::json!({"verb": "bd mol", "detail": "unknown verb"}),
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.events_of_type(EventType::ShimRefused).unwrap().len(),
+            1
+        );
+    }
+
+    /// Same validation guard on the other new audit arm.
+    #[test]
+    fn worker_drain_acked_with_an_unknown_field_is_refused_at_append() {
+        let (_dir, mut ledger) = temp_ledger();
+        let err = ledger
+            .append(EventInput {
+                kind: EventType::WorkerDrainAcked,
+                rig: None,
+                actor: "gc-shim".into(),
+                bead: None,
+                data: serde_json::json!({"session": "t/gc.publisher/1", "bogus": true}),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::CoreError::InvalidEventData { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            ledger
+                .events_of_type(EventType::WorkerDrainAcked)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn worker_drain_acked_well_formed_appends() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(EventInput {
+                kind: EventType::WorkerDrainAcked,
+                rig: None,
+                actor: "gc-shim".into(),
+                bead: None,
+                data: serde_json::json!({"session": "t/gc.publisher/1"}),
+            })
+            .unwrap();
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::WorkerDrainAcked)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The `COALESCE(?2, work_branch)` in `bead_claimed` PROTECTS a pre-existing
+    /// `work_branch` when a claim carries none (camp's own `camp claim`). This
+    /// seeds the column directly (in-crate `conn` access) — the CLEAREST, most
+    /// direct way to exercise the guard in isolation, one event away from the
+    /// UPDATE. (The state is ALSO reachable through the public API via a
+    /// crash-reopen — claim-with-branch → SessionCrashed reopens the bead
+    /// WITHOUT clearing work_branch → branch-less re-claim — which the
+    /// integration test `claim_invariant::claim_after_crash_reopen_preserves_the_work_branch`
+    /// drives end to end.)
+    ///
+    /// Mutation caught: `work_branch = ?2` (drop the COALESCE) — it would write
+    /// NULL over the seeded `camp/pre`, so `gc.work_branch` disappears → RED.
+    #[test]
+    fn claim_with_no_branch_preserves_a_pre_existing_work_branch_coalesce() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-2".into()),
+                data: serde_json::json!({ "title": "work", "assignee": "gc.publisher" }),
+            })
+            .unwrap();
+        // Seed a work_branch on the still-OPEN bead (artificial — the product
+        // cannot reach this state, which is exactly why the COALESCE guard is
+        // untestable via the public API).
+        ledger
+            .conn
+            .execute(
+                "UPDATE beads SET work_branch = 'camp/pre' WHERE id = 'gc-2'",
+                [],
+            )
+            .unwrap();
+
+        // Claim it WITHOUT a work_branch (the `camp claim` path).
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClaimed,
+                rig: None,
+                actor: "cli".into(),
+                bead: Some("gc-2".into()),
+                data: serde_json::json!({ "session": "t/gc.publisher/1" }),
+            })
+            .unwrap();
+
+        // The claim flipped the bead but LEFT the pre-existing branch intact.
+        let meta = ledger.bead_metadata("gc-2").unwrap();
+        assert_eq!(
+            meta.get("gc.work_branch").map(String::as_str),
+            Some("camp/pre"),
+            "COALESCE must not clobber a pre-existing work_branch with NULL"
+        );
+    }
 }

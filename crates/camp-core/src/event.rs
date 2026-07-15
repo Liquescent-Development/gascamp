@@ -91,6 +91,18 @@ pub enum EventType {
     /// (invariant 3: the ledger tells the whole story), because "the formula
     /// did not load" is not an answer an operator can act on.
     FormulaRefused,
+    /// compat §6 (worker contract): a gc/bd shim was handed a verb or flag camp
+    /// does not serve. FAIL FAST + EVENTED — a silently-ignored shim call is a
+    /// corrupted ledger (§6). Audit-only — no state fold. NAMES the refused verb
+    /// (invariant 3). `{binding?, agent?, verb, detail}`.
+    ShimRefused,
+    /// compat §6.2 (worker contract): a gc worker acknowledged its drain — the
+    /// release signal. This is campd's PROMPT-KILL trigger for the already-
+    /// released worker (Task 10), NOT gc's `session.drain_acked_with_assigned_work`
+    /// (gc's acked-while-still-holding-work anomaly, which has no camp counterpart
+    /// because camp truncates gc's continuation loop: one bead per session, no
+    /// assigned work remaining at ack). Audit-only — no state fold. `{session}`.
+    WorkerDrainAcked,
 }
 
 impl EventType {
@@ -131,6 +143,8 @@ impl EventType {
         EventType::ImportAdded,
         EventType::ImportRefused,
         EventType::FormulaRefused,
+        EventType::ShimRefused,
+        EventType::WorkerDrainAcked,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -171,6 +185,8 @@ impl EventType {
             EventType::ImportAdded => "import.added",
             EventType::ImportRefused => "import.refused",
             EventType::FormulaRefused => "formula.refused",
+            EventType::ShimRefused => "shim.refused",
+            EventType::WorkerDrainAcked => "worker.drain_acked",
         }
     }
 
@@ -314,6 +330,24 @@ mod tests {
         );
         assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&"import.added"));
         assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&"import.refused"));
+    }
+
+    #[test]
+    fn shim_and_drain_ack_events_roundtrip_and_are_camp_specific() {
+        // compat §6 (worker contract). Neither name exists in gc's registry:
+        // `worker.drain_acked` is camp's release trigger (gc's only `worker.*`
+        // is `worker.operation`), `shim.refused` follows import/formula.refused
+        // (gc has no `shim.*`). Invariant 7 — additive, never a redefinition.
+        for (variant, name) in [
+            (EventType::ShimRefused, "shim.refused"),
+            (EventType::WorkerDrainAcked, "worker.drain_acked"),
+        ] {
+            assert_eq!(variant.as_str(), name);
+            assert_eq!(EventType::parse(name).unwrap(), variant);
+            assert!(EventType::ALL.contains(&variant));
+            assert!(crate::vocab::CAMP_SPECIFIC_EVENTS.contains(&name));
+            assert!(!crate::vocab::GC_MIRRORED_EVENTS.contains(&name));
+        }
     }
 
     #[test]

@@ -247,6 +247,30 @@ pub fn build_spec(
                 "CAMP_TRANSCRIPT".to_owned(),
                 transcript_path.to_string_lossy().into_owned(),
             ),
+            // compat §6.1 — the gc worker contract's environment (projection
+            // #3 of the claimed bead row). The role-worker fragment reads
+            // BEADS_ACTOR (its EXPECTED_ASSIGNEE), falling back through
+            // GC_SESSION_NAME/GC_SESSION_ID — all three are the SESSION, which
+            // is `claimed_by` and so equals `bd show`'s `assignee` (Task 1).
+            ("BEADS_ACTOR".to_owned(), session_name.to_owned()),
+            ("GC_SESSION_NAME".to_owned(), session_name.to_owned()),
+            ("GC_SESSION_ID".to_owned(), session_name.to_owned()),
+            // EXPECTED_ROUTE = GC_TEMPLATE/GC_AGENT = the qualified agent. In
+            // production this equals the cooked route (both from resolve_agent),
+            // so the fragment's route check (bd show gc.routed_to == env) holds;
+            // the guard fixtures mismatch them on purpose to prove the shim
+            // reads the route from the BEAD, not from here (round-1 B1).
+            ("GC_AGENT".to_owned(), agent.name.clone()),
+            ("GC_TEMPLATE".to_owned(), agent.name.clone()),
+            // §6.3 — the worker's PATH resolves `gc`/`bd` to `.camp/bin` FIRST.
+            // Only campd-dispatched workers get this; attended sessions do not.
+            (
+                "PATH".to_owned(),
+                crate::cmd::shim::install::prepend_bin_path(
+                    camp_root,
+                    std::env::var("PATH").ok().as_deref(),
+                ),
+            ),
         ],
         stdout_path: sessions_dir.join(format!("{file_stem}.json")),
         stderr_path: sessions_dir.join(format!("{file_stem}.log")),
@@ -679,8 +703,11 @@ mod tests {
         assert!(task.contains("camp event emit"), "task: {task}");
         assert_eq!(argv.len(), 15);
 
+        // The four CAMP_* vars, then the compat §6.1 gc-worker environment
+        // (five gc vars + PATH). PATH is inherited-dependent, so assert its
+        // prefix separately.
         assert_eq!(
-            spec.env,
+            spec.env[..9].to_vec(),
             vec![
                 ("CAMP_DIR".to_owned(), "/camps/dev".to_owned()),
                 ("CAMP_BEAD".to_owned(), "gc-142".to_owned()),
@@ -689,7 +716,18 @@ mod tests {
                     "CAMP_TRANSCRIPT".to_owned(),
                     "/home/u/.claude/projects/-code-gc/x.jsonl".to_owned()
                 ),
+                ("BEADS_ACTOR".to_owned(), "dev/dev/1".to_owned()),
+                ("GC_SESSION_NAME".to_owned(), "dev/dev/1".to_owned()),
+                ("GC_SESSION_ID".to_owned(), "dev/dev/1".to_owned()),
+                ("GC_AGENT".to_owned(), "dev".to_owned()),
+                ("GC_TEMPLATE".to_owned(), "dev".to_owned()),
             ]
+        );
+        assert_eq!(spec.env[9].0, "PATH");
+        assert!(
+            spec.env[9].1.starts_with("/camps/dev/bin:"),
+            "PATH: {}",
+            spec.env[9].1
         );
         // decision G: capture paths under <camp>/sessions/
         assert_eq!(
@@ -700,6 +738,42 @@ mod tests {
             spec.stderr_path,
             Path::new("/camps/dev/sessions/dev-dev-1.log")
         );
+    }
+
+    /// compat §6.1 — the worker environment is the third projection of the
+    /// claimed bead row. All three assignee-chain vars are the SESSION; both
+    /// route vars are the qualified AGENT; PATH prepends `.camp/bin`.
+    #[test]
+    fn build_spec_exports_the_gc_worker_environment() {
+        let agent = AgentDef {
+            name: "gc.run-operator".into(),
+            ..full_agent()
+        };
+        let spec = build_spec(
+            Path::new("claude"),
+            &agent,
+            Path::new("/camps/dev"),
+            "gc-142",
+            "dev/gc.run-operator/1",
+            "sid",
+            Path::new("/h/.claude/x.jsonl"),
+            Path::new("/code/gc"),
+            StdinMode::HeldStream,
+        );
+        let env: std::collections::BTreeMap<_, _> = spec.env.iter().cloned().collect();
+        for k in ["BEADS_ACTOR", "GC_SESSION_NAME", "GC_SESSION_ID"] {
+            assert_eq!(env[k], "dev/gc.run-operator/1", "{k}");
+        }
+        for k in ["GC_AGENT", "GC_TEMPLATE"] {
+            assert_eq!(env[k], "gc.run-operator", "{k}");
+        }
+        assert!(
+            env["PATH"].starts_with("/camps/dev/bin:"),
+            "PATH: {}",
+            env["PATH"]
+        );
+        assert_eq!(env["CAMP_BEAD"], "gc-142"); // the four CAMP_* still present
+        assert_eq!(env["CAMP_SESSION"], "dev/gc.run-operator/1");
     }
 
     #[test]

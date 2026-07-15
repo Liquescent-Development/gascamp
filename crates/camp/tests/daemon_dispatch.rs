@@ -290,6 +290,47 @@ fn tier0_sling_runs_the_whole_contract_with_a_causal_trail() {
     assert!(out.status.success(), "refold drift after a Tier-0 run");
 }
 
+/// compat §6.3 (B12) — a real dispatch installs the gc/bd shims into
+/// `.camp/bin`, absolute-path and executable. Mutation caught: deleting the
+/// `write_shims` call in `launch()` (then `.camp/bin/gc` never appears).
+#[test]
+fn a_dispatch_installs_the_absolute_path_shims_into_camp_bin() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 10, "");
+    let _campd = Daemon::spawn(&root, &[]);
+    camp_ok(&root, &["sling", "do a thing"]);
+    wait_until(&root, "a dispatch (session.woke)", |e| {
+        count(e, "session.woke") >= 1
+    });
+
+    let gc = root.join("bin/gc");
+    let bd = root.join("bin/bd");
+    assert!(
+        gc.exists() && bd.exists(),
+        "launch must install .camp/bin/{{gc,bd}}"
+    );
+    let body = std::fs::read_to_string(&gc).unwrap();
+    // Absolute path (an installed campd binary lives at an absolute path), and
+    // NOT a bare `exec camp` (§6.3): a bare name would find the shim itself.
+    assert!(
+        body.starts_with("#!/bin/sh\nexec /") && body.contains(" gc-shim \"$@\""),
+        "shim must exec camp's absolute path: {body:?}"
+    );
+    assert!(
+        !body.contains("exec camp "),
+        "no bare-name exec (§6.3): {body:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&gc).unwrap().permissions().mode() & 0o111,
+            0o111,
+            "shims must be executable"
+        );
+    }
+}
+
 /// spec §13.3's literal example shape: "gc-1 closed → gc-2 ready →
 /// dispatched (session)". A dependent bead's dispatch must trail its
 /// blocker's close in the ledger.

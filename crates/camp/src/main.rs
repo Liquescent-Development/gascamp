@@ -26,6 +26,7 @@ mod cmd {
     pub mod search;
     pub mod service;
     pub mod session;
+    pub mod shim;
     pub mod show;
     pub mod sling;
     pub mod stop;
@@ -336,6 +337,19 @@ enum Command {
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
+    },
+    /// gc pack worker shim (compat §6): installed into `.camp/bin`, dispatch-
+    /// only, not for humans. Translates `gc <verb> …` to camp's ledger.
+    #[command(hide = true)]
+    GcShim {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// bd pack worker shim (compat §6): the `bd` half of the same contract.
+    #[command(hide = true)]
+    BdShim {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -855,5 +869,30 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // camp — the installed units are the registry (design §5).
             ServiceCommand::List => cmd::service::run_list(),
         },
+        // The two shim entry points BYPASS `report()`: a shim's outcome is a
+        // process exit code `report` cannot express (drain = exit 1 is a NORMAL
+        // outcome, not an error). The shim is a short-lived leaf whose ledger
+        // writes are committed before return, so `std::process::exit` skipping
+        // Drop is safe and deliberate (compat §6, Task 4 B8).
+        Command::GcShim { args } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            match cmd::shim::gc_shim(&camp, args) {
+                Ok(code) => std::process::exit(i32::from(code.0)),
+                Err(error) => {
+                    eprintln!("camp: {error:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::BdShim { args } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            match cmd::shim::bd_shim(&camp, args) {
+                Ok(code) => std::process::exit(i32::from(code.0)),
+                Err(error) => {
+                    eprintln!("camp: {error:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }

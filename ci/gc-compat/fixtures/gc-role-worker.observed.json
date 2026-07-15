@@ -1,0 +1,91 @@
+{
+  "_comment": "Task 1 measurement of the REAL gc-role-worker fragment. Operator ruling: MEASURE gc, do not infer it. These are OUR derived facts only; the fragment's copyrighted source is NEVER committed (compat spec §10). Re-derived by ci/gc-compat/worker_contract.py on every GCPACKS_REF move (Task 11 Step 4.5); drift fails the gate.",
+  "gcpacks_ref": "44b2eef94f035283b70df62d3bd1fc77bce13d56",
+  "fragment_path": "gascity/roles/template-fragments/gc-role-worker.template.md",
+  "fragment_note": "A Go-template ({{ define \"gc-role-worker\" }} ... {{- end }}) of 239 lines; identical bytes at gascity/template-fragments/gc-role-worker.template.md and gascity/roles/prompts/shared/gc-role-worker.md.tmpl. The runnable core is the 140-line GC_CLAIM bash heredoc (fragment lines 32-171). The rest is prose the LLM follows: set gc.outcome metadata, close the bead, continue (re-hook) or drain.",
+
+  "verbs": {
+    "gc": ["hook --claim --json", "runtime drain-ack"],
+    "bd": ["show <id> --json", "show <id>", "update <id> --set-metadata k=v", "close <id>", "close <id> --reason '...'"]
+  },
+  "verbs_static": {
+    "_comment": "Step 3 — EXHAUSTIVE-by-construction over the whole fragment TEXT (grep -oE '\\b(gc|bd) [a-z][a-z-]*' | sort -u), independent of which branch runs. Ground truth for reconciliation (Step 4).",
+    "pairs": ["bd close", "bd list", "bd mol", "bd ready", "bd show", "bd update", "gc hook", "gc prime", "gc runtime"]
+  },
+  "verbs_static_superset_ok": {
+    "_comment": "Fold-in NB1: verbs_static MUST be a superset of every per-branch dynamic verb, so an under-capturing static grep cannot silently shrink verbs_static and pass reconciliation. Verified: the dynamic verb-pairs {gc hook, gc runtime, bd show, bd update, bd close} are all present in verbs_static.pairs.",
+    "dynamic_pairs": ["gc hook", "gc runtime", "bd show", "bd update", "bd close"],
+    "is_subset_of_static": true
+  },
+
+  "hook_json_fields": {
+    "_comment": "Fields the fragment's inline python3 json_pick reads out of `gc hook --claim --json`. json_pick reads the FIRST element if the response is a JSON array. On drain the fragment keys on `action` before consulting the exit code.",
+    "top_level": ["action", "bead_id", "assignee", "route"]
+  },
+  "bd_show_json_fields": {
+    "_comment": "Fields the fragment reads out of `bd show <id> --json`. `assignee` OVERWRITES the hook's assignee (fragment lines 128-130); `metadata.gc.routed_to` OVERWRITES the hook's route (lines 131-134). These overwritten values are the ones the fragment compares.",
+    "top_level": ["id", "status", "assignee"],
+    "metadata_keys": ["gc.routed_to", "gc.root_bead_id", "gc.continuation_group"]
+  },
+
+  "branches": {
+    "happy": [
+      "gc hook --claim --json",
+      "bd show gc-2 --json",
+      "bd show gc-2",
+      "bd update gc-2 --set-metadata gc.outcome=pass",
+      "bd close gc-2",
+      "gc hook --claim --json",
+      "gc runtime drain-ack"
+    ],
+    "fail_close": [
+      "gc hook --claim --json",
+      "bd show gc-2 --json",
+      "bd show gc-2",
+      "bd update gc-2 --set-metadata gc.outcome=fail --set-metadata gc.failure_class=work_error",
+      "bd close gc-2 --reason 'work failed'",
+      "gc hook --claim --json",
+      "gc runtime drain-ack"
+    ],
+    "config_reject": [
+      "gc runtime drain-ack"
+    ]
+  },
+
+  "exit_contract": {
+    "hook_work": {"exit": 0, "why": "fragment line 101 rejects (CLAIM_REJECTED; sleep 2; continue) unless CLAIM_CODE==0 for a work action"},
+    "hook_drain": {"exit": "not load-bearing", "why": "fragment line 95 keys on JSON action==\"drain\" BEFORE checking CLAIM_CODE; the drain exit code is never consulted. Camp uses ShimExit(1) on drain (spec/plan), which is compatible — the fragment ignores it and reads `action`."},
+    "runtime_drain_ack": {"exit": 0, "why": "the fragment runs `gc runtime drain-ack` then `exit 0` on both the CONFIG_REJECTED and NO_ROUTED_WORK paths; its exit code is not consulted."},
+    "config_rejected": {"exit": 0, "why": "missing assignee OR missing python3 -> echo CONFIG_REJECTED; gc runtime drain-ack; exit 0 (fragment lines 38-48)"},
+    "no_routed_work": {"exit": 0, "why": "drain action -> echo NO_ROUTED_WORK; gc runtime drain-ack; exit 0 (fragment lines 95-99)"}
+  },
+
+  "env_read": {
+    "expected_assignee_chain": ["BEADS_ACTOR", "GC_SESSION_NAME", "GC_SESSION_ID", "GC_AGENT"],
+    "expected_route_chain": ["GC_TEMPLATE", "GC_AGENT"],
+    "note": "EXPECTED_ASSIGNEE = first non-empty of the assignee chain (fragment line 35). EXPECTED_ROUTE = first non-empty of the route chain (line 36). The fragment also EXPORTS (writes, does not read) GC_BEAD_ID, GC_ROOT_BEAD_ID, GC_CONTINUATION_GROUP."
+  },
+
+  "comparison_invariants": {
+    "_comment": "The load-bearing equalities the fragment enforces after a claim. If any fails, the fragment prints CLAIM_REJECTED and loops `sleep 2; continue` FOREVER (a hang) — this is why the §14 gate's env must match the cooked bead row.",
+    "assignee": "bd show `assignee` (== camp claimed_by == the session) MUST equal env EXPECTED_ASSIGNEE (== BEADS_ACTOR). Fragment line 151.",
+    "route": "bd show `metadata.gc.routed_to` (== camp `assignee` column, the cooked route) MUST equal env EXPECTED_ROUTE (== GC_TEMPLATE/GC_AGENT), enforced only when BOTH are non-empty. Fragment line 156. THIS IS THE ENV-LEG (plan NB1): in the real-fragment §14 gate, env GC_TEMPLATE/GC_AGENT must equal the cooked route or the fragment spins.",
+    "status": "bd show `status` MUST be `open` or `in_progress`. Fragment lines 143-150.",
+    "id": "bd show `id` MUST equal the hook's `bead_id`. Fragment line 138."
+  },
+
+  "reconciliation": {
+    "_comment": "Step 4 — cross-check verbs_static against phase-3's served set.",
+    "served_by_camp": {
+      "_comment": "The verbs camp's shims actually serve. The fragment's EXECUTED verbs (gc hook, gc runtime, bd show/update/close) are all here. gc convoy is served but the fragment never calls it.",
+      "gc": ["hook --claim --json", "runtime drain-ack", "convoy status --json"],
+      "bd": ["show [--json]", "update --set-metadata", "close [--reason]"]
+    },
+    "refused_loudly_by_camp": {
+      "_comment": "Every other verb/flag lands a shim.refused event AND a nonzero exit (§6: never a silent no-op). None is on ANY executed fragment branch, so refusing them cannot hang the worker.",
+      "verbs": ["gc prime", "bd mol", "bd list", "bd ready", "bd create"]
+    },
+    "static_outside_executed": ["gc prime", "bd mol", "bd list", "bd ready"],
+    "verdict": "NO STOP. `gc prime` (fragment line 24), `bd mol` (line 10), `bd ready`/`bd list` (line 17) all appear ONLY in PROHIBITION prose ('Do not run…'); none is on ANY executed branch (verified by driving happy/fail_close/config_reject under sh). No phase-4 verb (prime/mail) is required on the claim->close->drain path. camp serves exactly the fragment's executed verbs and refuses the rest LOUDLY (shim.refused + nonzero exit) — safe, because the fragment never calls them."
+  }
+}
