@@ -32,10 +32,13 @@ pub fn statusline(camp: &CampDir) -> Result<()> {
     match socket::request(camp, &Request::Status) {
         Ok(Response::Status { summary, red, .. }) => {
             println!(
-                "▲{} ●{} ✖{}",
-                summary.live_sessions.len(),
-                summary.ready,
-                red
+                "{}",
+                badge(
+                    summary.live_sessions.len(),
+                    summary.ready,
+                    red,
+                    summary.unread_mail
+                )
             );
             Ok(())
         }
@@ -60,9 +63,20 @@ fn render(summary: &StatusSummary, red: u64, campd_pid: u32) -> String {
         )
     };
     format!(
-        "campd pid: {campd_pid}\nlive sessions: {sessions}\nready: {}\nopen: {}\nstuck: {}\nred: {red}\n",
-        summary.ready, summary.open, summary.stuck
+        "campd pid: {campd_pid}\nlive sessions: {sessions}\nready: {}\nopen: {}\nstuck: {}\nred: {red}\nmail: {}\n",
+        summary.ready, summary.open, summary.stuck, summary.unread_mail
     )
+}
+
+/// The compact fleet badge. `✉N` is appended ONLY when unread mail exists —
+/// an empty mailbox adds no noise to the operator's prompt.
+fn badge(live: usize, ready: u64, red: u64, unread_mail: u64) -> String {
+    let base = format!("▲{live} ●{ready} ✖{red}");
+    if unread_mail > 0 {
+        format!("{base} ✉{unread_mail}")
+    } else {
+        base
+    }
 }
 
 #[cfg(test)]
@@ -78,20 +92,32 @@ mod tests {
             ready: 0,
             open: 0,
             stuck: 0,
+            unread_mail: 0,
         };
         assert_eq!(
             render(&empty, 0, 4242),
-            "campd pid: 4242\nlive sessions: 0\nready: 0\nopen: 0\nstuck: 0\nred: 0\n"
+            "campd pid: 4242\nlive sessions: 0\nready: 0\nopen: 0\nstuck: 0\nred: 0\nmail: 0\n"
         );
         let busy = StatusSummary {
             live_sessions: vec!["camp/dev/1".to_owned(), "camp/dev/2".to_owned()],
             ready: 1,
             open: 3,
             stuck: 0,
+            unread_mail: 2,
         };
         assert_eq!(
             render(&busy, 1, 7),
-            "campd pid: 7\nlive sessions: 2 (camp/dev/1, camp/dev/2)\nready: 1\nopen: 3\nstuck: 0\nred: 1\n"
+            "campd pid: 7\nlive sessions: 2 (camp/dev/1, camp/dev/2)\nready: 1\nopen: 3\nstuck: 0\nred: 1\nmail: 2\n"
+        );
+    }
+
+    #[test]
+    fn statusline_badge_includes_unread_mail_only_when_present() {
+        assert_eq!(badge(0, 1, 0, 2), "▲0 ●1 ✖0 ✉2");
+        assert_eq!(
+            badge(0, 1, 0, 0),
+            "▲0 ●1 ✖0",
+            "no ✉ when the mailbox is empty"
         );
     }
 }

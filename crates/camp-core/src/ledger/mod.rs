@@ -34,6 +34,11 @@ pub struct StatusSummary {
     pub ready: u64,
     pub open: u64,
     pub stuck: u64,
+    /// Unread `human` mail (compat §8.2) — a SEPARATE axis from the task
+    /// counts (task-scoped, issue #36). The statusline badge and `/status`
+    /// surface it; the operator-side pull is a human reading their own
+    /// mailbox, never a poll (invariant 1 intact).
+    pub unread_mail: u64,
 }
 
 /// One live `sessions` registry row with its `session.woke` provenance
@@ -133,6 +138,13 @@ impl Ledger {
     /// The next unused bead id for `prefix` (spec §12). See `camp_core::id`.
     pub fn next_bead_id(&self, prefix: &str) -> Result<String, CoreError> {
         crate::id::next_bead_id(&self.conn, prefix)
+    }
+
+    /// A borrow of the underlying connection for in-crate tests that assert
+    /// against read-only query helpers (`crate::mail`). Test-only.
+    #[cfg(test)]
+    pub(crate) fn conn_for_test(&self) -> &rusqlite::Connection {
+        &self.conn
     }
 
     /// True when `bead` is open and every `needs` target passed (decision 6).
@@ -378,12 +390,31 @@ impl Ledger {
         let ready = crate::readiness::ready_task_count(&self.conn)?;
         let open = crate::readiness::open_task_count(&self.conn)?;
         let stuck = crate::readiness::stuck_task_count(&self.conn)?;
+        let unread_mail = crate::mail::unread_human_mail_count(&self.conn)?;
         Ok(StatusSummary {
             live_sessions,
             ready,
             open,
             stuck,
+            unread_mail,
         })
+    }
+
+    /// Unread `human` mail messages (compat §8.2), for `camp mail inbox`.
+    pub fn unread_mail(&self) -> Result<Vec<crate::mail::MailMessage>, CoreError> {
+        crate::mail::unread_human_mail(&self.conn)
+    }
+
+    /// The unread-`human`-mail count, for the status surfaces and `mail check`.
+    pub fn unread_mail_count(&self) -> Result<u64, CoreError> {
+        crate::mail::unread_human_mail_count(&self.conn)
+    }
+
+    /// One mail message by id (any status), or `None` if not a mail bead —
+    /// for `camp mail read`/`archive` (Task 7), which must avoid `BeadRow`
+    /// (no `description`; type column is `kind`).
+    pub fn mail_message(&self, id: &str) -> Result<Option<crate::mail::MailMessage>, CoreError> {
+        crate::mail::mail_message_by_id(&self.conn, id)
     }
 
     /// The current status of a registered session (`live`/`stopped`/
@@ -2512,6 +2543,7 @@ mod tests {
                 ready: 0,
                 open: 0,
                 stuck: 0,
+                unread_mail: 0,
             }
         );
 
@@ -2551,6 +2583,7 @@ mod tests {
                 ready: 1,
                 open: 2,
                 stuck: 0,
+                unread_mail: 0,
             }
         );
     }
@@ -2585,6 +2618,7 @@ mod tests {
                 ready: 0,
                 open: 0,
                 stuck: 0,
+                unread_mail: 0,
             }
         );
 
@@ -2602,6 +2636,7 @@ mod tests {
                 ready: 1,
                 open: 1,
                 stuck: 0,
+                unread_mail: 0,
             }
         );
 
@@ -2620,6 +2655,7 @@ mod tests {
                 ready: 1,
                 open: 2,
                 stuck: 0,
+                unread_mail: 0,
             }
         );
     }
@@ -2639,6 +2675,7 @@ mod tests {
                 ready: 1,
                 open: 1,
                 stuck: 0,
+                unread_mail: 0,
             }
         );
         // a dispatch failure: no longer ready, now stuck (still open)
@@ -2658,7 +2695,39 @@ mod tests {
                 ready: 0,
                 open: 1,
                 stuck: 1,
+                unread_mail: 0,
             }
+        );
+    }
+
+    #[test]
+    fn status_summary_reports_unread_mail_separately_from_task_counts() {
+        // compat §8.2: unread mail is its OWN axis, never a task count. The
+        // fixture is TWO open+ready task beads + ONE mail bead, so the task
+        // counts (open==2, ready==2, stuck==0) all DIFFER from unread_mail==1.
+        // That makes this test SELF-SUFFICIENT: the named mutation — populate
+        // `unread_mail` from any task count (`open_task_count`/`ready_task_count`
+        // /`stuck_task_count`) — yields 2/2/0 ≠ 1 and reddens THIS test, not just
+        // its siblings.
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(created("gc-1", serde_json::json!({ "title": "work one" })))
+            .unwrap();
+        ledger
+            .append(created("gc-2", serde_json::json!({ "title": "work two" })))
+            .unwrap();
+        ledger
+            .append(crate::mail::mail_bead_event(
+                "gc", "hi", "body", "from", "cli", "gc-3",
+            ))
+            .unwrap();
+        let s = ledger.status_summary().unwrap();
+        assert_eq!(s.open, 2, "two open tasks; mail must not inflate this to 3");
+        assert_eq!(s.ready, 2, "both tasks are ready");
+        assert_eq!(s.stuck, 0);
+        assert_eq!(
+            s.unread_mail, 1,
+            "the mail surfaces on its own axis — NOT any task count (2/2/0)"
         );
     }
 
