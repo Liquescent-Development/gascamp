@@ -145,6 +145,10 @@ pub fn run(
     // read-channel watch — the layout above); connections start at 6.
     let mut next_token = 6usize;
     let mut self_raise_budget = SELF_RAISE_BUDGET;
+    // cp-3 (§5.3.2): dedup the loud `permission.saturated` fault to the crossing
+    // edge — emit once when the BLOCKED count crosses `max_blocked`, clear when
+    // it drops back, never once per wake.
+    let mut saturated = false;
 
     let mut last_seen = Timestamp::now();
     loop {
@@ -734,6 +738,28 @@ pub fn run(
         for input in control.expire_pending(Timestamp::now()) {
             ledger.append(input)?;
             appended_control_events = true;
+        }
+        // cp-3 (§5.3.2): a loud saturation fault when the BLOCKED count crosses
+        // `max_blocked` — the operator has more unanswered permission questions
+        // than campd will let pile up silently. Edge-deduped: emitted only on the
+        // <=max → >max transition, cleared on the way back. Audit-only (no fold).
+        {
+            let n_blocked = ledger.blocked_sessions()?.len();
+            let over = n_blocked > dispatcher.max_blocked();
+            if over && !saturated {
+                ledger.append(camp_core::event::EventInput {
+                    kind: EventType::PermissionSaturated,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: None,
+                    data: serde_json::json!({
+                        "blocked": n_blocked as u64,
+                        "max_blocked": dispatcher.max_blocked() as u64,
+                    }),
+                })?;
+                appended_control_events = true;
+            }
+            saturated = over;
         }
         if appended_control_events
             && let Err(e) = settle(

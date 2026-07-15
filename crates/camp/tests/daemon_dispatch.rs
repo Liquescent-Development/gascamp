@@ -1659,3 +1659,112 @@ fn a_retry_while_the_cause_persists_fails_once_more_and_returns_to_stuck() {
         "exactly the operator's one re-arm, nothing automatic: {events:#?}"
     );
 }
+
+/// A camp with an explicit `[dispatch].max_blocked` (cp-3 §5.3.2). Mirrors
+/// `scaffold` but pins both caps. Returns (root, rig).
+fn scaffold_blocked(dir: &Path, max_workers: usize, max_blocked: usize) -> (PathBuf, PathBuf) {
+    let root = dir.join(".camp");
+    std::fs::create_dir_all(&root).unwrap();
+    let rig = dir.join("repo");
+    std::fs::create_dir_all(&rig).unwrap();
+    std::fs::write(
+        root.join("camp.toml"),
+        format!(
+            "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\
+             [agent_defaults]\ntools = [\"Read\", \"Bash\"]\n\n\
+             [dispatch]\nmax_workers = {max_workers}\nmax_blocked = {max_blocked}\n\
+             command = \"{}\"\ndefault_agent = \"dev\"\n\n\
+             [patrol]\nstall_after = \"30s\"\n",
+            rig.display(),
+            fake_agent(),
+        ),
+    )
+    .unwrap();
+    write_agent(&root, "dev", "isolation: none\n");
+    camp_ok(&root, &["events", "--json"]);
+    (root, rig)
+}
+
+/// Like `wait_until`, but POKES campd (a socket round-trip) each iteration so it
+/// wakes and drains tailed stream files. On macOS a worker's `can_use_tool`
+/// append through its inherited stdout fd is notify-suppressed, so an explicit
+/// wake is how the harness surfaces it (a long `stall_after` keeps the ladder
+/// out of the way — this test is about slots/saturation, not stalls).
+fn wait_until_poking(root: &Path, what: &str, pred: impl Fn(&[serde_json::Value]) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let _ = camp(root, &["top"]); // poke → wake → drain_all
+        let events = events_json(root);
+        if pred(&events) {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("timed out waiting for {what}; events: {events:#?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// cp-3 §5.3.2: a BLOCKED worker does NOT hold a dispatch slot. With
+/// max_workers = 1, a worker blocked on a permission frees its slot, so a
+/// SECOND bead still dispatches — ten blocked workers can never deadlock
+/// dispatch (the bug §5.3.2 names). Mutation caught: dropping the blocked
+/// filter from the slot gate leaves worker B undispatched forever.
+#[test]
+fn a_blocked_worker_frees_its_dispatch_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold_blocked(dir.path(), 1, 10);
+    let _campd = Daemon::spawn(&root, &[("FAKE_AGENT_CAN_USE_TOOL", "1")]);
+
+    // worker A dispatches and blocks on a permission (freeing its only slot)
+    camp_ok(&root, &["sling", "task A"]);
+    wait_until_poking(&root, "worker A BLOCKED", |e| {
+        count(e, "permission.pending") == 1
+    });
+
+    // with A blocked, a second bead dispatches despite max_workers = 1
+    camp_ok(&root, &["sling", "task B"]);
+    wait_until_poking(&root, "worker B dispatched", |e| {
+        count(e, "session.woke") == 2
+    });
+
+    let events = events_json(&root);
+    assert_eq!(
+        count(&events, "session.woke"),
+        2,
+        "a blocked worker freed its slot: {events:#?}"
+    );
+}
+
+/// cp-3 §5.3.2: crossing `max_blocked` BLOCKED workers raises exactly ONE loud
+/// `permission.saturated` fault (edge-deduped). Mutation caught: dropping the
+/// edge dedup fires it every wake; an off-by-one threshold fires early/late.
+#[test]
+fn crossing_max_blocked_raises_one_saturation_fault() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold_blocked(dir.path(), 5, 2);
+    let _campd = Daemon::spawn(&root, &[("FAKE_AGENT_CAN_USE_TOOL", "1")]);
+
+    // three workers all block: the count crosses max_blocked = 2 at the third.
+    for i in 0..3 {
+        camp_ok(&root, &["sling", &format!("task {i}")]);
+    }
+    wait_until_poking(&root, "three BLOCKED workers", |e| {
+        count(e, "permission.pending") == 3
+    });
+    // one more poke-driven wake so the saturation check runs after the third blocks
+    wait_until_poking(&root, "the saturation fault", |e| {
+        count(e, "permission.saturated") >= 1
+    });
+
+    // a bounded quiet window: the fault is edge-deduped, not per-wake.
+    std::thread::sleep(Duration::from_millis(800));
+    let events = events_json(&root);
+    let sat: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["type"] == "permission.saturated")
+        .collect();
+    assert_eq!(sat.len(), 1, "exactly one saturation fault: {events:#?}");
+    assert_eq!(sat[0]["data"]["blocked"], 3);
+    assert_eq!(sat[0]["data"]["max_blocked"], 2);
+}

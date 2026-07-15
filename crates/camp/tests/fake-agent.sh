@@ -286,7 +286,10 @@ if [[ -n "${FAKE_AGENT_CAN_USE_TOOL:-}" ]]; then
   # stdout fd, then block reading stdin until campd answers with a
   # control_response for our request — then continue and close.
   read -r _task_line
-  req="${FAKE_AGENT_CAN_USE_TOOL_REQ:-cli-2}"
+  # Unique per worker by default (the CLI mints a fresh id per request): keying
+  # on the bead keeps concurrent workers from colliding on one request_id (which
+  # the ledger would dedup, leaving all but the first worker un-blocked).
+  req="${FAKE_AGENT_CAN_USE_TOOL_REQ:-cli-$CAMP_BEAD}"
   printf '{"type":"control_request","request_id":"%s","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo publish"}}}\n' "$req"
   while IFS= read -r _line; do
     case "$_line" in
