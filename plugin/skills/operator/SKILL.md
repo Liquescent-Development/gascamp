@@ -16,7 +16,12 @@ what the human would type.
   one bead; campd immediately spawns a headless-but-present worker (spec
   §8.4). You spawn nothing, and you do not reconstruct what campd is doing
   from `campd.log`, the `sessions/` dir, or the process table — the ledger is
-  the story.
+  the story. **The socket is the only path to a worker.** To watch, steer,
+  interrupt, or answer a live worker you go through the `camp` control-plane
+  verbs below, which reach it only over campd's socket (spec §4). You never
+  tail a worker's stream file and never reach it by pid — those are private
+  paths the control plane exists to abolish, and a client that used one could
+  not follow a worker onto another machine (§4.2).
 - **The local `camp/<bead>` branch IS the deliverable.** Camp v1 has **no remote**,
   no PR, and no merge step (spec §8.4, §12). Do not apply a global
   "code reaches main only via a PR" rule to a camp bead — there is nowhere to
@@ -57,12 +62,39 @@ moment the bead closes. **Never** write a bash `poll` loop or a
 `sleep`-and-recheck. (See the `subagent-hygiene` skill for waiting on async
 results without polling.)
 
-## 6. Verbs
+## 6. Verbs — every one a socket client (spec §4)
+
+Dispatch & inspect (the loop of §2):
 
 - `camp sling "<title>" [--agent A] [--rig R]` — enqueue one bead (`/sling`).
 - `camp show <bead> [--wait] [--json]` — one bead's state; `--wait` blocks
   until it closes, `--json` for machine reads.
-- `camp top` — fleet snapshot: live sessions, ready/open beads (`/status`).
-- `camp nudge <session> "<message>"` — converse with any session (`/nudge`).
-- `camp events` — the whole event log (`/events`) — read it, don't paste it.
+- `camp top` — fleet counts snapshot (`/status`); `camp events` — the whole
+  event log (`/events`) — read it, don't paste it.
+
+The overseer's control plane (spec §5.4 — each drives one socket verb, and
+ONLY the socket; none reads a stream file or a pid):
+
+- `camp sessions [--json]` — one-shot snapshot of every LIVE session by name,
+  with its state and whether it is **BLOCKED** on a permission (verb:
+  `sessions.list`). This is how you learn the session names the verbs below
+  take. `camp watch` is the same fleet, streamed live for a human on a second
+  monitor (verb: `fleet.subscribe`); `camp sessions` is the snapshot an agent
+  reads once.
+- `camp attach <session> [--only text|tools|edits|failures] [--tail]` — read
+  one worker's live typed event stream: tool calls, results, assistant text,
+  usage (verb: `session.subscribe`). Filter and replay; detach freely.
+- `camp nudge <session> "<message>"` — inject one user turn into a live
+  worker's campd-held stdin (verb: `session.send_turn`); it lands in the
+  worker's current conversation now (`/nudge`).
+- `camp interrupt <session>` — stop a live worker's current turn (verb:
+  `session.interrupt`). The ack's request id lands in the ledger.
+- `camp decide <session> <request_id> allow|allow_always|deny [--reason ...]`
+  — answer a worker's `can_use_tool` (verb: `session.permission_decision`).
+  You get the `<request_id>` from `camp attach <session>`: when the worker
+  blocks, attach's live stream renders `!! BLOCKED … request <request_id> …`
+  (the id rides the `can_use_tool` event on `session.subscribe` — it is not a
+  `camp sessions` field). `camp sessions` / `camp watch` tell you WHICH session
+  is BLOCKED; `camp attach` on that session tells you the id to answer with.
+  A `deny` needs `--reason` (the worker sees it).
 - `camp adopt` — reconcile the session registry against reality (`/adopt`).

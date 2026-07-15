@@ -38,6 +38,18 @@ fn plugin_ships_zero_agent_definitions() {
         );
     }
 
+    // Compat §5.1: an agent definition IS a directory with an `agent.toml`.
+    // The `agents/`-dir check above misses a bare agent.toml dropped elsewhere
+    // under plugin/ — so reject the file itself, anywhere. This is the tripwire
+    // that turns "the machinery mentions a role" into a RED build (§11).
+    for p in &paths {
+        assert!(
+            p.file_name().and_then(|n| n.to_str()) != Some("agent.toml"),
+            "the plugin must ship no agent definition (agent.toml): {}",
+            p.display()
+        );
+    }
+
     // The manifest must not declare an `agents` component path.
     let manifest = std::fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&manifest).unwrap();

@@ -62,3 +62,60 @@ fn operator_skill_lists_the_operator_verbs() {
         );
     }
 }
+
+#[test]
+fn operator_skill_names_the_control_plane_verbs() {
+    let s = operator_skill();
+    for needle in [
+        "camp sessions",  // §5.4 list sessions (sessions.list)
+        "camp attach",    // §5.4 read their streams (session.subscribe)
+        "camp nudge",     // §5.4 send them turns (session.send_turn)
+        "camp interrupt", // §5.4 interrupt them (session.interrupt)
+        "camp decide",    // §5.3 answer a permission (session.permission_decision)
+    ] {
+        assert!(
+            s.contains(needle),
+            "operator skill must name the control-plane verb `{needle}`"
+        );
+    }
+}
+
+#[test]
+fn operator_skill_states_the_no_private_paths_discipline() {
+    let s = operator_skill();
+    // Whitespace-normalized so markdown line-wrapping cannot hide a phrase that
+    // straddles a newline ("never\n  tail ...").
+    let norm = s.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The reach-a-worker-only-through-the-socket rule (§4): the skill must NAME
+    // the socket as the only path.
+    assert!(
+        norm.contains("socket"),
+        "operator skill must name the socket as the only path to a worker"
+    );
+
+    // NEGATIVE FORM (CP5-2): substring-presence of the nouns is NOT enough — a
+    // SKILL reworded to ENDORSE private paths ("you may tail a worker's stream
+    // file and reach it by pid") keeps every noun. The guard must require the
+    // FORBIDDING phrasing itself, so the endorsing rewording reddens it.
+    for phrase in ["never tail a worker's stream file", "never reach it by pid"] {
+        assert!(
+            norm.contains(phrase),
+            "operator skill must FORBID private paths in words — missing `{phrase}` (§4)"
+        );
+    }
+
+    // ...and it must carry no imperative that ENDORSES a private path. This is
+    // the direct catch for the mutation the reviewer proved slips past a
+    // noun-only guard.
+    for endorsement in [
+        "may tail a worker's stream file",
+        "can tail a worker's stream file",
+        "you may reach it by pid",
+    ] {
+        assert!(
+            !norm.contains(endorsement),
+            "operator skill must not ENDORSE a private path — found `{endorsement}` (§4)"
+        );
+    }
+}
