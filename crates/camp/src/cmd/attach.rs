@@ -4,8 +4,10 @@
 //! assistant text, token usage. It never opens a session file, never learns a
 //! pid; it reaches the worker only through the socket. Replay and live-follow are
 //! the SAME subscribe (cursor 0 replays history then follows; a finished session
-//! ends). From here you send a turn or interrupt; answering a permission request
-//! drops in when cp-3's verb lands.
+//! ends). From here you send a turn or interrupt. Answering a permission is
+//! out-of-band via the one-shot `camp decide` (cp-3, shipped), using the
+//! request_id this view renders on the BLOCKED line; an INTERACTIVE in-attach
+//! `/allow`//deny action is a separate cp-4 deferral.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -144,10 +146,20 @@ pub fn render_event(ev: &serde_json::Value) -> Vec<Rendered> {
                     .and_then(|r| r.get("tool_name"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("a tool");
+                // §5.4/§5.3: the request_id rides THIS frame (top-level) — the
+                // only socket surface that carries it, since SessionInfo has no
+                // such field. Render it, and name the real answer path: the
+                // one-shot `camp decide` (cp-3 shipped). Attach's INTERACTIVE
+                // /allow-//deny loop is still cp-4's deferral - not wired here.
+                let request_id = ev
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
                 vec![Rendered {
                     kind: EventKind::Permission,
                     line: format!(
-                        "  !! BLOCKED -- {tool} needs your decision (answer lands when cp-3 ships)"
+                        "  !! BLOCKED -- {tool} needs your decision -- request {request_id} \
+                         -- answer: camp decide <session> {request_id} allow|deny"
                     ),
                 }]
             } else {
@@ -260,8 +272,10 @@ impl StreamFrame {
 }
 
 /// A steering action parsed from an operator input line (§6: turns and
-/// decisions, not keypresses). The permission-answer actions (`/allow`,
-/// `/deny`) drop in here when cp-3's `session.permission_decision` verb lands.
+/// decisions, not keypresses). The overseer answers a permission out-of-band
+/// with the one-shot `camp decide` (cp-3, shipped) using the request_id this
+/// view renders on the BLOCKED line; wiring an INTERACTIVE `/allow`//deny
+/// action into this loop remains a separate cp-4 deferral.
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Turn(String),
@@ -878,6 +892,15 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].kind, EventKind::Permission);
         assert!(r[0].line.to_uppercase().contains("BLOCKED"), "{:?}", r[0]);
+        // cp-5 (§5.4): the operator's answer path needs the request_id, and the
+        // only socket surface that carries it is this stream frame. Render it.
+        let line = &r[0].line;
+        assert!(line.contains("r1"), "the BLOCKED line must render the request_id: {line}");
+        assert!(line.contains("camp decide"), "the BLOCKED line must name the answer path: {line}");
+        assert!(
+            !line.contains("cp-3"),
+            "the BLOCKED line must not claim cp-3 is unshipped: {line}"
+        );
     }
 
     #[test]
