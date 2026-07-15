@@ -8,6 +8,7 @@
 //! outcome, not an error). So `main` calls these directly and converts
 //! [`ShimExit`] to an exit code, bypassing `report()`.
 
+pub mod bd;
 pub mod hook;
 pub mod install;
 pub mod project;
@@ -71,8 +72,7 @@ pub fn gc_shim(camp: &CampDir, args: Vec<String>) -> Result<ShimExit> {
 
 /// `camp bd-shim <verb> …` — the `bd` translator entry point.
 pub fn bd_shim(camp: &CampDir, args: Vec<String>) -> Result<ShimExit> {
-    // Served bd verbs land in Task 7; until then every verb is refused.
-    refuse(camp, &verb_of(&args), "bd shim does not serve this verb")
+    bd::run(camp, &args)
 }
 
 #[cfg(test)]

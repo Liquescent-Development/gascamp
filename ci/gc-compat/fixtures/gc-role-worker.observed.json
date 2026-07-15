@@ -75,13 +75,17 @@
   },
 
   "reconciliation": {
-    "_comment": "Step 4 — cross-check verbs_static against phase-3's served set. Served: gc hook --claim --json, gc runtime drain-ack, gc convoy status --json, bd show/update/close/list/ready/create.",
-    "served_set": {
-      "gc": ["hook", "runtime", "convoy"],
-      "bd": ["show", "update", "close", "list", "ready", "create"]
+    "_comment": "Step 4 — cross-check verbs_static against phase-3's served set.",
+    "served_by_camp": {
+      "_comment": "The verbs camp's shims actually serve. The fragment's EXECUTED verbs (gc hook, gc runtime, bd show/update/close) are all here. gc convoy is served but the fragment never calls it.",
+      "gc": ["hook --claim --json", "runtime drain-ack", "convoy status --json"],
+      "bd": ["show [--json]", "update --set-metadata", "close [--reason]"]
     },
-    "static_outside_served": ["gc prime", "bd mol"],
-    "verdict": "NO STOP. Both `gc prime` (fragment line 24) and `bd mol` (line 10) appear ONLY in PROHIBITION prose ('Do not run `gc prime`', 'Do not use `bd mol current`'); neither is on ANY executed branch (verified by driving happy/fail_close/config_reject under sh). No phase-4 verb (prime/mail) is required on the claim->close->drain path. `bd list`/`bd ready` also appear only as prohibitions but are in the served set anyway. Refusing `gc prime`/`bd mol` is therefore safe: the fragment never calls them.",
-    "served_but_unused": ["gc convoy status --json", "bd create"]
+    "refused_loudly_by_camp": {
+      "_comment": "Every other verb/flag lands a shim.refused event AND a nonzero exit (§6: never a silent no-op). None is on ANY executed fragment branch, so refusing them cannot hang the worker.",
+      "verbs": ["gc prime", "bd mol", "bd list", "bd ready", "bd create"]
+    },
+    "static_outside_executed": ["gc prime", "bd mol", "bd list", "bd ready"],
+    "verdict": "NO STOP. `gc prime` (fragment line 24), `bd mol` (line 10), `bd ready`/`bd list` (line 17) all appear ONLY in PROHIBITION prose ('Do not run…'); none is on ANY executed branch (verified by driving happy/fail_close/config_reject under sh). No phase-4 verb (prime/mail) is required on the claim->close->drain path. camp serves exactly the fragment's executed verbs and refuses the rest LOUDLY (shim.refused + nonzero exit) — safe, because the fragment never calls them."
   }
 }
