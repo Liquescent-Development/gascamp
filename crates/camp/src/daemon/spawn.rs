@@ -206,6 +206,7 @@ pub fn build_spec(
     transcript_path: &Path,
     cwd: &Path,
     stdin_mode: StdinMode,
+    include_partial_messages: bool,
 ) -> Result<SpawnSpec, String> {
     let mut argv: Vec<OsString> = vec![command.as_os_str().to_owned()];
     {
@@ -231,6 +232,16 @@ pub fn build_spec(
                 arg("--verbose");
                 arg("--input-format");
                 arg("stream-json");
+                // §2.2 (cp-4): token deltas for a LIVE attach. Gated OFF by
+                // default -- autonomous dispatch must NOT gain it (per-token
+                // deltas nobody reads; a worker under partial messages "never
+                // goes quiet", control.rs:318). Only an opted-in agent gets it.
+                // Sits in the stream-flags arm right after --input-format
+                // stream-json, a DISTINCT position from cp-3's shared-tail
+                // --permission-prompt-tool.
+                if include_partial_messages {
+                    arg("--include-partial-messages");
+                }
             }
         }
         arg("--session-id");
@@ -644,6 +655,7 @@ mod tests {
             permission_mode: Some("acceptEdits".into()),
             isolation: Isolation::None,
             stall_after: None,
+            partial_messages: false,
             prompt: "Implement with TDD.".into(),
         }
     }
@@ -712,6 +724,7 @@ mod tests {
             Path::new("/home/u/.claude/projects/-code-gc/x.jsonl"),
             Path::new("/code/gc"),
             StdinMode::Null,
+            false,
         )
         .unwrap();
         let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
@@ -802,6 +815,7 @@ mod tests {
             Path::new("/h/.claude/x.jsonl"),
             Path::new("/code/gc"),
             StdinMode::HeldStream,
+            false,
         )
         .unwrap();
         let env: std::collections::BTreeMap<_, _> = spec.env.iter().cloned().collect();
@@ -829,6 +843,7 @@ mod tests {
             permission_mode: None,
             isolation: Isolation::None,
             stall_after: None,
+            partial_messages: false,
             prompt: "P".into(),
         };
         let spec = build_spec(
@@ -841,6 +856,7 @@ mod tests {
             Path::new("/t.jsonl"),
             Path::new("/code"),
             StdinMode::Null,
+            false,
         )
         .unwrap();
         let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
@@ -1216,6 +1232,7 @@ mod tests {
             Path::new("/home/u/.claude/projects/-code-gc/x.jsonl"),
             Path::new("/code/gc"),
             StdinMode::HeldStream,
+            false,
         )
         .unwrap();
         let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
@@ -1258,6 +1275,68 @@ mod tests {
             spec.env
         );
         assert_eq!(spec.stdin_mode, StdinMode::HeldStream);
+        // §2.2: autonomous dispatch must NOT gain --include-partial-messages.
+        // MUTATION: an unconditional append leaks token deltas into unattended
+        // dispatch -- this pin goes RED.
+        assert!(
+            !spec.argv.iter().any(|a| a == "--include-partial-messages"),
+            "default (autonomous) dispatch must not emit token deltas: {:?}",
+            spec.argv
+        );
+    }
+
+    /// §2.2: an attach-enabled spawn gains --include-partial-messages, and ONLY on
+    /// the HeldStream (stream-json) arm -- never on the Null/json-envelope arm.
+    /// MUTATION: the gate wired to the wrong arm, or dropped, fails here.
+    #[test]
+    fn partial_messages_flag_is_added_only_when_opted_in_and_only_on_the_stream_arm() {
+        let agent = full_agent(); // the merged helper at spawn.rs:639
+        let spec = build_spec(
+            Path::new("claude"),
+            &agent,
+            Path::new("/camp"),
+            "gc-1",
+            "camp/dev/1",
+            "sid",
+            Path::new("/t.jsonl"),
+            Path::new("/cwd"),
+            StdinMode::HeldStream,
+            true, // include_partial_messages
+        )
+        .unwrap();
+        let argv: Vec<String> = spec
+            .argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let i = argv
+            .iter()
+            .position(|a| a == "--include-partial-messages")
+            .expect("the flag must be present when opted in");
+        assert_eq!(argv[i - 2], "--input-format"); // SDK order: after --input-format stream-json
+        assert_eq!(argv[i - 1], "stream-json");
+
+        let null_spec = build_spec(
+            Path::new("claude"),
+            &agent,
+            Path::new("/camp"),
+            "gc-1",
+            "camp/dev/1",
+            "sid",
+            Path::new("/t.jsonl"),
+            Path::new("/cwd"),
+            StdinMode::Null,
+            true,
+        )
+        .unwrap();
+        assert!(
+            !null_spec
+                .argv
+                .iter()
+                .any(|a| a == "--include-partial-messages"),
+            "the json-envelope arm has no deltas to gate: {:?}",
+            null_spec.argv
+        );
     }
 
     /// cp-3 (§5.3.1): the `--permission-prompt-tool stdio` flag rides ONLY an
@@ -1273,6 +1352,7 @@ mod tests {
                 permission_mode: mode.map(str::to_owned),
                 isolation: Isolation::None,
                 stall_after: None,
+                partial_messages: false,
                 prompt: "P".into(),
             };
             let spec = build_spec(
@@ -1285,6 +1365,7 @@ mod tests {
                 Path::new("/t.jsonl"),
                 Path::new("/code"),
                 StdinMode::HeldStream,
+                false,
             )
             .unwrap();
             spec.argv
@@ -1325,6 +1406,7 @@ mod tests {
             permission_mode: Some("acceptEdits".into()),
             isolation: Isolation::None,
             stall_after: None,
+            partial_messages: false,
             prompt: "P".into(),
         };
         let spec = build_spec(
@@ -1337,6 +1419,7 @@ mod tests {
             Path::new("/t.jsonl"),
             Path::new("/code"),
             StdinMode::Null,
+            false,
         )
         .unwrap();
         let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
