@@ -1804,6 +1804,153 @@ mod tests {
         );
     }
 
+    /// cp-3 §5.3.3 (F2 follow-up): the RELEASE arm of the fail-closed requeue.
+    /// A bead-closed grace kill does NOT depend on the read channel, so when a
+    /// fatal pre-ladder drain skips the stall declaration on the SAME wake a
+    /// Release timer is due, the grace kill must STILL fire — otherwise a
+    /// released (bead-closed) worker leaks alive. Arms a Release timer, injects
+    /// a fatal drain, drives one wake through `stall_step`, and asserts the
+    /// released worker's `KillReleased` executes (the held `sleep` child is
+    /// SIGKILLed) while no stall is declared and the fatal drain is durable.
+    /// Reddens if `requeue_fires_without_declaring` drops the Release
+    /// `KillReleased` push (the worker survives — `test_child_wait` sees a
+    /// natural, successful `sleep` exit, not a signal).
+    #[test]
+    fn stall_step_fail_closed_still_fires_a_due_release_grace_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("camp.toml"), "[camp]\nname = \"t\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents/dev.md"),
+            "---\nname: dev\n---\nWork.\n",
+        )
+        .unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title": "t"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::SessionWoke,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "name": "s", "agent": "dev",
+                    "transcript_path": dir.path().join("projects/-p/sid.jsonl"),
+                    "bead": "gc-1",
+                }),
+            })
+            .unwrap();
+
+        let config = camp_core::config::CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        let mut dispatcher = Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.path().to_path_buf(),
+            },
+            config.clone(),
+        );
+        // A held worker that IGNORES its stdin (`sleep`): dropping its pipe on
+        // release does not end it, so only `kill_released` can — the clean
+        // discriminator for "did the grace kill fire?".
+        let pid = dispatcher.test_insert_held_sleeper(dir.path(), "s", "gc-1");
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let mut patrol = crate::daemon::patrol::PatrolRuntime::new(patrol_config, &config);
+        let mut control = crate::daemon::control::ControlRuntime::new(1024);
+        let mut read_channel = test_read_channel(dir.path());
+        read_channel.register(&mut ledger, "s").unwrap();
+
+        // Track + arm at t0.
+        let woke = ledger
+            .events_of_type(EventType::SessionWoke)
+            .unwrap()
+            .remove(0);
+        let t0 = Timestamp::now();
+        patrol.observe(&woke);
+        patrol.apply_tracking(&mut ledger, t0).unwrap();
+
+        // Close the bead → observe queues Release → execute_pending releases the
+        // worker and arms the Release grace timer (replacing the stall timer).
+        let close_seq = ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"outcome": "pass"}),
+            })
+            .unwrap();
+        let closed = ledger
+            .events_range(close_seq, Some(close_seq))
+            .unwrap()
+            .remove(0);
+        patrol.observe(&closed);
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, t0)
+            .unwrap();
+
+        // The fatal drain hits THIS wake, well past the 30s release grace.
+        read_channel.arm_drain_all_failure();
+        let mut conns: HashMap<Token, Conn> = HashMap::new();
+        let mut poll = Poll::new().unwrap();
+        let now = t0
+            .checked_add(jiff::SignedDuration::from_mins(120))
+            .unwrap();
+
+        let appended = stall_step(
+            &mut ledger,
+            &mut patrol,
+            &mut control,
+            &mut dispatcher,
+            &mut read_channel,
+            &mut conns,
+            &mut poll,
+            now,
+        )
+        .unwrap();
+
+        // Fail closed: no stall declared, the fatal drain is durable.
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::AgentStalled)
+                .unwrap()
+                .len(),
+            0,
+            "no stall declared on the fatal-drain wake"
+        );
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::PatrolDegraded)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.data["error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("drain_all failed")))
+                .count(),
+            1,
+            "the fatal drain is a durable patrol.degraded (inv-5)"
+        );
+        assert!(appended, "the wake did ledger work (the degraded append)");
+
+        // Execute the queued action: the grace kill — NOT read-channel-dependent
+        // — still fires despite the skipped stall declaration.
+        patrol
+            .execute_pending(&mut ledger, &mut dispatcher, now)
+            .unwrap();
+        let status = dispatcher.test_child_wait(pid);
+        assert!(
+            !status.success(),
+            "the due release grace kill still fired on the fail-closed wake — the \
+             released worker was SIGKILLed, not left leaking: {status:?}"
+        );
+    }
+
     /// PR #14 fix-pass NEW MEDIUM: the self-raise retry budget must bound
     /// — non-retryable failures never self-raise, and a persistent
     /// retryable failure degrades to log-and-wait instead of a hot loop.
