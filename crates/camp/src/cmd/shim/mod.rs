@@ -8,7 +8,9 @@
 //! outcome, not an error). So `main` calls these directly and converts
 //! [`ShimExit`] to an exit code, bypassing `report()`.
 
+pub mod hook;
 pub mod install;
+pub mod project;
 
 use anyhow::{Result, bail};
 use camp_core::event::{EventInput, EventType};
@@ -60,8 +62,11 @@ fn verb_of(args: &[String]) -> String {
 
 /// `camp gc-shim <verb> …` — the `gc` translator entry point.
 pub fn gc_shim(camp: &CampDir, args: Vec<String>) -> Result<ShimExit> {
-    // Served gc verbs land in Tasks 6/8; until then every verb is refused.
-    refuse(camp, &verb_of(&args), "gc shim does not serve this verb")
+    match args.first().map(String::as_str) {
+        Some("hook") => hook::run(camp, &args[1..]),
+        // `runtime`/`convoy` land in Task 8; every other verb is refused.
+        _ => refuse(camp, &verb_of(&args), "gc shim does not serve this verb"),
+    }
 }
 
 /// `camp bd-shim <verb> …` — the `bd` translator entry point.
