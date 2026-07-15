@@ -12,6 +12,7 @@ pub mod bd;
 pub mod hook;
 pub mod install;
 pub mod project;
+pub mod runtime;
 
 use anyhow::{Result, bail};
 use camp_core::event::{EventInput, EventType};
@@ -65,7 +66,9 @@ fn verb_of(args: &[String]) -> String {
 pub fn gc_shim(camp: &CampDir, args: Vec<String>) -> Result<ShimExit> {
     match args.first().map(String::as_str) {
         Some("hook") => hook::run(camp, &args[1..]),
-        // `runtime`/`convoy` land in Task 8; every other verb is refused.
+        Some("runtime") => runtime::run_runtime(camp, &args[1..]),
+        Some("convoy") => runtime::run_convoy(camp, &args[1..]),
+        // Every other gc verb (prime, mail, mol, …) is refused loudly (§6).
         _ => refuse(camp, &verb_of(&args), "gc shim does not serve this verb"),
     }
 }
