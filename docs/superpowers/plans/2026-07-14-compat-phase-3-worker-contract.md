@@ -1,5 +1,17 @@
 # Compat Phase 3 — The gc Worker Contract Implementation Plan
 
+## Plan-gate approval (2026-07-14)
+APPROVED by the adversarial 4-panelist plan gate. Rounds: R1 REJECT (12 findings B1-B12, all fixed in 606a147) → R2 REJECT (2 critic findings, fixed in 487ccd7) → R3 APPROVE. Final lens verdicts: contract/interface/execution APPROVE (round 2), execution/critic re-audit APPROVE (round 3).
+Accepted rulings/deviations (verified by the panels against merged code):
+- B1: route ownership is split — cook stamps beads.assignee (the qualified route) at BeadCreated; the claim stamps only work_branch. This satisfies §6.1's "one row, three projections, no second formatter" (all three fields land on the one bead row that bd_metadata projects). The claim must NOT re-stamp route from GC_AGENT env.
+- B4: the release event is named worker.drain_acked (additive; NOT a mirror of gc's session.drain_acked_with_assigned_work, which is gc's acked-while-still-holding-work anomaly with no camp counterpart).
+- §6.2 reconciled: bead-close only drops stdin + arms the 30s grace (never kills); drain-ack is the PROMPT kill via kill_released on the already-released worker. bd show --json metadata comes from readiness::bead_metadata (the one formatter); new events route through audit::<T> with deny_unknown_fields.
+Non-blocking notes to FOLD IN during execution (the reviewer accepted these as cheap improvements — implement them, do not skip):
+1. Task 1: add a superset assertion that verbs_static ⊇ the recorded dynamic `verbs`, so an under-capturing grep (a variable- or eval-indirected gc/bd invocation) cannot silently shrink verbs_static and pass reconciliation.
+2. Task 11: the §14 gate must keep release_grace (30s default) > the watchdog deadline (~20s) so the grace backstop cannot mask a drain-ack→KillReleased regression; state this and do NOT set release_grace below the deadline.
+3. Task 11 RED path: on the deadline/failure path, process-group-kill the `exec sleep 600` worker so a failing test does not orphan a 600s sleep (the worker is campd's grandchild).
+4. Heads-up (no change required): beads.work_branch gets a second writer at bead_closed, so gc.work_branch is not durable past a non-shipped close — fine for the fragment contract; note it.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 > **Revision 2 (plan-gate round 1 findings B1–B12 + non-blocking).** The central fix: the claim transaction does **NOT** re-stamp the route — cook already owns `beads.assignee` (= gc's `gc.routed_to`) at `BeadCreated` (cook.rs:407), so re-stamping it from `GC_AGENT` env would make the §6.1 projection equal *by construction* and re-admit the rev-3 bug. The claim stamps only `work_branch`; every projection reads the route from the **bead row** (via `readiness::bead_metadata`, the one formatter), and the guard fixtures set env `GC_AGENT` ≠ the cooked route so an independent re-derivation goes RED.
