@@ -348,6 +348,25 @@ enum Command {
     /// Watch the fleet live: one line per session, push-driven from the socket
     /// (control-plane §5.1). campd must be running.
     Watch,
+    /// Attach to one worker's live typed event stream (control-plane §5.2):
+    /// tool calls, results, assistant text, usage -- rendered live. Replays the
+    /// full history by default (a finished session ends); `--tail` follows live
+    /// only; `--from <offset>` resumes from a durable byte cursor. While
+    /// attached, a line is a turn, `/interrupt` stops the turn, `/q` detaches.
+    /// campd must be running.
+    Attach {
+        /// The session NAME (from `camp watch` / `camp top`).
+        session: String,
+        /// Filter: all|text|tools|edits|failures (default all).
+        #[arg(long, default_value = "all")]
+        only: String,
+        /// Follow live only -- skip the replayed history.
+        #[arg(long)]
+        tail: bool,
+        /// Resume from a durable byte offset (a prior subscription's cursor).
+        #[arg(long)]
+        from: Option<u64>,
+    },
     /// Operator mailbox (compat §8.2): read the mail workers send to the human.
     Mail {
         #[command(subcommand)]
@@ -904,6 +923,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Watch => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::watch::run(&camp)
+        }
+        Command::Attach {
+            session,
+            only,
+            tail,
+            from,
+        } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            let filter = cmd::attach::AttachFilter::parse(&only)?;
+            cmd::attach::run(&camp, session, filter, tail, from)
         }
         Command::Mail { cmd } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;

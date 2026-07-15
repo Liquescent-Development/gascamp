@@ -7,8 +7,14 @@
 //! ends). From here you send a turn or interrupt; answering a permission request
 //! drops in when cp-3's verb lands.
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+
 use anyhow::{Result, bail};
 use serde::Deserialize;
+
+use crate::campdir::CampDir;
+use crate::daemon::socket::{self, Request, Response};
 
 /// The KIND of a rendered line — what the `--only` filter selects on.
 #[derive(Debug, Clone, PartialEq)]
@@ -238,6 +244,21 @@ pub enum StreamFrame {
     Unknown,
 }
 
+impl StreamFrame {
+    /// The durable §9 resume cursor this frame carries -- the byte offset of the
+    /// START OF THE NEXT LINE. `None` for an `Unknown` frame (no offset to trust).
+    /// Surfaced to the operator so a later `camp attach --from <offset>` can pick
+    /// up exactly where a detach left off.
+    pub fn offset(&self) -> Option<u64> {
+        match self {
+            StreamFrame::Event { offset, .. }
+            | StreamFrame::Skipped { offset, .. }
+            | StreamFrame::End { offset, .. } => Some(*offset),
+            StreamFrame::Unknown => None,
+        }
+    }
+}
+
 /// A steering action parsed from an operator input line (§6: turns and
 /// decisions, not keypresses). The permission-answer actions (`/allow`,
 /// `/deny`) drop in here when cp-3's `session.permission_decision` verb lands.
@@ -276,11 +297,196 @@ pub fn render_frame(frame: &StreamFrame, filter: AttachFilter) -> Vec<String> {
     }
 }
 
+/// The start-cursor policy: `--from <offset>` (a durable §9 resume cursor) wins;
+/// else `--tail` means live-only (`None` -> campd starts at the tail); else the
+/// default is `Some(0)` -- the full history, then follow (replay of a finished
+/// session is exactly this on a session that ends).
+fn subscribe_cursor(tail: bool, from: Option<u64>) -> Option<u64> {
+    match (from, tail) {
+        (Some(off), _) => Some(off),
+        (None, true) => None,
+        (None, false) => Some(0),
+    }
+}
+
+pub fn run(
+    camp: &CampDir,
+    session: String,
+    only: AttachFilter,
+    tail: bool,
+    from: Option<u64>,
+) -> Result<()> {
+    let cursor = subscribe_cursor(tail, from);
+
+    // Connect + subscribe. The hello is bounded by REQUEST_TIMEOUT (a wedged
+    // campd fails fast, like every verb); a down campd is the standard loud
+    // error. A pure client never starts campd.
+    let path = camp.socket_path();
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(s) => s,
+        Err(_) => {
+            socket::require(
+                camp,
+                &Request::SessionSubscribe {
+                    session: session.clone(),
+                    cursor,
+                },
+            )?;
+            return Ok(()); // unreachable -- require errored -- keeps the type total
+        }
+    };
+    stream.set_read_timeout(Some(socket::REQUEST_TIMEOUT))?;
+    stream.set_write_timeout(Some(socket::REQUEST_TIMEOUT))?;
+    let mut line = serde_json::to_string(&Request::SessionSubscribe {
+        session: session.clone(),
+        cursor,
+    })?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())?;
+
+    let mut reader = BufReader::new(stream);
+    let mut hello = String::new();
+    reader.read_line(&mut hello)?;
+    match serde_json::from_str::<Response>(hello.trim_end()) {
+        Ok(Response::Subscribed {
+            ok: true,
+            cursor: c,
+            ..
+        }) => {
+            eprintln!(
+                "attached to {session} from byte offset {c} (/q to detach, /interrupt to stop the turn)"
+            );
+        }
+        Ok(Response::Error { error, .. }) => bail!("campd refused session.subscribe: {error}"),
+        other => bail!("unexpected session.subscribe hello: {other:?}"),
+    }
+    // Long-lived now: no read timeout (a quiet stream is not a wedged daemon -- §4.4).
+    reader.get_ref().set_read_timeout(None)?;
+
+    // The stream reader runs on its own thread so the main thread can read stdin
+    // for steering. It OWNS the reader; on EOF (`end` frame flush, campd closing
+    // the stream, or our own detach dropping the socket) it returns.
+    let printer = std::thread::spawn(move || -> Result<()> {
+        // The last durable §9 offset seen -- reported on `end` so the operator has
+        // the exact `--from` cursor to resume from.
+        let mut last_offset: Option<u64> = None;
+        loop {
+            let mut frame_line = String::new();
+            let n = reader.read_line(&mut frame_line)?;
+            if n == 0 {
+                return Ok(()); // campd closed the stream (or we detached)
+            }
+            let trimmed = frame_line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<StreamFrame>(trimmed) {
+                Ok(frame) => {
+                    if let Some(off) = frame.offset() {
+                        last_offset = Some(off);
+                    }
+                    for out in render_frame(&frame, only) {
+                        println!("{out}");
+                    }
+                    if matches!(frame, StreamFrame::End { .. }) {
+                        if let Some(off) = last_offset {
+                            eprintln!("(resume this replay with --from {off})");
+                        }
+                        return Ok(()); // finished session: replay complete
+                    }
+                }
+                Err(e) => bail!("malformed stream frame {trimmed:?}: {e}"),
+            }
+        }
+    });
+
+    // The steering loop: a line is a turn, `/interrupt` interrupts, `/q`/EOF
+    // detaches. Each action is a SEPARATE one-shot connection (the subscribe
+    // socket is server-push only) -- reusing the proven verbs.
+    let stdin = std::io::stdin();
+    let mut input = String::new();
+    loop {
+        input.clear();
+        if printer.is_finished() {
+            break; // the session ended -- stop prompting
+        }
+        let n = stdin.lock().read_line(&mut input)?;
+        if n == 0 {
+            break; // EOF on stdin = detach
+        }
+        match parse_action(&input) {
+            Action::Detach => break,
+            Action::Turn(text) => {
+                match socket::request_if_up(
+                    camp,
+                    &Request::SessionSendTurn {
+                        session: session.clone(),
+                        text,
+                    },
+                )? {
+                    Some(Response::SendTurn { via, .. }) if via == "stdin" => {
+                        eprintln!("(turn delivered to {session})")
+                    }
+                    Some(Response::SendTurn { .. }) => eprintln!(
+                        "(no live pipe for {session}; use `camp nudge` to resume an exited session)"
+                    ),
+                    Some(other) => eprintln!("(unexpected send_turn response: {other:?})"),
+                    None => eprintln!("(campd went away; cannot deliver the turn)"),
+                }
+            }
+            Action::Interrupt => {
+                match socket::request_if_up(
+                    camp,
+                    &Request::SessionInterrupt {
+                        session: session.clone(),
+                    },
+                )? {
+                    Some(Response::Interrupt { request_id, .. }) => {
+                        eprintln!("(interrupt sent to {session}, request {request_id})")
+                    }
+                    Some(other) => eprintln!("(unexpected interrupt response: {other:?})"),
+                    None => eprintln!("(campd went away; cannot interrupt)"),
+                }
+            }
+        }
+    }
+
+    // Detach: only JOIN the printer when it has already finished (a session that
+    // ended). For a still-live session we detach by letting the process exit --
+    // the kernel closes our socket fd and campd's next flush sees the peer gone
+    // (FlushStep::Gone, silent, worker unaffected). Joining a printer still
+    // blocked in read_line would hang, so we must not.
+    if printer.is_finished() {
+        match printer.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {} // the printer cannot panic (no unwrap/expect in it)
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn subscribe_cursor_policy_from_wins_then_tail_then_replay_from_zero() {
+        assert_eq!(subscribe_cursor(false, Some(64)), Some(64), "--from wins");
+        assert_eq!(
+            subscribe_cursor(true, Some(64)),
+            Some(64),
+            "--from still wins over --tail"
+        );
+        assert_eq!(subscribe_cursor(true, None), None, "--tail = live only");
+        assert_eq!(
+            subscribe_cursor(false, None),
+            Some(0),
+            "default = history then follow (replay)"
+        );
+    }
 
     #[test]
     fn decodes_an_event_frame_and_exposes_its_offset_and_inner_event() {
@@ -320,6 +526,27 @@ mod tests {
     fn an_unknown_frame_kind_decodes_to_unknown_never_errors() {
         let f: StreamFrame = serde_json::from_str(r#"{"frame":"from_the_future","x":1}"#).unwrap();
         assert!(matches!(f, StreamFrame::Unknown));
+    }
+
+    #[test]
+    fn offset_exposes_the_durable_resume_cursor_for_every_real_frame() {
+        let ev = StreamFrame::Event {
+            offset: 42,
+            event: json!({}),
+        };
+        let sk = StreamFrame::Skipped {
+            offset: 9,
+            bytes: 700000,
+            reason: "over_cap".into(),
+        };
+        let en = StreamFrame::End {
+            offset: 100,
+            reason: "stopped".into(),
+        };
+        assert_eq!(ev.offset(), Some(42));
+        assert_eq!(sk.offset(), Some(9));
+        assert_eq!(en.offset(), Some(100));
+        assert_eq!(StreamFrame::Unknown.offset(), None); // no offset to trust
     }
 
     #[test]
