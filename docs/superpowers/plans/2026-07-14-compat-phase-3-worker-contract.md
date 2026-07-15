@@ -107,15 +107,26 @@ Write a scratch recording `gc`/`bd` (each appends its full argv to a log and ret
 
 Record, per branch, into the fixture: the exact `gc`/`bd` verbs+flags, the JSON fields the fragment's inline `python3` parses out of `hook --claim --json` and `bd show --json`, the exit-code contract (`hook` work=0/drain=1, `drain-ack` exit), and every env var read.
 
-- [ ] **Step 3: Reconcile the observed verb set against phase-3's served set**
+- [ ] **Step 3: EXHAUSTIVE static extraction — every verb in the fragment TEXT, not just the branches you drove (R2-B1)**
 
-The served set is: `gc hook --claim --json`, `gc runtime drain-ack`, `gc convoy status --json`, `bd show/update/close/list/ready/create`. If ANY branch (happy, fail-close, OR config-reject) invokes a verb outside that set on a path the fragment must complete (`prime`, `mail send`, a `bd` verb not listed): **STOP and report to the lead** — refusing it would hang the fragment (`set +e; sleep 2; continue`), and moving it into phase-3 or accepting a documented refusal is a scope decision, not a guess. Record the finding in the fixture either way.
+The 3-branch dynamic drive (Step 2) proves no-hang on the paths it scripts, but a verb reachable only on a FOURTH branch nobody scripted (a `mail send human` on some non-fail-close escalation, a `bd`/`convoy` call on a re-hook or progress path) never enters that recording — and in production it is refused, eaten by `set +e; sleep 2; continue`, and the worker hangs while every test stays green. So add an **exhaustive-by-construction** net that does not depend on which branch runs: statically extract EVERY `gc`/`bd` invocation from the fragment source and dedupe it:
 
-- [ ] **Step 4: Commit** (the fragment text is NOT committed — §10; only our derived facts)
+```bash
+FRAG=/tmp/gcpacks/<fragment_path>   # from Step 1
+grep -oE '\b(gc|bd) [a-z][a-z-]*' "$FRAG" | sort -u
+```
+
+Record this deduped set in the fixture under `verbs_static` (distinct from the per-branch `verbs`). It is the ground truth the reconciliation checks against.
+
+- [ ] **Step 4: Reconcile the static verb set against phase-3's served set**
+
+The served set is: `gc hook --claim --json`, `gc runtime drain-ack`, `gc convoy status --json`, `bd show/update/close/list/ready/create`. Cross-check **`verbs_static`** (Step 3 — exhaustive over the whole fragment, every branch) — NOT only the three driven branches — against that served set. If ANY statically-extracted verb falls outside it (`prime`, `mail send`, a `bd`/`convoy` verb not listed): **STOP and report to the lead** — refusing it would hang the fragment, and moving it into phase-3 or accepting a documented refusal is a scope decision, not a guess. (Practical exposure is narrow — the served `bd` set is broad and §2 records `bd mol`/`ready`/`gate` as prohibitions-only — but exhaustive-by-construction is the requirement, not "the branches I thought to script".) Record the finding in the fixture either way.
+
+- [ ] **Step 5: Commit** (the fragment text is NOT committed — §10; only our derived facts, incl. `verbs_static`)
 
 ```bash
 git add ci/gc-compat/fixtures/gc-role-worker.observed.json
-git commit -m "compat(worker): measure the real gc-role-worker fragment on all branches"
+git commit -m "compat(worker): measure the real gc-role-worker fragment (all branches + static verb set)"
 ```
 
 ---
@@ -193,6 +204,8 @@ git commit -m "compat(worker): shim.refused + worker.drain_acked, validated audi
 
 **Interfaces:**
 - Produces: `BeadClaimed { session, work_branch: Option<String> }`. When `work_branch` is `Some`, the SAME `UPDATE` that sets `claimed_by`/`status='in_progress'` sets `beads.work_branch`. **`beads.assignee` (the route → `gc.routed_to`) is NEVER touched — cook owns it (cook.rs:407).** Consumed by Task 6 (hook emits `{session, work_branch}`), Task 6's `claim_projection` (reads the columns back). `camp claim` (claim.rs) keeps emitting `{session}` only (`work_branch` `None` → column untouched).
+
+**Durability note (heads-up, not a required change):** `beads.work_branch` now has a SECOND writer — `bead_closed` sets it on the `shipped` path (fold.rs:490). So a claim-stamped `gc.work_branch` is not durable past a `no-op`/`blocked`/`abandoned` (non-shipped) close, which leaves it as the claim value. This is fine for the fragment contract (the branch matters during the claim→close window, which is when the worker reads it); recorded so a later phase that needs post-close durability of `gc.work_branch` knows the two writers exist.
 
 **Why not `route` (B1 — the central fix):** cook stamps `beads.assignee = <qualified route>` at `BeadCreated`. If the claim re-stamped it from `GC_AGENT` env via `COALESCE`, the bead's `gc.routed_to`, the hook's printed route, and env `GC_AGENT` would be equal *by construction* — the §6.1 byte-projection guard would confirm equality only when everything is equal by construction, re-admitting the exact rev-3 bug (a projection deriving the route from env instead of the bead). So the claim leaves `assignee` alone; every projection reads the route from the bead row, and Task 6/11 fixtures set `GC_AGENT` ≠ the cooked route to make a re-derivation observable.
 
@@ -468,6 +481,8 @@ git commit -m "compat(worker): gc hook --claim --json — claim flip + drain, ro
 - `bd show <bead> --json` → JSON `{ "id":…, "status":…, "assignee": <claimed_by>, …, "metadata": <readiness::bead_metadata(conn, bead)> }`. **The `metadata` map MUST come from `readiness::bead_metadata` (readiness.rs:201), which already emits `gc.routed_to`, `gc.work_branch`, and every non-projected `bead_meta` key — it is NOT re-derived in shim code.** The top-level `assignee` is `claimed_by` (the session). §6.1: `bd show`'s assignee/route overwrite hook's in the fragment before it compares.
 - `bd update <bead> --set-metadata k=v …` → `BeadUpdated { metadata }`; `bd close <bead> --status …` → camp's close (outcome/work-outcome, vocab.rs:58,68); `bd create`/`list`/`ready` → camp equivalents. Flags outside Task 1's `verbs.bd` recording → `refuse`.
 
+**Acknowledged out-of-fragment-scope edges (map only what Task 1 records; do not gold-plate).** The corpus fragment's happy/fail paths use `bd close` with `pass`/`fail` only — `blocked`/`abandoned`/`no-op` need mapping ONLY if Task 1's recording shows the fragment emitting them (map exactly what it uses; refuse the rest). `bd update --set-metadata` on a **projected key** (`gc.work_branch`/`gc.routed_to`) would try to write `bead_meta` while reads project from the column — `write_meta` already REFUSES this (fold.rs:221-233, "a key with a dedicated column is refused"), so it surfaces as a loud shim error, not a silent divergence; the fragment does not do it. A **double-claim of one open bead** cannot occur (the hook is pinned to `CAMP_BEAD`, one bead per session, §6.2) and `bead_claimed` rejects a non-`open` claim anyway. Each is a one-line acknowledgement, not new machinery.
+
 - [ ] **Step 1: Confirm** the `bd` subcommand+flag set and the `bd_show_json_fields` against `gc-role-worker.observed.json` (the fragment reads `assignee` + `gc.routed_to` from `bd show` at fragment lines 127-133). Cite the fixture.
 
 - [ ] **Step 2: Write the failing tests**
@@ -613,6 +628,14 @@ fn a_worker_that_never_acks_is_killed_by_the_grace_backstop() {
     // bead closes, no drain-ack; the TimerKind::Release grace fires → kill_released.
     // Mutation caught: removing the bead-close grace arm (a crashed-mid-drain worker leaks).
 }
+#[test]
+fn a_drain_ack_at_the_grace_boundary_still_reaps_via_the_ack_not_a_double_kill() {
+    // NB2 — pin the "post-close drain << grace" claim instead of deriving it. Configure a
+    // SHORT release_grace and drive the ack right AT/just-before it: assert the drain-ack
+    // KillReleased reaps the worker exactly once (idempotent with the grace fire that lands
+    // in the same wake) — no double kill_released, no panic. This is the boundary where the
+    // §6.2 race would reappear if the two paths were not idempotent.
+}
 ```
 
 - [ ] **Step 2: Run, watch fail** — FAIL.
@@ -644,13 +667,17 @@ fn hook_bd_show_and_env_project_the_same_bead_row() {
 }
 ```
 
-- [ ] **Step 2: The hermetic loop test with a REAL watchdog (B11 — happy AND fail-close, B2)** — write `crates/camp/tests/fixtures/gc-fragment.sh`: a FAITHFUL synthetic fragment from `gc-role-worker.observed.json` — the `EXPECTED_ASSIGNEE`/`python3` guard, the `set +e … while true` claim loop (`gc hook --claim --json` → `bd show` → `bd close` → on drain, `gc runtime drain-ack; exit 0`). Provide a `FAIL` mode that takes the `bd close --status fail` branch and any failure-report verb Task 1 recorded, so the fail-close verb set is DRIVEN, not just grepped. In `worker_contract.rs`, drive REAL campd with `[dispatch].command` = a fake `claude` that `exec`s `sh gc-fragment.sh`, real ledger, real shims (installed by `launch` — Task 9). Watchdog: a poll loop `while !bead_closed { if start.elapsed() > DEADLINE { child.kill(); panic!("fragment hung in sleep 2; continue") } try_wait(); sleep(50ms) }` (the `daemon_drain.rs` pattern — `Instant`/`Duration`/poll, never a blocking `child.wait()`), then assert the child exited 0. Run BOTH the happy and fail-close modes.
+**Independence note (NB1 — state explicitly):** `hook.route` and `bd.metadata.gc.routed_to` are NOT independent legs — both call the single `readiness::bead_metadata` formatter (that reuse is the B5 fix), so their mutual equality is tautological and only proves the formatter is called, not that the route is right. The genuinely independent leg is **env `GC_AGENT` == the cooked route** — the equality the REAL fragment depends on to not spin (it compares `EXPECTED_ROUTE` from env against `bd show`'s route). That leg is pinned ONLY by the real-campd Task 11 §14 gate (Step 2/4), because only there does the env come from a real `build_spec` and the route from a real cook. **This is why closing R2-B2's lingering fixture matters: the §14 gate is the sole honest guard of the env leg, so it must actually run the integrated path to the end.**
+
+- [ ] **Step 2: The hermetic loop test with a REAL watchdog AND a LINGERING worker (B11 happy+fail-close B2; R2-B2 lifecycle)** — write `crates/camp/tests/fixtures/gc-fragment.sh`: a FAITHFUL synthetic fragment from `gc-role-worker.observed.json` — the `EXPECTED_ASSIGNEE`/`python3` guard, the `set +e … while true` claim loop (`gc hook --claim --json` → `bd show` → `bd close` → on drain, `gc runtime drain-ack`). **After `drain-ack` the fragment MUST LINGER, NOT `exit 0`** — e.g. `exec sleep 600` (well past the deadline). Rationale (R2-B2): in production the worker is a `claude -p` whose held stdin does NOT exit on EOF (P3, spawn.rs:98) — that is the entire reason `kill_released` exists (dispatch.rs:341). A fragment that self-exits ends only its bash subshell and makes campd's kill a no-op, so the drain-ack → `poke` → `observe(WorkerDrainAcked)` → `KillReleased` → `kill_released` wiring — the single §6.2 behavior camp owns — is NEVER exercised in the integrated path (Task 10's `cat`-based unit test is the only guard, and it is time-simulated in isolation). A lingering fragment forces **campd's kill** to be what reaps the worker.
+
+  Provide a `FAIL` mode that takes the `bd close --status fail` branch and any failure-report verb Task 1 recorded, so the fail-close verb set is DRIVEN, not just grepped. In `worker_contract.rs`, drive REAL campd with `[dispatch].command` = a fake `claude` that `exec`s `sh gc-fragment.sh`, real ledger, real shims (installed by `launch` — Task 9). Watchdog: a poll loop `while !reaped { if start.elapsed() > DEADLINE { child.kill(); panic!("campd did not reap the drained worker — the drain-ack→KillReleased wiring regressed, or the fragment hung in sleep 2; continue") } try_wait(); sleep(50ms) }` (the `daemon_drain.rs` pattern — `Instant`/`Duration`/poll, never a blocking `child.wait()`). Assert BOTH: the bead reached `closed`, AND campd reaped the worker (a `session.stopped` for it) **while the fragment was still in its `sleep 600`** — i.e. the reap came from campd's kill, not the fragment self-exiting. Because the fragment sleeps 600 s but the deadline is ~20 s, the ONLY way `reaped` becomes true in time is campd's KillReleased firing; if that wiring regressed, the fragment sleeps past the deadline → the watchdog fails RED. Run BOTH happy and fail-close modes.
 
 ```rust
 #[test]
-fn a_gc_worker_closes_a_gc_bead_end_to_end_via_a_faithful_fragment() { /* happy; DEADLINE 20s */ }
+fn campd_reaps_a_lingering_gc_worker_via_drain_ack_after_it_closes_the_bead() { /* happy; DEADLINE 20s; worker sleeps 600s */ }
 #[test]
-fn the_fail_close_branch_also_completes_without_a_hang() { /* fail mode; DEADLINE 20s */ }
+fn the_fail_close_branch_also_closes_and_is_reaped_without_a_hang() { /* fail mode; DEADLINE 20s */ }
 ```
 
 - [ ] **Step 3: Run the hermetic tests** — `cargo test -p camp --test worker_contract` → PASS.
@@ -658,8 +685,8 @@ fn the_fail_close_branch_also_completes_without_a_hang() { /* fail mode; DEADLIN
 - [ ] **Step 4: The §14 CI gate (real corpus fragment)** — write `ci/gc-compat/worker_contract.py <corpus-checkout> <camp-binary>`, mirroring `e2e_corpus.py`:
   1. `camp init`; `camp import add <corpus>/gascity/roles --name gc` (the deployment recipe, §3/§7.3); set `[agent_defaults].tools`.
   2. Create/route a bead to a real `gc.<agent>` (so `gc.routed_to` is stamped from cook).
-  3. Real campd with `[dispatch].command` = a fake claude that `exec`s `sh` on the REAL rendered `gc-role-worker` fragment. **The renderer is THIS Python harness** (it substitutes the fragment's Go-template with the recorded env/values) — NOT a camp "prime" (prime is phase-4; `parse_agent_dir` reads the prompt raw) (NB1).
-  4. Assert under a wall deadline: the bead reaches `closed`, a `worker.drain_acked` appears, the worker process exits — a hang fails the gate. Drive the fail-close branch too.
+  3. Real campd with `[dispatch].command` = a fake claude that runs `sh` on the REAL rendered `gc-role-worker` fragment and then **LINGERS** (`sh <fragment>; exec sleep 600`) — NOT exits when the fragment's bash returns. Same rationale as Step 2 (R2-B2): a real `claude -p` does not exit on task completion or EOF (P3), so the fake claude must linger for campd's drain-ack→KillReleased to be the thing that reaps it; a self-exiting wrapper makes the kill a no-op and leaves the one camp-owned lifecycle decision unexercised even here. **The renderer is THIS Python harness** (it substitutes the fragment's Go-template with the recorded env/values) — NOT a camp "prime" (prime is phase-4; `parse_agent_dir` reads the prompt raw) (NB1).
+  4. Assert under a wall deadline: the bead reaches `closed`, a `worker.drain_acked` appears, and **campd reaps the lingering worker** (`session.stopped`) — since the wrapper sleeps 600 s, a reap within the deadline can only be campd's KillReleased; a hang (wiring regressed) fails the gate. Drive the fail-close branch too.
   5. Re-derive `gc-role-worker.observed.json` from the live fragment and fail on drift; add this to the README "Moving GCPACKS_REF" procedure.
 
   **What green proves, stated plainly (NB2):** a passing §14 gate proves the SHIM CONTRACT (the fragment's verbs are served, the bead-side projection holds, the drain handshake completes). It does NOT prove production dispatch of a gc agent's *rendered prompt to a real claude* — that is a phase-4/§5.1 (`prime`) concern the fake-claude gate deliberately does not exercise.
@@ -746,6 +773,8 @@ python3 ci/gc-compat/worker_contract.py /tmp/gcpacks target/debug/camp
 - §12.3 + §14 → Task 11.
 
 **Round-1 findings, each addressed:** B1 claim no longer stamps route + env≠bead mismatch fixtures (Tasks 3/6/11); B2 full-branch measurement + fail-close driven (Tasks 1/11); B3 drain-ack = prompt kill (not redundant — bead-close does not kill), grace-race defused by continuation truncation, timing-not-reason assertion, slow-drain test (Task 10); B4 `worker.drain_acked` with justification (Task 2); B5 `bd show` metadata from `readiness::bead_metadata` (Task 7); B6 `claim_projection(conn, bead)` avoids `BeadRow` (Task 6); B7 `deny_unknown_fields` payloads via `audit::<T>` + a validation test (Task 2); B8 `ShimExit` + bespoke `main` arms (Task 4); B9 tests sited in `tests/claim_invariant.rs` with the cook harness + corrected expected-fail (Task 3); B10 `--test refold_prop` (Tasks 2/3); B11 poll-loop watchdog, no blocking `wait()` (Task 11); B12 launch-level shim-install assertion (Task 9); execNB drain-ack observed in `patrol::observe` + column-inversion note (Tasks 3/6/10 + the orientation table); NB1/NB2 renderer named, §14-scope stated (Task 11).
+
+**Round-2 findings, each addressed:** R2-B1 exhaustive static verb extraction (`grep -oE '\b(gc|bd) [a-z][a-z-]*'`) cross-checked against the served set, not just the 3 driven branches (Task 1 Steps 3–4); R2-B2 the §14 fixture (both hermetic and the Python gate) LINGERS after `drain-ack` (`exec sleep 600`) so campd's drain-ack→KillReleased is what reaps the worker — the integrated path now exercises the one camp-owned §6.2 decision, and a wiring regression hangs the deadline RED (Task 11 Steps 2/4); NB1 the env-leg independence dependency stated explicitly (Task 11 Step 1 note); NB2 a grace-boundary idempotency test (Task 10); the optional edges (`bd close` outcome space, `--set-metadata` on a projected key, double-claim) acknowledged as out-of-fragment-scope (Task 7); the `beads.work_branch` second-writer durability heads-up recorded (Task 3).
 
 **Type consistency:** `BeadClaimed{session, work_branch}` (Task 3) = what the hook emits (Task 6). `claim_projection(conn, bead) -> {assignee, route, work_branch}` (Task 6) is used by hook (Task 6) and — via `readiness::bead_metadata` for the metadata map — by bd-show (Task 7), and asserted against env in Task 11. `ShimExit` (Task 4) is returned by every shim verb and consumed by the `main` arms. `EventType::ShimRefused`/`WorkerDrainAcked` (Task 2) are emitted by Tasks 5/8 and observed by Task 10.
 
