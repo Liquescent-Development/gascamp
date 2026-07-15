@@ -135,6 +135,13 @@ impl Ledger {
         crate::id::next_bead_id(&self.conn, prefix)
     }
 
+    /// A borrow of the underlying connection for in-crate tests that assert
+    /// against read-only query helpers (`crate::mail`). Test-only.
+    #[cfg(test)]
+    pub(crate) fn conn_for_test(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
+
     /// True when `bead` is open and every `needs` target passed (decision 6).
     pub fn is_ready(&self, bead: &str) -> Result<bool, CoreError> {
         crate::readiness::is_ready(&self.conn, bead)

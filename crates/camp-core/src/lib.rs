@@ -10,6 +10,7 @@ pub mod formula;
 pub mod id;
 pub mod import;
 pub mod ledger;
+pub mod mail;
 pub mod orders;
 pub mod pack;
 pub mod patrol;
