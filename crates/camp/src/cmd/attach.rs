@@ -8,6 +8,7 @@
 //! drops in when cp-3's verb lands.
 
 use anyhow::{Result, bail};
+use serde::Deserialize;
 
 /// The KIND of a rendered line — what the `--only` filter selects on.
 #[derive(Debug, Clone, PartialEq)]
@@ -214,11 +215,212 @@ impl AttachFilter {
     }
 }
 
+/// One frame off the `session.subscribe` wire (cp-1). Lenient -- an unknown
+/// `frame` is ignored, never a crash (the client renders campd's protocol; it
+/// does not validate it). `offset` is the durable §9 resume cursor.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "frame", rename_all = "snake_case")]
+pub enum StreamFrame {
+    Event {
+        offset: u64,
+        event: serde_json::Value,
+    },
+    Skipped {
+        offset: u64,
+        bytes: u64,
+        reason: String,
+    },
+    End {
+        offset: u64,
+        reason: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// A steering action parsed from an operator input line (§6: turns and
+/// decisions, not keypresses). The permission-answer actions (`/allow`,
+/// `/deny`) drop in here when cp-3's `session.permission_decision` verb lands.
+#[derive(Debug, PartialEq)]
+pub enum Action {
+    Turn(String),
+    Interrupt,
+    Detach,
+}
+
+/// Map an input line to an action. A blank line or `/q` detaches; `/interrupt`
+/// interrupts; anything else is a turn.
+pub fn parse_action(line: &str) -> Action {
+    match line.trim() {
+        "" | "/q" | "/quit" => Action::Detach,
+        "/interrupt" => Action::Interrupt,
+        other => Action::Turn(other.to_owned()),
+    }
+}
+
+/// Turn one frame into the ready-to-print lines under `filter`. `Event` frames
+/// go through `render_event` + the filter; `Skipped`/`End` render their own
+/// marker lines UNCONDITIONALLY (they are stream structure, not agent content).
+pub fn render_frame(frame: &StreamFrame, filter: AttachFilter) -> Vec<String> {
+    match frame {
+        StreamFrame::Event { event, .. } => render_event(event)
+            .into_iter()
+            .filter(|r| filter.matches(r) && !r.line.is_empty())
+            .map(|r| r.line)
+            .collect(),
+        StreamFrame::Skipped { bytes, reason, .. } => {
+            vec![format!("  [skipped {bytes} bytes: {reason}]")]
+        }
+        StreamFrame::End { reason, .. } => vec![format!("-- session {reason} --")],
+        StreamFrame::Unknown => vec![],
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn decodes_an_event_frame_and_exposes_its_offset_and_inner_event() {
+        let line = r#"{"frame":"event","session":"t/dev/1","offset":42,"event":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}}"#;
+        let f: StreamFrame = serde_json::from_str(line).unwrap();
+        match f {
+            StreamFrame::Event { offset, event } => {
+                assert_eq!(offset, 42);
+                assert_eq!(event["type"], "assistant");
+            }
+            other => panic!("expected Event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_skipped_and_end_frames() {
+        let sk: StreamFrame = serde_json::from_str(
+            r#"{"frame":"skipped","session":"s","offset":9,"bytes":700000,"reason":"over_cap"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            sk,
+            StreamFrame::Skipped {
+                offset: 9,
+                bytes: 700000,
+                ..
+            }
+        ));
+        let en: StreamFrame = serde_json::from_str(
+            r#"{"frame":"end","session":"s","offset":100,"reason":"stopped"}"#,
+        )
+        .unwrap();
+        assert!(matches!(en, StreamFrame::End { offset: 100, .. }));
+    }
+
+    #[test]
+    fn an_unknown_frame_kind_decodes_to_unknown_never_errors() {
+        let f: StreamFrame = serde_json::from_str(r#"{"frame":"from_the_future","x":1}"#).unwrap();
+        assert!(matches!(f, StreamFrame::Unknown));
+    }
+
+    #[test]
+    fn render_frame_composes_render_and_filter() {
+        let line = r#"{"frame":"event","session":"s","offset":1,"event":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Bash","input":{"command":"ls"}}]}}}"#;
+        let f: StreamFrame = serde_json::from_str(line).unwrap();
+        assert!(render_frame(&f, AttachFilter::Edits).is_empty()); // Edits hides a Bash tool_use
+        let lines = render_frame(&f, AttachFilter::Tools); // Tools shows it
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("ls"));
+    }
+
+    #[test]
+    fn render_frame_shows_skipped_and_end_markers_regardless_of_filter() {
+        let sk = StreamFrame::Skipped {
+            offset: 9,
+            bytes: 700000,
+            reason: "over_cap".into(),
+        };
+        let en = StreamFrame::End {
+            offset: 100,
+            reason: "stopped".into(),
+        };
+        assert!(
+            render_frame(&sk, AttachFilter::Edits)[0]
+                .to_lowercase()
+                .contains("skipped")
+        );
+        assert!(
+            render_frame(&en, AttachFilter::Text)[0]
+                .to_lowercase()
+                .contains("stopped")
+        );
+    }
+
+    /// CP4's OWNED half of the "replay of a finished session" exit criterion: the
+    /// CLIENT renders a WHOLE finished-session replay — every history line in order,
+    /// then the terminal marker. The DAEMON's full-history-then-end delivery over a
+    /// cursor-0 subscribe is cp-1's guarantee (tests/control.rs:1387, cited in Task
+    /// 6); this proves the piece cp-1 cannot: that the client turns that byte stream
+    /// into the operator's scrollback WITHOUT truncating it. It pins exactly the
+    /// mutation the gate flagged (a replay that drops history frames): decode each
+    /// wire line, render it, and assert the full ordered transcript + `-- session
+    /// stopped --` appear.
+    #[test]
+    fn client_renders_a_full_finished_replay_in_order_then_the_end_marker() {
+        // A realistic cursor-0 replay: an init/text line, a tool call, its result,
+        // the worker's terminal answer, then the end frame — exactly the frame
+        // sequence tests/control.rs:1387 delivers over the wire.
+        let wire = [
+            r#"{"frame":"event","session":"s","offset":10,"event":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"starting"}]}}}"#,
+            r#"{"frame":"event","session":"s","offset":40,"event":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Bash","input":{"command":"make"}}]}}}"#,
+            r#"{"frame":"event","session":"s","offset":90,"event":{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok","is_error":false}]}}}"#,
+            r#"{"frame":"event","session":"s","offset":140,"event":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done here"}]}}}"#,
+            r#"{"frame":"end","session":"s","offset":140,"reason":"stopped"}"#,
+        ];
+        let mut out: Vec<String> = Vec::new();
+        for line in wire {
+            let f: StreamFrame = serde_json::from_str(line).unwrap();
+            out.extend(render_frame(&f, AttachFilter::All));
+        }
+        // The FULL history rendered, IN ORDER — not a truncated prefix.
+        let joined = out.join("\n");
+        let starting = out
+            .iter()
+            .position(|l| l.contains("starting"))
+            .expect("first line");
+        let make = out
+            .iter()
+            .position(|l| l.contains("make"))
+            .expect("tool call");
+        let done = out
+            .iter()
+            .position(|l| l.contains("done here"))
+            .expect("terminal answer");
+        assert!(
+            starting < make && make < done,
+            "history must render in order: {out:#?}"
+        );
+        assert!(
+            joined.contains("ok"),
+            "the tool result is part of the replay: {out:#?}"
+        );
+        // The terminal marker is LAST — the operator sees the session finished.
+        assert!(
+            out.last().unwrap().contains("session stopped"),
+            "ends with the terminal marker: {out:#?}"
+        );
+    }
+
+    #[test]
+    fn parse_action_maps_lines_to_turns_interrupts_and_detach() {
+        assert_eq!(
+            parse_action("fix the build"),
+            Action::Turn("fix the build".into())
+        );
+        assert_eq!(parse_action("/interrupt"), Action::Interrupt);
+        assert_eq!(parse_action("/q"), Action::Detach);
+        assert_eq!(parse_action("  /q  "), Action::Detach);
+        assert_eq!(parse_action(""), Action::Detach); // a blank line is a detach-safe no-op
+    }
 
     #[test]
     fn filter_all_admits_everything() {
