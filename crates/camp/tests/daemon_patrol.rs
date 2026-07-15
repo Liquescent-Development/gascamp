@@ -361,6 +361,79 @@ fn ladder_exhaustion_emits_and_stops() {
     drop(campd);
 }
 
+/// cp-3 §5.3.3 — THE HEART, integration CONFIRM (macOS-genuine; a CONFIRM, not
+/// the falsifying guard — that is the platform-independent component test on
+/// `stall_step`). A fake worker emits a `can_use_tool` through its OWN long-lived
+/// inherited stdout fd — genuinely notify-suppressed on macOS (surfaced only by
+/// the ladder's pre-ladder drain), and surfaced via inotify on Linux. Either way
+/// it reaches BLOCKED, and past the stall threshold it is NEVER nudged,
+/// restarted, or killed. (Do NOT inject the can_use_tool with a test-side
+/// open+write+close — that fires notify and defeats the point; the worker
+/// self-emits through its inherited fd.)
+#[test]
+fn a_blocked_worker_is_never_nudged_restarted_or_killed_past_the_stall_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(
+        dir.path(),
+        "stall_after = \"1s\"",
+        &[("dev", "isolation: none\n")],
+    );
+    let campd = Daemon::spawn(
+        &root,
+        &dir.path().join("claude-home"),
+        &[("FAKE_AGENT_CAN_USE_TOOL", "1")],
+    );
+    camp_ok(&root, &["sling", "ask permission"]);
+
+    // BLOCKED reached: a permission.pending event carries its cause.
+    wait_until(&root, "the permission.pending (BLOCKED)", |e| {
+        e.iter()
+            .any(|ev| ev["type"] == "permission.pending" && ev["data"]["tool_name"] == "Bash")
+    });
+    let before = events_json(&root);
+    let session = before.iter().find(|e| e["type"] == "session.woke").unwrap()["data"]["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Deltas measured FROM the BLOCKED point: a pre-BLOCKED nudge (possible if
+    // worker startup outran the first 1s fire) is not a violation — the HEART is
+    // that a worker that IS blocked takes no further ladder action.
+    let stalled_before = count(&before, "agent.stalled");
+
+    // 3× stall_after of real time: a BLOCKED worker takes NO ladder action.
+    std::thread::sleep(Duration::from_millis(3000));
+    let events = events_json(&root);
+    assert_eq!(
+        count(&events, "agent.stalled"),
+        stalled_before,
+        "a BLOCKED worker is never declared stalled past the threshold: {events:#?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "session.crashed" && e["data"]["name"] == session.as_str())
+            .count(),
+        0,
+        "a BLOCKED worker is never killed"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "session.woke" && e["data"]["name"] == session.as_str())
+            .count(),
+        1,
+        "a BLOCKED worker is never respawned"
+    );
+    assert!(
+        !events.iter().any(|e| e["type"] == "permission.decided"),
+        "no decision was made, so it is still blocked"
+    );
+    // campd is unharmed and responsive (not wedged).
+    let out = camp_ok(&root, &["top"]);
+    assert!(out.contains("live"), "top output: {out}");
+    drop(campd);
+}
+
 /// Master plan: "kill -9 campd mid-run → restart → adopt reconciles
 /// exactly (crashed marked, live re-armed, orphan worktree swept)."
 /// Worker A (worktree-isolated) is SIGKILLed while campd is dead and its

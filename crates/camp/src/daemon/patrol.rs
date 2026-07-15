@@ -153,6 +153,13 @@ pub struct PatrolRuntime {
     /// which `fire_due` empties and `declare_stalls` re-arms — is the
     /// source of truth for "currently stalled".
     stalled: HashSet<String>,
+    /// cp-3 (§5.3.3): sessions patrol has seen BLOCKED (a pending permission).
+    /// A blocked worker is not a stalled worker — it is WAITING ON US, so its
+    /// stall timer is DISARMED (it adds no wakeup, invariant 1) and it is exempt
+    /// from the ladder. Reconciled edge-triggered from ledger truth each wake by
+    /// `reconcile_blocked`; the disarm happens on working→blocked, the re-arm on
+    /// blocked→working (a decision).
+    blocked: HashSet<String>,
 }
 
 /// A poisoned mutex still yields its data (the orders-watch precedent):
@@ -224,6 +231,7 @@ impl PatrolRuntime {
             pending: Vec::new(),
             activity: HashSet::new(),
             stalled: HashSet::new(),
+            blocked: HashSet::new(),
         }
     }
 
@@ -291,6 +299,49 @@ impl PatrolRuntime {
 
     pub fn fire_due(&mut self, now: Timestamp) -> Vec<StallFire> {
         self.timers.fire_due(now)
+    }
+
+    /// cp-3 (§5.3.3): bring patrol's timers in line with the ledger's BLOCKED
+    /// set. On the working→blocked edge, DISARM (a waiting worker is not a
+    /// stalled worker — it must add no wakeup and take no ladder action). On
+    /// blocked→working (a decision), RE-ARM from `now` (the worker is presumed
+    /// working again). Idempotent, so it is safe to call from both the
+    /// pre-ladder drain seam and the common post-harvest path each wake.
+    pub fn reconcile_blocked(&mut self, ledger: &Ledger, now: Timestamp) -> Result<()> {
+        let ledger_blocked: HashSet<String> = ledger.blocked_sessions()?.into_iter().collect();
+        // working → blocked: disarm and record.
+        for s in ledger_blocked
+            .difference(&self.blocked)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.timers.disarm(&s);
+            self.blocked.insert(s);
+        }
+        // blocked → working: a decision arrived — re-arm from zero (only a
+        // tracked worker has a threshold to re-arm; an adopted, untracked
+        // worker's silence is owned by the adoption kill, not the ladder).
+        for s in self
+            .blocked
+            .difference(&ledger_blocked)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if let Some(t) = self.tracked.get(&s).cloned() {
+                self.rearm(&s, &t, now);
+            }
+            self.blocked.remove(&s);
+        }
+        Ok(())
+    }
+
+    /// cp-3 test accessor: is `session`'s stall timer currently armed? Reads the
+    /// timer store directly — the invariant-1 disarm guard and the re-arm guard
+    /// assert on it. `#[cfg(test)]` and `pub` so the external daemon_patrol
+    /// tests and the inline unit guards both reach it.
+    #[cfg(test)]
+    pub fn is_armed(&self, session: &str) -> bool {
+        self.timers.is_armed(session)
     }
 
     /// Observe one committed event (inside the cursor transaction —
@@ -664,6 +715,17 @@ impl PatrolRuntime {
             let Some(tracked) = self.tracked.get(&fire.session) else {
                 continue; // untracked since the fire was computed
             };
+            // §5.3.3: a BLOCKED session is exempt from the ENTIRE ladder — no
+            // agent.stalled, no on_fire (which would burn a restart-budget
+            // increment), no action. Belt-and-braces with reconcile_blocked's
+            // disarm: a fire that slips through (the timer popped before the
+            // reconcile disarmed it) is swallowed here and the timer left
+            // disarmed. THE HEART PROPERTY: no BLOCKED worker is ever nudged,
+            // restarted, or killed by the ladder.
+            if self.blocked.contains(&fire.session) {
+                self.timers.disarm(&fire.session);
+                continue;
+            }
             let tracked = tracked.clone();
             let action = if tracked.owned == Owned::Annotate {
                 "annotate"
@@ -1875,6 +1937,125 @@ mod tests {
         assert_eq!(stalled.len(), 2);
         assert_eq!(stalled[1].data["action"], "restart");
         assert_eq!(stalled[1].data["restarts"], 1);
+    }
+
+    /// A pending permission for `session` in the ledger (the BLOCKED marker).
+    fn seed_pending(ledger: &mut Ledger, session: &str, request_id: &str) {
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionPending,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": session, "request_id": request_id, "tool_name": "Bash",
+                }),
+            })
+            .unwrap();
+    }
+
+    /// cp-3 §5.3.3 unit guard 1 (INVARIANT 1): a BLOCKED session must contribute
+    /// NOTHING to the poll deadline. reconcile_blocked DISARMS its stall timer on
+    /// the working→blocked edge. Mutation caught: dropping reconcile_blocked's
+    /// disarm leaves the timer armed → RED.
+    #[test]
+    fn permission_pending_disarms_the_stall_timer_so_a_blocked_worker_adds_no_wakeup() {
+        let (dir, mut ledger, _config, mut patrol) = fixture();
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        let now = ts("2026-07-07T07:00:00Z");
+        patrol.observe(&event);
+        patrol.apply_tracking(&mut ledger, now).unwrap();
+        assert!(
+            patrol.is_armed("t/dev/1"),
+            "precondition: an armed stall timer"
+        );
+
+        seed_pending(&mut ledger, "t/dev/1", "cli-1");
+        patrol.reconcile_blocked(&ledger, now).unwrap();
+        assert!(
+            !patrol.is_armed("t/dev/1"),
+            "permission.pending DISARMS — a blocked worker adds no wakeup (invariant 1)"
+        );
+    }
+
+    /// cp-3 §5.3.3 unit guard 2 (THE SKIP, exercised alone): feed declare_stalls
+    /// a synthetic Stall fire for a session that is in patrol.blocked WITH its
+    /// timer still armed. It must declare ZERO agent.stalled and leave the timer
+    /// disarmed. Mutation caught: removing the `self.blocked.contains` skip in
+    /// declare_stalls → the fire declares a stall → RED.
+    #[test]
+    fn declare_stalls_declares_nothing_for_a_blocked_session_even_with_an_armed_timer() {
+        let (dir, mut ledger, _config, mut patrol) = fixture();
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        let now = ts("2026-07-07T07:00:00Z");
+        patrol.observe(&event);
+        patrol.apply_tracking(&mut ledger, now).unwrap();
+        assert!(
+            patrol.is_armed("t/dev/1"),
+            "precondition: an armed stall timer"
+        );
+        // Mark it blocked WITHOUT disarming (this guard isolates the skip, not
+        // the reconcile disarm — the private field is reachable from this child
+        // module).
+        patrol.blocked.insert("t/dev/1".to_owned());
+
+        let fire = StallFire {
+            session: "t/dev/1".into(),
+            kind: TimerKind::Stall,
+            deadline: now,
+            threshold: SignedDuration::from_secs(600),
+        };
+        let declared = patrol.declare_stalls(&mut ledger, &[fire], now).unwrap();
+        assert!(!declared, "a blocked session declares nothing");
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::AgentStalled)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(
+            !patrol.is_armed("t/dev/1"),
+            "the swallowed fire disarms the timer"
+        );
+    }
+
+    /// cp-3 §5.3.3 unit guard 3 (THE RE-ARM edge): a blocked-then-decided session
+    /// gets a fresh armed timer. Mutation caught: dropping reconcile_blocked's
+    /// re-arm leaves the decided worker un-timed → RED.
+    #[test]
+    fn a_decision_re_arms_the_stall_timer_from_zero() {
+        let (dir, mut ledger, _config, mut patrol) = fixture();
+        let transcript = dir.path().join("projects/-p/sid.jsonl");
+        let event = woke_event(&mut ledger, "t/dev/1", "dev", "gc-1", &transcript, "campd");
+        let now = ts("2026-07-07T07:00:00Z");
+        patrol.observe(&event);
+        patrol.apply_tracking(&mut ledger, now).unwrap();
+
+        // block it (disarms), then decide it (a decided permission is no longer
+        // in blocked_sessions).
+        seed_pending(&mut ledger, "t/dev/1", "cli-1");
+        patrol.reconcile_blocked(&ledger, now).unwrap();
+        assert!(!patrol.is_armed("t/dev/1"), "blocked → disarmed");
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionDecided,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "t/dev/1", "request_id": "cli-1",
+                    "decision": "allow", "decided_by": "operator",
+                }),
+            })
+            .unwrap();
+        patrol.reconcile_blocked(&ledger, now).unwrap();
+        assert!(
+            patrol.is_armed("t/dev/1"),
+            "a decision re-arms from zero — the worker is presumed working again"
+        );
     }
 
     /// ROUND-1 BLOCKER 1 REGRESSION PIN: patrol's own agent.stalled (actor
