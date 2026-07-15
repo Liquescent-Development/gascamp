@@ -1,5 +1,13 @@
 # Compat Phase 4 — Operator-Directed Mail + Prime Implementation Plan
 
+## Plan-gate approval (2026-07-15)
+APPROVED by the adversarial 4-panelist plan gate. Rounds: R1 REJECT (4 findings) → R2 UNANIMOUS APPROVE (contract/interface/execution/critic).
+Accepted rulings (verified by the panels against real code / gc source at the pinned refs):
+- C4-B2 (the round-1 "bead_meta table is actually `n`" finding) was FALSE — the metadata table IS `bead_meta` (schema.rs:52, fold.rs:264, readiness.rs:203; there is no table `n`). No change; queries are correct.
+- No new EventType: mail rides the existing type="mail" bead through bead.created/updated/closed; mark-read = BeadUpdated, archive = close. event.rs/vocab.rs/fold.rs stay untouched; vocab-pin + refold unaffected.
+- The </system-reminder> sanitizer MATCHES gc's promptsafe EXACTLY (exact-literal, case-SENSITIVE fixpoint — independently verified at GASCITY_REF). Case/whitespace/newline variants pass through UNCHANGED by design; a case-insensitive strip would DIVERGE from gc and violate invariant 6. This is the correct compat answer, NOT a hole.
+- archive = close with outcome="pass" (camp never deletes, invariant 3). Corpus guard: V1_ROOTS={bmad,gstack,compound-engineering,superpowers,gascity}, floor MIN_HUMAN_SENDS=8, reproduced both directions (8 human PASS / send-free root → VACUOUS exit 1).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Serve the gc worker's `mail send human` and `prime` verbs on the compat-3 shim surface, add the operator-side `camp mail inbox|read|archive|count|check` CLI, and surface the unread-mail count on the statusline/`/status` — with invariant 1 intact (no injection hook, no per-turn worker check, no polling).
@@ -39,7 +47,7 @@ Measured by BUILDING/READING gc at `GASCITY_REF` and the corpus at `GCPACKS_REF`
 
 **A5 — `gc prime`** (`cmd/gc/cmd_prime.go:59-120`, name resolution `primeInvocationAgentName:155-174`): "Output the behavioral prompt for an agent." Agent name = `args[0]`, else `$GC_ALIAS`, else `$GC_AGENT`. If the agent has a `prompt_template`, render+print it; else a default worker prompt. Non-strict exit 0. **Camp's prompt is already materialized** at import (`AgentDef.prompt`, `pack.rs:41`) and campd exports `GC_AGENT = GC_TEMPLATE = agent.name` (the qualified name) to the worker (`spawn.rs:263-264`). So camp's `prime` resolves the agent via `resolve_agent(cfg, name)` (`pack.rs:251`) and prints `AgentDef.prompt`. **No default-prompt fallback** — the shim is dispatch-only (§6.3); an unresolvable agent is a hard error (house rule: no fallbacks).
 
-**A6 — `</system-reminder>` sanitizer, RE-MEASURED at `GASCITY_REF`** (`internal/promptsafe/promptsafe.go:44-64`, applied at `cmd_mail.go:772-780`). The FULL body, read at the pinned ref:
+**A6 — `</system-reminder>` sanitizer, RE-MEASURED at `GASCITY_REF`** (`internal/promptsafe/promptsafe.go:42-60`, applied at `cmd_mail.go:772-780`). The FULL body, read at the pinned ref:
 ```go
 func SanitizeForSystemReminder(s string) string {
     if s == "" { return s }
@@ -72,7 +80,7 @@ Measured properties (each load-bearing for camp's port — do not soften):
 | `oversight-rig/agents` | 1 | — | NO (not a v1 target) |
 | `docs/design` | 3 | — | NO (not a pack) |
 
-**The 8 v1-served sends are all `gc mail send human`.** `gascity/tests/` exists in the corpus but contains ZERO sends (the "4 in gc's own tests" of compat §16 live in the gascity SOURCE repo, not the packs). The guard MUST scan the v1-served roots `{bmad, gstack, compound-engineering, superpowers, gascity}` (scanning `gascity` covers both `gascity/assets` and `gascity/roles`) and MUST NOT scan `gastown`/`oversight-rig` (their non-human sends are legitimately v2 and would false-positive). Floor for the anti-vacuity assertion: **8** human sends.
+**The 8 v1-served sends are all `gc mail send human`.** `gascity/tests/` exists in the corpus and contains 4 `gc mail send` occurrences — but they live in a `.py` file, which the guard's suffix filter (`.md`/`.toml`/`.tmpl`) correctly excludes, so they never reach the count; the floor stays 8 (the "4 in gc's own tests" of compat §16). The guard MUST scan the v1-served roots `{bmad, gstack, compound-engineering, superpowers, gascity}` (scanning `gascity` covers both `gascity/assets` and `gascity/roles`) and MUST NOT scan `gastown`/`oversight-rig` (their non-human sends are legitimately v2 and would false-positive). Floor for the anti-vacuity assertion: **8** human sends.
 
 ---
 
