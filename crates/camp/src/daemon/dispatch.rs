@@ -675,6 +675,9 @@ impl Dispatcher {
         };
         let claude_root = spawn::claude_config_root().map_err(|e| format!("{e:#}"))?;
         let transcript = spawn::transcript_path_under(&claude_root, &cwd, &session_id);
+        // cp-3 (§5.3.1): build_spec refuses an unclassifiable --permission-mode
+        // (it cannot tell whether the mode can ask), and that refusal rides this
+        // `?` into the dispatch.failed reason — the evented refusal seam.
         let spec = spawn::build_spec(
             &self.config.dispatch.command,
             &agent,
@@ -688,7 +691,7 @@ impl Dispatcher {
             // (the live nudge path; fake agents tolerate it, C3). NOT
             // command-sniffed — a mode fallback would be a hidden branch.
             spawn::StdinMode::HeldStream,
-        );
+        )?;
         Ok(Prep {
             spec,
             agent_name: agent.name,

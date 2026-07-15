@@ -161,6 +161,28 @@ pub fn task_message(bead_id: &str, session_name: &str) -> String {
     user_message(&task_prompt(bead_id, session_name))
 }
 
+/// cp-3 (§5.3.1): the `--permission-prompt-tool stdio` flag routes ONLY
+/// decisions the CLI would otherwise ask about. A mode that can never ask
+/// (`bypassPermissions`) gets NO flag — adding it would make the CLI refuse the
+/// argv (the incoherent combo). An unrecognized mode cannot be classified, so it
+/// is refused at spawn rather than guessed (invariant 5, fail fast).
+///
+/// Returns `Ok(Some("stdio"))` for an askable mode (`None` → the CLI default,
+/// `"default"`, `"acceptEdits"`, `"plan"`), `Ok(None)` for `"bypassPermissions"`,
+/// and `Err(..)` for any other string.
+pub fn permission_prompt_flag(
+    permission_mode: Option<&str>,
+) -> Result<Option<&'static str>, String> {
+    match permission_mode {
+        None | Some("default") | Some("acceptEdits") | Some("plan") => Ok(Some("stdio")),
+        Some("bypassPermissions") => Ok(None),
+        Some(other) => Err(format!(
+            "unknown --permission-mode {other:?}: camp cannot tell whether it can ask for a \
+             permission decision, so it refuses to spawn rather than guess (control-plane §5.3.1)"
+        )),
+    }
+}
+
 /// Assemble the exec plan. Pure — no filesystem, no process. The argv is
 /// asserted verbatim by tests against F1/F2/F7, plan decision L, and
 /// (stream mode) probe P2.
@@ -175,7 +197,7 @@ pub fn build_spec(
     transcript_path: &Path,
     cwd: &Path,
     stdin_mode: StdinMode,
-) -> SpawnSpec {
+) -> Result<SpawnSpec, String> {
     let mut argv: Vec<OsString> = vec![command.as_os_str().to_owned()];
     {
         let mut arg = |s: &str| argv.push(OsString::from(s));
@@ -212,6 +234,17 @@ pub fn build_spec(
             arg("--permission-mode");
             arg(mode); // F7
         }
+        // cp-3 (§5.3.1): route permission decisions to campd's stdio control
+        // plane — ONLY in HeldStream (dispatch) mode, and ONLY when the resolved
+        // mode can ask. A Null-mode `json` spawn never streams a control plane;
+        // bypassPermissions gets NO flag (adding it makes the CLI refuse the
+        // argv); an unclassifiable mode is refused at spawn (fail fast).
+        if stdin_mode == StdinMode::HeldStream
+            && let Some(flag) = permission_prompt_flag(agent.permission_mode.as_deref())?
+        {
+            arg("--permission-prompt-tool");
+            arg(flag);
+        }
         if let Some(tools) = &agent.tools {
             arg("--allowedTools");
             arg(&tools.join(",")); // F7 (comma-joined list form)
@@ -230,7 +263,7 @@ pub fn build_spec(
 
     let sessions_dir = camp_root.join("sessions");
     let file_stem = munge(session_name);
-    SpawnSpec {
+    Ok(SpawnSpec {
         session_name: session_name.to_owned(),
         claude_session_id: session_id.to_owned(),
         transcript_path: transcript_path.to_owned(),
@@ -275,7 +308,7 @@ pub fn build_spec(
         stdout_path: sessions_dir.join(format!("{file_stem}.json")),
         stderr_path: sessions_dir.join(format!("{file_stem}.log")),
         stdin_mode,
-    }
+    })
 }
 
 /// Exec the worker. stdin is /dev/null in Null mode (F5 — an open
@@ -670,7 +703,8 @@ mod tests {
             Path::new("/home/u/.claude/projects/-code-gc/x.jsonl"),
             Path::new("/code/gc"),
             StdinMode::Null,
-        );
+        )
+        .unwrap();
         let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
         // F2: json envelope; F1: pre-assigned session id; F7: per-agent
         // pins; decision L: agent prompt via --append-system-prompt, task
@@ -759,7 +793,8 @@ mod tests {
             Path::new("/h/.claude/x.jsonl"),
             Path::new("/code/gc"),
             StdinMode::HeldStream,
-        );
+        )
+        .unwrap();
         let env: std::collections::BTreeMap<_, _> = spec.env.iter().cloned().collect();
         for k in ["BEADS_ACTOR", "GC_SESSION_NAME", "GC_SESSION_ID"] {
             assert_eq!(env[k], "dev/gc.run-operator/1", "{k}");
@@ -797,7 +832,8 @@ mod tests {
             Path::new("/t.jsonl"),
             Path::new("/code"),
             StdinMode::Null,
-        );
+        )
+        .unwrap();
         let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
         for flag in ["--model", "--permission-mode", "--allowedTools"] {
             assert!(!argv.contains(&flag), "{flag} must be absent: {argv:?}");
@@ -1171,7 +1207,8 @@ mod tests {
             Path::new("/home/u/.claude/projects/-code-gc/x.jsonl"),
             Path::new("/code/gc"),
             StdinMode::HeldStream,
-        );
+        )
+        .unwrap();
         let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
         assert_eq!(
             argv,
@@ -1188,6 +1225,12 @@ mod tests {
                 "sonnet",
                 "--permission-mode",
                 "acceptEdits",
+                // cp-3 (§5.3.1): HeldStream + an askable mode routes decisions to
+                // campd's stdio control plane. Placed in the shared tail after
+                // --permission-mode; cp-4's --include-partial-messages sits in the
+                // stream-flags arm, a distinct position.
+                "--permission-prompt-tool",
+                "stdio",
                 "--allowedTools",
                 "Read,Edit,Bash",
                 "--append-system-prompt",
@@ -1206,6 +1249,92 @@ mod tests {
             spec.env
         );
         assert_eq!(spec.stdin_mode, StdinMode::HeldStream);
+    }
+
+    /// cp-3 (§5.3.1): the `--permission-prompt-tool stdio` flag rides ONLY an
+    /// askable mode in HeldStream; bypassPermissions gets no flag; an
+    /// unclassifiable mode is refused at spawn.
+    #[test]
+    fn permission_prompt_flag_is_added_only_for_askable_modes() {
+        fn argv_for(mode: Option<&str>) -> Vec<String> {
+            let agent = AgentDef {
+                name: "a".into(),
+                model: None,
+                tools: None,
+                permission_mode: mode.map(str::to_owned),
+                isolation: Isolation::None,
+                stall_after: None,
+                prompt: "P".into(),
+            };
+            let spec = build_spec(
+                Path::new("claude"),
+                &agent,
+                Path::new("/c"),
+                "gc-1",
+                "t/a/1",
+                "sid",
+                Path::new("/t.jsonl"),
+                Path::new("/code"),
+                StdinMode::HeldStream,
+            )
+            .unwrap();
+            spec.argv
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect()
+        }
+        fn pair_present(argv: &[String], flag: &str, value: &str) -> bool {
+            argv.windows(2).any(|w| w[0] == flag && w[1] == value)
+        }
+
+        for mode in [None, Some("default"), Some("acceptEdits"), Some("plan")] {
+            let argv = argv_for(mode);
+            assert!(
+                pair_present(&argv, "--permission-prompt-tool", "stdio"),
+                "mode {mode:?} can ask → the stdio flag routes its decisions: {argv:?}"
+            );
+        }
+        let argv = argv_for(Some("bypassPermissions"));
+        assert!(
+            !argv.iter().any(|a| a == "--permission-prompt-tool"),
+            "bypassPermissions never asks → no flag, no behaviour change: {argv:?}"
+        );
+        assert!(
+            permission_prompt_flag(Some("wat")).is_err(),
+            "an unclassifiable mode is refused, never guessed (invariant 5)"
+        );
+    }
+
+    /// cp-3 (§5.3.1): a Null-mode (json) spawn never streams a control plane, so
+    /// it gets NO permission-prompt-tool flag regardless of mode.
+    #[test]
+    fn null_mode_never_gets_the_permission_prompt_flag() {
+        let agent = AgentDef {
+            name: "a".into(),
+            model: None,
+            tools: None,
+            permission_mode: Some("acceptEdits".into()),
+            isolation: Isolation::None,
+            stall_after: None,
+            prompt: "P".into(),
+        };
+        let spec = build_spec(
+            Path::new("claude"),
+            &agent,
+            Path::new("/c"),
+            "gc-1",
+            "t/a/1",
+            "sid",
+            Path::new("/t.jsonl"),
+            Path::new("/code"),
+            StdinMode::Null,
+        )
+        .unwrap();
+        let argv: Vec<&str> = spec.argv.iter().map(|s| s.to_str().unwrap()).collect();
+        assert!(
+            !argv.contains(&"--permission-prompt-tool"),
+            "Null mode has no stdio control plane: {argv:?}"
+        );
     }
 
     /// The nudge/task wire shape, pinned against probe P2.

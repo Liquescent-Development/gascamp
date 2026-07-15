@@ -2454,10 +2454,10 @@ mod tests {
     fn wait_for_capture(dir: &std::path::Path, bead: &str, needle: &str) -> String {
         let path = dir.join(format!("{bead}.out"));
         for _ in 0..300 {
-            if let Ok(s) = std::fs::read_to_string(&path) {
-                if s.contains(needle) {
-                    return s;
-                }
+            if let Ok(s) = std::fs::read_to_string(&path)
+                && s.contains(needle)
+            {
+                return s;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

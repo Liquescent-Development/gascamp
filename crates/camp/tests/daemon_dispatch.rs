@@ -1768,3 +1768,46 @@ fn crossing_max_blocked_raises_one_saturation_fault() {
     assert_eq!(sat[0]["data"]["blocked"], 3);
     assert_eq!(sat[0]["data"]["max_blocked"], 2);
 }
+
+/// cp-3 §5.3.1: an unclassifiable `--permission-mode` is refused AT SPAWN with a
+/// named dispatch.failed reason — camp never guesses whether a mode can ask
+/// (invariant 5). Mutation caught: dropping the `Err` arm of
+/// `permission_prompt_flag` silently guesses, and no dispatch.failed appears.
+#[test]
+fn an_unclassifiable_permission_mode_is_refused_at_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(".camp");
+    std::fs::create_dir_all(&root).unwrap();
+    let rig = dir.path().join("repo");
+    std::fs::create_dir_all(&rig).unwrap();
+    std::fs::write(
+        root.join("camp.toml"),
+        format!(
+            "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\
+             [agent_defaults]\ntools = [\"Read\"]\npermission_mode = \"wat\"\n\n\
+             [dispatch]\nmax_workers = 4\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
+            rig.display(),
+            fake_agent(),
+        ),
+    )
+    .unwrap();
+    write_agent(&root, "dev", "isolation: none\n");
+    camp_ok(&root, &["events", "--json"]);
+    let _campd = Daemon::spawn(&root, &[]);
+    camp_ok(&root, &["sling", "unrunnable"]);
+
+    wait_until(&root, "the §5.3.1 dispatch refusal", |e| {
+        e.iter().any(|ev| {
+            ev["type"] == "dispatch.failed"
+                && ev["data"]["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("control-plane §5.3.1"))
+        })
+    });
+    let events = events_json(&root);
+    assert_eq!(
+        count(&events, "session.woke"),
+        0,
+        "an unclassifiable mode never spawns a worker"
+    );
+}

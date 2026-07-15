@@ -820,7 +820,7 @@ fn stall_step(
         )?;
         patrol.reconcile_blocked(ledger, now)?;
     }
-    Ok(patrol.declare_stalls(ledger, &stall_fires, now)?)
+    patrol.declare_stalls(ledger, &stall_fires, now)
 }
 
 /// cp-1: ingest whatever the read channel just handed over, and append what it
