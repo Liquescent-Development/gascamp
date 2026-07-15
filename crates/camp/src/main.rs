@@ -31,6 +31,7 @@ mod cmd {
     pub mod sling;
     pub mod stop;
     pub mod top;
+    pub mod watch;
 }
 
 use std::ffi::OsStr;
@@ -327,6 +328,9 @@ enum Command {
         #[arg(long)]
         statusline: bool,
     },
+    /// Watch the fleet live: one line per session, push-driven from the socket
+    /// (control-plane §5.1). campd must be running.
+    Watch,
     /// Write a consistent, integrity-checked copy of the ledger (VACUUM
     /// INTO). DEST must not already exist.
     Backup {
@@ -835,6 +839,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 cmd::top::run(&camp)
             }
+        }
+        Command::Watch => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::watch::run(&camp)
         }
         Command::Backup { dest } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
