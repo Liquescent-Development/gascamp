@@ -80,6 +80,12 @@ pub enum Request {
     SessionInterrupt {
         session: String,
     },
+    /// cp-2 (§4.1): SUBSCRIBE to the fleet — the aggregate stream of session
+    /// state transitions, stalls, permission requests, and completions. A
+    /// connection MODE like `session.subscribe`, but LEDGER/model-sourced: no
+    /// cursor, and the hello is followed by a snapshot then live deltas.
+    #[serde(rename = "fleet.subscribe")]
+    FleetSubscribe,
 }
 
 /// cp-1 (§4.1): one live session, as the control plane speaks of it.
@@ -89,7 +95,7 @@ pub enum Request {
 /// §4.2 — THERE IS NO `pid`, AND THAT IS THE DESIGN: *"a protocol that hands out
 /// pids cannot cross a machine boundary."* Sessions are named; names are what
 /// travel. A pid would be a shortcut that silently welds this protocol to one host.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub name: String,
     pub agent: String,
@@ -157,6 +163,17 @@ pub enum Response {
         v: u8,
         subscription: String,
         cursor: u64,
+    },
+    /// cp-2 (§4.1) `fleet.subscribe`'s HELLO. No `cursor`: a fleet has no byte
+    /// history to resume from — its history is the snapshot the frames deliver
+    /// (scoping decision 3). `v` future-proofs the frame vocabulary. Placed AFTER
+    /// `Subscribed` and BEFORE `Interrupt` so untagged resolution stays
+    /// unambiguous — `{"ok":..,"v":..,"subscription":..}` has no `cursor`,
+    /// distinguishing it from `Subscribed`.
+    FleetSubscribed {
+        ok: bool,
+        v: u8,
+        subscription: String,
     },
     /// cp-1 (§4.1) `session.interrupt`: D1's ACK. The interrupt is IN THE PIPE;
     /// the worker's answer lands in the ledger as `control.responded`, keyed by
@@ -797,6 +814,32 @@ mod tests {
             !line.contains("pid"),
             "sessions.list must never hand out a pid (§4.2): {line}"
         );
+    }
+
+    /// cp-2 (§4.1/§4.2): `fleet.subscribe`'s wire, pinned in both directions.
+    /// §4.2: the aggregate stream is addressed by NAME; the verb carries no cursor
+    /// (a fleet's history is the current snapshot — scoping decision 3).
+    #[test]
+    fn fleet_subscribe_wire_format_is_pinned() {
+        assert_eq!(
+            serde_json::to_string(&Request::FleetSubscribe).unwrap(),
+            r#"{"op":"fleet.subscribe"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"op":"fleet.subscribe"}"#).unwrap(),
+            Request::FleetSubscribe
+        );
+        let line = serde_json::to_string(&Response::FleetSubscribed {
+            ok: true,
+            v: 1,
+            subscription: "fleet-1".into(),
+        })
+        .unwrap();
+        assert_eq!(line, r#"{"ok":true,"v":1,"subscription":"fleet-1"}"#);
+        assert!(matches!(
+            serde_json::from_str::<Response>(r#"{"ok":true,"v":1,"subscription":"fleet-1"}"#).unwrap(),
+            Response::FleetSubscribed { subscription, .. } if subscription == "fleet-1"
+        ));
     }
 
     /// cp-1 (§4.1): the control-plane verbs' wire, pinned in BOTH directions.

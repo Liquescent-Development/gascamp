@@ -1046,6 +1046,20 @@ fn drain_lines(
                     control.serve_interrupt(&session, ledger, dispatcher, Timestamp::now());
                 respond(&mut conn.stream, &response)?;
             }
+            // cp-2 (§4.1): fleet.subscribe. TEMPORARY — the real handler (hello +
+            // snapshot + push fanout) is wired in Task 5, once fleet_model (Task 3)
+            // and FleetSource (Task 4) exist. This arm keeps the crate compiling
+            // between Tasks 2 and 5 and is REPLACED in Task 5.
+            Ok(Request::FleetSubscribe) => {
+                respond(
+                    &mut conn.stream,
+                    &Response::Error {
+                        ok: false,
+                        error: "fleet.subscribe is not yet served (cp-2 in progress)".into(),
+                    },
+                )?;
+                return Ok(Some(ConnState::Closed));
+            }
             Err(e) => {
                 respond(
                     &mut conn.stream,
