@@ -416,6 +416,12 @@ pub struct ControlRuntime {
     /// construction; a phase that makes them common must prune it with the session.
     degraded_seen: HashSet<(String, u64)>,
     next_subscription: u64,
+    /// The most recently computed fleet model, refreshed by `fanout` and by
+    /// `serve_fleet_subscribe`. It is what the WRITABLE-edge `pump` diffs against
+    /// when it continues a cap-STOPped fleet delta (that path has no ledger in
+    /// scope). Empty when no fleet subscriber exists — computing it then would be
+    /// pure waste (invariant 1).
+    fleet_model: Vec<SessionInfo>,
 }
 
 impl ControlRuntime {
@@ -443,6 +449,7 @@ impl ControlRuntime {
             pending_events: Vec::new(),
             degraded_seen: HashSet::new(),
             next_subscription: 0,
+            fleet_model: Vec::new(),
         }
     }
 
@@ -506,15 +513,17 @@ impl ControlRuntime {
         // `scan < tail` strands it: `blocked_since` is None (the peer IS reading),
         // no WRITABLE edge is pending once `out` drains, and the last line of the
         // history is never delivered.
-        let subscriber_work = self
-            .subscribers
-            .values()
-            .any(|s| s.out.is_empty() && (s.held || s.scan < s.tail) && !s.end_sent);
+        let subscriber_work = self.subscribers.values().any(|s| match &s.source {
+            Source::File(fs) => s.out.is_empty() && (fs.held || fs.scan < fs.tail) && !fs.end_sent,
+            // A fleet fill fully drains per pump loop or WouldBlocks — no
+            // empty-`out`-with-pending state persists, so no zero-arm is needed.
+            Source::Fleet(_) => false,
+        });
 
         let earliest_stall = self
             .subscribers
             .values()
-            .filter_map(|s| s.blocked_since)
+            .filter_map(|s| s.out.blocked_since)
             .map(|t| t + signed(self.stall_timeout))
             .min();
 
@@ -1193,16 +1202,26 @@ impl ControlRuntime {
         patrol: &PatrolRuntime,
         read_channel: &ReadChannelRuntime,
     ) -> Response {
-        let rows = match ledger.live_sessions() {
-            Ok(rows) => rows,
-            Err(e) => {
-                return Response::Error {
-                    ok: false,
-                    error: format!("listing live sessions: {e}"),
-                };
-            }
-        };
-        let sessions = rows
+        match self.fleet_model(ledger, patrol, read_channel) {
+            Ok(sessions) => Response::SessionsList { ok: true, sessions },
+            Err(e) => Response::Error {
+                ok: false,
+                error: format!("listing live sessions: {e}"),
+            },
+        }
+    }
+
+    /// §4.1/§4.3: the fleet — one `SessionInfo` per LIVE session, BY NAME, from the
+    /// ledger registry (not campd's child map: an adopted worker is a live session
+    /// too). The single definition shared by `sessions.list` and `fleet.subscribe`.
+    pub fn fleet_model(
+        &self,
+        ledger: &Ledger,
+        patrol: &PatrolRuntime,
+        read_channel: &ReadChannelRuntime,
+    ) -> anyhow::Result<Vec<SessionInfo>> {
+        let rows = ledger.live_sessions()?;
+        Ok(rows
             .into_iter()
             .map(|row| SessionInfo {
                 // `last_activity` is the last complete line the session produced;
@@ -1227,8 +1246,60 @@ impl ControlRuntime {
                 rig: row.rig,
                 bead: row.bead,
             })
-            .collect();
-        Response::SessionsList { ok: true, sessions }
+            .collect())
+    }
+
+    /// §4.1/§4.4 `fleet.subscribe`: the hello. It REGISTERS and refreshes the cached
+    /// model so the FIRST post-hello pump (event_loop) emits the full snapshot; it
+    /// never writes — `respond()` writes the hello, then the loop pumps (B11).
+    pub fn serve_fleet_subscribe(
+        &mut self,
+        token: Token,
+        ledger: &Ledger,
+        patrol: &PatrolRuntime,
+        read_channel: &ReadChannelRuntime,
+    ) -> Response {
+        if self.subscribers.len() >= MAX_SUBSCRIBERS {
+            return Response::Error {
+                ok: false,
+                error: format!(
+                    "campd already has {MAX_SUBSCRIBERS} subscriptions open (the MAX_SUBSCRIBERS \
+                     cap). Each holds up to {SUBSCRIBER_BUFFER_BYTES} bytes of outbound buffer."
+                ),
+            };
+        }
+        match self.fleet_model(ledger, patrol, read_channel) {
+            Ok(model) => self.fleet_model = model,
+            Err(e) => {
+                return Response::Error {
+                    ok: false,
+                    error: format!("building the fleet model: {e}"),
+                };
+            }
+        }
+        self.next_subscription += 1;
+        let id = format!("fleet-{}", self.next_subscription);
+        self.subscribers.insert(
+            token,
+            Subscriber {
+                id: id.clone(),
+                out: OutBuf::new(),
+                source: Source::Fleet(FleetSource::new()),
+            },
+        );
+        Response::FleetSubscribed {
+            ok: true,
+            v: 1,
+            subscription: id,
+        }
+    }
+
+    /// True when at least one fleet subscriber is registered — the guard that keeps
+    /// the model recompute off the hot path when nobody is watching.
+    fn has_fleet_subscribers(&self) -> bool {
+        self.subscribers
+            .values()
+            .any(|s| matches!(s.source, Source::Fleet(_)))
     }
 
     /// The INBOUND half: everything the read channel drained this wake.
@@ -2238,16 +2309,17 @@ mod tests {
         loop {
             rt.pump(token, conn, t0());
             let s = rt.test_sub(token);
-            if s.out.is_empty() && !s.held && s.cursor == s.tail {
+            let fs = s.file();
+            if s.out.is_empty() && !fs.held && fs.cursor == fs.tail {
                 return;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "pump never drained: cursor={} tail={} out={} held={}",
-                s.cursor,
-                s.tail,
-                s.out.len(),
-                s.held
+                fs.cursor,
+                fs.tail,
+                s.out.out.len(),
+                fs.held
             );
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2348,7 +2420,7 @@ mod tests {
         assert_eq!(frames[0]["frame"], "event");
         assert_eq!(frames[0]["event"]["text"], pad);
         assert_eq!(
-            rt.test_sub(T).cursor,
+            rt.test_sub(T).file().cursor,
             tail,
             "the cursor advanced exactly past the whole line"
         );
@@ -2377,12 +2449,13 @@ mod tests {
         loop {
             rt.pump(T, &mut conn, t0());
             assert!(
-                rt.test_sub(T).partial.len() <= cap,
+                rt.test_sub(T).file().partial.len() <= cap,
                 "partial grew past the cap: {}",
-                rt.test_sub(T).partial.len()
+                rt.test_sub(T).file().partial.len()
             );
             let s = rt.test_sub(T);
-            if s.out.is_empty() && !s.held && s.cursor == s.tail {
+            let fs = s.file();
+            if s.out.is_empty() && !fs.held && fs.cursor == fs.tail {
                 break;
             }
             assert!(std::time::Instant::now() < deadline, "pump never drained");
@@ -2401,9 +2474,9 @@ mod tests {
         // The cursor advanced PAST the monster, so the next line still arrives.
         assert_eq!(frames[1]["frame"], "event");
         assert_eq!(frames[1]["event"]["text"], "after the monster");
-        assert_eq!(rt.test_sub(T).cursor, tail);
+        assert_eq!(rt.test_sub(T).file().cursor, tail);
         assert!(
-            rt.test_sub(T).oversize.is_none(),
+            rt.test_sub(T).file().oversize.is_none(),
             "the oversize scan ended at the newline"
         );
     }
@@ -2433,7 +2506,7 @@ mod tests {
         // The client NEVER reads => the socket fills, then `out` fills to the cap.
         let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !rt.test_sub(T).held {
+        while !rt.test_sub(T).file().held {
             match rt.pump(T, &mut conn, t0()) {
                 PumpOutcome::Ok => {}
                 PumpOutcome::Drop(_) => panic!(
@@ -2449,13 +2522,14 @@ mod tests {
             );
         }
         let sub = rt.test_sub(T);
-        assert!(sub.out.len() <= cap, "out is bounded by the cap");
-        assert!(sub.held, "the complete line is HELD, not lost");
+        let fs = sub.file();
+        assert!(sub.out.out.len() <= cap, "out is bounded by the cap");
+        assert!(fs.held, "the complete line is HELD, not lost");
         assert!(
-            !sub.partial.is_empty(),
+            !fs.partial.is_empty(),
             "and it is still IN `partial` — nothing was thrown away"
         );
-        let held_cursor = sub.cursor;
+        let held_cursor = fs.cursor;
         assert!(
             held_cursor < tail,
             "the cursor did NOT advance past the line it could not send"
@@ -2466,7 +2540,7 @@ mod tests {
         assert!(!frames.is_empty());
         rt.pump(T, &mut conn, t0());
         assert!(
-            rt.test_sub(T).cursor > held_cursor,
+            rt.test_sub(T).file().cursor > held_cursor,
             "once the socket drained, the held line was delivered and the cursor moved"
         );
     }
@@ -2493,7 +2567,7 @@ mod tests {
         for _ in 0..8 {
             rt.pump(T, &mut conn, t0());
         }
-        let out = rt.test_sub(T).out.len();
+        let out = rt.test_sub(T).out.out.len();
         assert!(
             out > HISTORY_CHUNK_BYTES,
             "`out` must accumulate across MANY chunks (it held {out} bytes) — \
@@ -2574,7 +2648,7 @@ mod tests {
 
         // Drive to a REAL cap-stop (the client never reads).
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !rt.test_sub(T).held {
+        while !rt.test_sub(T).file().held {
             rt.pump(T, &mut conn, t0());
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2585,8 +2659,11 @@ mod tests {
         // ...and now make that held line the LAST one, with `out` flushed: exactly
         // the terminal state of a catch-up that ran at the cap.
         let sub = rt.subscribers.get_mut(&T).expect("the subscriber");
-        sub.tail = sub.scan;
-        sub.out.clear();
+        sub.out.out.clear();
+        match &mut sub.source {
+            Source::File(fs) => fs.tail = fs.scan,
+            Source::Fleet(_) => unreachable!("this test inserts a file subscriber"),
+        }
 
         assert_eq!(
             rt.poll_timeout(t0()),
@@ -2686,7 +2763,8 @@ mod tests {
                  forever"
             );
             let s = rt.test_sub(T);
-            if s.out.is_empty() && !s.held && s.cursor == s.tail {
+            let fs = s.file();
+            if s.out.is_empty() && !fs.held && fs.cursor == fs.tail {
                 break;
             }
             assert!(std::time::Instant::now() < deadline, "pump never drained");
@@ -2794,7 +2872,7 @@ mod tests {
             assert!(matches!(rt.pump(T, &mut conn, t0()), PumpOutcome::Ok));
         }
         assert!(
-            rt.test_sub(T).blocked_since.is_some(),
+            rt.test_sub(T).out.blocked_since.is_some(),
             "a zero-accept write must stamp `blocked_since`"
         );
         // The stall deadline is the ONLY thing that can ever fire for this
@@ -2840,7 +2918,7 @@ mod tests {
         for _ in 0..6 {
             rt.pump(T, &mut conn, t0());
         }
-        assert!(rt.test_sub(T).blocked_since.is_some());
+        assert!(rt.test_sub(T).out.blocked_since.is_some());
 
         // The peer READS. It must drain enough that campd's NEXT write genuinely
         // accepts bytes — `blocked_since` is cleared by an accepted WRITE, not by the
@@ -2869,7 +2947,7 @@ mod tests {
         // `blocked_since` may be freshly re-stamped (the socket filled again — it is
         // a slow reader, not a stopped one). What must NOT survive is the ORIGINAL
         // stamp: accepting a byte RESETS the clock.
-        if let Some(since) = rt.test_sub(T).blocked_since {
+        if let Some(since) = rt.test_sub(T).out.blocked_since {
             assert!(
                 since >= later,
                 "accepting ANY byte must RESET the stall clock — the original stamp \
@@ -2902,7 +2980,7 @@ mod tests {
         let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !rt.test_sub(T).held {
+        while !rt.test_sub(T).file().held {
             assert!(
                 !matches!(rt.pump(T, &mut conn, t0()), PumpOutcome::Drop(_)),
                 "THE CAP IS A STOP: a subscriber merely BEHIND is never dropped"
@@ -2914,11 +2992,11 @@ mod tests {
             );
         }
         assert!(
-            rt.test_sub(T).out.len() <= cap,
+            rt.test_sub(T).out.out.len() <= cap,
             "`out` is bounded by the cap"
         );
         assert!(
-            !rt.test_sub(T).partial.is_empty(),
+            !rt.test_sub(T).file().partial.is_empty(),
             "the held line is STILL IN `partial` — nothing was thrown away"
         );
 
@@ -2945,7 +3023,11 @@ mod tests {
             "B".repeat(36),
             "the line AFTER the held one is a SEPARATE frame, never glued to it"
         );
-        assert_eq!(rt.test_sub(T).cursor, tail, "every byte was delivered");
+        assert_eq!(
+            rt.test_sub(T).file().cursor,
+            tail,
+            "every byte was delivered"
+        );
     }
 
     /// B2 — SILENT TRUNCATION. A stall MID-CHUNK must lose nothing.
@@ -2981,7 +3063,7 @@ mod tests {
             assert_eq!(f["frame"], "event");
             assert_eq!(f["event"]["i"], i, "in order, none skipped");
         }
-        assert_eq!(rt.test_sub(T).cursor, tail);
+        assert_eq!(rt.test_sub(T).file().cursor, tail);
     }
 
     /// R5: the `end` frame reaches a CAUGHT-UP subscriber — driven deterministically,
@@ -3034,6 +3116,397 @@ mod tests {
             frames[0]["reason"]
         );
         assert_eq!(gone, vec![T], "and the connection is closed (EOF follows)");
+    }
+
+    // ===== cp-2: the OutBuf seam + fleet source ============================
+
+    #[test]
+    fn outbuf_flush_stalls_a_peer_that_stops_reading_past_the_window() {
+        use std::os::unix::net::UnixStream;
+        let (client, server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut conn = Conn {
+            stream: mio::net::UnixStream::from_std(server),
+            buf: Vec::new(),
+        };
+        // `client` is never read: the peer has stopped reading.
+
+        let mut out = OutBuf::new();
+        out.append(&vec![b'x'; 512 * 1024]); // more than one socket send buffer
+        let t0 = jiff::Timestamp::now();
+        let stall = std::time::Duration::from_millis(50);
+
+        // Flush at t0 until the socket is full and the write WouldBlocks — THIS is
+        // where blocked_since is stamped (a first Ok(n) partial write clears it, so
+        // the stamp only survives once no more bytes are accepted).
+        loop {
+            match out.flush(&mut conn, t0, stall) {
+                FlushStep::Drained => continue,
+                FlushStep::WouldBlock => break,
+                other => panic!("unexpected flush step before the window: {other:?}"),
+            }
+        }
+        assert_eq!(
+            out.blocked_since,
+            Some(t0),
+            "a zero-accept write stamps blocked_since at t0"
+        );
+
+        // One flush 60ms later — past the 50ms window — must Stall.
+        let later = t0 + jiff::SignedDuration::from_millis(60);
+        assert!(
+            matches!(out.flush(&mut conn, later, stall), FlushStep::Stalled),
+            "a peer that has not read for >= stall_timeout is Stalled"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn one_pump_scans_at_most_the_per_wake_budget() {
+        use std::io::Write as _;
+        const T: Token = Token(9);
+        // ~420 KiB of complete JSON lines: past MAX_PUMP_BYTES_PER_WAKE (256 KiB),
+        // under the 1 MiB default cap — so the SCAN budget is the binding limit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let line = format!(
+            "{}\n",
+            serde_json::json!({"type": "assistant", "pad": "x".repeat(60)})
+        );
+        let mut tail = 0u64;
+        while tail < 420 * 1024 {
+            f.write_all(line.as_bytes()).unwrap();
+            tail += line.len() as u64;
+        }
+        f.flush().unwrap();
+
+        let mut control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT); // 1 MiB cap
+        let file = std::fs::File::open(&path).unwrap();
+        // Client NOT read: the socket fills and flush WouldBlocks — but the SCAN
+        // budget still bounds FILL, so ONE pump cannot reach the tail.
+        let (client, mut conn) = control.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+        control.pump(T, &mut conn, t0());
+        let scan = control.test_sub(T).file().scan;
+        assert!(
+            scan < tail,
+            "one pump must NOT scan the whole history — the per-wake budget bounds it \
+             (regression: scan={scan}, tail={tail})"
+        );
+        assert!(
+            scan <= MAX_PUMP_BYTES_PER_WAKE as u64 + line.len() as u64,
+            "one pump scans at most the budget + one line: scan={scan}"
+        );
+        drop(client);
+    }
+
+    /// Build (ledger, patrol, read_channel) with ONE campd-woken live session
+    /// named "t/dev/1", agent "dev" — the minimal fixture for the model-building
+    /// and hello tests. PatrolRuntime/ReadChannelRuntime are constructed as
+    /// `daemon::run` does at startup, on a defaults-only config.
+    fn fleet_fixture() -> (tempfile::TempDir, Ledger, PatrolRuntime, ReadChannelRuntime) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        seed_live_session(&mut ledger, "t/dev/1");
+        let config = camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap();
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let patrol = PatrolRuntime::new(patrol_config, &config);
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let read_channel = ReadChannelRuntime::new(sessions, 256 * 1024 * 1024).unwrap();
+        (dir, ledger, patrol, read_channel)
+    }
+
+    /// cp-2: the fleet model is `sessions.list`'s rows, reusable. A live session
+    /// woken by campd appears as one `working` row addressed by name.
+    #[test]
+    fn fleet_model_returns_one_row_per_live_session() {
+        let (_dir, ledger, patrol, read_channel) = fleet_fixture();
+        let control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let model = control
+            .fleet_model(&ledger, &patrol, &read_channel)
+            .unwrap();
+        assert_eq!(model.len(), 1);
+        assert_eq!(model[0].agent, "dev");
+        assert_eq!(model[0].state, "working");
+        assert!(
+            !model[0].blocked,
+            "cp-2 never sets blocked — cp-3 owns the producer"
+        );
+    }
+
+    /// Drive one fleet subscriber to a quiet point against a fixed model. ONE
+    /// `pump_with_model` call runs the whole FILL→FLUSH driver until the socket
+    /// WouldBlocks or the delta is fully delivered, so a single call reaches the
+    /// quiet point for the room-available sockets these tests use.
+    fn pump_fleet_to_quiet(
+        rt: &mut ControlRuntime,
+        token: Token,
+        conn: &mut Conn,
+        model: &[SessionInfo],
+    ) {
+        match rt.pump_with_model(token, conn, jiff::Timestamp::now(), model) {
+            PumpOutcome::Ok | PumpOutcome::Gone => {}
+            PumpOutcome::Drop(_) => panic!("unexpected drop"),
+        }
+    }
+
+    /// Read all currently-available newline JSON frames from a non-blocking client.
+    fn read_frames(client: &std::os::unix::net::UnixStream) -> Vec<serde_json::Value> {
+        use std::io::Read as _;
+        let mut c = client.try_clone().unwrap();
+        c.set_nonblocking(true).unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            match c.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// cp-2 (§4.1): a fresh fleet subscriber gets the SNAPSHOT (one `session` frame
+    /// per live row) then `synced`; a later state change pushes ONE delta frame; a
+    /// departed session pushes a `gone` frame. Driven with no daemon, no timing.
+    #[test]
+    fn fleet_source_emits_snapshot_then_deltas_then_gone() {
+        const T: Token = Token(1);
+        let mut control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (client, mut conn) = control.test_insert_fleet_subscriber(T);
+
+        let row = |name: &str, state: &str| SessionInfo {
+            name: name.into(),
+            agent: "dev".into(),
+            rig: Some("gc".into()),
+            bead: Some("gc-1".into()),
+            state: state.into(),
+            last_activity: "2026-07-14T00:00:00Z".into(),
+            blocked: false,
+        };
+
+        let model = vec![row("camp/dev/1", "working"), row("camp/dev/2", "working")];
+        pump_fleet_to_quiet(&mut control, T, &mut conn, &model);
+        let frames = read_frames(&client);
+        assert_eq!(frames.iter().filter(|f| f["frame"] == "session").count(), 2);
+        assert!(
+            frames.iter().any(|f| f["frame"] == "synced"),
+            "snapshot ends with synced"
+        );
+        assert!(frames.iter().any(|f| f["frame"] == "session"
+            && f["session"]["name"] == "camp/dev/1"
+            && f["session"]["state"] == "working"));
+
+        let model = vec![row("camp/dev/1", "stalled"), row("camp/dev/2", "working")];
+        pump_fleet_to_quiet(&mut control, T, &mut conn, &model);
+        let frames = read_frames(&client);
+        assert_eq!(frames.len(), 1, "only the changed row is pushed");
+        assert_eq!(frames[0]["frame"], "session");
+        assert_eq!(frames[0]["session"]["name"], "camp/dev/1");
+        assert_eq!(frames[0]["session"]["state"], "stalled");
+
+        let model = vec![row("camp/dev/1", "stalled")];
+        pump_fleet_to_quiet(&mut control, T, &mut conn, &model);
+        let frames = read_frames(&client);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["frame"], "gone");
+        assert_eq!(frames[0]["name"], "camp/dev/2");
+        drop(client);
+    }
+
+    /// cp-2 (§4.2): the fleet frame shapes, byte-exact. A rename/reorder in
+    /// FleetSessionFrame/FleetGoneFrame is a wire break and must turn this red.
+    #[test]
+    fn fleet_frame_shapes_are_pinned() {
+        let s = SessionInfo {
+            name: "camp/dev/1".into(),
+            agent: "dev".into(),
+            rig: Some("gc".into()),
+            bead: Some("gc-1".into()),
+            state: "working".into(),
+            last_activity: "2026-07-14T00:00:00Z".into(),
+            blocked: false,
+        };
+        assert_eq!(
+            String::from_utf8(fleet_session_frame(&s)).unwrap(),
+            "{\"frame\":\"session\",\"session\":{\"name\":\"camp/dev/1\",\"agent\":\"dev\",\
+             \"rig\":\"gc\",\"bead\":\"gc-1\",\"state\":\"working\",\
+             \"last_activity\":\"2026-07-14T00:00:00Z\",\"blocked\":false}}\n"
+        );
+        assert_eq!(
+            String::from_utf8(fleet_gone_frame("camp/dev/1")).unwrap(),
+            "{\"frame\":\"gone\",\"name\":\"camp/dev/1\"}\n"
+        );
+        assert_eq!(
+            String::from_utf8(fleet_synced_frame()).unwrap(),
+            "{\"frame\":\"synced\"}\n"
+        );
+    }
+
+    /// cp-2 (§4.4): the cap is a STOP, not a Drop. With the client NOT reading, the
+    /// socket fills and `flush` WouldBlocks; the ONLY thing keeping `out` bounded is
+    /// the `has_room` STOP. Removing it lets `fill` append the whole (unbounded)
+    /// model into `out`.
+    #[test]
+    fn fleet_cap_is_a_stop_and_out_never_exceeds_the_cap() {
+        const T: Token = Token(1);
+        let row = |i: usize| SessionInfo {
+            name: format!("camp/dev/{i}"),
+            agent: "dev".into(),
+            rig: Some("gc".into()),
+            bead: Some("gc-1".into()),
+            state: "working".into(),
+            last_activity: "2026-07-14T00:00:00Z".into(),
+            blocked: false,
+        };
+        let frame_len = fleet_session_frame(&row(1)).len();
+        let cap = frame_len * 2; // room for ~2 frames — far below the model's total
+        let mut control = ControlRuntime::new(cap);
+        let (client, mut conn) = control.test_insert_fleet_subscriber(T);
+        // 300 rows (~60 KiB of frames) >> socket send buffer (~8 KiB) and >> cap, so
+        // once the socket fills, `out` growth is bounded ONLY by the has_room STOP.
+        let model: Vec<SessionInfo> = (0..300).map(row).collect();
+        // DO NOT read the client. A few pumps, all within stall_timeout so no Drop.
+        for _ in 0..4 {
+            assert!(
+                !matches!(
+                    control.pump_with_model(T, &mut conn, jiff::Timestamp::now(), &model),
+                    PumpOutcome::Drop(_)
+                ),
+                "the cap is a STOP, never a Drop"
+            );
+            assert!(
+                control.test_sub(T).out.out.len() <= cap,
+                "out must never exceed the cap while the socket is full — the cap is a STOP \
+                 (out={}, cap={cap})",
+                control.test_sub(T).out.out.len()
+            );
+        }
+        drop(client);
+    }
+
+    /// cp-2 (§4.4): a stalled fleet subscriber is dropped LOUDLY, and the event
+    /// names `"(fleet)"`, not a worker.
+    #[test]
+    fn a_stalled_fleet_subscriber_is_dropped_loudly_naming_fleet() {
+        const T: Token = Token(1);
+        let stall = std::time::Duration::from_millis(50);
+        // cap small so `out` stays non-empty (blocked_since persists) while the
+        // socket is full; stall short so the window is crossed deterministically.
+        let mut control = ControlRuntime::with_stall_timeout(4096, stall);
+        let (client, mut conn) = control.test_insert_fleet_subscriber(T);
+        let row = |i: usize| SessionInfo {
+            name: format!("camp/dev/{i}"),
+            agent: "dev".into(),
+            rig: Some("gc".into()),
+            bead: Some("gc-1".into()),
+            state: "working".into(),
+            last_activity: "2026-07-14T00:00:00Z".into(),
+            blocked: false,
+        };
+        // The model must exceed the socket's send+recv buffer so the first pump
+        // WouldBlocks and stamps blocked_since. macOS's buffer is ~8 KiB, but
+        // Linux's default is ~200 KiB PER DIRECTION — a 500-row model (~75 KiB)
+        // drained clean there and the drop never fired (CI-only failure). 8000
+        // rows (~1.2 MiB) overflow any realistic buffer.
+        let model: Vec<SessionInfo> = (0..8000).map(row).collect();
+        let t0 = jiff::Timestamp::now();
+        // First pump: the driver loops FILL→FLUSH until WouldBlock, filling the
+        // socket and stamping blocked_since=t0. Client NOT read.
+        let _ = control.pump_with_model(T, &mut conn, t0, &model);
+        assert!(
+            control.test_sub(T).out.blocked_since.is_some(),
+            "the socket must fill and stamp blocked_since at t0 — enlarge the model if this fails \
+             on a runner with an even larger socket buffer"
+        );
+        // A pump 60ms later — past the 50ms window — drops the peer LOUDLY.
+        let later = t0 + jiff::SignedDuration::from_millis(60);
+        match control.pump_with_model(T, &mut conn, later, &model) {
+            PumpOutcome::Drop(ev) => {
+                assert_eq!(ev.kind, EventType::SubscriberDropped);
+                assert_eq!(
+                    ev.data["session"], "(fleet)",
+                    "a fleet drop names (fleet), not a worker"
+                );
+                assert!(
+                    ev.data["buffered_bytes"].as_u64().unwrap() > 0,
+                    "names the high-water mark"
+                );
+            }
+            _ => panic!("a fleet peer that stopped reading must be dropped loudly"),
+        }
+        drop(client);
+    }
+
+    /// cp-2 (§4.1): two subscribers at different points get different deltas from
+    /// the SAME model — no `sent` leakage, no dropped update for the second.
+    #[test]
+    fn two_fleet_subscribers_diverge_by_their_own_sent_state() {
+        const A: Token = Token(1);
+        const B: Token = Token(2);
+        let mut control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let row = |name: &str| SessionInfo {
+            name: name.into(),
+            agent: "dev".into(),
+            rig: Some("gc".into()),
+            bead: Some("gc-1".into()),
+            state: "working".into(),
+            last_activity: "2026-07-14T00:00:00Z".into(),
+            blocked: false,
+        };
+
+        // A catches up on a ONE-session model and drains its snapshot.
+        let (ca, mut conna) = control.test_insert_fleet_subscriber(A);
+        let m1 = vec![row("camp/dev/1")];
+        pump_fleet_to_quiet(&mut control, A, &mut conna, &m1);
+        let _ = read_frames(&ca);
+
+        // B subscribes now; BOTH pumped against a TWO-session model.
+        let (cb, mut connb) = control.test_insert_fleet_subscriber(B);
+        let m2 = vec![row("camp/dev/1"), row("camp/dev/2")];
+        pump_fleet_to_quiet(&mut control, A, &mut conna, &m2);
+        pump_fleet_to_quiet(&mut control, B, &mut connb, &m2);
+
+        let fa = read_frames(&ca);
+        let fb = read_frames(&cb);
+        // A already had dev/1 -> ONLY dev/2 is new (no re-send of dev/1).
+        assert_eq!(fa.iter().filter(|f| f["frame"] == "session").count(), 1);
+        assert_eq!(
+            fa.iter().find(|f| f["frame"] == "session").unwrap()["session"]["name"],
+            "camp/dev/2"
+        );
+        // B is fresh -> the FULL snapshot: both sessions + synced.
+        assert_eq!(fb.iter().filter(|f| f["frame"] == "session").count(), 2);
+        assert!(fb.iter().any(|f| f["frame"] == "synced"));
+        drop(ca);
+        drop(cb);
+    }
+
+    /// cp-2 (§4.1/§4.4): the hello registers a fleet subscriber and answers
+    /// synchronously with `FleetSubscribed` (bounded by REQUEST_TIMEOUT, like every
+    /// other verb). MAX_SUBSCRIBERS bounds it.
+    #[test]
+    fn serve_fleet_subscribe_registers_and_answers_the_hello() {
+        let (_dir, ledger, patrol, read_channel) = fleet_fixture();
+        let mut control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let response = control.serve_fleet_subscribe(Token(7), &ledger, &patrol, &read_channel);
+        assert!(matches!(
+            response,
+            Response::FleetSubscribed { ok: true, v: 1, .. }
+        ));
+        assert_eq!(
+            control.subscriber_count(),
+            1,
+            "a fleet subscriber is registered"
+        );
     }
 }
 
@@ -3258,9 +3731,123 @@ pub enum PumpOutcome {
 
 /// One subscriber. Three reader positions, and the distinction is what makes a
 /// long line survivable.
-struct Subscriber {
-    id: String,
-    session: String,
+/// What one `flush` attempt did.
+#[derive(Debug)]
+pub enum FlushStep {
+    /// The socket accepted bytes (out may still hold more) — the driver re-fills.
+    Drained,
+    /// The socket is full and the peer is still reading — the WRITABLE edge re-arms us.
+    WouldBlock,
+    /// R1: the peer accepted ZERO bytes for `stall_timeout` with data buffered — DROP it.
+    Stalled,
+    /// EPIPE / ECONNRESET / a zero-length write — the peer is gone.
+    Gone,
+}
+
+/// The outbound half of every subscription — file OR fleet. It owns the §4.4
+/// buffer-cap policy (a STOP), the R1 backpressure-stall policy (a DROP), and
+/// the socket write. The stall rule is the ONLY drop policy, and it lives here
+/// exactly once. "Hold the line in `partial`" is NOT here — that is a FILE
+/// concept (a fleet row has no file), so it stays in `FileSource`.
+pub struct OutBuf {
+    /// Bytes queued for this socket. Bounded by the cap (a STOP, never a kill),
+    /// plus at most one small over-cap `skipped` frame (see `FileSource`).
+    pub out: Vec<u8>,
+    /// The largest `out` reached — `buffered_bytes` in `subscriber.dropped`
+    /// (§4.4: "naming the session and the high-water mark").
+    ///
+    /// NOTE: `out` is bounded by the cap *plus at most one small frame* — the
+    /// `oversize` `skipped` frame is appended with no cap check (it is ~100 bytes and
+    /// cannot be held, since the line it describes was never buffered). "out ≤ cap"
+    /// is therefore off by one frame, deliberately, and stated.
+    pub high_water: usize,
+    /// R1: when the peer last accepted ZERO bytes with data buffered. Stamped on a
+    /// zero-accept write, CLEARED the moment ANY byte is accepted.
+    ///
+    /// **RESIDUAL, RECORDED (round-2 review).** This clears only when campd's own
+    /// `write()` accepts bytes — and a non-blocking write on a unix socket returns
+    /// `EAGAIN` with ZERO bytes until free space reaches the kernel's LOW-WATER MARK
+    /// (~2 KiB on macOS). So the code enforces *"a peer whose socket has not freed a
+    /// low-water mark's worth"*, which is very slightly stronger than §4.4's *"a peer
+    /// that stopped reading"*: a peer sipping < ~4 KiB per `SUBSCRIBER_STALL_TIMEOUT`
+    /// (30 s at the shipped default) is dropped while still, technically, reading.
+    /// At that rate it is indistinguishable from a stopped peer, so the reach is
+    /// small — but it is a real difference between the spec's words and the code's,
+    /// and it is written down rather than discovered later.
+    pub blocked_since: Option<Timestamp>,
+}
+
+impl OutBuf {
+    pub fn new() -> OutBuf {
+        OutBuf {
+            out: Vec::new(),
+            high_water: 0,
+            blocked_since: None,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.out.is_empty()
+    }
+    /// §4.4: does one more frame fit under the cap? The cap is a STOP — a source
+    /// whose next frame does not fit HOLDS it (file: in `partial`; fleet: by not
+    /// advancing `sent`) rather than dropping the peer.
+    pub fn has_room(&self, frame_len: usize, cap: usize) -> bool {
+        self.out.len() + frame_len <= cap
+    }
+    pub fn append(&mut self, frame: &[u8]) {
+        self.out.extend_from_slice(frame);
+        self.high_water = self.high_water.max(self.out.len());
+    }
+    /// ONE write attempt. cp-1's FLUSH block (C), verbatim minus the drop-event
+    /// construction (the caller owns the event shape).
+    pub fn flush(&mut self, conn: &mut Conn, now: Timestamp, stall_timeout: Duration) -> FlushStep {
+        use std::io::Write as _;
+        match conn.stream.write(&self.out) {
+            Ok(0) => FlushStep::Gone,
+            Ok(n) => {
+                self.out.drain(..n);
+                self.blocked_since = None; // R1: it IS reading.
+                FlushStep::Drained
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => FlushStep::Drained,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // G2: the WRITABLE EDGE re-arms us. Do NOT arm a timeout here — a
+                // zero timeout on a blocked write turns it into a SPIN, and since
+                // macOS's socket buffer (~8 KiB) is far smaller than a chunk's worth
+                // of frames, EVERY healthy subscriber hits this on essentially every
+                // chunk.
+                //
+                // R1: but a peer that accepts ZERO bytes is a peer that has STOPPED
+                // READING — and THAT, not the size of `out`, is what a drop means.
+                if self.blocked_since.is_none() {
+                    self.blocked_since = Some(now);
+                }
+                if let Some(since) = self.blocked_since
+                    && now.duration_since(since) >= signed(stall_timeout)
+                {
+                    self.high_water = self.high_water.max(self.out.len());
+                    return FlushStep::Stalled;
+                }
+                FlushStep::WouldBlock
+            }
+            // EPIPE / ECONNRESET: the peer is gone. A normal detach is NOT a fault
+            // and appends NO event (§5.2).
+            Err(_) => FlushStep::Gone,
+        }
+    }
+}
+
+/// The source half of a subscription. Task 1 ships only `File`; Task 4 adds
+/// `Fleet`. The `OutBuf` is source-agnostic; the SOURCE is what differs.
+pub enum Source {
+    File(FileSource),
+    Fleet(FleetSource),
+}
+
+/// cp-1's byte-cursor tailer, unchanged. One worker's stdout FILE, delivered
+/// `[cursor, tail)` as `event`/`skipped`/`end` frames.
+pub struct FileSource {
+    pub session: String,
     /// The open stream file. Held across disposal ON PURPOSE — on Unix an
     /// unlinked inode survives while an fd is open, so a Closing subscriber
     /// FINISHES ITS HISTORY (C7).
@@ -3321,122 +3908,52 @@ struct Subscriber {
     /// ONLY path to `Gone`, so EOF never arrives and the fd and one of 8 subscriber
     /// slots are never released.
     end_sent: bool,
-
-    /// Bytes queued for this socket. Bounded by the cap — and the cap is a STOP,
-    /// never a kill.
-    out: Vec<u8>,
     /// R3: the measured byte cost of an `event` frame's wrapper for this session.
     frame_overhead: usize,
-    /// R1: when the peer last accepted ZERO bytes with data buffered. Stamped on a
-    /// zero-accept write, CLEARED the moment ANY byte is accepted.
-    ///
-    /// **RESIDUAL, RECORDED (round-2 review).** This clears only when campd's own
-    /// `write()` accepts bytes — and a non-blocking write on a unix socket returns
-    /// `EAGAIN` with ZERO bytes until free space reaches the kernel's LOW-WATER MARK
-    /// (~2 KiB on macOS). So the code enforces *"a peer whose socket has not freed a
-    /// low-water mark's worth"*, which is very slightly stronger than §4.4's *"a peer
-    /// that stopped reading"*: a peer sipping < ~4 KiB per `SUBSCRIBER_STALL_TIMEOUT`
-    /// (30 s at the shipped default) is dropped while still, technically, reading.
-    /// At that rate it is indistinguishable from a stopped peer, so the reach is
-    /// small — but it is a real difference between the spec's words and the code's,
-    /// and it is written down rather than discovered later.
-    blocked_since: Option<Timestamp>,
-    /// The largest `out` reached — `buffered_bytes` in `subscriber.dropped`
-    /// (§4.4: "naming the session and the high-water mark").
-    ///
-    /// NOTE: `out` is bounded by the cap *plus at most one small frame* — the
-    /// `oversize` `skipped` frame is appended with no cap check (it is ~100 bytes and
-    /// cannot be held, since the line it describes was never buffered). "out ≤ cap"
-    /// is therefore off by one frame, deliberately, and stated.
-    high_water: usize,
 }
 
-/// R1/R3: emit ONE complete line from `partial`, or report that `out` has no room
-/// for it.
-///
-/// Returns `false` => the caller STALLS: `partial` KEEPS the complete line, `held`
-/// stays true, `cursor` does NOT advance, and NOTHING IS LOST. The cap is a STOP.
-///
-/// PRECONDITION (established by the only caller): `sub.held` is true and
-/// `sub.partial` ENDS WITH '\n'.
-///
-/// It can never stall FOREVER: the pre-push guard bounds
-/// `partial.len() + frame_overhead <= cap` BEFORE the '\n' goes in, and `body`
-/// strips that '\n' again — so `frame.len() = frame_overhead + body.len() <= cap`
-/// and this frame ALWAYS fits an EMPTY `out`. A held line goes out the moment the
-/// socket drains what is ahead of it.
-fn try_emit_line(sub: &mut Subscriber, cap: usize) -> bool {
-    // B1: `partial` INCLUDES the '\n', so `off` lands PAST the newline — which is
-    // what makes it a valid §9 resume cursor (the start of the NEXT line).
-    let off = sub.cursor + sub.partial.len() as u64;
-
-    let frame = {
-        let mut end = sub.partial.len().saturating_sub(1); // strip '\n'
-        if end > 0 && sub.partial[end - 1] == b'\r' {
-            end -= 1;
-        }
-        let body = &sub.partial[..end];
-        if trim_ascii_whitespace(body).is_empty() {
-            // G11: a blank line is a SILENT no-op — no frame, no event — exactly
-            // as cp-0 treats it. Emitting a `skipped` frame for a no-op would be
-            // noise a client has to filter.
-            sub.cursor = off;
-            sub.partial.clear();
-            sub.held = false;
-            return true;
-        }
-        match event_frame(&sub.session, off, body) {
-            Some(f) => f,
-            None => skipped_frame(&sub.session, off, body.len() as u64, "not_a_json_object"),
-        }
-    };
-
-    if sub.out.len() + frame.len() > cap {
-        return false; // STALL (R1) — never a Drop.
-    }
-
-    sub.out.extend_from_slice(&frame);
-    sub.high_water = sub.high_water.max(sub.out.len());
-    sub.cursor = off;
-    sub.partial.clear();
-    sub.held = false;
-    true
+/// A subscription: an id, its outbound buffer (`OutBuf`, source-agnostic), and
+/// its SOURCE (a file tailer, or — from Task 4 — the fleet model).
+pub struct Subscriber {
+    id: String,
+    out: OutBuf,
+    source: Source,
 }
 
-fn degraded_event(session: &str, error: String) -> EventInput {
-    EventInput {
-        kind: EventType::PatrolDegraded,
-        rig: None,
-        actor: "campd".into(),
-        bead: None,
-        data: serde_json::json!({ "session": session, "error": error }),
+/// Test-only: reach the file source, so cp-1's subscriber tests keep reading
+/// `.held`/`.cursor`/`.scan`/`.tail` (now nested under `Source::File`).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+impl Subscriber {
+    fn file(&self) -> &FileSource {
+        match &self.source {
+            Source::File(fs) => fs,
+            Source::Fleet(_) => panic!("test_sub used on a non-file subscriber"),
+        }
     }
 }
 
-/// THE ONE DATA PATH (D6"), and the only place bytes reach a subscriber's socket.
-///
-/// A free function, not a method, because it needs `&mut Subscriber` and
-/// `&mut ControlRuntime`'s collectors at the same time — disjoint fields, which
-/// the borrow checker only accepts when they are named separately.
-#[allow(clippy::too_many_arguments)]
-fn pump_subscriber(
-    sub: &mut Subscriber,
-    conn: &mut Conn,
-    now: Timestamp,
-    cap: usize,
-    stall_timeout: Duration,
-    pending_events: &mut Vec<EventInput>,
-    degraded_seen: &mut HashSet<(String, u64)>,
-) -> PumpOutcome {
-    use std::io::Write as _;
-    use std::os::unix::fs::FileExt as _;
+impl FileSource {
+    /// cp-1 blocks (A) FILL + (B) TERMINAL, verbatim. Emits frames INTO `out`
+    /// via `out.has_room` / `out.append`, STOPPING at the cap (R1). `scanned` is
+    /// the driver's per-pump-call budget: the FILL while-guard keeps
+    /// `*scanned < MAX_PUMP_BYTES_PER_WAKE` and `*scanned += 1` runs per byte
+    /// absorbed, EXACTLY as cp-1 did with its function-local `scanned`. Returns
+    /// whether it is TERMINAL — the `end` frame appended (nothing left to give),
+    /// OR a hard file inconsistency, both of which the driver turns into `Gone`.
+    fn fill(
+        &mut self,
+        out: &mut OutBuf,
+        cap: usize,
+        scanned: &mut usize,
+        pending_events: &mut Vec<EventInput>,
+        degraded_seen: &mut HashSet<(String, u64)>,
+    ) -> bool {
+        use std::os::unix::fs::FileExt as _;
 
-    // G1: bounds the SCAN, not merely the output.
-    let mut scanned = 0usize;
-
-    loop {
-        // B3(e): RESET every outer iteration. Declared outside the loop and never
-        // reset, "the socket took bytes, so FILL may resume" is simply false.
+        // B3(e): RESET every fill call (= every outer driver iteration). Declared
+        // here and never reset, "the socket took bytes, so FILL may resume" is
+        // simply false.
         let mut stalled = false;
 
         // ---- (A) FILL: turn file bytes into frames, STOPPING at the cap -------
@@ -3447,47 +3964,53 @@ fn pump_subscriber(
         // `scan < tail` alone strands such a line: nothing is armed to wake it, the
         // last line of the history is never delivered, and TERMINAL (which requires
         // an empty `partial`) can never fire — no end frame, no EOF, fd + slot leaked.
-        while !stalled && (sub.held || sub.scan < sub.tail) && scanned < MAX_PUMP_BYTES_PER_WAKE {
+        while !stalled && (self.held || self.scan < self.tail) && *scanned < MAX_PUMP_BYTES_PER_WAKE
+        {
             // B3(a): a COMPLETE line held over because `out` was full. (No
             // `stalled` flag needed here: this `break` leaves the FILL loop
             // directly. The flag exists for the BYTE loop below, whose `break`
             // only exits the inner `for` — the `while` guard then re-reads it and
             // stops FILL from pulling another chunk on top of a held line.)
-            if sub.held {
-                if !try_emit_line(sub, cap) {
+            if self.held {
+                if !self.try_emit_line(out, cap) {
                     break;
                 }
                 continue; // try_emit_line cleared `held`
             }
 
-            let want = std::cmp::min(HISTORY_CHUNK_BYTES as u64, sub.tail - sub.scan) as usize;
+            let want = std::cmp::min(HISTORY_CHUNK_BYTES as u64, self.tail - self.scan) as usize;
             let mut buf = vec![0u8; want];
-            let n = match sub.file.read_at(&mut buf, sub.scan) {
+            let n = match self.file.read_at(&mut buf, self.scan) {
                 // R4: the stream file is append-only; it CANNOT shrink. `scan <
                 // tail` with a zero-byte read is a genuine inconsistency, not a
                 // benign EOF — and left unhandled it advances neither `scan` nor
                 // `out` while the loop guard stays true: campd HANGS inside pump.
+                // The original returned PumpOutcome::Gone here (discarding `out`);
+                // in the bool-return world that is: report LOUDLY once, DISCARD
+                // `out` so the driver sees empty and returns Gone, terminal = true.
                 Ok(0) => {
                     pending_events.push(degraded_event(
-                        &sub.session,
+                        &self.session,
                         format!(
                             "subscribe: the stream file is SHORTER than campd's own drained \
                              offset (read 0 bytes at {} with tail {}). The file is append-only \
                              and cannot shrink, so this is a real inconsistency — the \
                              subscription is closed rather than looping forever",
-                            sub.scan, sub.tail
+                            self.scan, self.tail
                         ),
                     ));
-                    return PumpOutcome::Gone;
+                    out.out.clear();
+                    return true;
                 }
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
                     pending_events.push(degraded_event(
-                        &sub.session,
-                        format!("subscribe: reading the stream file at {}: {e}", sub.scan),
+                        &self.session,
+                        format!("subscribe: reading the stream file at {}: {e}", self.scan),
                     ));
-                    return PumpOutcome::Gone;
+                    out.out.clear();
+                    return true;
                 }
             };
 
@@ -3500,41 +4023,35 @@ fn pump_subscriber(
                 // a permanent cursor/scan desync. With per-byte accounting a stall
                 // simply leaves the remainder at [scan, ..) and the next FILL
                 // re-reads it. Nothing is lost.
-                sub.scan += 1;
-                scanned += 1;
+                self.scan += 1;
+                *scanned += 1;
 
                 // ---- oversize: the line's FRAME cannot fit the whole cap.
                 //      COUNT, never buffer.
-                if let Some(count) = sub.oversize {
+                if let Some(count) = self.oversize {
                     if b == b'\n' {
-                        let off = sub.cursor + count + 1; // + the newline
-                        sub.out.extend_from_slice(&skipped_frame(
-                            &sub.session,
-                            off,
-                            count,
-                            "over_cap",
-                        ));
-                        sub.high_water = sub.high_water.max(sub.out.len());
+                        let off = self.cursor + count + 1; // + the newline
+                        out.append(&skipped_frame(&self.session, off, count, "over_cap"));
                         // G11: ONE durable event, deduped per (session, offset) —
                         // N subscribers hit the SAME over-cap line and must not
                         // append N events. (This dedupe is the whole reason the set
                         // exists.)
-                        if degraded_seen.insert((sub.session.clone(), sub.cursor)) {
+                        if degraded_seen.insert((self.session.clone(), self.cursor)) {
                             pending_events.push(degraded_event(
-                                &sub.session,
+                                &self.session,
                                 format!(
                                     "subscribe: a stream line of {count} bytes at offset {} \
                                      exceeds the subscriber buffer cap ({cap} bytes) and was \
                                      SKIPPED — subscribers received a skipped frame naming it. \
                                      campd itself never buffered it (§4.4)",
-                                    sub.cursor
+                                    self.cursor
                                 ),
                             ));
                         }
-                        sub.cursor = off;
-                        sub.oversize = None;
+                        self.cursor = off;
+                        self.oversize = None;
                     } else {
-                        sub.oversize = Some(count + 1);
+                        self.oversize = Some(count + 1);
                     }
                     continue;
                 }
@@ -3546,9 +4063,9 @@ fn pump_subscriber(
                 //      NEXT line's '\n' — silently consuming a whole line with no
                 //      frame, and reporting a byte count spanning two.
                 if b == b'\n' {
-                    sub.partial.push(b'\n'); // B1: THE NEWLINE GOES IN.
-                    sub.held = true;
-                    if !try_emit_line(sub, cap) {
+                    self.partial.push(b'\n'); // B1: THE NEWLINE GOES IN.
+                    self.held = true;
+                    if !self.try_emit_line(out, cap) {
                         stalled = true; // R1: HOLD the line. Never Drop.
                         break;
                     }
@@ -3560,87 +4077,292 @@ fn pump_subscriber(
                 //      whose FRAME is not can be neither skipped nor delivered, and
                 //      its subscriber is dropped — deterministically, on every
                 //      re-subscribe.
-                if sub.partial.len() + 1 + sub.frame_overhead > cap {
-                    sub.oversize = Some(sub.partial.len() as u64 + 1);
-                    sub.partial.clear(); // free the memory
+                if self.partial.len() + 1 + self.frame_overhead > cap {
+                    self.oversize = Some(self.partial.len() as u64 + 1);
+                    self.partial.clear(); // free the memory
                     continue;
                 }
 
-                sub.partial.push(b);
+                self.partial.push(b);
             }
         }
 
         // ---- (B) TERMINAL: the full history FIRST, then the end frame, ONCE ----
         //
-        // B3(d): `!sub.held` — a HELD line is unfinished history, and an
+        // B3(d): `!self.held` — a HELD line is unfinished history, and a
         // `partial.is_empty()` test alone is satisfied while a held line waits.
-        if !sub.end_sent
-            && sub.out.is_empty()
-            && sub.closing.is_some()
-            && sub.scan == sub.tail
-            && !sub.held
-            && sub.partial.is_empty()
-            && sub.oversize.is_none()
+        if !self.end_sent
+            && out.is_empty()
+            && self.closing.is_some()
+            && self.scan == self.tail
+            && !self.held
+            && self.partial.is_empty()
+            && self.oversize.is_none()
         {
-            let reason = sub.closing.clone().unwrap_or_else(|| "stopped".into());
-            sub.out
-                .extend_from_slice(&end_frame(&sub.session, sub.tail, &reason));
+            let reason = self.closing.clone().unwrap_or_else(|| "stopped".into());
+            out.append(&end_frame(&self.session, self.tail, &reason));
             // R2: WITHOUT THIS, (B) re-fires on every iteration — unbounded
             // duplicate end frames, and `Gone` is never reached.
-            sub.end_sent = true;
+            self.end_sent = true;
         }
 
-        // ---- (C) FLUSH --------------------------------------------------------
+        self.end_sent
+    }
+
+    /// R1/R3: emit ONE complete line from `partial`, or report that `out` has no room
+    /// for it.
+    ///
+    /// Returns `false` => the caller STALLS: `partial` KEEPS the complete line, `held`
+    /// stays true, `cursor` does NOT advance, and NOTHING IS LOST. The cap is a STOP.
+    ///
+    /// PRECONDITION (established by the only caller): `self.held` is true and
+    /// `self.partial` ENDS WITH '\n'.
+    ///
+    /// It can never stall FOREVER: the pre-push guard bounds
+    /// `partial.len() + frame_overhead <= cap` BEFORE the '\n' goes in, and `body`
+    /// strips that '\n' again — so `frame.len() = frame_overhead + body.len() <= cap`
+    /// and this frame ALWAYS fits an EMPTY `out`. A held line goes out the moment the
+    /// socket drains what is ahead of it.
+    fn try_emit_line(&mut self, out: &mut OutBuf, cap: usize) -> bool {
+        // B1: `partial` INCLUDES the '\n', so `off` lands PAST the newline — which is
+        // what makes it a valid §9 resume cursor (the start of the NEXT line).
+        let off = self.cursor + self.partial.len() as u64;
+
+        let frame = {
+            let mut end = self.partial.len().saturating_sub(1); // strip '\n'
+            if end > 0 && self.partial[end - 1] == b'\r' {
+                end -= 1;
+            }
+            let body = &self.partial[..end];
+            if trim_ascii_whitespace(body).is_empty() {
+                // G11: a blank line is a SILENT no-op — no frame, no event — exactly
+                // as cp-0 treats it. Emitting a `skipped` frame for a no-op would be
+                // noise a client has to filter.
+                self.cursor = off;
+                self.partial.clear();
+                self.held = false;
+                return true;
+            }
+            match event_frame(&self.session, off, body) {
+                Some(f) => f,
+                None => skipped_frame(&self.session, off, body.len() as u64, "not_a_json_object"),
+            }
+        };
+
+        if !out.has_room(frame.len(), cap) {
+            return false; // STALL (R1) — never a Drop.
+        }
+
+        out.append(&frame);
+        self.cursor = off;
+        self.partial.clear();
+        self.held = false;
+        true
+    }
+}
+
+#[derive(Serialize)]
+struct FleetSessionFrame<'a> {
+    frame: &'static str,
+    session: &'a SessionInfo,
+}
+#[derive(Serialize)]
+struct FleetGoneFrame<'a> {
+    frame: &'static str,
+    name: &'a str,
+}
+
+fn fleet_session_frame(s: &SessionInfo) -> Vec<u8> {
+    let mut line = serde_json::to_string(&FleetSessionFrame {
+        frame: "session",
+        session: s,
+    })
+    .unwrap_or_else(|_| String::from("{\"frame\":\"session\"}"));
+    line.push('\n');
+    line.into_bytes()
+}
+fn fleet_gone_frame(name: &str) -> Vec<u8> {
+    let mut line = serde_json::to_string(&FleetGoneFrame {
+        frame: "gone",
+        name,
+    })
+    .unwrap_or_else(|_| String::from("{\"frame\":\"gone\"}"));
+    line.push('\n');
+    line.into_bytes()
+}
+fn fleet_synced_frame() -> Vec<u8> {
+    b"{\"frame\":\"synced\"}\n".to_vec()
+}
+
+/// The LEDGER/model-sourced half of a subscription. It holds no file — its
+/// "cursor" is the by-name snapshot `sent` it last delivered, which is why the
+/// §4.4 cap-STOP here is "leave `sent` unchanged for an un-emitted row" (the
+/// model is recomputable next wake) rather than "hold the line in `partial`".
+pub struct FleetSource {
+    sent: HashMap<String, SessionInfo>,
+    synced: bool,
+}
+
+impl FleetSource {
+    fn new() -> FleetSource {
+        FleetSource {
+            sent: HashMap::new(),
+            synced: false,
+        }
+    }
+
+    /// Diff `model` against `sent`, emitting the delta into `out` and STOPPING at
+    /// the cap. NON-TERMINAL always — a fleet subscription only ends on client
+    /// detach or campd shutdown.
+    fn fill(
+        &mut self,
+        out: &mut OutBuf,
+        cap: usize,
+        model: &[SessionInfo],
+        pending_events: &mut Vec<EventInput>,
+    ) {
+        // (1) added / changed rows.
+        for s in model {
+            if self.sent.get(&s.name) == Some(s) {
+                continue;
+            }
+            let frame = fleet_session_frame(s);
+            // Fail LOUD, never silent-livelock: a single frame that cannot fit an
+            // EMPTY cap would stall forever (invariant 5). Unreachable in practice
+            // (a SessionInfo frame is < 1 KiB, cap default 1 MiB) — HANDLED, not
+            // assumed: report it and advance `sent` so the snapshot completes.
+            if frame.len() > cap {
+                pending_events.push(degraded_event(
+                    &s.name,
+                    format!(
+                        "fleet: a session frame of {} bytes exceeds the subscriber buffer cap \
+                         ({cap} bytes) and was SKIPPED for subscriber delivery",
+                        frame.len()
+                    ),
+                ));
+                self.sent.insert(s.name.clone(), s.clone());
+                continue;
+            }
+            if !out.has_room(frame.len(), cap) {
+                return; // R1 cap-STOP: `sent` unchanged; resumed next fill.
+            }
+            out.append(&frame);
+            self.sent.insert(s.name.clone(), s.clone());
+        }
+        // (2) departed rows: in `sent` but not in `model`.
+        let live: HashSet<&str> = model.iter().map(|s| s.name.as_str()).collect();
+        let goners: Vec<String> = self
+            .sent
+            .keys()
+            .filter(|n| !live.contains(n.as_str()))
+            .cloned()
+            .collect();
+        for name in goners {
+            let frame = fleet_gone_frame(&name);
+            if !out.has_room(frame.len(), cap) {
+                return;
+            }
+            out.append(&frame);
+            self.sent.remove(&name);
+        }
+        // (3) the snapshot terminator, once.
+        if !self.synced {
+            let frame = fleet_synced_frame();
+            if !out.has_room(frame.len(), cap) {
+                return;
+            }
+            out.append(&frame);
+            self.synced = true;
+        }
+    }
+}
+
+fn degraded_event(session: &str, error: String) -> EventInput {
+    EventInput {
+        kind: EventType::PatrolDegraded,
+        rig: None,
+        actor: "campd".into(),
+        bead: None,
+        data: serde_json::json!({ "session": session, "error": error }),
+    }
+}
+
+/// R1/§4.4: the loud drop event. `session` names the source; a fleet drop uses
+/// the marker `"(fleet)"` (Task 4). `subscription` + `buffered_bytes` +
+/// `cap_bytes` are the high-water forensics §4.4 requires.
+fn subscriber_dropped_event(sub: &Subscriber, cap: usize) -> EventInput {
+    let session = match &sub.source {
+        Source::File(fs) => fs.session.clone(),
+        Source::Fleet(_) => "(fleet)".to_owned(),
+    };
+    EventInput {
+        kind: EventType::SubscriberDropped,
+        rig: None,
+        actor: "campd".into(),
+        bead: None,
+        data: serde_json::json!({
+            "session": session,
+            "subscription": sub.id,
+            "buffered_bytes": sub.out.high_water as u64,
+            "cap_bytes": cap as u64,
+        }),
+    }
+}
+
+/// THE ONE DATA PATH (D6"), and the only place bytes reach a subscriber's socket.
+///
+/// The DRIVER: it owns the per-CALL scan budget (`scanned`), ties source FILL to
+/// `OutBuf` FLUSH, and maps a stall to the loud drop. A free function, not a
+/// method, because it needs `&mut Subscriber` and `&mut ControlRuntime`'s
+/// collectors at the same time — disjoint fields, which the borrow checker only
+/// accepts when they are named separately.
+#[allow(clippy::too_many_arguments)]
+fn pump_subscriber(
+    sub: &mut Subscriber,
+    conn: &mut Conn,
+    now: Timestamp,
+    cap: usize,
+    stall_timeout: Duration,
+    pending_events: &mut Vec<EventInput>,
+    degraded_seen: &mut HashSet<(String, u64)>,
+    fleet_model: &[SessionInfo], // the Fleet arm diffs against it; File ignores it
+) -> PumpOutcome {
+    // G1: the per-CALL scan budget. Reset ONCE here, PERSISTS across every
+    // FILL→FLUSH→re-FILL below — this is what bounds work per wake. Making it
+    // local to `fill` would reset it per re-fill and break the bound.
+    let mut scanned = 0usize;
+    loop {
+        // FILL (source-specific), then FLUSH (OutBuf). The driver ties them.
+        let terminal = match &mut sub.source {
+            Source::File(fs) => fs.fill(
+                &mut sub.out,
+                cap,
+                &mut scanned,
+                pending_events,
+                degraded_seen,
+            ),
+            Source::Fleet(fleet) => {
+                fleet.fill(&mut sub.out, cap, fleet_model, pending_events);
+                false // never terminal
+            }
+        };
         if sub.out.is_empty() {
-            // R2: the ONLY path to Gone, and it is now REACHABLE.
-            if sub.end_sent {
-                return PumpOutcome::Gone;
-            }
-            return PumpOutcome::Ok;
+            // Nothing to write. A TERMINAL file source with an empty out has
+            // flushed its `end` frame (or hit a hard inconsistency) — it is Gone.
+            // Otherwise it simply waits for the next wake (a live line, or a fleet
+            // state change).
+            return if terminal {
+                PumpOutcome::Gone
+            } else {
+                PumpOutcome::Ok
+            };
         }
-        match conn.stream.write(&sub.out) {
-            Ok(0) => return PumpOutcome::Gone,
-            Ok(n) => {
-                sub.out.drain(..n);
-                sub.blocked_since = None; // R1: it IS reading.
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // G2: the WRITABLE EDGE re-arms us. Do NOT arm a timeout here — a
-                // zero timeout on a blocked write turns it into a SPIN, and since
-                // macOS's socket buffer (~8 KiB) is far smaller than a chunk's worth
-                // of frames, EVERY healthy subscriber hits this on essentially every
-                // chunk.
-                //
-                // R1: but a peer that accepts ZERO bytes is a peer that has STOPPED
-                // READING — and THAT, not the size of `out`, is what a drop means.
-                if sub.blocked_since.is_none() {
-                    sub.blocked_since = Some(now);
-                }
-                if let Some(since) = sub.blocked_since
-                    && now.duration_since(since) >= signed(stall_timeout)
-                {
-                    sub.high_water = sub.high_water.max(sub.out.len());
-                    return PumpOutcome::Drop(EventInput {
-                        kind: EventType::SubscriberDropped,
-                        rig: None,
-                        actor: "campd".into(),
-                        bead: None,
-                        data: serde_json::json!({
-                            "session": sub.session,
-                            "subscription": sub.id,
-                            "buffered_bytes": sub.high_water as u64,
-                            "cap_bytes": cap as u64,
-                        }),
-                    });
-                }
-                return PumpOutcome::Ok;
-            }
-            // EPIPE / ECONNRESET: the peer is gone. A normal detach is NOT a fault
-            // and appends NO event (§5.2).
-            Err(_) => return PumpOutcome::Gone,
+        match sub.out.flush(conn, now, stall_timeout) {
+            FlushStep::Drained => continue, // room freed — re-fill (scanned persists)
+            FlushStep::WouldBlock => return PumpOutcome::Ok, // WRITABLE edge re-arms
+            FlushStep::Gone => return PumpOutcome::Gone,
+            FlushStep::Stalled => return PumpOutcome::Drop(subscriber_dropped_event(sub, cap)),
         }
-        // Loop: the socket took bytes, so `out` has room and FILL may resume.
     }
 }
 
@@ -3710,21 +4432,21 @@ impl ControlRuntime {
             token,
             Subscriber {
                 id: id.clone(),
-                session: session.to_owned(),
-                file,
-                // The invariant `cursor <= scan <= tail`, from birth.
-                cursor: c,
-                scan: c,
-                partial: Vec::new(),
-                held: false, // B3: a REAL flag, never a `partial` inspection
-                oversize: None,
-                tail,
-                closing: None,
-                end_sent: false, // R2
-                out: Vec::new(),
-                high_water: 0,
-                frame_overhead: measure_frame_overhead(session), // R3: MEASURED
-                blocked_since: None,                             // R1
+                out: OutBuf::new(),
+                source: Source::File(FileSource {
+                    session: session.to_owned(),
+                    file,
+                    // The invariant `cursor <= scan <= tail`, from birth.
+                    cursor: c,
+                    scan: c,
+                    partial: Vec::new(),
+                    held: false, // B3: a REAL flag, never a `partial` inspection
+                    oversize: None,
+                    tail,
+                    closing: None,
+                    end_sent: false,                                 // R2
+                    frame_overhead: measure_frame_overhead(session), // R3: MEASURED
+                }),
             },
         );
         Response::Subscribed {
@@ -3743,12 +4465,29 @@ impl ControlRuntime {
     /// plus any `over_cap` `patrol.degraded` from the collector).
     pub fn fanout(
         &mut self,
+        ledger: &Ledger,
+        patrol: &PatrolRuntime,
         read_channel: &ReadChannelRuntime,
         conns: &mut HashMap<Token, Conn>,
         now: Timestamp,
     ) -> (Vec<Token>, Vec<EventInput>) {
+        // §4.3: recompute the fleet model ONCE per wake, and ONLY when a fleet
+        // subscriber exists — computing it with nobody watching is pure waste
+        // (invariant 1).
+        if self.has_fleet_subscribers() {
+            match self.fleet_model(ledger, patrol, read_channel) {
+                Ok(model) => self.fleet_model = model,
+                Err(e) => self.pending_events.push(degraded_event(
+                    "(fleet)",
+                    format!("fleet model refresh: {e}"),
+                )),
+            }
+        }
         let cap = self.subscriber_buffer_bytes;
         let stall = self.stall_timeout;
+        // Take the model so the pump loop can borrow it immutably while
+        // `&mut self.pending_events`/`&mut self.degraded_seen` stay disjoint.
+        let model = std::mem::take(&mut self.fleet_model);
         let mut gone = Vec::new();
         let mut events = Vec::new();
 
@@ -3757,23 +4496,28 @@ impl ControlRuntime {
             let Some(sub) = self.subscribers.get_mut(&token) else {
                 continue;
             };
-            // The tail refresh, specified for all three cases:
-            match read_channel.tail_state(&sub.session) {
-                // A CLOSING subscriber's tail is PINNED at the final offset, whatever
-                // `tail_state` now says.
-                //
-                // HONESTLY: also defence in depth. Deleting this arm survives the
-                // suite — once a session is disposed `tail_state` returns None, which
-                // the `None` arm below already leaves `tail` untouched. It stays
-                // because a future phase could make `tail_state` answer for a disposed
-                // session; it is not gated today.
-                _ if sub.closing.is_some() => {}
-                Some((_, t)) => sub.tail = t,
-                // The session is no longer tailed. LEAVE `tail` UNCHANGED — never
-                // zero it, never panic. This is the window between `dispose_pending`
-                // and `close_disposed` within ONE wake, and `close_disposed` pins
-                // the authoritative value immediately after.
-                None => {}
+            // The tail refresh, specified for all three cases (FILE sources only —
+            // a fleet source has no tail).
+            match &mut sub.source {
+                Source::File(fs) => match read_channel.tail_state(&fs.session) {
+                    // A CLOSING subscriber's tail is PINNED at the final offset,
+                    // whatever `tail_state` now says.
+                    //
+                    // HONESTLY: also defence in depth. Deleting this arm survives the
+                    // suite — once a session is disposed `tail_state` returns None,
+                    // which the `None` arm below already leaves `tail` untouched. It
+                    // stays because a future phase could make `tail_state` answer for
+                    // a disposed session; it is not gated today.
+                    _ if fs.closing.is_some() => {}
+                    Some((_, t)) => fs.tail = t,
+                    // The session is no longer tailed. LEAVE `tail` UNCHANGED — never
+                    // zero it, never panic. This is the window between `dispose_pending`
+                    // and `close_disposed` within ONE wake, and `close_disposed` pins
+                    // the authoritative value immediately after.
+                    None => {}
+                },
+                // A fleet source has no tail to refresh.
+                Source::Fleet(_) => {}
             }
             let Some(conn) = conns.get_mut(&token) else {
                 gone.push(token);
@@ -3787,6 +4531,7 @@ impl ControlRuntime {
                 stall,
                 &mut self.pending_events,
                 &mut self.degraded_seen,
+                &model,
             ) {
                 PumpOutcome::Ok => {}
                 PumpOutcome::Gone => gone.push(token),
@@ -3796,12 +4541,30 @@ impl ControlRuntime {
                 }
             }
         }
+        self.fleet_model = model; // restore
         events.append(&mut self.pending_events);
         (gone, events)
     }
 
     /// Pump ONE subscriber (the WRITABLE-edge path, and the hello's first bytes).
     pub fn pump(&mut self, token: Token, conn: &mut Conn, now: Timestamp) -> PumpOutcome {
+        // Take/restore the cached model so a resumed cap-STOPped fleet delta diffs
+        // against the SAME model `fanout` computed (this path has no ledger in
+        // scope). A forgotten restore would re-fill against an empty model → a
+        // spurious `gone` per row.
+        let model = std::mem::take(&mut self.fleet_model);
+        let outcome = self.pump_inner(token, conn, now, &model);
+        self.fleet_model = model; // restore
+        outcome
+    }
+
+    fn pump_inner(
+        &mut self,
+        token: Token,
+        conn: &mut Conn,
+        now: Timestamp,
+        model: &[SessionInfo],
+    ) -> PumpOutcome {
         let cap = self.subscriber_buffer_bytes;
         let stall = self.stall_timeout;
         let Some(sub) = self.subscribers.get_mut(&token) else {
@@ -3815,6 +4578,7 @@ impl ControlRuntime {
             stall,
             &mut self.pending_events,
             &mut self.degraded_seen,
+            model,
         )
     }
 
@@ -3860,7 +4624,7 @@ impl ControlRuntime {
             let tokens: Vec<Token> = self
                 .subscribers
                 .iter()
-                .filter(|(_, s)| s.session == d.session)
+                .filter(|(_, s)| matches!(&s.source, Source::File(fs) if fs.session == d.session))
                 .map(|(t, _)| *t)
                 .collect();
 
@@ -3868,16 +4632,24 @@ impl ControlRuntime {
                 let Some(sub) = self.subscribers.get_mut(&token) else {
                     continue;
                 };
-                sub.closing = Some(reason.clone());
-                // The AUTHORITATIVE end of the stream (Task 4's `dispose_pending`
-                // recorded it). The `end` frame's offset comes from HERE.
-                //
-                // HONESTLY: this line is DEFENCE IN DEPTH, not a gated invariant.
-                // Deleting it survives the whole suite, because `fanout` has already
-                // refreshed `tail` from `tail_state` earlier in the SAME wake and the
-                // two agree. It stays because the ordering it relies on is a property
-                // of the event loop, not of this function — but do not call it tested.
-                sub.tail = d.final_offset;
+                // Only FILE subscribers are tied to a disposed session (the filter
+                // above already guarantees this arm).
+                match &mut sub.source {
+                    Source::File(fs) => {
+                        fs.closing = Some(reason.clone());
+                        // The AUTHORITATIVE end of the stream (Task 4's `dispose_pending`
+                        // recorded it). The `end` frame's offset comes from HERE.
+                        //
+                        // HONESTLY: this line is DEFENCE IN DEPTH, not a gated invariant.
+                        // Deleting it survives the whole suite, because `fanout` has already
+                        // refreshed `tail` from `tail_state` earlier in the SAME wake and the
+                        // two agree. It stays because the ordering it relies on is a property
+                        // of the event loop, not of this function — but do not call it tested.
+                        fs.tail = d.final_offset;
+                    }
+                    // A fleet subscriber is not tied to a disposed session.
+                    Source::Fleet(_) => {}
+                }
                 let Some(conn) = conns.get_mut(&token) else {
                     gone.push(token);
                     continue;
@@ -3892,6 +4664,7 @@ impl ControlRuntime {
                     stall,
                     &mut self.pending_events,
                     &mut self.degraded_seen,
+                    &[], // a disposal wake targets file subscribers; fleet is pumped by fanout
                 ) {
                     PumpOutcome::Ok => {}
                     PumpOutcome::Gone => gone.push(token),
@@ -3961,20 +4734,20 @@ impl ControlRuntime {
             token,
             Subscriber {
                 id: format!("sub-{}", self.next_subscription),
-                session: session.to_owned(),
-                file,
-                cursor,
-                scan: cursor,
-                partial: Vec::new(),
-                held: false,
-                oversize: None,
-                tail,
-                closing: None,
-                end_sent: false,
-                out: Vec::new(),
-                high_water: 0,
-                frame_overhead: measure_frame_overhead(session),
-                blocked_since: None,
+                out: OutBuf::new(),
+                source: Source::File(FileSource {
+                    session: session.to_owned(),
+                    file,
+                    cursor,
+                    scan: cursor,
+                    partial: Vec::new(),
+                    held: false,
+                    oversize: None,
+                    tail,
+                    closing: None,
+                    end_sent: false,
+                    frame_overhead: measure_frame_overhead(session),
+                }),
             },
         );
         (client, conn)
@@ -3985,5 +4758,57 @@ impl ControlRuntime {
     #[cfg(test)]
     fn test_sub(&self, token: Token) -> &Subscriber {
         &self.subscribers[&token]
+    }
+
+    /// Insert a FLEET subscriber directly over a `UnixStream::pair()`, so the
+    /// model-diff pump can be driven with NO daemon and NO ledger.
+    pub fn test_insert_fleet_subscriber(
+        &mut self,
+        token: Token,
+    ) -> (std::os::unix::net::UnixStream, Conn) {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let conn = Conn {
+            stream: mio::net::UnixStream::from_std(server),
+            buf: Vec::new(),
+        };
+        self.next_subscription += 1;
+        self.subscribers.insert(
+            token,
+            Subscriber {
+                id: format!("fleet-{}", self.next_subscription),
+                out: OutBuf::new(),
+                source: Source::Fleet(FleetSource::new()),
+            },
+        );
+        (client, conn)
+    }
+
+    /// Drive ONE subscriber's pump against an explicit fleet model at an explicit
+    /// `now` (production supplies the model through `fanout`; this is the unit
+    /// entry, and `now` is explicit so stall-window tests are deterministic).
+    pub fn pump_with_model(
+        &mut self,
+        token: Token,
+        conn: &mut Conn,
+        now: Timestamp,
+        model: &[SessionInfo],
+    ) -> PumpOutcome {
+        let cap = self.subscriber_buffer_bytes;
+        let stall = self.stall_timeout;
+        let Some(sub) = self.subscribers.get_mut(&token) else {
+            return PumpOutcome::Gone;
+        };
+        pump_subscriber(
+            sub,
+            conn,
+            now,
+            cap,
+            stall,
+            &mut self.pending_events,
+            &mut self.degraded_seen,
+            model,
+        )
     }
 }

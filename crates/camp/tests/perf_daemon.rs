@@ -347,6 +347,85 @@ fn idle_campd_with_tailed_workers_zero_cpu_under_20mb() {
     drop(subs);
 }
 
+/// §4.3 (cp-2): a FLEET subscriber on quiescent workers costs ZERO wakeups. The
+/// model does not change while workers are silent, so no diff, no frame, no
+/// write — the same idle property session.subscribe proved, for the aggregate.
+///
+/// Same construction as the tailed-workers arm, but the N held-open connections
+/// are `fleet.subscribe`: each reads its hello + snapshot to `synced`, then STOPS
+/// reading and holds idle across the same 30 s window. RED on CPU here means the
+/// fleet fanout wakes campd with an unchanged model — a real invariant-1 bug.
+#[test]
+#[ignore = "idle harness: run via `make perf` (release, local-only)"]
+fn idle_campd_with_fleet_subscribers_zero_cpu_under_20mb() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 8, "");
+    let hold = dir.path().join("hold");
+    std::fs::create_dir_all(&hold).unwrap();
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_HOLD_DIR", hold.to_str().unwrap())]);
+    let pid = campd.pid();
+
+    // Dispatch M=4 quiescent workers (each claims then holds; its stdout file
+    // stays open and its session stays registered for the read channel).
+    for i in 0..4 {
+        let _bead = camp_ok(&root, &["sling", &format!("quiescent task {i}")])
+            .trim()
+            .to_owned();
+    }
+    wait_until(&root, "4 sessions dispatched", |e| {
+        e.iter().filter(|ev| ev["type"] == "session.woke").count() == 4
+    });
+
+    // K = 4 FLEET subscribers, held open across the whole idle window. Each reads
+    // its hello + full snapshot to `synced`, then stops reading — the quiescent
+    // profile §4.3 asks about (an unchanged model produces no further frames).
+    let mut subs: Vec<std::os::unix::net::UnixStream> = Vec::new();
+    for _ in 0..4 {
+        let mut s = std::os::unix::net::UnixStream::connect(root.join("campd.sock")).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        std::io::Write::write_all(&mut s, b"{\"op\":\"fleet.subscribe\"}\n").unwrap();
+        let mut reader = BufReader::new(s.try_clone().unwrap());
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        assert!(
+            hello.contains("\"ok\":true"),
+            "the fleet.subscribe hello must succeed: {hello:?}"
+        );
+        // Read frames until the snapshot terminator `synced`, then STOP reading.
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line.contains("\"frame\":\"synced\"") {
+                break;
+            }
+        }
+        // §4.4: timeout-exempt after the hello + snapshot.
+        s.set_read_timeout(None).unwrap();
+        subs.push(s);
+    }
+    assert_eq!(subs.len(), 4, "K=4 fleet subscribers held open");
+
+    // The measurement window: 30 s idle with 4 tailed workers AND 4 fleet subs.
+    let (cpu0, _rss0) = ps_cputime_rss(pid);
+    std::thread::sleep(Duration::from_secs(30));
+    let (cpu1, rss1) = ps_cputime_rss(pid);
+
+    let delta = cpu1.saturating_sub(cpu0);
+    eprintln!(
+        "[daemon] idle 30s with 4 tailed workers + 4 fleet subscribers: cpu delta {delta:?}, rss {rss1} KB"
+    );
+    assert!(
+        delta <= Duration::from_millis(10),
+        "idle CPU delta {delta:?} exceeds 10 ms — a FLEET SUBSCRIPTION IS WAKING CAMPD \
+         WITH AN UNCHANGED MODEL (invariant 1, §4.3). Fix it; never accommodate it."
+    );
+    assert!(
+        rss1 < 20 * 1024,
+        "idle RSS {rss1} KB exceeds 20 MB with 4 tailed workers + 4 fleet subscribers"
+    );
+    drop(subs);
+}
+
 /// cp-1 (G1/G2) — **THE LOADED ARM**, and it is the one that matters.
 ///
 /// The idle gate is CONSTRUCTED to be blind to the two worst bugs this phase can

@@ -493,6 +493,7 @@ pub fn run(
             ledger,
             control,
             dispatcher,
+            patrol,
             read_channel,
             &mut conns,
             &mut poll,
@@ -661,6 +662,7 @@ pub fn run(
             ledger,
             control,
             dispatcher,
+            patrol,
             read_channel,
             &mut conns,
             &mut poll,
@@ -740,10 +742,12 @@ pub fn run(
 ///
 /// Returns whether it appended anything (the caller settles to advance the campd
 /// cursor past those events).
+#[allow(clippy::too_many_arguments)]
 fn control_step(
     ledger: &mut Ledger,
     control: &mut super::control::ControlRuntime,
     dispatcher: &mut Dispatcher,
+    patrol: &PatrolRuntime,
     read_channel: &mut super::read_channel::ReadChannelRuntime,
     conns: &mut HashMap<Token, Conn>,
     poll: &mut Poll,
@@ -762,7 +766,7 @@ fn control_step(
     // D6": refresh every subscriber's `tail` and pump. A "live" line is just
     // `tail` advancing — `fanout` never touches `lines` at all, which is what
     // makes truncation and duplication structurally impossible.
-    let (gone, events) = control.fanout(read_channel, conns, now);
+    let (gone, events) = control.fanout(ledger, patrol, read_channel, conns, now);
     for input in events {
         ledger.append(input)?;
         appended = true;
@@ -1045,6 +1049,32 @@ fn drain_lines(
                 let response =
                     control.serve_interrupt(&session, ledger, dispatcher, Timestamp::now());
                 respond(&mut conn.stream, &response)?;
+            }
+            // cp-2 (§4.1): fleet.subscribe turns this connection into the aggregate
+            // STREAM. The hello goes out FIRST (it must be the first bytes on the
+            // socket); the post-hello pump emits the snapshot (B11 — nothing else
+            // will fire for it). Mirrors the session.subscribe arm exactly.
+            Ok(Request::FleetSubscribe) => {
+                let response = control.serve_fleet_subscribe(token, ledger, patrol, read_channel);
+                let subscribed = matches!(response, Response::FleetSubscribed { .. });
+                respond(&mut conn.stream, &response)?;
+                if subscribed {
+                    match control.pump(token, conn, Timestamp::now()) {
+                        super::control::PumpOutcome::Ok => {}
+                        super::control::PumpOutcome::Gone => {
+                            control.forget(token);
+                            return Ok(Some(ConnState::Closed));
+                        }
+                        super::control::PumpOutcome::Drop(event) => {
+                            ledger.append(event)?;
+                            control.forget(token);
+                            return Ok(Some(ConnState::Closed));
+                        }
+                    }
+                    for input in control.take_pending_events() {
+                        ledger.append(input)?;
+                    }
+                }
             }
             Err(e) => {
                 respond(
