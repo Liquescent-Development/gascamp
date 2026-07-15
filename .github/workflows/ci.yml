@@ -105,6 +105,8 @@ jobs:
         run: python3 ci/gc-compat/e2e_corpus.py gcpacks-src target/debug/camp
       - name: "phase-3 WORKER CONTRACT gate — the real gc-role-worker fragment closes a gc bead (§14)"
         run: python3 ci/gc-compat/worker_contract.py gcpacks-src target/debug/camp
+      - name: compat-4 mail/prime corpus guard (v1 sends stay send-human; prime stays prose-only)
+        run: python3 ci/gc-compat/mail_prime_corpus.py gcpacks-src
       - name: read pinned gascity ref
         id: gc-ref
         run: echo "ref=$(cat ci/gc-compat/GASCITY_REF)" >> "$GITHUB_OUTPUT"
