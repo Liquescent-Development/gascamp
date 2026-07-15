@@ -18,6 +18,7 @@ mod cmd {
     pub mod export;
     pub mod import;
     pub mod init;
+    pub mod interrupt;
     pub mod ls;
     pub mod mail;
     pub mod nudge;
@@ -376,6 +377,14 @@ enum Command {
         /// Resume from a durable byte offset (a prior subscription's cursor).
         #[arg(long)]
         from: Option<u64>,
+    },
+    /// Interrupt a live worker's current turn (control-plane §5.4) — a one-shot
+    /// over the socket's `session.interrupt` verb. The non-interactive sibling
+    /// of `camp attach`'s `/interrupt`. campd must be running (a pure client —
+    /// a turn is stoppable only through the pipe campd holds).
+    Interrupt {
+        /// The session NAME (from `camp sessions` / `camp watch`).
+        session: String,
     },
     /// Operator mailbox (compat §8.2): read the mail workers send to the human.
     Mail {
@@ -947,6 +956,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             let filter = cmd::attach::AttachFilter::parse(&only)?;
             cmd::attach::run(&camp, session, filter, tail, from)
+        }
+        Command::Interrupt { session } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::interrupt::run(&camp, session)
         }
         Command::Mail { cmd } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
