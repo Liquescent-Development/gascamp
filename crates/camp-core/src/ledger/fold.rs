@@ -61,6 +61,12 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         // state, owned by `camp import`).
         EventType::ImportAdded | EventType::ImportRefused => Ok(()),
         EventType::FormulaRefused => formula_refused(event),
+        // compat §6 (worker contract): AUDIT-ONLY — durable truth, no state
+        // fold. The `deny_unknown_fields` parse IS the append-time validation
+        // (never a bare `=> Ok(())` that would drop it, B7). A malformed shim
+        // event is refused at append, not stored and replayed forever.
+        EventType::ShimRefused => audit::<ShimRefused>(event),
+        EventType::WorkerDrainAcked => audit::<WorkerDrainAcked>(event),
     }
 }
 
@@ -1407,6 +1413,30 @@ struct SubscriberDropped {
     cap_bytes: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // PERMANENT: audit-only — see SessionInterrupted.
+struct ShimRefused {
+    /// The pack binding + qualified agent the refusing worker belongs to, when
+    /// campd exported them (`$GC_TEMPLATE`/`$GC_AGENT`). Optional: an
+    /// unattributable refusal is still worth recording.
+    #[serde(default)]
+    binding: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+    /// The refused verb (e.g. `bd mol`) — NAMED so the ledger tells the whole
+    /// story (invariant 3, §6).
+    verb: String,
+    detail: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // PERMANENT: audit-only — see SessionInterrupted.
+struct WorkerDrainAcked {
+    session: String,
+}
+
 /// `control.failed` (§2.1): a control request campd could not complete.
 /// Audit-only, but `cause` is validated against the closed set — an event
 /// carrying a cause nothing can route is worse than no event at all.
@@ -1432,4 +1462,119 @@ fn control_failed(event: &Event) -> Result<(), CoreError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use crate::clock::FixedClock;
+    use crate::event::{EventInput, EventType};
+    use crate::ledger::Ledger;
+
+    fn temp_ledger() -> (tempfile::TempDir, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open_with_clock(
+            &dir.path().join("camp.db"),
+            Box::new(FixedClock::new("2026-07-05T21:14:03Z")),
+        )
+        .unwrap();
+        (dir, ledger)
+    }
+
+    /// The audit arm VALIDATES: an unknown field is refused AT APPEND
+    /// (`deny_unknown_fields`) and nothing is stored.
+    ///
+    /// Mutation caught: routing `EventType::ShimRefused` to a bare `=> Ok(())`
+    /// (which would accept the malformed event and replay it forever).
+    #[test]
+    fn shim_refused_with_an_unknown_field_is_refused_at_append() {
+        let (_dir, mut ledger) = temp_ledger();
+        let err = ledger
+            .append(EventInput {
+                kind: EventType::ShimRefused,
+                rig: None,
+                actor: "gc-shim".into(),
+                bead: None,
+                data: serde_json::json!({"verb": "x", "detail": "y", "bogus": 1}),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::CoreError::InvalidEventData { .. }),
+            "unexpected error: {err:?}"
+        );
+        // Rejections appended nothing: the transaction rolled back.
+        assert!(
+            ledger
+                .events_of_type(EventType::ShimRefused)
+                .unwrap()
+                .is_empty(),
+            "a refused event must not be stored"
+        );
+    }
+
+    /// A well-formed `shim.refused` (with the optional binding/agent absent)
+    /// appends; the arm is not rejecting valid events.
+    #[test]
+    fn shim_refused_well_formed_appends() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(EventInput {
+                kind: EventType::ShimRefused,
+                rig: None,
+                actor: "gc-shim".into(),
+                bead: None,
+                data: serde_json::json!({"verb": "bd mol", "detail": "unknown verb"}),
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.events_of_type(EventType::ShimRefused).unwrap().len(),
+            1
+        );
+    }
+
+    /// Same validation guard on the other new audit arm.
+    #[test]
+    fn worker_drain_acked_with_an_unknown_field_is_refused_at_append() {
+        let (_dir, mut ledger) = temp_ledger();
+        let err = ledger
+            .append(EventInput {
+                kind: EventType::WorkerDrainAcked,
+                rig: None,
+                actor: "gc-shim".into(),
+                bead: None,
+                data: serde_json::json!({"session": "t/gc.publisher/1", "bogus": true}),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::CoreError::InvalidEventData { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            ledger
+                .events_of_type(EventType::WorkerDrainAcked)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn worker_drain_acked_well_formed_appends() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(EventInput {
+                kind: EventType::WorkerDrainAcked,
+                rig: None,
+                actor: "gc-shim".into(),
+                bead: None,
+                data: serde_json::json!({"session": "t/gc.publisher/1"}),
+            })
+            .unwrap();
+        assert_eq!(
+            ledger
+                .events_of_type(EventType::WorkerDrainAcked)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }
