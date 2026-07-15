@@ -12,6 +12,7 @@ pub mod bd;
 pub mod hook;
 pub mod install;
 pub mod mail;
+pub mod prime;
 pub mod project;
 pub mod runtime;
 
@@ -70,6 +71,7 @@ pub fn gc_shim(camp: &CampDir, args: Vec<String>) -> Result<ShimExit> {
         Some("runtime") => runtime::run_runtime(camp, &args[1..]),
         Some("convoy") => runtime::run_convoy(camp, &args[1..]),
         Some("mail") => mail::run(camp, &args[1..]),
+        Some("prime") => prime::run(camp, &args[1..]),
         // Every other gc verb (mol, …) is refused loudly (§6).
         _ => refuse(camp, &verb_of(&args), "gc shim does not serve this verb"),
     }
