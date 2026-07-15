@@ -161,6 +161,12 @@ pub enum WorkerMessage<'a> {
     CanUseTool {
         request_id: String,
         tool_name: String,
+        /// The CLI's own id for the tool-use block. Optional — the envelope
+        /// stays permissive (C9). Parsed for completeness (the fixture test
+        /// reads it); cp-3 records `permission.pending` from `request_id` +
+        /// `tool_name` only (scoping decision 2), so production never reads it.
+        #[allow(dead_code)]
+        tool_use_id: Option<String>,
     },
     /// §9: the CLI wants to show a human a dialog. camp refuses, every time.
     RequestUserDialog { request_id: String },
@@ -268,6 +274,7 @@ pub fn parse_worker_line(line: &str) -> Result<WorkerMessage<'_>, ControlWireErr
                 Some("can_use_tool") => Ok(WorkerMessage::CanUseTool {
                     request_id,
                     tool_name: body["tool_name"].as_str().unwrap_or_default().to_owned(),
+                    tool_use_id: body["tool_use_id"].as_str().map(str::to_owned),
                 }),
                 // `dialog_kind`'s VALUE SET was not recoverable from the
                 // bundle (it is a minified variable), so camp NEVER keys on
@@ -1221,6 +1228,10 @@ impl ControlRuntime {
         read_channel: &ReadChannelRuntime,
     ) -> anyhow::Result<Vec<SessionInfo>> {
         let rows = ledger.live_sessions()?;
+        // §5.3: BLOCKED is folded ledger truth — a live session with a pending
+        // permission. Computed once for the whole fleet.
+        let blocked: std::collections::HashSet<String> =
+            ledger.blocked_sessions()?.into_iter().collect();
         Ok(rows
             .into_iter()
             .map(|row| SessionInfo {
@@ -1238,9 +1249,9 @@ impl ControlRuntime {
                 } else {
                     "working".into()
                 },
-                // §5.3: phase 3 owns the producer. cp-1 never flips this quietly
-                // — a can_use_tool that arrives is a LOUD control.failed.
-                blocked: false,
+                // §5.3: a live session with an undecided permission renders
+                // BLOCKED — cp-3 lights this bit from folded ledger truth.
+                blocked: blocked.contains(&row.name),
                 name: row.name,
                 agent: row.agent,
                 rig: row.rig,
@@ -1311,6 +1322,7 @@ impl ControlRuntime {
         &mut self,
         lines: &[StreamLine],
         dispatcher: &mut Dispatcher,
+        ledger: &Ledger,
         now: Timestamp,
     ) -> Vec<EventInput> {
         let mut events: Vec<EventInput> = Vec::new();
@@ -1386,35 +1398,56 @@ impl ControlRuntime {
                 Ok(WorkerMessage::CanUseTool {
                     request_id,
                     tool_name,
+                    tool_use_id: _,
                 }) => {
-                    // §5.3.1: STRUCTURALLY UNREACHABLE in cp-1 — camp does not
-                    // pass `--permission-prompt-tool`. If it arrives anyway,
-                    // something is badly wrong, and camp says so plainly rather
-                    // than quietly flipping a `blocked` bit. cp-1 takes NO
-                    // automatic action: phase 3 owns both the answer and §5.3.2's
-                    // slot rule.
-                    let input = EventInput {
-                        kind: EventType::ControlFailed,
-                        rig: None,
-                        actor: "campd".into(),
-                        bead: None,
-                        data: serde_json::json!({
-                            "session": sl.session,
-                            "request_id": request_id,
-                            "cause": "permission_unanswerable",
-                            "reason": format!(
-                                "the worker asked permission to use {tool_name:?}, and cp-1 \
-                                 CANNOT answer a can_use_tool (the permission plane is phase 3). \
-                                 This flow should be structurally unreachable — camp does not \
-                                 pass --permission-prompt-tool — so its arrival is itself the \
-                                 fault. The worker is now BLOCKED FOREVER waiting for an answer \
-                                 that will never come, holding a dispatch slot: stop it with \
-                                 `camp stop {}`",
-                                sl.session
-                            ),
-                        }),
-                    };
-                    push_fault(&mut events, &mut faults, &sl.session, input);
+                    // §5.3: the worker is asking to run a tool its allowlist
+                    // does not cover. Mark it BLOCKED by appending
+                    // `permission.pending` (which folds the `permissions` row).
+                    // §2.3 dedup: a re-read line whose pending already committed
+                    // must NOT append a second — the ledger is the guard, never
+                    // a swallowed UNIQUE conflict.
+                    match ledger.permission_exists(&request_id) {
+                        Ok(true) => {} // already recorded (a re-drain after restart) — skip
+                        Ok(false) => {
+                            let (rig, bead) = dispatcher
+                                .child_info(&sl.session)
+                                .map(|(r, b)| (Some(r), Some(b)))
+                                .unwrap_or((None, None));
+                            events.push(EventInput {
+                                kind: EventType::PermissionPending,
+                                rig,
+                                actor: "campd".into(),
+                                bead,
+                                data: serde_json::json!({
+                                    "session": sl.session,
+                                    "request_id": request_id,
+                                    "tool_name": tool_name,
+                                }),
+                            });
+                        }
+                        Err(e) => {
+                            // A ledger read failing here is a real fault — surface
+                            // it, never silently drop a permission request
+                            // (invariant 5). The worker stays BLOCKED and the
+                            // fault names why campd could not record it.
+                            let input = EventInput {
+                                kind: EventType::ControlFailed,
+                                rig: None,
+                                actor: "campd".into(),
+                                bead: None,
+                                data: serde_json::json!({
+                                    "session": sl.session,
+                                    "request_id": request_id,
+                                    "cause": "permission_unanswerable",
+                                    "reason": format!(
+                                        "checking whether the permission request is already \
+                                         recorded failed: {e}"
+                                    ),
+                                }),
+                            };
+                            push_fault(&mut events, &mut faults, &sl.session, input);
+                        }
+                    }
                 }
                 // D6": subscribers are fed from the FILE by `pump`, never from
                 // here. A stream line has no control-plane effect beyond the
@@ -2121,9 +2154,12 @@ mod tests {
             WorkerMessage::CanUseTool {
                 request_id,
                 tool_name,
+                tool_use_id,
             } => {
                 assert_eq!(request_id, "cli-fixture-2");
                 assert_eq!(tool_name, "Bash");
+                // The fixture carries tool_use_id — the permissive envelope reads it.
+                assert_eq!(tool_use_id.as_deref(), Some("toolu_fixture"));
             }
             other => panic!("expected a CanUseTool, got {other:?}"),
         }
@@ -2149,12 +2185,53 @@ mod tests {
             WorkerMessage::CanUseTool {
                 request_id,
                 tool_name,
+                tool_use_id: _,
             } => {
                 assert_eq!(request_id, "cli-fixture-2");
                 assert_eq!(tool_name, "Bash");
             }
             other => panic!("unknown keys must not break the parse; got {other:?}"),
         }
+    }
+
+    /// A test Dispatcher with no children (`child_info` returns None).
+    fn test_dispatcher(dir: &std::path::Path) -> Dispatcher {
+        Dispatcher::new(
+            crate::campdir::CampDir {
+                root: dir.to_path_buf(),
+            },
+            camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap(),
+        )
+    }
+
+    /// cp-3 Task 4: a `can_use_tool` becomes a `permission.pending` EventInput,
+    /// and a re-drain of the same line whose pending already committed does NOT
+    /// re-emit (§2.3 ledger-backed dedup).
+    #[test]
+    fn a_can_use_tool_becomes_a_permission_pending_and_dedups() {
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (dir, mut ledger) = temp_ledger();
+        seed_live_session(&mut ledger, "t-dev-1");
+        let mut disp = test_dispatcher(dir.path());
+        let line = StreamLine {
+            session: "t-dev-1".into(),
+            line: r#"{"type":"control_request","request_id":"cli-2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo publish"}}}"#.into(),
+        };
+
+        let events = rt.ingest(std::slice::from_ref(&line), &mut disp, &ledger, t0());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventType::PermissionPending);
+        assert_eq!(events[0].data["request_id"], "cli-2");
+        assert_eq!(events[0].data["tool_name"], "Bash");
+        assert_eq!(events[0].data["session"], "t-dev-1");
+
+        // Commit it, then re-ingest the SAME line: no duplicate (§2.3).
+        ledger.append(events[0].clone()).unwrap();
+        let again = rt.ingest(std::slice::from_ref(&line), &mut disp, &ledger, t0());
+        assert!(
+            again.is_empty(),
+            "a request_id the ledger already carries never re-emits pending"
+        );
     }
 
     /// D3: the transparent stream surface. A non-control line is handed back
@@ -3231,8 +3308,53 @@ mod tests {
         assert_eq!(model[0].state, "working");
         assert!(
             !model[0].blocked,
-            "cp-2 never sets blocked — cp-3 owns the producer"
+            "no pending permission → the bit stays false (the baseline)"
         );
+    }
+
+    /// cp-3 Task 5: a live session with a pending permission renders
+    /// `blocked: true`; after the decision it flips back to `false`.
+    #[test]
+    fn fleet_model_blocked_reflects_a_live_pending_permission() {
+        let (_dir, mut ledger, patrol, read_channel) = fleet_fixture();
+        let control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionPending,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "t/dev/1", "request_id": "cli-7", "tool_name": "Bash",
+                }),
+            })
+            .unwrap();
+        let model = control
+            .fleet_model(&ledger, &patrol, &read_channel)
+            .unwrap();
+        assert!(
+            model[0].blocked,
+            "a live session with a pending permission renders BLOCKED"
+        );
+
+        // The decision unblocks it.
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionDecided,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": "t/dev/1", "request_id": "cli-7",
+                    "decision": "allow", "decided_by": "operator",
+                }),
+            })
+            .unwrap();
+        let model = control
+            .fleet_model(&ledger, &patrol, &read_channel)
+            .unwrap();
+        assert!(!model[0].blocked, "a decided permission is not blocked");
     }
 
     /// Drive one fleet subscriber to a quiet point against a fixed model. ONE

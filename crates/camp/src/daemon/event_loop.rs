@@ -757,7 +757,11 @@ fn control_step(
 
     let lines = read_channel.take_stream_lines();
     if !lines.is_empty() {
-        for input in control.ingest(&lines, dispatcher, now) {
+        // The immutable borrow for `ingest` (it reads the ledger to dedup a
+        // permission.pending) ends when it returns the owned Vec, before the
+        // `&mut` append loop below.
+        let inputs = control.ingest(&lines, dispatcher, ledger, now);
+        for input in inputs {
             ledger.append(input)?;
             appended = true;
         }
