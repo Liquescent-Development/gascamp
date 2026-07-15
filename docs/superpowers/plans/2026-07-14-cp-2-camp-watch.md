@@ -284,12 +284,18 @@ pub struct Subscriber {
 
 /// Test-only: reach the file source, so cp-1's subscriber tests keep reading
 /// `.held`/`.cursor`/`.scan`/`.tail` (now nested under `Source::File`).
+///
+/// The match stays exhaustive in Task 1 because `Source` has only the `File`
+/// variant here — the `Fleet` arm is a COMMENT, added in Task 4 exactly as the
+/// `subscriber_dropped_event` and `pump_subscriber` FILL matches do. Adding a
+/// `Source::Fleet(_) => ...` arm now is an E0599 (the variant does not exist
+/// yet) and fails Task 1's own Step 9 gate.
 #[cfg(test)]
 impl Subscriber {
     fn file(&self) -> &FileSource {
         match &self.source {
             Source::File(fs) => fs,
-            Source::Fleet(_) => panic!("test_sub used on a non-file subscriber"),
+            // Source::Fleet(_) => panic!("test_sub used on a non-file subscriber") — added in Task 4
         }
     }
 }
@@ -390,7 +396,7 @@ fn pump_to_completion(rt: &mut ControlRuntime, token: Token, conn: &mut Conn) {
 }
 ```
 
-- Every other `rt.test_sub(T).<field>` access in the module: `.blocked_since` → `.out.blocked_since` (e.g. cp-1's stall tests at `control.rs:2797`, `:2843`, `:2872`); `.held`/`.cursor`/`.scan`/`.tail` → `.file().held`/`.file().cursor`/`.file().scan`/`.file().tail`; `.out.len()` → `.out.out.len()`; `.out.is_empty()` stays (OutBuf has `is_empty`). Grep the test module for `test_sub(` and update every hit.
+- Every other `rt.test_sub(T).<field>` access in the module: `.blocked_since` → `.out.blocked_since` (e.g. cp-1's stall tests at `control.rs:2797`, `:2843`, `:2872`); `.held`/`.cursor`/`.scan`/`.tail`/`.partial` (sites ~`2380`/`2382`/`2921`)/`.oversize` (~`2406`) → `.file().held`/`.file().cursor`/`.file().scan`/`.file().tail`/`.file().partial`/`.file().oversize`; `.out.len()` → `.out.out.len()`; `.out.is_empty()` stays (OutBuf has `is_empty`). Grep the test module for `test_sub(` and update every hit — the named sites are a foot-gun list, not the whole set.
 
 Preserve behaviour exactly. No `session.subscribe` test may change its assertions.
 
@@ -876,6 +882,12 @@ pub enum Source {
     File(FileSource),
     Fleet(FleetSource),
 }
+```
+
+Now that `Source::Fleet` EXISTS, replace the commented Fleet arm in the `#[cfg(test)] Subscriber::file()` accessor (Task 1 Step 5) with the real arm:
+
+```rust
+            Source::Fleet(_) => panic!("test_sub used on a non-file subscriber"),
 ```
 
 In `pump_subscriber`'s FILL match (Task 1 Step 6), delete the `let _ = fleet_model;` line and add:
@@ -1707,8 +1719,10 @@ Subscribe (drain the snapshot), then trigger the worker's exit via interrupt, th
 
 ```rust
 /// A completion is PUSHED, not polled: a session that ends yields a `gone` frame
-/// to a live fleet subscriber with NO client-initiated poke — the frame rides
-/// the SIGCHLD wake the worker's exit causes.
+/// to a live fleet subscriber with NO poke OF THE FLEET CONNECTION. The frame
+/// rides a genuine wake from the real reap (the worker's SIGCHLD, or the
+/// interrupt connection closing) — never a fleet-connection poll. Which wake
+/// carries it does not matter; that no fleet-connection poke does is the proof.
 #[test]
 fn fleet_subscribe_pushes_a_gone_on_session_end() {
     let dir = tempfile::tempdir().unwrap();
@@ -1868,3 +1882,5 @@ Bring up a camp with a dispatched fake worker (`camp daemon` in one shell), then
 - Session NAME-REUSE across a fleet subscription (a name reappears after a `gone`): the by-name `sent`/`rows` maps handle it, but no test drives it.
 - A worker going gone WHILE its snapshot is cap-STOPped mid-delivery to a slow subscriber: `sent` correctness holds (the `gone` diff fires once the row was delivered), but no test drives the interleaving.
 - The perf-gate stall-window blind spot (Task 8 known gap).
+- **`pump`'s take/restore against the CACHED `self.fleet_model`** (Task 5 Step 3): the unit tests drive the explicit-model `pump_with_model`, so the WRITABLE-edge `pump` path that diffs a resumed cap-STOPped delta against `self.fleet_model` is exercised only end-to-end. A forgotten restore there would re-fill against an empty model → a spurious `gone` per row. Low risk (the restore is specified and `fanout` recomputes the model each wake), but untested in isolation — a candidate for a follow-up unit test, not a cp-2 blocker.
+- **The two `degraded_event` defensive branches** — the oversized-single-frame skip in `FleetSource::fill` and the `fleet_model()` refresh-error branch in `fanout` — are live but untested (both are effectively unreachable in practice). Named here so they are known thin spots, not silently assumed dead.
