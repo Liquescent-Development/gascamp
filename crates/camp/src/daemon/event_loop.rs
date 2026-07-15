@@ -1054,6 +1054,26 @@ fn drain_lines(
                     control.serve_interrupt(&session, ledger, dispatcher, Timestamp::now());
                 respond(&mut conn.stream, &response)?;
             }
+            // cp-3 (§5.3.4): answer a worker's can_use_tool. The handler appends
+            // `permission.decided` to the ledger FIRST (the serialization point),
+            // then writes the control_response. The blocked→working re-arm rides
+            // `reconcile_blocked` in the post-harvest path (Task 8), same wake.
+            Ok(Request::SessionPermissionDecision {
+                session,
+                request_id,
+                decision,
+                message,
+            }) => {
+                let response = control.serve_permission_decision(
+                    &session,
+                    &request_id,
+                    &decision,
+                    message.as_deref(),
+                    ledger,
+                    dispatcher,
+                );
+                respond(&mut conn.stream, &response)?;
+            }
             // cp-2 (§4.1): fleet.subscribe turns this connection into the aggregate
             // STREAM. The hello goes out FIRST (it must be the first bytes on the
             // socket); the post-hello pump emits the snapshot (B11 — nothing else

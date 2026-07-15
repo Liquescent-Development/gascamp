@@ -1205,6 +1205,120 @@ impl ControlRuntime {
         }
     }
 
+    /// §5.3.4 `session.permission_decision`: answer a worker's `can_use_tool`.
+    ///
+    /// LEDGER FIRST, then the pipe. The `permission.decided` append is the
+    /// serialization point: first-answer-wins is enforced by the fold
+    /// (`UPDATE … WHERE status='pending'`), so a losing decider's append FAILS
+    /// and we read who won. The decision is DURABLE before it is delivered — so
+    /// a worker whose stdin campd no longer holds still shows ANSWERED in the
+    /// ledger, and the stall ladder (Task 8) owns its silence (§5.3.4 inverse
+    /// window). Re-arm of the stall timer is NOT done here — Task 8's
+    /// `reconcile_blocked` re-arms on the blocked→working edge this same wake,
+    /// keeping this handler free of a `patrol` dependency (layering).
+    pub fn serve_permission_decision(
+        &mut self,
+        session: &str,
+        request_id: &str,
+        decision: &str,
+        message: Option<&str>,
+        ledger: &mut Ledger,
+        dispatcher: &mut Dispatcher,
+    ) -> Response {
+        // Validate the wire shape BEFORE touching the ledger (a bad verb is the
+        // caller's error, not a campd action to record).
+        if !matches!(decision, "allow" | "allow_always" | "deny") {
+            return Response::Error {
+                ok: false,
+                error: format!("unknown decision {decision:?} (allow|allow_always|deny)"),
+            };
+        }
+        let reason = message.map(str::trim).unwrap_or("");
+        if decision == "deny" && reason.is_empty() {
+            return Response::Error {
+                ok: false,
+                error: "a deny decision must carry a message (the operator's reason)".into(),
+            };
+        }
+        let (rig, bead) = dispatcher
+            .child_info(session)
+            .map(|(r, b)| (Some(r), Some(b)))
+            .unwrap_or((None, None));
+
+        // (1) LEDGER FIRST — the serialization point. First-answer-wins is
+        // enforced by the fold; a losing decider's append FAILS and we read who
+        // won.
+        let decided = ledger.append(EventInput {
+            kind: EventType::PermissionDecided,
+            rig,
+            actor: "campd".into(),
+            bead,
+            data: serde_json::json!({
+                "session": session,
+                "request_id": request_id,
+                "decision": decision,
+                "decided_by": "operator",
+                "reason": (!reason.is_empty()).then_some(reason),
+            }),
+        });
+        if let Err(e) = decided {
+            return match ledger.permission_decider(request_id) {
+                Ok(Some(who)) => Response::Error {
+                    ok: false,
+                    error: format!("already decided by {who}"),
+                },
+                _ => Response::Error {
+                    ok: false,
+                    error: format!("recording the decision failed: {e}"),
+                },
+            };
+        }
+
+        // (2) THEN the pipe. allow_always sends the allow bytes (scoping
+        // decision 1).
+        let msg = match decision {
+            "deny" => ParentMessage::PermissionDeny {
+                request_id: request_id.to_owned(),
+                message: reason.to_owned(),
+            },
+            _ => ParentMessage::PermissionAllow {
+                request_id: request_id.to_owned(),
+            },
+        };
+        let line = match msg.to_line() {
+            Ok(l) => l,
+            Err(e) => {
+                return Response::Error {
+                    ok: false,
+                    error: format!("building the permission response: {e}"),
+                };
+            }
+        };
+        match dispatcher.write_control(session, &line) {
+            ControlWrite::Delivered => Response::PermissionDecided {
+                ok: true,
+                request_id: request_id.to_owned(),
+                decision: decision.to_owned(),
+            },
+            // The decision is DURABLE (answered) but we could not hand it to the
+            // worker. §5.3.4's inverse window: the worker is no longer
+            // answerable — its re-armed stall timer (Task 8) fires, the ladder
+            // drains, finds NO pending (it is decided), and walks its normal
+            // bounded restart. Loud to the caller; the ledger truth is correct.
+            ControlWrite::NoPipe => Response::Error {
+                ok: false,
+                error: format!(
+                    "decision recorded, but campd holds no stdin pipe for {session} (adopted or \
+                     released) — the worker cannot receive it; the stall ladder now owns it"
+                ),
+            },
+            ControlWrite::Failed(e) => Response::Error {
+                ok: false,
+                error: format!("decision recorded, but delivering it to {session} failed: {e}"),
+            },
+        }
+    }
+
     /// §4.1 `session.send_turn` (D4 — the `nudge` socket verb's replacement).
     /// Deliver -> record (`session.nudged`) -> respond. `NoPipe` is NOT an error
     /// here — unlike an interrupt, a turn HAS a resume path, and `via:"none"`
@@ -2315,6 +2429,107 @@ mod tests {
         assert!(
             again.is_empty(),
             "a request_id the ledger already carries never re-emits pending"
+        );
+    }
+
+    /// Seed a live session with a pending permission for `request_id`.
+    fn seed_pending(ledger: &mut Ledger, session: &str, request_id: &str) {
+        seed_live_session(ledger, session);
+        ledger
+            .append(EventInput {
+                kind: EventType::PermissionPending,
+                rig: None,
+                actor: "campd".into(),
+                bead: None,
+                data: serde_json::json!({
+                    "session": session, "request_id": request_id, "tool_name": "Bash",
+                }),
+            })
+            .unwrap();
+    }
+
+    /// Poll a held-cat worker's stdout capture (`<dir>/<bead>.out`) until it
+    /// contains `needle` — cat echoes what campd wrote into its stdin. Bounded,
+    /// so a non-delivery is a loud failure, not a hang.
+    fn wait_for_capture(dir: &std::path::Path, bead: &str, needle: &str) -> String {
+        let path = dir.join(format!("{bead}.out"));
+        for _ in 0..300 {
+            if let Ok(s) = std::fs::read_to_string(&path) {
+                if s.contains(needle) {
+                    return s;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the capture file never contained {needle:?}");
+    }
+
+    /// cp-3 Task 7: the decision is appended to the ledger BEFORE the pipe write,
+    /// it is delivered, and a SECOND decider loses (first-answer-wins).
+    #[test]
+    fn permission_decision_appends_decided_before_writing_and_first_answer_wins() {
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (dir, mut led) = temp_ledger();
+        seed_pending(&mut led, "t-dev-1", "cli-2");
+        let mut disp = test_dispatcher(dir.path());
+        disp.test_insert_held_cat(dir.path(), "t-dev-1", "gc-1");
+
+        let r =
+            rt.serve_permission_decision("t-dev-1", "cli-2", "allow", None, &mut led, &mut disp);
+        assert!(
+            matches!(r, Response::PermissionDecided { ok: true, .. }),
+            "{r:?}"
+        );
+        // durable
+        assert_eq!(
+            led.permission_decider("cli-2").unwrap().as_deref(),
+            Some("operator")
+        );
+        // delivered (cat echoed the allow bytes to its capture)
+        let capture = wait_for_capture(dir.path(), "gc-1", r#""behavior":"allow""#);
+        assert!(capture.contains(r#""behavior":"allow""#));
+
+        // a SECOND decider loses — no second write, an explicit refusal
+        let r2 = rt.serve_permission_decision(
+            "t-dev-1",
+            "cli-2",
+            "deny",
+            Some("no"),
+            &mut led,
+            &mut disp,
+        );
+        match r2 {
+            Response::Error { error, .. } => {
+                assert!(error.contains("already decided by operator"), "{error}")
+            }
+            other => panic!("expected already-decided error, got {other:?}"),
+        }
+    }
+
+    /// cp-3 Task 7 (§5.3.4 inverse window): the decision is recorded FIRST, so a
+    /// worker whose stdin campd no longer holds still shows ANSWERED in the
+    /// ledger — and the caller is told delivery failed.
+    #[test]
+    fn a_decision_is_durable_even_when_the_pipe_is_gone_inverse_window() {
+        let mut rt = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let (dir, mut led) = temp_ledger();
+        seed_pending(&mut led, "t-dev-1", "cli-5");
+        let mut disp = test_dispatcher(dir.path()); // NO child → write_control returns NoPipe
+
+        let r =
+            rt.serve_permission_decision("t-dev-1", "cli-5", "allow", None, &mut led, &mut disp);
+        assert!(
+            matches!(r, Response::Error { .. }),
+            "delivery failed, so the caller is told so: {r:?}"
+        );
+        assert_eq!(
+            led.permission_decider("cli-5").unwrap().as_deref(),
+            Some("operator"),
+            "but the decision is DURABLE — ledger-before-pipe means answered even when undelivered"
+        );
+        assert!(
+            led.blocked_sessions().unwrap().is_empty(),
+            "and the session is no longer BLOCKED"
         );
     }
 
