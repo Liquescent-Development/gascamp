@@ -1194,16 +1194,26 @@ impl ControlRuntime {
         patrol: &PatrolRuntime,
         read_channel: &ReadChannelRuntime,
     ) -> Response {
-        let rows = match ledger.live_sessions() {
-            Ok(rows) => rows,
-            Err(e) => {
-                return Response::Error {
-                    ok: false,
-                    error: format!("listing live sessions: {e}"),
-                };
-            }
-        };
-        let sessions = rows
+        match self.fleet_model(ledger, patrol, read_channel) {
+            Ok(sessions) => Response::SessionsList { ok: true, sessions },
+            Err(e) => Response::Error {
+                ok: false,
+                error: format!("listing live sessions: {e}"),
+            },
+        }
+    }
+
+    /// §4.1/§4.3: the fleet — one `SessionInfo` per LIVE session, BY NAME, from the
+    /// ledger registry (not campd's child map: an adopted worker is a live session
+    /// too). The single definition shared by `sessions.list` and `fleet.subscribe`.
+    pub fn fleet_model(
+        &self,
+        ledger: &Ledger,
+        patrol: &PatrolRuntime,
+        read_channel: &ReadChannelRuntime,
+    ) -> anyhow::Result<Vec<SessionInfo>> {
+        let rows = ledger.live_sessions()?;
+        Ok(rows
             .into_iter()
             .map(|row| SessionInfo {
                 // `last_activity` is the last complete line the session produced;
@@ -1228,8 +1238,7 @@ impl ControlRuntime {
                 rig: row.rig,
                 bead: row.bead,
             })
-            .collect();
-        Response::SessionsList { ok: true, sessions }
+            .collect())
     }
 
     /// The INBOUND half: everything the read channel drained this wake.
@@ -3128,6 +3137,41 @@ mod tests {
             "one pump scans at most the budget + one line: scan={scan}"
         );
         drop(client);
+    }
+
+    /// Build (ledger, patrol, read_channel) with ONE campd-woken live session
+    /// named "t/dev/1", agent "dev" — the minimal fixture for the model-building
+    /// and hello tests. PatrolRuntime/ReadChannelRuntime are constructed as
+    /// `daemon::run` does at startup, on a defaults-only config.
+    fn fleet_fixture() -> (tempfile::TempDir, Ledger, PatrolRuntime, ReadChannelRuntime) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        seed_live_session(&mut ledger, "t/dev/1");
+        let config = camp_core::config::CampConfig::parse("[camp]\nname = \"t\"\n").unwrap();
+        let patrol_config = camp_core::patrol::PatrolConfig::from_section(&config.patrol).unwrap();
+        let patrol = PatrolRuntime::new(patrol_config, &config);
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let read_channel = ReadChannelRuntime::new(sessions, 256 * 1024 * 1024).unwrap();
+        (dir, ledger, patrol, read_channel)
+    }
+
+    /// cp-2: the fleet model is `sessions.list`'s rows, reusable. A live session
+    /// woken by campd appears as one `working` row addressed by name.
+    #[test]
+    fn fleet_model_returns_one_row_per_live_session() {
+        let (_dir, ledger, patrol, read_channel) = fleet_fixture();
+        let control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let model = control
+            .fleet_model(&ledger, &patrol, &read_channel)
+            .unwrap();
+        assert_eq!(model.len(), 1);
+        assert_eq!(model[0].agent, "dev");
+        assert_eq!(model[0].state, "working");
+        assert!(
+            !model[0].blocked,
+            "cp-2 never sets blocked — cp-3 owns the producer"
+        );
     }
 }
 
