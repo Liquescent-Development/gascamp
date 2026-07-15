@@ -62,3 +62,37 @@ fn operator_skill_lists_the_operator_verbs() {
         );
     }
 }
+
+#[test]
+fn operator_skill_names_the_control_plane_verbs() {
+    let s = operator_skill();
+    for needle in [
+        "camp sessions",  // §5.4 list sessions (sessions.list)
+        "camp attach",    // §5.4 read their streams (session.subscribe)
+        "camp nudge",     // §5.4 send them turns (session.send_turn)
+        "camp interrupt", // §5.4 interrupt them (session.interrupt)
+        "camp decide",    // §5.3 answer a permission (session.permission_decision)
+    ] {
+        assert!(
+            s.contains(needle),
+            "operator skill must name the control-plane verb `{needle}`"
+        );
+    }
+}
+
+#[test]
+fn operator_skill_states_the_no_private_paths_discipline() {
+    let s = operator_skill();
+    // The reach-a-worker-only-through-the-socket rule (§4): the skill must tell
+    // the operator NOT to tail a worker's stream file or reach it by pid.
+    assert!(
+        s.contains("socket"),
+        "operator skill must name the socket as the only path to a worker"
+    );
+    for needle in ["stream file", "pid"] {
+        assert!(
+            s.contains(needle),
+            "operator skill must forbid reaching a worker by `{needle}` (§4)"
+        );
+    }
+}
