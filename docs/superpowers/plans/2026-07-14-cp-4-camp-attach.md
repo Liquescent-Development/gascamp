@@ -10,6 +10,13 @@
 
 ---
 
+## Plan-gate status
+
+- **Round 1 (2026-07-14): REJECT** on one blocking finding (CP4-B1); 3/4 panels APPROVE. The contract panel ruled the CRUX-2 replay scope FAITHFUL (§9 scopes replayable history to the append-only stream file; reaped = explicit error — no overclaim). The §2.2 double-pin, the stateless-client structure, and the cp-3 coordination were confirmed.
+- **CP4-B1 (fixed):** Task 6's replay-from-0 e2e (a) would not run green without a wake-loop poke and (b) was a weaker near-duplicate of the merged `a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends` (control.rs:1387). Resolved by the gate-sanctioned DRY path: DROP the daemon-level duplicate, CITE control.rs:1387 as the daemon guarantee (Task 6 Step 3), and move cp-4's OWNED replay proof to the client-render layer (`client_renders_a_full_finished_replay_in_order_then_the_end_marker`, Task 3) — which pins exactly the truncating-replay mutation.
+- **Non-blocking, folded in:** `full_agent()` (not `fully_pinned_agent()`) at T5 A1; `SubClient`/`read_frame_or_eof` naming + use in T6; a composition-gap test that the prod call site passes `agent.partial_messages` (T5 B4); explicit Known-Gaps lines for §4.2 CI-not-pinned no-file-access, §5.2 "diff" (not delivered), per-turn usage fidelity, the `run()` detach-orchestration thin spot, and cp-3-time `can_use_tool` shape validation.
+- CRUX-2 keeps its PENDING-OPERATOR-CONFIRMATION block below (the operator's call is only "OK to defer the larger post-reap transcript replay"; the §9 scope itself was ruled faithful).
+
 ## ⚠ SCOPE DECISION — replay source (PENDING OPERATOR CONFIRMATION)
 
 **This block is load-bearing; the plan gate and the operator must both see it.** There is a genuine SPEC-SCOPE tension between §5.2 and §9, and narrowing it is a decision the OPERATOR owns. The lead has surfaced it to the operator; this plan proceeds on the working assumption below and can be redirected with a single edit.
@@ -78,7 +85,7 @@ Decisions this plan makes where the spec's end-state is richer than cp-4's slice
 - **Modify `crates/camp-core/src/pack.rs`** — `AgentDef.partial_messages: bool` + `resolve_agent_def` / `parse_agent_dir`. SHARED-SURFACE with cp-3 (both add one optional guarded-surface field).
 - **Modify `crates/camp/src/daemon/dispatch.rs`** — the single `build_spec` call site (`dispatch.rs:657`) passes `agent.partial_messages`.
 - **Modify `crates/camp/src/main.rs`** — additive: `pub mod attach;`, the `Attach { session, only, tail, from }` command variant, its dispatch arm.
-- **Modify `crates/camp/tests/control.rs`** — the two exit-criteria e2e tests, reusing the existing `Daemon`/`scaffold`/`dispatch_one`/`connect`/`request` harness.
+- **Modify `crates/camp/tests/control.rs`** — ONE new e2e (attach+detach unnoticed, via the merged `SubClient`); the replay exit criterion is covered by an owned split (a CITATION of cp-1's `a_subscriber_gets_the_full_history…:1387` + cp-4's client-render unit test), not a second e2e — see Task 6.
 
 ---
 
@@ -604,6 +611,43 @@ fn render_frame_shows_skipped_and_end_markers_regardless_of_filter() {
     assert!(render_frame(&en, AttachFilter::Text)[0].to_lowercase().contains("stopped"));
 }
 
+/// CP4's OWNED half of the "replay of a finished session" exit criterion: the
+/// CLIENT renders a WHOLE finished-session replay — every history line in order,
+/// then the terminal marker. The DAEMON's full-history-then-end delivery over a
+/// cursor-0 subscribe is cp-1's guarantee (tests/control.rs:1387, cited in Task
+/// 6); this proves the piece cp-1 cannot: that the client turns that byte stream
+/// into the operator's scrollback WITHOUT truncating it. It pins exactly the
+/// mutation the gate flagged (a replay that drops history frames): decode each
+/// wire line, render it, and assert the full ordered transcript + `-- session
+/// stopped --` appear.
+#[test]
+fn client_renders_a_full_finished_replay_in_order_then_the_end_marker() {
+    // A realistic cursor-0 replay: an init/text line, a tool call, its result,
+    // the worker's terminal answer, then the end frame — exactly the frame
+    // sequence tests/control.rs:1387 delivers over the wire.
+    let wire = [
+        r#"{"frame":"event","session":"s","offset":10,"event":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"starting"}]}}}"#,
+        r#"{"frame":"event","session":"s","offset":40,"event":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Bash","input":{"command":"make"}}]}}}"#,
+        r#"{"frame":"event","session":"s","offset":90,"event":{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok","is_error":false}]}}}"#,
+        r#"{"frame":"event","session":"s","offset":140,"event":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done here"}]}}}"#,
+        r#"{"frame":"end","session":"s","offset":140,"reason":"stopped"}"#,
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for line in wire {
+        let f: StreamFrame = serde_json::from_str(line).unwrap();
+        out.extend(render_frame(&f, AttachFilter::All));
+    }
+    // The FULL history rendered, IN ORDER — not a truncated prefix.
+    let joined = out.join("\n");
+    let starting = out.iter().position(|l| l.contains("starting")).expect("first line");
+    let make = out.iter().position(|l| l.contains("make")).expect("tool call");
+    let done = out.iter().position(|l| l.contains("done here")).expect("terminal answer");
+    assert!(starting < make && make < done, "history must render in order: {out:#?}");
+    assert!(joined.contains("ok"), "the tool result is part of the replay: {out:#?}");
+    // The terminal marker is LAST — the operator sees the session finished.
+    assert!(out.last().unwrap().contains("session stopped"), "ends with the terminal marker: {out:#?}");
+}
+
 #[test]
 fn parse_action_maps_lines_to_turns_interrupts_and_detach() {
     assert_eq!(parse_action("fix the build"), Action::Turn("fix the build".into()));
@@ -951,7 +995,7 @@ Add a NEW test (requirement 2 — flag ON, right arm, right position):
 /// MUTATION: the gate wired to the wrong arm, or dropped, fails here.
 #[test]
 fn partial_messages_flag_is_added_only_when_opted_in_and_only_on_the_stream_arm() {
-    let agent = fully_pinned_agent(); // same construction the fixture test uses
+    let agent = full_agent(); // the merged helper at spawn.rs:597
     let spec = build_spec(
         Path::new("claude"), &agent, Path::new("/camp"), "gc-1", "camp/dev/1",
         "sid", Path::new("/t.jsonl"), Path::new("/cwd"),
@@ -973,7 +1017,7 @@ fn partial_messages_flag_is_added_only_when_opted_in_and_only_on_the_stream_arm(
 }
 ```
 
-If there is no `fully_pinned_agent()` helper, build the `AgentDef` inline exactly as `argv_matches_the_fixture_facts_for_a_fully_pinned_agent` (`spawn.rs:661`) does — copy its agent construction verbatim (and add the new `partial_messages` field once Step B1 exists; until then, construct the agent literal with `partial_messages: false`).
+`full_agent()` (`spawn.rs:597`) is the merged fixture-agent helper; once Step B1 adds the `partial_messages` field, `full_agent()`'s literal gains it (default `false`) — the flag-on test above sets it via the `include_partial_messages` build_spec arg, NOT via the agent, so `full_agent()` stays a plain fixture. (Before Step B1 lands, `full_agent()` has no such field and this test still compiles because the flag is driven by the `build_spec` bool.)
 
 - [ ] **Step A2: Run to verify the tests fail**
 
@@ -1058,14 +1102,40 @@ Expected: FAIL before B1's field/parse, PASS after.
 
 At `crates/camp/src/daemon/dispatch.rs:657` (the single production `build_spec` call, `StdinMode::HeldStream`), pass `agent.partial_messages` as the new trailing arg. This is what makes requirement 1 real end-to-end: the default agent (no `agent.toml` key) yields `false`, so autonomous dispatch stays flag-free.
 
-- [ ] **Step B4: Build the workspace + run the affected suites**
+- [ ] **Step B4: Pin the composition — the PROD call site reads the field, not a constant**
+
+The three links are each pinned in isolation (resolution default-false, `build_spec` conditional both ways, the call-site wiring) — but a hardcoded literal at `dispatch.rs:657` (a `true` OR a `false`) would slip through, because no test yet drives the AGENT field THROUGH the call site to the argv. Close it with a dispatch-level test that inspects the produced `SpawnSpec.argv`. The seam already exists: `Dispatcher::prepare(&self, ledger, bead) -> Result<Prep, String>` (`dispatch.rs:601`) returns `Prep { spec: SpawnSpec }` (`dispatch.rs:129`), both reachable from dispatch.rs's own `#[cfg(test)]` module.
+
+In `dispatch.rs`'s test module, REUSING an existing dispatch test's scaffold (search the module for a test that builds a `Dispatcher` + `Ledger` + a claimed `BeadRow` and calls `prepare`/dispatch — the neighbourhood around `a_cap_full_patrol_respawn_queues_and_retries_when_a_slot_frees`, `dispatch.rs:4249`, has the harness; copy it verbatim, do not invent one):
+
+```rust
+/// §2.2 composition: the PROD dispatch call site passes `agent.partial_messages`
+/// to build_spec — not a hardcoded value. Driven THROUGH prepare so a constant at
+/// dispatch.rs:657 fails: a hardcoded `true` reddens the default-agent case; a
+/// hardcoded `false` reddens the opted-in case.
+#[test]
+fn dispatch_wires_the_agent_partial_messages_field_into_the_worker_argv() {
+    // (i) a default agent (partial_messages = false) => NO flag in the spec argv.
+    //     Build the Dispatcher/ledger/bead exactly as the neighbouring dispatch
+    //     tests do, resolve a default agent, call prepare, assert:
+    //         !prep.spec.argv.iter().any(|a| a == "--include-partial-messages")
+    // (ii) an agent resolved with partial_messages = true => the flag IS present:
+    //         prep.spec.argv.iter().any(|a| a == "--include-partial-messages")
+    // Keep the two cases in ONE test (shared scaffold); the field is the only
+    // difference between them.
+}
+```
+
+If reaching `prepare` from a test is heavier than the neighbouring tests make it (e.g. it needs a real rig/worktree), fall back to whichever dispatch test already asserts against a produced `SpawnSpec`/argv and add the two `--include-partial-messages` presence/absence assertions there — the requirement is one argv-level assertion per direction driven through the call site, not a specific test name.
+
+- [ ] **Step B5: Build the workspace + run the affected suites**
 
 Run: `cargo build -p camp && cargo test -p camp-core -- partial_messages && cargo test -p camp --lib -- daemon::spawn`
 Expected: clean + PASS.
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings`
 Expected: clean.
 
-- [ ] **Step B5: Commit**
+- [ ] **Step B6: Commit**
 
 ```bash
 git add crates/camp-core/src/pack.rs crates/camp/src/daemon/dispatch.rs
@@ -1074,16 +1144,17 @@ git commit -m "feat(agent): per-agent partial_messages opt-in, wired to the spaw
 
 ---
 
-## Task 6: Exit-criteria end-to-end — attach+detach unnoticed, and replay of a finished session
+## Task 6: Exit-criteria coverage — attach+detach unnoticed (e2e), and replay (owned split, no duplication)
 
-The two exit criteria, proven over the REAL socket against a live fake worker, reusing `tests/control.rs`'s harness. These speak the wire directly (like cp-2's e2e), not the `camp attach` binary — the client's own logic is unit-tested in Tasks 1-4; here we prove the COMPOSED behaviour. **Neither test sets `--include-partial-messages` — the exit criteria do not depend on the flag (requirement 3).**
+The two exit criteria. **Exit criterion 1 (attach+detach unnoticed)** is a self-contained cp-4 e2e over the REAL socket (Step 1). **Exit criterion 2 (replay of a finished session)** is proven by an OWNED SPLIT that respects DRY — the DAEMON's full-history-then-`end` delivery over a cursor-0 subscribe on a finishing session is ALREADY pinned by the merged `a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends` (`tests/control.rs:1387`) at the IDENTICAL wire path cp-4 uses (cursor 0 + `FAKE_AGENT_EXIT_AFTER_CONTROL` + interrupt-to-exit); the CLIENT's rendering of that replay is cp-4's own, pinned by `client_renders_a_full_finished_replay_in_order_then_the_end_marker` (Task 3). Duplicating cp-1's daemon test here would be a DRY violation and a weaker near-copy (the round-1 CP4-B1 finding) — so Step 3 CITES it instead of re-implementing it. **Neither the e2e nor the cited path sets `--include-partial-messages` — the exit criteria do not depend on the flag (requirement 3).**
 
 **Harness facts (verified against `tests/control.rs`):**
 - `let dir = tempfile::tempdir().unwrap(); let (root, _rig) = scaffold(dir.path(), 4);` — `dir` MUST stay in scope for the whole test.
 - `let (_bead, session) = dispatch_one(&root);` — returns `(bead, session)`; bind in that order.
 - `Daemon::spawn(&root, &[(env, val)])`. `FAKE_AGENT_CONTROL_LOOP=1` = a worker that keeps its stream stdin open and answers control requests (stays live). `FAKE_AGENT_EXIT_AFTER_CONTROL=1` = answers one control request then exits (→ SIGCHLD → reap).
-- `connect(&root) -> UnixStream`; `request(&mut stream, r#"{...}"#) -> serde_json::Value`.
-- The session.subscribe idiom already in this file (`control.rs:661+`): write `{"op":"session.subscribe","session":"…","cursor":N}`, read the `Subscribed` hello, then read `event`/`skipped`/`end` frames under a read timeout. Reuse the existing `SubConn`/`read_frame_or_eof` helper (`control.rs:760`) if present; otherwise mirror cp-2's `fleet_subscribe` helper shape.
+- `connect(&root) -> UnixStream`; `request(&mut stream, r#"{...}"#) -> serde_json::Value` (request/response, self-driving — answered on the accept wake, no poke needed).
+- **The merged subscribe client: `SubClient` (`control.rs:674`).** `SubClient::open(root, session, cursor: Option<u64>) -> io::Result<SubClient>` (`:684`) connects + subscribes + reads the hello; `SubClient::read_frame_or_eof(within: Duration) -> FrameOrEof` (`:760`) returns `FrameOrEof::{Frame(Value), Eof, Timeout}` (`:822`). Use it rather than hand-rolling `connect`+`BufReader` — it is what every merged subscribe test uses.
+- **The wake rule (why `a_subscriber_…:1387` pokes inside its read loop):** campd flushes the terminal `end` frame only on a WAKE after reap. A subscribe-until-`end` read loop with NO external wake blocks to its deadline. So any such loop MUST drive campd's wake loop with `request(&mut connect(&root), r#"{"op":"poke","seq":N}"#)` inside the loop (`control.rs:1412`). Exit criterion 1's Step 1 does NOT hit this: it never blocks on a pushed frame — its assertions are request/response (`sessions.list`, a fresh subscribe hello).
 
 **Files:**
 - Modify: `crates/camp/tests/control.rs`
@@ -1091,13 +1162,16 @@ The two exit criteria, proven over the REAL socket against a live fake worker, r
 
 - [ ] **Step 1: Write the attach+detach-unnoticed e2e test**
 
+Uses `SubClient::open` (the merged subscribe client) for the subscribe halves; its assertions are all request/response (self-driving), so no wake-loop poke is needed.
+
 ```rust
 // ===== cp-4: camp attach (per-agent view) =================================
 
 /// EXIT CRITERION 1: attach + detach without the worker noticing. Subscribe to a
-/// LIVE worker, read at least one frame, then DETACH (drop the connection). The
-/// worker must be unaffected: still `live` in the registry afterward, and a FRESH
-/// subscribe still works. campd appends no fault on the detach (silent -- cp-1).
+/// LIVE worker, read a frame if any (non-asserting), then DETACH (drop the
+/// SubClient). The worker must be unaffected: still `working` in the registry
+/// afterward, and a FRESH subscribe still succeeds. campd appends no fault on the
+/// detach (a peer-gone flush is silent -- cp-1, control.rs:3833-3835).
 #[test]
 fn attach_then_detach_leaves_the_worker_untouched() {
     let dir = tempfile::tempdir().unwrap();
@@ -1105,24 +1179,19 @@ fn attach_then_detach_leaves_the_worker_untouched() {
     let campd = Daemon::spawn(&root, &[("FAKE_AGENT_CONTROL_LOOP", "1")]);
     let (_bead, session) = dispatch_one(&root);
 
+    // Attach from cursor 0 (history-then-follow), read a frame if one is ready
+    // (content is NOT the point — this must not hard-assert a pushed frame), then
+    // DETACH by dropping the SubClient at the end of the scope.
     {
-        let mut sub = connect(&root);
-        sub.write_all(format!(r#"{{"op":"session.subscribe","session":"{session}","cursor":0}}"#).as_bytes()).unwrap();
-        sub.write_all(b"\n").unwrap();
-        let mut reader = BufReader::new(sub.try_clone().unwrap());
-        let mut hello = String::new();
-        reader.read_line(&mut hello).unwrap();
-        let v: serde_json::Value = serde_json::from_str(hello.trim_end()).unwrap();
-        assert_eq!(v["ok"], true, "subscribe hello: {v}");
-        assert!(v["cursor"].as_u64().is_some(), "hello carries a byte cursor (§9): {v}");
-        reader.get_ref().set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line); // read a frame if any; content is not the point
-        // DETACH: drop `sub`/`reader` at end of scope.
+        let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
+        // Non-asserting single read: a Frame, a Timeout, or an Eof are all fine —
+        // the detach test turns on non-interference, not on content.
+        let _ = sub.read_frame_or_eof(Duration::from_millis(500));
+        // drop(sub) here detaches.
     }
 
-    // The worker is still live: sessions.list shows it working (the detach did not
-    // disturb its held pipe or its stream file).
+    // The worker is still live: sessions.list (request/response, self-driving)
+    // shows it `working` — the detach did not disturb its held pipe or stream file.
     let mut ctl = connect(&root);
     let resp = request(&mut ctl, r#"{"op":"sessions.list"}"#);
     let live = resp["sessions"].as_array().unwrap();
@@ -1132,99 +1201,35 @@ fn attach_then_detach_leaves_the_worker_untouched() {
     );
 
     // A FRESH subscribe still succeeds (the stream file was never disturbed).
-    let mut sub2 = connect(&root);
-    sub2.write_all(format!(r#"{{"op":"session.subscribe","session":"{session}","cursor":0}}"#).as_bytes()).unwrap();
-    sub2.write_all(b"\n").unwrap();
-    let mut r2 = BufReader::new(sub2);
-    let mut hello2 = String::new();
-    r2.read_line(&mut hello2).unwrap();
-    let v2: serde_json::Value = serde_json::from_str(hello2.trim_end()).unwrap();
-    assert_eq!(v2["ok"], true, "a fresh attach after a detach still works: {v2}");
+    let sub2 = SubClient::open(&root, &session, Some(0));
+    assert!(sub2.is_ok(), "a fresh attach after a detach still works: {:?}", sub2.err());
 
     drop(campd);
 }
 ```
 
-MUTATION pinned: a detach that closes the worker's stdin, kills it, or corrupts the stream file → the post-detach `sessions.list` would not show it `working`, or the fresh subscribe would error. If the exact `FAKE_AGENT_CONTROL_LOOP` liveness shape differs, model the assertion on the cp-1 test that proves a worker stays live across a subscribe (search `tests/control.rs` for a `CONTROL_LOOP` + `sessions.list`/liveness pattern) — do NOT weaken to "no panic".
+MUTATION pinned: a detach that closes the worker's stdin, kills it, or corrupts the stream file → the post-detach `sessions.list` would not show it `working`, or the fresh `SubClient::open` would error. If the exact `FAKE_AGENT_CONTROL_LOOP` liveness shape differs, model the assertion on the cp-1 test that proves a worker stays live across a subscribe (search `tests/control.rs` for a `CONTROL_LOOP` + `sessions.list`/liveness pattern) — do NOT weaken to "no panic".
 
 - [ ] **Step 2: Run it**
 
 Run: `cargo test -p camp --test control attach_then_detach_leaves_the_worker_untouched -- --nocapture`
 Expected: PASS. If it fails, debug with systematic-debugging — do not weaken the assertion.
 
-- [ ] **Step 3: Write the replay-of-a-finished-session e2e test**
+- [ ] **Step 3: Replay of a finished session — CITE cp-1's daemon guarantee; do NOT duplicate it**
 
-```rust
-/// EXIT CRITERION 2: replay of a finished session. Attach from cursor 0 to a
-/// worker that produces its stream and then EXITS; read the full byte history
-/// back (the durable replay) and the terminal `end` frame. Replay over the
-/// RETAINED stream file (§9); cp-1's closing/Disposed keeps the fd alive through
-/// disposal so an attached-from-0 subscriber finishes the history.
-#[test]
-fn replay_from_zero_delivers_the_full_history_and_an_end_frame() {
-    let dir = tempfile::tempdir().unwrap();
-    let (root, _rig) = scaffold(dir.path(), 4);
-    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_EXIT_AFTER_CONTROL", "1")]);
-    let (_bead, session) = dispatch_one(&root);
+Exit criterion 2 is proven by the OWNED SPLIT (see this task's intro), NOT a new e2e:
 
-    // Attach from the START while the session is still tailed.
-    let mut sub = connect(&root);
-    sub.write_all(format!(r#"{{"op":"session.subscribe","session":"{session}","cursor":0}}"#).as_bytes()).unwrap();
-    sub.write_all(b"\n").unwrap();
-    let mut reader = BufReader::new(sub.try_clone().unwrap());
-    let mut hello = String::new();
-    reader.read_line(&mut hello).unwrap();
-    assert_eq!(serde_json::from_str::<serde_json::Value>(hello.trim_end()).unwrap()["ok"], true);
-    reader.get_ref().set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+- **DAEMON half (full history, then `end`, no truncation, over cursor-0 subscribe on a finishing session):** already pinned by the merged **`a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends`** (`tests/control.rs:1387`). It uses the EXACT wire path cp-4's replay relies on — `SubClient::open(.., Some(0))`, `FAKE_AGENT_EXIT_AFTER_CONTROL`, interrupt-to-exit — and asserts the strong bar: the full history precedes `end` (`events.len() >= 2`, the worker's terminal `control_response` present), EOF NEVER arrives before `end` (§9 no-truncation), offset fidelity (last event offset == end offset), the `{stopped,crashed}` reason set, and a real EOF after `end`. cp-4 adds NOTHING to the daemon here, so re-implementing this test would be a DRY violation and the round-1 CP4-B1 weaker-near-duplicate. **Add a code comment in cp-4's Task-3 client test and this task pointing to control.rs:1387 as the daemon guarantee.**
+- **CLIENT half (the replay renders as ordered scrollback + a terminal marker, no dropped history):** cp-4's own `client_renders_a_full_finished_replay_in_order_then_the_end_marker` (Task 3) — it drives the SAME frame sequence control.rs:1387 delivers through `decode`+`render_frame` and asserts every history line in order + `-- session stopped --`. This is the piece no daemon test can cover (cp-1 has no client), and it pins exactly the "truncating replay" mutation the gate flagged.
 
-    // Drive the worker to exit: interrupt it (the canonical "answer and die" path,
-    // exactly as control.rs:345's cp-1 test does). Exit -> SIGCHLD -> reap -> `end`.
-    {
-        let mut ctl = connect(&root);
-        let _ = request(&mut ctl, &format!(r#"{{"op":"session.interrupt","session":"{session}"}}"#));
-    }
+Together these compose exit criterion 2. There is NO new e2e in this step — a new one would either duplicate control.rs:1387 (DRY) or be weaker (CP4-B1). If a future reviewer wants a single self-contained composed e2e, the honest way is a NEW fake-worker mode that emits richer history, not a re-run of the cursor-0/exit path already pinned.
 
-    // Read frames until the `end` -- with NO poke of the subscribe connection.
-    let mut saw_event = false;
-    let mut end_reason: Option<String> = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while std::time::Instant::now() < deadline && end_reason.is_none() {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                let t = line.trim_end();
-                if t.is_empty() { continue; }
-                let v: serde_json::Value = serde_json::from_str(t).unwrap();
-                match v["frame"].as_str() {
-                    Some("event") => {
-                        assert_eq!(v["session"], session.as_str());
-                        assert!(v["offset"].as_u64().is_some(), "an event frame carries a resume offset (§9): {v}");
-                        saw_event = true;
-                    }
-                    Some("end") => end_reason = v["reason"].as_str().map(|s| s.to_owned()),
-                    _ => {}
-                }
-            }
-            Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
-            Err(e) => panic!("read: {e}"),
-        }
-    }
-    assert!(saw_event, "the finished session's history must replay as event frames");
-    assert_eq!(end_reason.as_deref(), Some("stopped"),
-        "a finished session terminates the subscription with end{{reason:stopped}}");
-    drop(campd);
-}
-```
+- [ ] **Step 4: Run the whole control file + gates**
 
-MUTATION pinned: no `end` frame (a subscriber never learns the session finished), or a replay that skips the history (subscribe-from-tail instead of from-0). If `FAKE_AGENT_EXIT_AFTER_CONTROL` yields `crashed` rather than `stopped` in your tree, assert the `end` frame's presence and that `reason` is one of `{"stopped","crashed"}` — the terminal frame is the criterion; the exact reason is the fake's exit path.
-
-- [ ] **Step 4: Run it, then the whole control file + gates**
-
-Run: `cargo test -p camp --test control replay_from_zero_delivers_the_full_history_and_an_end_frame -- --nocapture`
-Expected: PASS.
 Run: `cargo test -p camp --test control`
-Expected: PASS — all cp-0/cp-1/cp-2 e2e tests still green.
+Expected: PASS — Step 1's new test plus all cp-0/cp-1/cp-2 e2e tests (including `a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends`) green.
+Run: `cargo test -p camp --lib -- cmd::attach`
+Expected: PASS — including `client_renders_a_full_finished_replay_in_order_then_the_end_marker` (the CLIENT half of exit criterion 2).
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings`
 Expected: clean.
 
@@ -1232,7 +1237,7 @@ Expected: clean.
 
 ```bash
 git add crates/camp/tests/control.rs
-git commit -m "test(cp-4): camp attach end to end -- detach leaves the worker untouched; replay of a finished session (cp-4)"
+git commit -m "test(cp-4): camp attach detach leaves the worker untouched; replay covered by owned split (cp-4)"
 ```
 
 ---
@@ -1268,15 +1273,15 @@ cp-4 adds NO standing daemon cost: an attached session is a cp-1 `session.subscr
 1. **Spec coverage.**
    - §5.2 live typed event stream (tool calls + inputs, tool results, assistant text, token usage) → Task 1 renderer (each kind tested). ✅
    - §5.2 filter → Task 2 `AttachFilter` + `--only`. ✅
-   - §5.2 replay ("scrub back through a finished session") → Tasks 4 (`subscribe_cursor` default `Some(0)`) + 6 (replay e2e). Source = retained stream file per §9 (⚠ decision, pending operator); transcript replay deferred. ✅
+   - §5.2 replay ("scrub back through a finished session") → an OWNED SPLIT (Task 6 Step 3): the DAEMON full-history-then-`end` guarantee is cp-1's `a_subscriber_gets_the_full_history…` (control.rs:1387, CITED not duplicated — DRY / round-1 CP4-B1); the CLIENT replay-render is cp-4's `client_renders_a_full_finished_replay_in_order_then_the_end_marker` (Task 3); the cursor policy is `subscribe_cursor` default `Some(0)` (Task 4). Source = retained stream file per §9 (⚠ decision, pending operator); transcript replay deferred. ✅
    - §5.2 send-turn + interrupt → Task 3 `parse_action` + Task 4 action loop over `session.send_turn`/`session.interrupt`. ✅
    - §5.2 "answer a permission request" → DEFERRED to cp-3; rendered-but-not-wired (Task 1 `Permission` kind; scoping decision 3). ✅
    - §5.2 "detach freely; the worker neither knows nor cares" → Task 4 detach + Task 6 exit-criterion 1. ✅
    - §2.2 `--include-partial-messages` gates deltas; autonomous dispatch must NOT gain them → Task 5 (three named-mutation pins). ✅
    - §9 cursors are byte offsets; reaped stream is an explicit error → Tasks 3/4 (offset-carrying frames, `--from` resume) + campd's existing reaped-session error surfaced by the client. ✅
    - Exit criteria (attach+detach unnoticed; replay of a finished session; CI green) → Task 6 + Task 7. ✅
-2. **Placeholder scan.** No `TBD`/`TODO`/"add error handling"/"similar to Task N". The only prose-directed steps are Task 5 B1/B2 ("mirror the isolation resolution test/pattern") and Task 6's "model on the cp-1 CONTROL_LOOP liveness test if the fake's shape differs" — each names the exact existing site to copy. Every code step carries complete code.
-3. **Type consistency.** `EventKind`/`Rendered`/`render_event`/`tool_summary` (T1) → `AttachFilter`/`EDIT_TOOLS` (T2) → `StreamFrame`/`Action`/`parse_action`/`render_frame` (T3) → `subscribe_cursor`/`run` (T4) line up. `render_frame(&StreamFrame, AttachFilter) -> Vec<String>` and `AttachFilter::matches(&Rendered) -> bool` are used identically downstream. `build_spec`'s new trailing `include_partial_messages: bool` (T5) is threaded to every call site (one prod, five test). `AgentDef.partial_messages` (T5 B1) matches the dispatch call site (B3).
+2. **Placeholder scan.** No `TBD`/`TODO`/"add error handling"/"similar to Task N". The prose-directed steps — Task 5 B1/B2 ("mirror the isolation resolution test/pattern"), Task 5 B4 ("reuse the neighbouring dispatch-test scaffold around control-flow near `dispatch.rs:4249`; call `prepare`, inspect `prep.spec.argv`"), and Task 6 Step 1's "model on the cp-1 CONTROL_LOOP liveness test if the fake's shape differs" — each names the exact existing site to copy. Every code step carries complete code.
+3. **Type consistency.** `EventKind`/`Rendered`/`render_event`/`tool_summary` (T1) → `AttachFilter`/`EDIT_TOOLS` (T2) → `StreamFrame`/`Action`/`parse_action`/`render_frame` (T3) → `subscribe_cursor`/`run` (T4) line up. `render_frame(&StreamFrame, AttachFilter) -> Vec<String>` and `AttachFilter::matches(&Rendered) -> bool` are used identically downstream. `build_spec`'s new trailing `include_partial_messages: bool` (T5 Step A3) is threaded to EVERY call site — one prod (`dispatch.rs:657`, passing `agent.partial_messages`) and every `#[cfg(test)]` call (each passing `false`, except the flag-on test's two calls passing `true`). Helper names verified against the code: `full_agent()` (spawn.rs:597), `SubClient`/`SubClient::open`/`read_frame_or_eof`/`FrameOrEof` (control.rs:674/684/760/822), `Dispatcher::prepare`→`Prep{spec}` (dispatch.rs:601/129). `AgentDef.partial_messages` (T5 B1) matches the dispatch call site (B3) and is composition-pinned (B4).
 
 ## Notes for the implementer
 
@@ -1289,6 +1294,10 @@ cp-4 adds NO standing daemon cost: an attached session is a cp-1 `session.subscr
 ## Known gaps (state, do not close in cp-4)
 
 - **Post-reap transcript replay is deferred** (⚠ replay decision, pending operator). A reaped/disposed session's subscribe is the explicit §9 error; genuine `.jsonl`-transcript replay is a follow-up (new verb + claude-transcript format adapter behind the same renderer).
+- **§5.2's "diff — what did this agent change?" is NOT delivered.** It is a larger, separable per-agent-view capability (a working-tree/git diff surface for the worker's rig), orthogonal to the live/replay stream this slice ships. Deferred to a follow-up.
 - **Partial-message delta RENDERING is lenient, not rich.** With the flag on, `stream_event`/`content_block_delta` events render through the `Other` path rather than as smooth incremental text. Rich delta rendering is additive on top of Task 1; the exit criteria and §5.2's listed content need only complete events.
-- **The steering loop is not unit-tested end-to-end** (threads + stdin). Its pure pieces (`parse_action`, `render_frame`, `subscribe_cursor`) are tested; the sends reuse verbs proven by cp-1's e2e. A manual smoke (Task 7 Step 2) covers the composed loop.
-- **`--from <offset>` is not exercised by an automated cp-4 test.** The cursor policy is unit-tested; resuming a real subscription from a mid-stream durable offset is covered transitively by cp-1's resume-from-offset subscriber tests. A dedicated cp-4 e2e is a candidate follow-up.
+- **Token-usage fidelity is message-terminal, not per-turn.** The renderer surfaces output tokens + cost from the `result` event (the session-terminal usage). Richer per-assistant-message `message.usage` accounting is a delta-tier enrichment (it rides the same partial-messages stream), deferred with the rest of the delta work.
+- **The composed `run()` detach orchestration is proven ONLY by the Task 7 manual smoke** — this is the plan's genuine weakest point. The printer-thread `join`-only-if-finished, the no-spurious-interrupt on `/q`, and EOF-on-stdin→detach are glue over threads + stdin that no automated test exercises. Its pure pieces (`parse_action`, `render_frame`, `subscribe_cursor`) ARE unit-tested, and the sends reuse verbs proven by cp-1's e2e; this is acceptable at cp-2's wire-level-precedent bar, but it is named here as the thin spot, not silently assumed.
+- **§4.2 "the client opens no session files" is verified MANUAL-ONLY (Task 7 Step 2 `lsof`).** CI does NOT pin no-file-access — the client's file-avoidance is a structural property (it holds only a socket) rather than an asserted one. Named so it is a known gap, not an assumed guarantee.
+- **`--from <offset>` is not exercised by an automated cp-4 test.** The cursor policy is unit-tested (`subscribe_cursor`); resuming a real subscription from a mid-stream durable offset is covered transitively by cp-1's resume-from-offset subscriber tests. A dedicated cp-4 e2e is a candidate follow-up.
+- **The `can_use_tool` render SHAPE (`type=="control_request"` + `request.subtype=="can_use_tool"`) is asserted against a hand-written fixture, not a real CLI frame.** It is rendered-but-not-wired and lenient, so a shape mismatch is harmless to the exit criteria; VALIDATE it against a real permission frame at cp-3 integration, when the producer exists.
