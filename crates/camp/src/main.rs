@@ -332,6 +332,11 @@ enum Command {
     /// Watch the fleet live: one line per session, push-driven from the socket
     /// (control-plane §5.1). campd must be running.
     Watch,
+    /// Operator mailbox (compat §8.2): read the mail workers send to the human.
+    Mail {
+        #[command(subcommand)]
+        cmd: MailCommand,
+    },
     /// Write a consistent, integrity-checked copy of the ledger (VACUUM
     /// INTO). DEST must not already exist.
     Backup {
@@ -476,6 +481,36 @@ enum ImportCommand {
         /// The binding to remove
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum MailCommand {
+    /// Send mail to `human` (any other recipient is refused — gastown/v2).
+    Send {
+        /// Recipient (only `human` is served in v1).
+        recipient: String,
+        /// Positional body (joined with spaces; ignored when `-m` is given).
+        body: Vec<String>,
+        #[arg(short = 's', long)]
+        subject: Option<String>,
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+        #[arg(long)]
+        rig: Option<String>,
+    },
+    /// List unread mail.
+    Inbox {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a message and mark it read.
+    Read { id: String },
+    /// Archive (close) one or more messages.
+    Archive { ids: Vec<String> },
+    /// Print the unread count.
+    Count,
+    /// Exit 0 if unread mail exists, 1 if empty (gc's contract).
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -844,6 +879,34 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Watch => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             cmd::watch::run(&camp)
+        }
+        Command::Mail { cmd } => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            match cmd {
+                MailCommand::Send {
+                    recipient,
+                    body,
+                    subject,
+                    message,
+                    rig,
+                } => {
+                    let body = message.unwrap_or_else(|| body.join(" "));
+                    cmd::mail::send(&camp, &recipient, subject, body, rig)
+                }
+                MailCommand::Inbox { json } => cmd::mail::inbox(&camp, json),
+                MailCommand::Read { id } => cmd::mail::read(&camp, &id),
+                MailCommand::Archive { ids } => cmd::mail::archive(&camp, &ids),
+                MailCommand::Count => cmd::mail::count(&camp),
+                MailCommand::Check => {
+                    // BYPASS report(): an empty inbox = exit 1 is a NORMAL
+                    // outcome (A2), like the shim drain — NOT an error. A count
+                    // query, never a loop (invariant 1).
+                    let ledger = camp_core::ledger::Ledger::open(&camp.db_path())?;
+                    let n = ledger.unread_mail_count()?;
+                    println!("{n}");
+                    std::process::exit(if n > 0 { 0 } else { 1 });
+                }
+            }
         }
         Command::Backup { dest } => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
