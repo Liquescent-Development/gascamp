@@ -7,6 +7,8 @@
 //! ends). From here you send a turn or interrupt; answering a permission request
 //! drops in when cp-3's verb lands.
 
+use anyhow::{Result, bail};
+
 /// The KIND of a rendered line — what the `--only` filter selects on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventKind {
@@ -159,11 +161,165 @@ pub fn render_event(ev: &serde_json::Value) -> Vec<Rendered> {
     }
 }
 
+/// Tools the `edits` filter selects -- the file-mutating family.
+pub const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// The `--only` filter (§5.2). Coarse by design; finer filters are additive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AttachFilter {
+    All,
+    Text,
+    Tools,
+    Edits,
+    Failures,
+}
+
+impl AttachFilter {
+    pub fn parse(s: &str) -> Result<AttachFilter> {
+        match s {
+            "all" => Ok(AttachFilter::All),
+            "text" => Ok(AttachFilter::Text),
+            "tools" => Ok(AttachFilter::Tools),
+            "edits" => Ok(AttachFilter::Edits),
+            "failures" => Ok(AttachFilter::Failures),
+            other => {
+                bail!("unknown --only filter {other:?}: expected all|text|tools|edits|failures")
+            }
+        }
+    }
+
+    /// Does this line pass? A `Permission` line ALWAYS passes -- a question
+    /// addressed to the operator must never be filtered away.
+    pub fn matches(&self, r: &Rendered) -> bool {
+        if r.kind == EventKind::Permission {
+            return true;
+        }
+        match self {
+            AttachFilter::All => true,
+            AttachFilter::Text => r.kind == EventKind::Text,
+            AttachFilter::Tools => {
+                matches!(
+                    r.kind,
+                    EventKind::ToolUse { .. } | EventKind::ToolResult { .. }
+                )
+            }
+            AttachFilter::Edits => {
+                matches!(&r.kind, EventKind::ToolUse { tool } if EDIT_TOOLS.contains(&tool.as_str()))
+            }
+            AttachFilter::Failures => {
+                matches!(r.kind, EventKind::ToolResult { is_error: true })
+                    || r.kind == EventKind::Result && r.line.to_lowercase().contains("error")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn filter_all_admits_everything() {
+        let f = AttachFilter::All;
+        assert!(f.matches(&Rendered {
+            kind: EventKind::Text,
+            line: "x".into()
+        }));
+        assert!(f.matches(&Rendered {
+            kind: EventKind::Result,
+            line: "x".into()
+        }));
+    }
+
+    #[test]
+    fn filter_edits_admits_only_edit_family_tool_uses() {
+        let f = AttachFilter::Edits;
+        assert!(f.matches(&Rendered {
+            kind: EventKind::ToolUse {
+                tool: "Edit".into()
+            },
+            line: "x".into()
+        }));
+        assert!(f.matches(&Rendered {
+            kind: EventKind::ToolUse {
+                tool: "Write".into()
+            },
+            line: "x".into()
+        }));
+        assert!(!f.matches(&Rendered {
+            kind: EventKind::ToolUse {
+                tool: "Bash".into()
+            },
+            line: "x".into()
+        }));
+        assert!(!f.matches(&Rendered {
+            kind: EventKind::Text,
+            line: "x".into()
+        }));
+    }
+
+    #[test]
+    fn filter_failures_admits_error_results_only() {
+        let f = AttachFilter::Failures;
+        assert!(f.matches(&Rendered {
+            kind: EventKind::ToolResult { is_error: true },
+            line: "x".into()
+        }));
+        assert!(!f.matches(&Rendered {
+            kind: EventKind::ToolResult { is_error: false },
+            line: "x".into()
+        }));
+        assert!(!f.matches(&Rendered {
+            kind: EventKind::Text,
+            line: "x".into()
+        }));
+    }
+
+    #[test]
+    fn filter_tools_admits_tool_uses_and_results() {
+        let f = AttachFilter::Tools;
+        assert!(f.matches(&Rendered {
+            kind: EventKind::ToolUse {
+                tool: "Bash".into()
+            },
+            line: "x".into()
+        }));
+        assert!(f.matches(&Rendered {
+            kind: EventKind::ToolResult { is_error: false },
+            line: "x".into()
+        }));
+        assert!(!f.matches(&Rendered {
+            kind: EventKind::Text,
+            line: "x".into()
+        }));
+    }
+
+    #[test]
+    fn filter_parse_rejects_an_unknown_name() {
+        assert!(AttachFilter::parse("all").is_ok());
+        assert!(AttachFilter::parse("edits").is_ok());
+        assert!(AttachFilter::parse("nonsense").is_err());
+    }
+
+    #[test]
+    fn a_permission_line_survives_every_filter() {
+        // BLOCKED must be impossible to miss -- no filter may hide it (§5.3 spirit).
+        let p = Rendered {
+            kind: EventKind::Permission,
+            line: "!! BLOCKED".into(),
+        };
+        for f in [
+            AttachFilter::All,
+            AttachFilter::Text,
+            AttachFilter::Tools,
+            AttachFilter::Edits,
+            AttachFilter::Failures,
+        ] {
+            assert!(f.matches(&p), "{f:?} hid a permission line");
+        }
+    }
 
     #[test]
     fn renders_assistant_text() {
