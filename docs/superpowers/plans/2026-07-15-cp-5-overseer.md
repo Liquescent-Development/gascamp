@@ -27,11 +27,11 @@ This is the mapping the plan gate checks. Every action reaches the worker THROUG
 
 | §5.4 action | socket verb (frozen) | `Request` variant → `Response` variant (`socket.rs`) | CLI client the skill names | status |
 |---|---|---|---|---|
-| list sessions | `sessions.list` | `Request::SessionsList` → `Response::SessionsList { ok, sessions: Vec<SessionInfo> }` (`socket.rs:57`, `:140-143`); `SessionInfo { name, agent, rig, bead, state, blocked }` (`socket.rs:112-130`) — **no pid, by design** (`socket.rs:109-111`) | **`camp sessions [--json]`** — NEW one-shot client (Task 1) | verb merged (cp-1); client added by cp-5 |
+| list sessions | `sessions.list` | `Request::SessionsList` → `Response::SessionsList { ok, sessions: Vec<SessionInfo> }` (`socket.rs`, `enum Request::SessionsList` / `enum Response::SessionsList`); `SessionInfo { name, agent, rig, bead, state, last_activity, blocked }` (`socket.rs`, `pub struct SessionInfo`) — **no pid and no request_id, by design** (the doc comment above `SessionInfo`: "a protocol that hands out pids cannot cross a machine boundary") | **`camp sessions [--json]`** — NEW one-shot client (Task 1) | verb merged (cp-1); client added by cp-5 |
 | read their streams | `session.subscribe` | `Request::SessionSubscribe { session, cursor }` → `Response::Subscribed { ok, v, subscription, cursor }` then server-push frames (`socket.rs:67-71`, `:175-180`) | `camp attach <session> [--only] [--tail] [--from]` (cp-4) | merged (cp-4); reused |
 | send them turns | `session.send_turn` | `Request::SessionSendTurn { session, text }` → `Response::SendTurn { ok, via }` (`socket.rs:49-52`, `:167-170`) | `camp nudge <session> "<text>"` (cp-1) | merged (cp-1); reused |
 | interrupt them | `session.interrupt` | `Request::SessionInterrupt { session }` → `Response::Interrupt { ok, request_id }` (`socket.rs:80-82`, `:209-212`) | **`camp interrupt <session>`** — NEW one-shot client (Task 2) | verb merged (cp-1); client added by cp-5 |
-| answer a permission | `session.permission_decision` | `Request::SessionPermissionDecision { session, request_id, decision, message }` → `Response::PermissionDecided { ok, request_id, decision }` (`socket.rs:90-96`, `:200-204`) | `camp decide <session> <request_id> allow\|allow_always\|deny [--reason]` (cp-3) | merged (cp-3); reused |
+| answer a permission | `session.permission_decision` | `Request::SessionPermissionDecision { session, request_id, decision, message }` → `Response::PermissionDecided { ok, request_id, decision }` (`socket.rs`, `enum Request::SessionPermissionDecision` / `enum Response::PermissionDecided`) | `camp decide <session> <request_id> allow\|allow_always\|deny [--reason]` (cp-3) — the `request_id` is DISCOVERED through the socket: the `can_use_tool` `control_request` frame (top-level `request_id`) arrives on the `session.subscribe` stream and `camp attach` renders it in its BLOCKED line (Task 3B). NOT carried by `SessionInfo` (it has no such field). | verb+client merged (cp-3); the id's render surfaced by cp-5 (Task 3B) |
 
 **Why `camp sessions` and `camp interrupt` are new (contract deviation — additive only; see the dedicated section below).** The socket verbs exist, but the only merged CLI surfaces for them are the human-facing streaming views (`camp watch` blocks forever; `camp attach`'s `/interrupt` lives inside an interactive stdin steering loop) and the aggregate `camp top` (counts, not a per-session list). §5.4's overseer is an *agent* that needs a one-shot snapshot to discover session NAMES and a one-shot stop — the exact shape cp-3 already shipped for the permission verb (`camp decide`). Both new clients are pure `socket::require` round-trips; they add zero protocol/daemon machinery, so §5.4's "it needs no new machinery" (about the PROTOCOL) still holds.
 
@@ -42,7 +42,8 @@ This is the mapping the plan gate checks. Every action reaches the worker THROUG
 - `crates/camp/src/cmd/sessions.rs` — **create.** `camp sessions [--json]`: one-shot `sessions.list` socket client; renders the per-session table (human) or the `Vec<SessionInfo>` JSON (machine). One responsibility: turn one `sessions.list` round-trip into output.
 - `crates/camp/src/cmd/interrupt.rs` — **create.** `camp interrupt <session>`: one-shot `session.interrupt` socket client; prints the ack `request_id`. Mirror of `cmd/decide.rs`.
 - `crates/camp/src/main.rs` — **modify.** Register the two `pub mod`s (`:7-38` block), add two clap `Command` variants, add two dispatch arms.
-- `plugin/skills/operator/SKILL.md` — **modify.** Rewrite the mental-model and Verbs sections so the operator is a control-plane client: name `camp sessions`, `camp attach`, `camp nudge`, `camp interrupt`, `camp decide`; state the reach-a-worker-only-through-the-socket discipline; keep every load-bearing line the pinning test guards.
+- `crates/camp/src/cmd/attach.rs` — **modify (Task 3B).** In `render_event`'s `can_use_tool` arm, render the permission `request_id` (it rides the stream frame; it is the only socket surface that carries it) and replace the stale `"answer lands when cp-3 ships"` with the real `camp decide` path; correct the matching stale comment on `enum Action`. Does NOT wire attach's interactive `/allow`//deny loop (cp-4's deferral).
+- `plugin/skills/operator/SKILL.md` — **modify.** Rewrite the mental-model and Verbs sections so the operator is a control-plane client: name `camp sessions`, `camp attach`, `camp nudge`, `camp interrupt`, `camp decide`; state the reach-a-worker-only-through-the-socket discipline; state that the `decide` `request_id` comes from `camp attach`'s BLOCKED line (the subscribe stream), not from `camp sessions`; keep every load-bearing line the pinning test guards.
 - `crates/camp/tests/plugin_operator_skill.rs` — **modify.** Extend the skill-pinning test to require the control-plane verbs and the no-private-paths discipline line.
 - `crates/camp/tests/plugin_policy.rs` — **modify.** Strengthen the zero-agent-definitions guard (an `agent.toml` anywhere under `plugin/`, not only an `agents/` dir) and prove it goes RED.
 - `crates/camp/tests/overseer.rs` — **create.** The exit-criteria integration test: every §5.4 action driven as the real CLI subprocess the skill names, against a live fake fleet over the socket (sufficiency/positive arm), PLUS the no-private-paths falsification instrument (necessity arm: campd down ⇒ loud fail; sufficiency arm: worker stream files + campd.log unreadable ⇒ still works) PLUS the static source-audit tripwire.
@@ -57,7 +58,7 @@ This is the mapping the plan gate checks. Every action reaches the worker THROUG
 - Test: unit tests inside `crates/camp/src/cmd/sessions.rs` (`render` is pure); the socket round-trip is covered by the integration test in Task 5
 
 **Interfaces:**
-- Consumes: `socket::require(camp, &Request::SessionsList) -> Result<Response>` (`socket.rs:436`); `Response::SessionsList { ok, sessions }` (`socket.rs:140`); `SessionInfo { name, agent, rig, bead, state, blocked }` (`socket.rs:112`, already `#[derive(Serialize)]`).
+- Consumes: `socket::require(camp, &Request::SessionsList) -> Result<Response>` (`socket.rs`, `pub fn require`); `Response::SessionsList { ok, sessions }` (`socket.rs`, `enum Response::SessionsList`); `SessionInfo { name, agent, rig, bead, state, last_activity, blocked }` (`socket.rs`, `pub struct SessionInfo` — all seven fields; already `#[derive(Serialize)]`).
 - Produces: `pub fn run(camp: &CampDir, json: bool) -> anyhow::Result<()>`; `fn render(sessions: &[SessionInfo]) -> String` (pure, unit-tested).
 
 - [ ] **Step 1: Write the failing unit test for `render`**
@@ -244,7 +245,7 @@ git commit -m "feat(cp-5): camp sessions — one-shot sessions.list socket clien
 - Test: the socket round-trip is covered by Task 5's integration test; this task adds no unit test (the client is a straight-line `socket::require` match with no pure logic to unit-test — mirroring `cmd/decide.rs`, which has none either).
 
 **Interfaces:**
-- Consumes: `socket::require(camp, &Request::SessionInterrupt { session }) -> Result<Response>`; `Response::Interrupt { ok, request_id }` (`socket.rs:209`).
+- Consumes: `socket::require(camp, &Request::SessionInterrupt { session }) -> Result<Response>`; `Response::Interrupt { ok, request_id }` (`socket.rs`, `enum Response::Interrupt`).
 - Produces: `pub fn run(camp: &CampDir, session: String) -> anyhow::Result<()>`.
 
 - [ ] **Step 1: Write the failing integration expectation (deferred to Task 5) — here, write the module skeleton that must compile**
@@ -441,8 +442,12 @@ ONLY the socket; none reads a stream file or a pid):
 - `camp interrupt <session>` — stop a live worker's current turn (verb:
   `session.interrupt`). The ack's request id lands in the ledger.
 - `camp decide <session> <request_id> allow|allow_always|deny [--reason ...]`
-  — answer a worker's `can_use_tool`: the BLOCKED row in `camp sessions` /
-  `camp watch` carries the `request_id` (verb: `session.permission_decision`).
+  — answer a worker's `can_use_tool` (verb: `session.permission_decision`).
+  You get the `<request_id>` from `camp attach <session>`: when the worker
+  blocks, attach's live stream renders `!! BLOCKED … request <request_id> …`
+  (the id rides the `can_use_tool` event on `session.subscribe` — it is not a
+  `camp sessions` field). `camp sessions` / `camp watch` tell you WHICH session
+  is BLOCKED; `camp attach` on that session tells you the id to answer with.
   A `deny` needs `--reason` (the worker sees it).
 - `camp adopt` — reconcile the session registry against reality (`/adopt`).
 ```
@@ -457,6 +462,97 @@ Expected: PASS — all six tests (four original + two new).
 ```bash
 git add plugin/skills/operator/SKILL.md crates/camp/tests/plugin_operator_skill.rs
 git commit -m "feat(cp-5): operator skill becomes a control-plane client (spec §5.4)"
+```
+
+---
+
+### Task 3B: Surface the permission `request_id` in `camp attach`, and correct the stale "cp-3 hasn't shipped" text
+
+**Why this task exists (round-1 gate BLOCKER 1 + 2).** The overseer's answer path is `camp decide <session> <request_id>`, but the `request_id` is discoverable through the socket ONLY on the `session.subscribe` stream: the `can_use_tool` frame carries a top-level `request_id` (verified: `tests/fake-agent.sh` emits `{"type":"control_request","request_id":"…","request":{"subtype":"can_use_tool",…}}`; `attach.rs`'s own unit test feeds `"request_id":"r1"`). But `attach.rs`'s `render_event` `can_use_tool` arm currently DROPS that id and renders `"(answer lands when cp-3 ships)"` — a falsehood now that cp-3 is merged. `SessionInfo` has no `request_id` field and the wire is frozen (this plan's Global-Constraints rule), so the id must be surfaced where it already lives — in the rendered stream line. This task renders the id and names the real answer path, WITHOUT wiring attach's interactive `/allow`//deny loop (that remains cp-4's separate deferral — scope boundary drawn by the gate).
+
+**Files:**
+- Modify: `crates/camp/src/cmd/attach.rs` — the `render_event` `can_use_tool` arm (the `!! BLOCKED …` line), and the stale doc comment on the `Action` enum.
+- Test: `crates/camp/src/cmd/attach.rs`'s existing unit test `a_can_use_tool_control_request_renders_as_a_visible_permission_line` (it already builds an event with `"request_id":"r1"`).
+
+**Interfaces:**
+- Consumes: the stream event `ev` in `render_event` — `ev["request_id"]` (top-level String on a `control_request` frame) and `ev["request"]["tool_name"]`.
+- Produces: a BLOCKED render of the stable form `!! BLOCKED -- <tool> needs your decision -- request <request_id> -- answer: camp decide <session> <request_id> allow|deny`, parseable by a `request (\S+)` match (Task 5 Step 5 depends on this exact `request <id>` token).
+
+- [ ] **Step 1: Write the failing assertion into the existing attach unit test**
+
+In `crates/camp/src/cmd/attach.rs`, find `a_can_use_tool_control_request_renders_as_a_visible_permission_line` (it constructs an event with `"request_id": "r1"` and asserts a visible `BLOCKED` permission line). ADD, after its existing assertions, an assertion that the id is now rendered and the false text is gone:
+
+```rust
+    // cp-5 (§5.4): the operator's answer path needs the request_id, and the
+    // only socket surface that carries it is this stream frame. Render it.
+    let line = &rendered[0].line;
+    assert!(line.contains("r1"), "the BLOCKED line must render the request_id: {line}");
+    assert!(line.contains("camp decide"), "the BLOCKED line must name the answer path: {line}");
+    assert!(
+        !line.contains("cp-3"),
+        "the BLOCKED line must not claim cp-3 is unshipped: {line}"
+    );
+```
+
+(If the test binds `rendered` under a different local name, match the existing name; the assertions are what matter.)
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test -p camp --bin camp cmd::attach::tests::a_can_use_tool_control_request_renders_as_a_visible_permission_line -- --nocapture`
+Expected: FAIL — the current line renders `"(answer lands when cp-3 ships)"`, has no `r1`, no `camp decide`.
+
+- [ ] **Step 3: Render the id and correct the text**
+
+In `render_event`, replace the `can_use_tool` block (the `vec![Rendered { kind: EventKind::Permission, line: format!("  !! BLOCKED -- {tool} needs your decision (answer lands when cp-3 ships)") }]`) with:
+
+```rust
+            if sub == "can_use_tool" {
+                let tool = ev
+                    .get("request")
+                    .and_then(|r| r.get("tool_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("a tool");
+                // §5.4/§5.3: the request_id rides THIS frame (top-level) — the
+                // only socket surface that carries it, since SessionInfo has no
+                // such field. Render it, and name the real answer path: the
+                // one-shot `camp decide` (cp-3 shipped). Attach's INTERACTIVE
+                // /allow-//deny loop is still cp-4's deferral — not wired here.
+                let request_id = ev
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                vec![Rendered {
+                    kind: EventKind::Permission,
+                    line: format!(
+                        "  !! BLOCKED -- {tool} needs your decision -- request {request_id} \
+                         -- answer: camp decide <session> {request_id} allow|deny"
+                    ),
+                }]
+            } else {
+```
+
+- [ ] **Step 4: Correct the stale `Action` enum comment**
+
+Replace the doc comment on `pub enum Action` (currently "The permission-answer actions (`/allow`, `/deny`) drop in here when cp-3's `session.permission_decision` verb lands.") with:
+
+```rust
+/// A steering action parsed from an operator input line (§6: turns and
+/// decisions, not keypresses). The overseer answers a permission out-of-band
+/// with the one-shot `camp decide` (cp-3, shipped) using the request_id this
+/// view renders on the BLOCKED line; wiring an INTERACTIVE `/allow`//deny
+/// action into this loop remains a separate cp-4 deferral.
+```
+
+- [ ] **Step 5: Run the attach unit tests green**
+
+Run: `cargo test -p camp --bin camp cmd::attach`
+Expected: PASS — the amended test and every other attach test.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/camp/src/cmd/attach.rs
+git commit -m "fix(cp-5): camp attach renders the permission request_id, drops stale cp-3 text (§5.4)"
 ```
 
 ---
@@ -542,7 +638,7 @@ This is the exit criterion: the overseer performs every §5.4 action against a F
 | session states | `working`, `stalled`, `BLOCKED` (permission pending), and a finished/exited worker | — |
 | fleet cardinality | **≥2 concurrent live sessions**, so `sessions.list` returns multiple rows and every steer verb must select by NAME (proves name-addressing, not positional/pid) | very large fleets (perf gate's job, §4.3) |
 | §5.4 verbs | all five: `sessions.list`, `session.subscribe`, `session.send_turn`, `session.interrupt`, `session.permission_decision` | `fleet.subscribe` (cp-2's `camp watch` surface, not a §5.4 overseer action) |
-| decide outcomes | `allow` on a genuinely BLOCKED worker (the worker then continues) | `allow_always` / `deny` re-validation and multi-decider races (cp-3's own suite) |
+| decide outcomes | `allow` on a genuinely BLOCKED worker, with the `request_id` DISCOVERED through the `session.subscribe` stream (`camp attach`'s BLOCKED line) — never supplied to the test | `allow_always` / `deny` re-validation and multi-decider races (cp-3's own suite) |
 | worker binary | `tests/fake-agent.sh` only (the state-machine layer, §8) | the real `claude` `$0`/paid tiers (§8's split — cp-5 adds no compat-gate obligation) |
 | transport | the unix socket | remote/other transports (§4.2 rule 3 — out of scope) |
 | private-path artifacts | present AND poisoned/absent in Task 6's falsification arm (stream files, campd.log, pids) | — |
@@ -598,9 +694,15 @@ fn camp_sessions_lists_the_whole_fleet_by_name_over_the_socket() {
     let out = camp_ok(&root, &["sessions", "--json"]);
     let sessions: Vec<Value> = serde_json::from_str(out.trim()).unwrap();
     assert!(sessions.len() >= 2, "expected ≥2 live sessions, got: {out}");
-    // Every row is addressed BY NAME and carries no pid field (§4.2 / socket.rs:109).
+    // Every row is addressed BY NAME (§4.2, `SessionInfo`'s doc comment).
     for s in &sessions {
         assert!(s["name"].as_str().is_some_and(|n| !n.is_empty()));
+    }
+    // FUTURE-REGRESSION TRIPWIRE, not run coverage: `SessionInfo` never
+    // serializes a pid today, so this is a tautology now. It is kept ONLY to go
+    // RED the day someone adds a `pid` field to the frozen wire (§4.2 rule 1) —
+    // labelled so a reviewer does not count it as behavioural evidence.
+    for s in &sessions {
         assert!(s.get("pid").is_none(), "SessionInfo must never carry a pid: {s}");
     }
 }
@@ -662,41 +764,75 @@ fn camp_interrupt_stops_the_turn_over_the_socket() {
 Run: `cargo test -p camp --test overseer camp_nudge camp_interrupt -- --nocapture`
 Expected: PASS both.
 
-- [ ] **Step 5: Write the `session.permission_decision` test (BLOCKED → decide → continue)**
+- [ ] **Step 5: Write the `session.permission_decision` test (BLOCKED → DISCOVER the id over the socket → decide → continue)**
 
-Append:
+The exit criterion demands the `request_id` be obtained THROUGH THE SOCKET, not supplied out-of-band. So the test does NOT set `FAKE_AGENT_CAN_USE_TOOL_REQ` and does NOT reconstruct the id from the bead — it lets the worker mint its own id (fake-agent's default `cli-$CAMP_BEAD`, exactly as the real CLI mints one) and DISCOVERS it by parsing `camp attach`'s BLOCKED line (which Task 3B now renders as `… request <id> …`, sourced from the `session.subscribe` stream). Append:
 
 ```rust
-/// §5.4/§5.3 "answer a permission": a worker asks `can_use_tool`, `camp
-/// sessions --json` renders it BLOCKED, `camp decide allow` records+delivers
-/// the decision over the socket, and the worker continues. Every step is a
-/// socket round-trip; nothing reads the worker's stream file.
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// §5.4/§5.3 "answer a permission", end to end over the socket ALONE and with
+/// the request_id DISCOVERED — never hardcoded. A worker asks `can_use_tool`;
+/// `camp sessions --json` shows it BLOCKED; `camp attach` renders the id off the
+/// `session.subscribe` stream; the test parses that id and answers with `camp
+/// decide`; the worker continues. If the id could not be discovered through the
+/// socket, this test cannot pass — which is the falsification the gate demanded.
 #[test]
-fn camp_decide_answers_a_blocked_workers_permission_over_the_socket() {
+fn camp_decide_answers_a_blocked_worker_with_a_socket_discovered_request_id() {
     let dir = tempfile::tempdir().unwrap();
     let (root, _agent) = scaffold(dir.path(), 10);
-    let req_id = "cli-overseer";
-    let _d = Daemon::spawn(
-        &root,
-        &[
-            ("FAKE_AGENT_CAN_USE_TOOL", "1"),
-            ("FAKE_AGENT_CAN_USE_TOOL_REQ", req_id),
-        ],
-    );
+    // NOTE: no FAKE_AGENT_CAN_USE_TOOL_REQ — the worker mints its own id; the
+    // test must LEARN it through the socket, not know it a priori.
+    let _d = Daemon::spawn(&root, &[("FAKE_AGENT_CAN_USE_TOOL", "1")]);
     let (_bead, session) = dispatch_one(&root);
-    // campd reads the can_use_tool and marks the session BLOCKED (permission.pending).
     wait_until(&root, "permission.pending", |events| {
         events.iter().any(|e| e["type"] == "permission.pending")
     });
-    // The overseer SEES it as BLOCKED over the socket.
+
+    // 1) The overseer sees WHICH session is BLOCKED — over the socket.
     let listed: Vec<Value> =
         serde_json::from_str(camp_ok(&root, &["sessions", "--json"]).trim()).unwrap();
     assert!(
         listed.iter().any(|s| s["name"] == session.as_str() && s["blocked"] == true),
         "the blocked worker must render blocked in sessions.list: {listed:?}"
     );
-    // The overseer answers — over the socket.
-    let out = camp_ok(&root, &["decide", &session, req_id, "allow"]);
+
+    // 2) DISCOVER the request_id from `camp attach`'s BLOCKED line (a bounded
+    //    child read; attach follows live, so read until the line, then kill).
+    let mut child = Command::new(BIN)
+        .env_remove("CAMP_DIR")
+        .args(["--camp", root.to_str().unwrap(), "attach", &session])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut request_id: Option<String> = None;
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        line.clear();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if line.contains("BLOCKED") && line.contains("request ") {
+            // parse the token after "request " (Task 3B's stable format)
+            if let Some(rest) = line.split("request ").nth(1) {
+                request_id = rest.split_whitespace().next().map(str::to_owned);
+            }
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let request_id = request_id.expect("must discover the request_id from attach's BLOCKED line");
+    assert!(!request_id.is_empty() && request_id != "?", "discovered a bad id: {request_id:?}");
+
+    // 3) Answer with the DISCOVERED id — over the socket.
+    let out = camp_ok(&root, &["decide", &session, &request_id, "allow"]);
     assert!(out.contains("allow"), "decide did not record allow: {out}");
     wait_until(&root, "permission.decided", |events| {
         events.iter().any(|e| e["type"] == "permission.decided" && e["data"]["decision"] == "allow")
@@ -706,20 +842,18 @@ fn camp_decide_answers_a_blocked_workers_permission_over_the_socket() {
 }
 ```
 
+(The `use` lines here are shared with Step 7; declare each `use` once at the top of `overseer.rs` when both steps land.)
+
 - [ ] **Step 6: Run it**
 
 Run: `cargo test -p camp --test overseer camp_decide_answers -- --nocapture`
-Expected: PASS.
+Expected: PASS — and it CANNOT pass unless attach (Task 3B) actually renders the id, which is the intended coupling.
 
 - [ ] **Step 7: Write the `session.subscribe` (read-their-streams) test — a bounded child read**
 
-`camp attach` on a live session follows forever, so drive it as a child, read until a known rendered line appears, then kill it — the same bounded-read discipline `control.rs`'s `SubClient` uses. Append:
+`camp attach` on a live session follows forever, so drive it as a child, read until a known rendered line appears, then kill it — the same bounded-read discipline `control.rs`'s `SubClient` uses. (The `std::io::{BufRead, BufReader}`, `std::process::{Command, Stdio}`, and `std::time::{Duration, Instant}` imports are already declared once at the top of `overseer.rs` by Step 5 — do not re-import.) Append:
 
 ```rust
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
-
 /// §5.4 "read their streams": `camp attach` renders the worker's live typed
 /// events over `session.subscribe`. Bounded child read: attach, see a rendered
 /// line, kill — attach never opens the stream file (its own doc, attach.rs:4).
@@ -788,7 +922,7 @@ git commit -m "test(cp-5): overseer performs every §5.4 action against a fake f
 The wave's discipline: an instrument that can FALSIFY "the overseer touches only the socket," not one that merely asserts it. Three layers, each RED the moment a client grows a private path:
 
 - **A. Necessity — campd down ⇒ loud failure, never a private-path read.** With the FULL on-disk state present (a live session row in the ledger, its `sessions/<s>.json` stream file, the worker's pid recorded and its process alive) but campd's socket gone, every observe/steer-a-live-worker verb FAILS LOUDLY. A verb that grew a stream-file tail or a pid signal would SUCCEED here → the assertion goes RED. This proves the socket is NECESSARY.
-- **B. Sufficiency — private paths unreadable ⇒ every verb still works.** campd UP with a live fake worker, but the worker's `sessions/*.json` stream files and `campd.log` are `chmod 000`. Every overseer verb still succeeds over the socket. campd itself is unaffected — it holds those fds already open (a post-open `chmod` cannot revoke an open descriptor on Unix), so any failure can only come from a CLIENT doing a fresh `open()` of a file it must never touch → RED. This proves the socket is SUFFICIENT.
+- **B. Sufficiency — private paths unreadable ⇒ every verb still works.** campd UP with a live fake worker, but the worker's `sessions/*.json` stream files and `campd.log` are `chmod 000`. Every overseer verb still succeeds over the socket. campd itself is unaffected — it holds those fds already open (a post-open `chmod` cannot revoke an open descriptor on Unix), so any failure can only come from a CLIENT doing a fresh `open()` of a file it must never touch → RED. This proves the socket is SUFFICIENT. **NON-ROOT ASSUMPTION (stated so a future reader does not trust a vacuous green):** mode `000` blocks a non-root process but NOT root, which bypasses permission bits. On `ubuntu-latest` GitHub CI the job runs as a non-root user with no `container:`, so the poison bites; but a developer running the suite as root (or in a root container) would sail through `open()` and the arm would pass vacuously. Arm B therefore SELF-CHECKS: after `chmod 000` it tries to open the poisoned file from the test process itself — if that open SUCCEEDS (we are effectively root), the poison is vacuous, so it restores perms and returns early rather than assert a hollow pass.
 - **C. Static tripwire.** The pure-client source (`cmd/sessions.rs`, `cmd/interrupt.rs`, `cmd/attach.rs`, `cmd/decide.rs`) must reference `socket::` and NONE of the private-path builders (`sessions_dir`, `stdout_path`, `log_path`, `.join("sessions")`, `/proc`, `libc::kill`, `.pid`). A compile-cheap grep tripwire that goes RED the instant someone wires a private path into an overseer client.
 
 **The `camp nudge` exception (flagged, justified).** `nudge` is the one overseer verb with a non-socket branch: when campd is down or the session has no held pipe it resumes via `claude --resume` (`cmd/nudge.rs:66-106`). That is NOT a §4 private-path violation — it spawns a process keyed on the ledger's recorded `claude_session_id` (a NAME/id, §4.2 rule 1), never tailing a stream file and never signalling a pid. So `nudge` is EXCLUDED from arm A (campd-down legitimately routes to resume) and from arm C (its module is intentionally not socket-pure), but INCLUDED in arm B (campd up, poisoned files ⇒ its live `session.send_turn` path still works). This asymmetry is the honest contract and is stated here rather than discovered later.
@@ -854,7 +988,7 @@ fn socket_is_necessary_campd_down_is_a_loud_failure_not_a_private_path_read() {
 }
 ```
 
-Note: reuse the harness's existing `Daemon::kill9(self)` (`control.rs:143-148` — SIGKILL, `wait`, `mem::forget` to avoid a double-kill in `Drop`); it consumes `d`, which is why arm A takes campd down inside a block that returns only `session`. The lingering fake-agent worker is reaped in teardown: it exits on its own `FAKE_AGENT_LINGER_ON_EOF` timeout, and the tempdir drop removes its cwd — mirror the restart tests' cleanup (`control.rs:529-556`), and if flakiness appears add a best-effort `pkill -f "$CAMP_SESSION"` at the end of the test.
+Note: reuse the harness's existing `Daemon::kill9(self)` (`control.rs`, `fn kill9` — SIGKILL, `wait`, `mem::forget` to avoid a double-kill in `Drop`); it consumes `d`, which is why arm A takes campd down inside a block that returns only `session`. The lingering fake-agent worker is reaped in teardown: it exits on its own `FAKE_AGENT_LINGER_ON_EOF` timeout, and the tempdir drop removes its cwd — mirror the crash-restart cleanup the interrupt-restart test uses (`control.rs`, `fn a_campd_restart_across_an_in_flight_interrupt_invents_no_fault`), and if flakiness appears add a best-effort `pkill -f "$CAMP_SESSION"` at the end of the test.
 
 - [ ] **Step 2: Run arm A**
 
@@ -905,6 +1039,17 @@ fn socket_is_sufficient_unreadable_private_paths_do_not_stop_any_verb() {
             (p, perm)
         })
         .collect();
+
+    // NON-ROOT SELF-CHECK: mode 000 does not stop root. If THIS process can
+    // still open the poisoned stream file, we are effectively root and the
+    // whole arm is vacuous — restore and bail rather than assert a hollow pass.
+    if stream.exists() && std::fs::File::open(&stream).is_ok() {
+        eprintln!("skipping sufficiency arm: running as root, chmod 000 is vacuous");
+        for (p, perm) in saved {
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+        return;
+    }
 
     // Every verb still works — over the socket alone.
     let listed: Vec<Value> =
@@ -1018,22 +1163,26 @@ git push -u origin cp-5-overseer
 - §5.4 "read their streams" → Task 5 Step 7 (`camp attach` / `session.subscribe`). ✓
 - §5.4 "send them turns" → Task 5 Step 3 (`camp nudge` / `session.send_turn`). ✓
 - §5.4 "interrupt them" → Task 2 + Task 5 Step 3 (`camp interrupt` / `session.interrupt`). ✓
-- §5.3 "answer a permission" → Task 5 Step 5 (`camp decide` / `session.permission_decision`). ✓
+- §5.3 "answer a permission" → Task 3B (surface the `request_id` on `camp attach`'s BLOCKED line — the only socket source of the id) + Task 5 Step 5 (`camp decide` with the id DISCOVERED through that surface, never hardcoded). ✓
+- attach's stale "cp-3 hasn't shipped" render + comment corrected → Task 3B (does not wire the interactive answer loop — cp-4's deferral). ✓
 - §4 no-private-paths, PROVABLY (falsifiable) → Task 6 arms A/B/C. ✓
 - master §11 zero-agent-definitions, with a RED proof → Task 4. ✓
 - "the overseer becomes a client, not a special case; needs no new machinery" → Task 3 skill rewrite; the two new CLIs add zero protocol/daemon machinery (flagged under Contract Deviations). ✓
 - Exit criterion "every §5.4 action against a FAKE fleet through the socket alone; CI green" → Task 5 (fake-fleet, socket-only) + Task 7 (CI green). ✓
 
-**2. Placeholder scan.** No "TBD"/"add error handling"/"similar to Task N". Every code step shows complete code; the one deliberate deferral (the `control.rs` harness helpers reproduced into `overseer.rs`) is a verbatim copy of pinned, existing code with an exact citation (`control.rs:10-262`), not an invention — this keeps the plan DRY without hiding logic. The `Daemon::kill_hard` helper is specified with its model (`control.rs:529-556`).
+**2. Placeholder scan.** No "TBD"/"add error handling"/"similar to Task N". Every code step shows complete code; the one deliberate deferral (the `control.rs` harness helpers reproduced into `overseer.rs`) is a verbatim copy of pinned, existing code cited by SYMBOL (the `munge` / `scaffold` / `Daemon` / `dispatch_one` / `wait_for_stdout` helpers at the top of `control.rs`), not an invention — this keeps the plan DRY without hiding logic. Arm A reuses the existing `Daemon::kill9` (`control.rs`, `fn kill9`); no new harness symbol is invented.
 
-**3. Type consistency.** `SessionInfo { name, agent, rig, bead, state, last_activity, blocked }` matches `socket.rs:112-130` exactly (the unit-test constructor in Task 1 fills all seven fields). `Request::SessionsList`, `Request::SessionInterrupt { session }`, `Response::SessionsList { sessions, .. }`, `Response::Interrupt { request_id, .. }` match `socket.rs`. `socket::require` signature matches `socket.rs:436`. `cmd::sessions::run(&CampDir, bool)` and `cmd::interrupt::run(&CampDir, String)` are consistent between their modules and the `main.rs` dispatch arms.
+**Citation policy (round-2 fix):** this revision cites SYMBOLS (`fn kill9`, `enum Request::SessionsList`, `pub struct SessionInfo`, `render_event`'s `can_use_tool` arm) rather than line numbers, which drift. Where a bare line number remained from round 1 it was converted or removed.
+
+**3. Type consistency.** `SessionInfo { name, agent, rig, bead, state, last_activity, blocked }` matches `socket.rs`'s `pub struct SessionInfo` exactly (the unit-test constructor in Task 1 fills all seven fields). `Request::SessionsList`, `Request::SessionInterrupt { session }`, `Response::SessionsList { sessions, .. }`, `Response::Interrupt { request_id, .. }` match `socket.rs`'s `enum Request` / `enum Response`. `socket::require` signature matches `socket.rs`'s `pub fn require`. `cmd::sessions::run(&CampDir, bool)` and `cmd::interrupt::run(&CampDir, String)` are consistent between their modules and the `main.rs` dispatch arms. Task 3B reads only `ev["request_id"]` / `ev["request"]["tool_name"]`, both already present on the `control_request` stream frame `render_event` receives (verified against `tests/fake-agent.sh`'s `can_use_tool` emission and attach's own `a_can_use_tool_control_request_renders_as_a_visible_permission_line` test).
 
 ## Contract Deviations (additive only)
 
 1. **Two new one-shot CLI clients — `camp sessions` and `camp interrupt`.** §5.4 says the overseer "needs no new machinery." That is true of the PROTOCOL and the daemon: cp-5 adds no verb, no `Request`/`Response` field, no handler. It adds two thin client-side CLI surfaces because the merged CLI only exposed the streaming/human forms of these two verbs (`camp watch` blocks; `camp attach`'s `/interrupt` is inside an interactive loop; `camp top` is aggregate counts), and an *agent* overseer needs a one-shot snapshot to learn session names and a one-shot stop. This is the exact precedent cp-3 set with `camp decide` (a one-shot pure client over `session.permission_decision`). Both are pure `socket::require` round-trips. **Additive, no removal, no protocol change.**
 2. **`camp nudge`'s resume fallback is NOT a §4 private-path violation.** `nudge` resumes via `claude --resume` keyed on the ledger's recorded `claude_session_id` when campd is down or there is no held pipe (`cmd/nudge.rs:66-106`). It never tails a stream file and never signals a pid — it addresses by name/id (§4.2 rule 1). The falsification instrument therefore scopes `nudge` OUT of arm A (necessity) and arm C (static purity) and IN to arm B (sufficiency). Stated explicitly so a reviewer does not read the exclusion as a hole.
 3. **Policy test strengthened, not just reused.** Task 4 adds an `agent.toml`-anywhere check to `plugin_policy.rs` beyond the existing `agents/`-directory check, because compat §5.1 defines an agent as a directory-with-`agent.toml`, and a bare `agent.toml` outside a literal `agents/` dir would otherwise pass. Additive to the existing guard.
+4. **`camp attach` render touched (Task 3B) — a correction, not new machinery.** cp-4 shipped `camp attach` with a BLOCKED line that dropped the permission `request_id` and asserted `"answer lands when cp-3 ships"`. cp-3 IS merged, and cp-5's contract makes the operator a full §5.4 client including answer-a-permission — so leaving that render intact would ship a live surface telling the human the answer path does not exist AND would hide the only socket source of the id the overseer needs. Task 3B renders the id (already present on the stream frame — no wire change) and names the real `camp decide` path. It deliberately does NOT wire attach's interactive `/allow`//deny loop: that remains cp-4's separate deferral (scope boundary set by the round-1 gate). Corrective + additive; removes a false claim, adds no protocol.
 
 ## Execution Handoff
 
-This document is the deliverable of a planning-only session. A fresh implementer session executes it after the plan gate approves it. Recommended execution: **superpowers:subagent-driven-development** (a fresh subagent per task, two-stage review between tasks), because Tasks 1–2 (client code), 3 (skill+pin), 4 (policy), and 5–6 (the falsifiable instrument) each carry an independent test cycle and a meaningful review boundary.
+This document is the deliverable of a planning-only session. A fresh implementer session executes it after the plan gate approves it. Recommended execution: **superpowers:subagent-driven-development** (a fresh subagent per task, two-stage review between tasks), because Tasks 1–2 (client code), 3 (skill+pin), 3B (attach id render + stale-text correction), 4 (policy), and 5–6 (the falsifiable instrument) each carry an independent test cycle and a meaningful review boundary. Task ordering constraint: 3B lands before Task 5, because Task 5 Step 5 discovers the `request_id` from the BLOCKED line that 3B renders.
