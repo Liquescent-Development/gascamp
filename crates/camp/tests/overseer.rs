@@ -417,3 +417,156 @@ fn camp_attach_streams_a_workers_events_over_the_socket() {
     let _ = child.wait();
     assert!(saw_stream, "camp attach produced no rendered stream line");
 }
+
+// ===== Task 6: the no-private-paths falsification instrument (§4) ==========
+
+/// FALSIFIER A (§4 necessity): with the ledger, the worker's stream file, and
+/// the worker's pid all present on disk but campd's socket GONE, every
+/// observe/steer-a-live-worker verb fails LOUDLY. A verb that read the stream
+/// file or signalled the pid would SUCCEED here — this assertion is what turns
+/// that regression RED. (`camp nudge` is excluded: campd-down legitimately
+/// routes to its resume path — see the plan's nudge exception.)
+#[test]
+fn socket_is_necessary_campd_down_is_a_loud_failure_not_a_private_path_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _agent) = scaffold(dir.path(), 10);
+    // A worker that OUTLIVES campd, so the pid + stream file are live/present
+    // after we kill campd (the tempting private paths are fully populated).
+    let session = {
+        let d = Daemon::spawn(
+            &root,
+            &[
+                ("FAKE_AGENT_CONTROL_LOOP", "1"),
+                ("FAKE_AGENT_LINGER_ON_EOF", "60"),
+            ],
+        );
+        let (_bead, session) = dispatch_one(&root);
+        wait_for_stdout(&root, &session, "\"subtype\":\"init\"");
+        // The private paths a cheating client would reach for MUST exist now:
+        assert!(
+            stdout_path(&root, &session).exists(),
+            "stream file must be present"
+        );
+        // SIGKILL campd (the harness's crash-only `kill9`, which consumes `d`),
+        // leaving the lingering worker + its stream file + the ledger behind.
+        d.kill9();
+        session
+    };
+    // With NO socket, each verb must fail loudly — not silently read a file.
+    for args in [
+        vec!["sessions"],
+        vec!["sessions", "--json"],
+        vec!["interrupt", session.as_str()],
+        vec!["decide", session.as_str(), "cli-x", "allow"],
+        vec!["attach", session.as_str()],
+    ] {
+        let out = camp(&root, &args);
+        assert!(
+            !out.status.success(),
+            "verb `{args:?}` succeeded with campd DOWN — it must reach a live \
+             worker only through the socket, never a file or pid"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("campd") || err.contains("socket"),
+            "verb `{args:?}` failed but not with a campd/socket error: {err}"
+        );
+    }
+}
+
+/// FALSIFIER B (§4 sufficiency): campd UP, but the worker's stream file and
+/// campd.log are chmod 000. Every overseer verb still works over the socket.
+/// campd is unaffected — it holds those fds already open; only a CLIENT doing a
+/// fresh open() of a forbidden file would fail here → RED. (`camp nudge` IS
+/// included: its live session.send_turn path must not read those files either.)
+#[cfg(unix)]
+#[test]
+fn socket_is_sufficient_unreadable_private_paths_do_not_stop_any_verb() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _agent) = scaffold(dir.path(), 10);
+    let req_id = "cli-suff";
+    let _d = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_CAN_USE_TOOL", "1"),
+            ("FAKE_AGENT_CAN_USE_TOOL_REQ", req_id),
+            ("FAKE_AGENT_LINGER_ON_EOF", "30"),
+        ],
+    );
+    let (_bead, session) = dispatch_one(&root);
+    wait_until(&root, "permission.pending", |events| {
+        events.iter().any(|e| e["type"] == "permission.pending")
+    });
+
+    // Poison every private path a cheating client might read. campd already
+    // holds these fds open, so its own tailing is unaffected.
+    let stream = stdout_path(&root, &session);
+    let log = root.join("campd.log");
+    let saved: Vec<(std::path::PathBuf, std::fs::Permissions)> = [stream.clone(), log.clone()]
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|p| {
+            let perm = std::fs::metadata(&p).unwrap().permissions();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+            (p, perm)
+        })
+        .collect();
+
+    // NON-ROOT SELF-CHECK: mode 000 does not stop root. If THIS process can
+    // still open the poisoned stream file, we are effectively root and the
+    // whole arm is vacuous — restore and bail rather than assert a hollow pass.
+    if stream.exists() && std::fs::File::open(&stream).is_ok() {
+        eprintln!("skipping sufficiency arm: running as root, chmod 000 is vacuous");
+        for (p, perm) in saved {
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+        return;
+    }
+
+    // Every verb still works — over the socket alone.
+    let listed: Vec<Value> =
+        serde_json::from_str(camp_ok(&root, &["sessions", "--json"]).trim()).unwrap();
+    assert!(listed.iter().any(|s| s["name"] == session.as_str() && s["blocked"] == true));
+    camp_ok(&root, &["nudge", &session, "still here?"]); // live send_turn path
+    camp_ok(&root, &["decide", &session, req_id, "allow"]);
+
+    // Restore perms so tempdir teardown can clean up.
+    for (p, perm) in saved {
+        std::fs::set_permissions(&p, perm).unwrap();
+    }
+}
+
+/// FALSIFIER C: the pure overseer clients must talk to `socket::` and NOTHING
+/// that reaches a worker by file or pid. This is the compile-cheap tripwire —
+/// it goes RED the instant a private-path builder is imported into a client.
+/// (`cmd/nudge.rs` is excluded: its resume path is a documented, name-keyed
+/// process spawn, not a stream-file tail or a pid signal — see the plan.)
+#[test]
+fn pure_overseer_clients_reference_only_the_socket_never_a_private_path() {
+    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let forbidden = [
+        "sessions_dir",
+        "stdout_path",
+        "log_path",
+        ".join(\"sessions\")",
+        "/proc",
+        "libc::kill",
+        ".pid",
+    ];
+    for file in ["sessions.rs", "interrupt.rs", "attach.rs", "decide.rs"] {
+        let text = std::fs::read_to_string(src.join(file)).unwrap();
+        assert!(
+            text.contains("socket::"),
+            "{file} must reach the worker via socket::"
+        );
+        for needle in forbidden {
+            assert!(
+                !text.contains(needle),
+                "{file} references a PRIVATE PATH `{needle}` — an overseer client \
+                 must reach a worker only through the socket (§4)"
+            );
+        }
+    }
+}
