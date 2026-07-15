@@ -201,6 +201,60 @@ fn wait_for_stdout(root: &Path, session: &str, needle: &str) {
     }
 }
 
+/// Read `child`'s stdout lines until `pred` matches or `within` elapses, then
+/// kill the child. Returns the matching line, or None on timeout/EOF.
+///
+/// BOUNDED BY CONSTRUCTION (CP5-1, inv-5 fail-fast): the read runs on its own
+/// thread and feeds a channel, and the caller polls with `recv_timeout`, so a
+/// QUIET stream lets the deadline fire on schedule. A bare `read_line` in the
+/// caller's loop would block PAST the deadline (it is only re-checked at the top
+/// of the loop), turning a regression — attach never rendering the awaited line
+/// — into a hang to the global harness timeout instead of a clean fail at
+/// `within`.
+fn read_child_line_until(
+    child: &mut Child,
+    within: Duration,
+    pred: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let stdout = child.stdout.take().expect("child stdout must be piped");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break, // EOF or the pipe closed on kill
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break; // the receiver went away (match found / deadline)
+                    }
+                }
+            }
+        }
+    });
+    let deadline = Instant::now() + within;
+    let mut found = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(line) if pred(&line) => {
+                found = Some(line);
+                break;
+            }
+            Ok(_) => {}      // a line that did not match — keep reading
+            Err(_) => break, // timeout, or the reader closed (EOF)
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    found
+}
+
 // ===== Task 5: every §5.4 action against a fake fleet, over the socket =====
 
 /// §5.4 "it can list sessions": `camp sessions --json` returns EVERY live
@@ -341,26 +395,18 @@ fn camp_decide_answers_a_blocked_worker_with_a_socket_discovered_request_id() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut request_id: Option<String> = None;
-    let mut line = String::new();
-    while Instant::now() < deadline {
-        line.clear();
-        if reader.read_line(&mut line).unwrap() == 0 {
-            break;
-        }
-        if line.contains("BLOCKED") && line.contains("request ") {
-            // parse the token after "request " (Task 3B's stable format)
-            if let Some(rest) = line.split("request ").nth(1) {
-                request_id = rest.split_whitespace().next().map(str::to_owned);
-            }
-            break;
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    let request_id = request_id.expect("must discover the request_id from attach's BLOCKED line");
+    // Bounded read (CP5-1): the deadline fires even while attach is quiet, so a
+    // regression that stops rendering the `request <id>` token FAILS cleanly at
+    // ~20s rather than hanging to the global harness timeout.
+    let blocked_line = read_child_line_until(&mut child, Duration::from_secs(20), |l| {
+        l.contains("BLOCKED") && l.contains("request ")
+    });
+    let request_id = blocked_line
+        .as_deref()
+        .and_then(|l| l.split("request ").nth(1)) // Task 3B's stable format
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_owned)
+        .expect("must discover the request_id from attach's BLOCKED line within the deadline");
     assert!(
         !request_id.is_empty() && request_id != "?",
         "discovered a bad id: {request_id:?}"
@@ -406,26 +452,18 @@ fn camp_attach_streams_a_workers_events_over_the_socket() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut saw_stream = false;
-    let mut line = String::new();
-    while Instant::now() < deadline {
-        line.clear();
-        if reader.read_line(&mut line).unwrap() == 0 {
-            break;
-        }
-        // A rendered typed event off session.subscribe — the BLOCKED line, which
-        // only exists because attach decoded a control_request frame over the
-        // socket (attach.rs renders `system/init` to an empty, filtered line).
-        if line.contains("BLOCKED") {
-            saw_stream = true;
-            break;
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    assert!(saw_stream, "camp attach produced no rendered stream line");
+    // Bounded read (CP5-1): a rendered typed event off session.subscribe — the
+    // BLOCKED line, which exists only because attach decoded a control_request
+    // frame over the socket (attach.rs renders `system/init` to an empty,
+    // filtered line). A quiet stream fails at the deadline, never hangs.
+    let saw_stream = read_child_line_until(&mut child, Duration::from_secs(20), |l| {
+        l.contains("BLOCKED")
+    })
+    .is_some();
+    assert!(
+        saw_stream,
+        "camp attach produced no rendered stream line within the deadline"
+    );
 }
 
 // ===== Task 6: the no-private-paths falsification instrument (§4) ==========

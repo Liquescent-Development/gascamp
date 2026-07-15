@@ -83,16 +83,39 @@ fn operator_skill_names_the_control_plane_verbs() {
 #[test]
 fn operator_skill_states_the_no_private_paths_discipline() {
     let s = operator_skill();
-    // The reach-a-worker-only-through-the-socket rule (§4): the skill must tell
-    // the operator NOT to tail a worker's stream file or reach it by pid.
+    // Whitespace-normalized so markdown line-wrapping cannot hide a phrase that
+    // straddles a newline ("never\n  tail ...").
+    let norm = s.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The reach-a-worker-only-through-the-socket rule (§4): the skill must NAME
+    // the socket as the only path.
     assert!(
-        s.contains("socket"),
+        norm.contains("socket"),
         "operator skill must name the socket as the only path to a worker"
     );
-    for needle in ["stream file", "pid"] {
+
+    // NEGATIVE FORM (CP5-2): substring-presence of the nouns is NOT enough — a
+    // SKILL reworded to ENDORSE private paths ("you may tail a worker's stream
+    // file and reach it by pid") keeps every noun. The guard must require the
+    // FORBIDDING phrasing itself, so the endorsing rewording reddens it.
+    for phrase in ["never tail a worker's stream file", "never reach it by pid"] {
         assert!(
-            s.contains(needle),
-            "operator skill must forbid reaching a worker by `{needle}` (§4)"
+            norm.contains(phrase),
+            "operator skill must FORBID private paths in words — missing `{phrase}` (§4)"
+        );
+    }
+
+    // ...and it must carry no imperative that ENDORSES a private path. This is
+    // the direct catch for the mutation the reviewer proved slips past a
+    // noun-only guard.
+    for endorsement in [
+        "may tail a worker's stream file",
+        "can tail a worker's stream file",
+        "you may reach it by pid",
+    ] {
+        assert!(
+            !norm.contains(endorsement),
+            "operator skill must not ENDORSE a private path — found `{endorsement}` (§4)"
         );
     }
 }

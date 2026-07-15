@@ -278,14 +278,24 @@ pub enum Action {
     Turn(String),
     Interrupt,
     Detach,
+    /// A permission-answer keypress (`/allow`, `/allow_always`, `/deny`) typed at
+    /// a BLOCKED worker. attach does NOT wire the interactive decide path (cp-4's
+    /// deferral), so rather than silently delivering it as a user turn (CP5-3's
+    /// UX surprise), the steering loop points the operator at the out-of-band
+    /// answer — `camp decide <session> <request_id>` from the BLOCKED line.
+    DecideHint,
 }
 
 /// Map an input line to an action. A blank line or `/q` detaches; `/interrupt`
-/// interrupts; anything else is a turn.
+/// interrupts; a leading `/allow`//deny keypress is a decide-hint (answered
+/// out-of-band, not here); anything else is a turn.
 pub fn parse_action(line: &str) -> Action {
-    match line.trim() {
+    let trimmed = line.trim();
+    let verb = trimmed.split_whitespace().next().unwrap_or("");
+    match trimmed {
         "" | "/q" | "/quit" => Action::Detach,
         "/interrupt" => Action::Interrupt,
+        _ if matches!(verb, "/allow" | "/allow_always" | "/deny") => Action::DecideHint,
         other => Action::Turn(other.to_owned()),
     }
 }
@@ -458,6 +468,17 @@ pub fn run(
                     Some(other) => eprintln!("(unexpected interrupt response: {other:?})"),
                     None => eprintln!("(campd went away; cannot interrupt)"),
                 }
+            }
+            Action::DecideHint => {
+                // CP5-3: attach does NOT wire the interactive answer path (cp-4's
+                // deferral). Rather than deliver `/allow`//deny as a user turn,
+                // point the operator at the out-of-band verb, whose request_id is
+                // the one this view renders on the BLOCKED line.
+                eprintln!(
+                    "(permission answers are out-of-band from this view: run \
+                     `camp decide {session} <request_id> allow|allow_always|deny [--reason ...]` \
+                     using the request id shown on the BLOCKED line above)"
+                );
             }
         }
     }
@@ -658,6 +679,25 @@ mod tests {
         assert_eq!(parse_action("/q"), Action::Detach);
         assert_eq!(parse_action("  /q  "), Action::Detach);
         assert_eq!(parse_action(""), Action::Detach); // a blank line is a detach-safe no-op
+    }
+
+    #[test]
+    fn parse_action_intercepts_permission_keypresses_as_a_decide_hint() {
+        // CP5-3: /allow//deny typed at a BLOCKED worker must NOT be delivered as
+        // a user turn (a mild UX surprise). attach does not wire the interactive
+        // decide path (cp-4's deferral); it points the operator at the
+        // out-of-band `camp decide` instead.
+        assert_eq!(parse_action("/allow"), Action::DecideHint);
+        assert_eq!(parse_action("/allow_always"), Action::DecideHint);
+        assert_eq!(parse_action("/deny"), Action::DecideHint);
+        assert_eq!(parse_action("/deny not safe"), Action::DecideHint); // trailing args
+        assert_eq!(parse_action("  /allow  "), Action::DecideHint); // surrounding space
+        // a plain turn that merely MENTIONS allow is still a turn — only the
+        // leading `/allow`//deny keypress is intercepted.
+        assert_eq!(
+            parse_action("allow the build to run"),
+            Action::Turn("allow the build to run".into())
+        );
     }
 
     #[test]
