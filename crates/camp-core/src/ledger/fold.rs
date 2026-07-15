@@ -1589,4 +1589,57 @@ mod tests {
             1
         );
     }
+
+    /// The `COALESCE(?2, work_branch)` in `bead_claimed` PROTECTS a pre-existing
+    /// `work_branch` when a claim carries none (camp's own `camp claim`). This
+    /// is unreachable through `Ledger::append` alone — an OPEN bead never has a
+    /// `work_branch` (the only writers are the claim itself and a shipped close,
+    /// both of which leave the bead non-open), so the guard's job only shows on
+    /// a directly-seeded column. We seed it here (in-crate `conn` access) to
+    /// exercise the branch the integration test structurally cannot.
+    ///
+    /// Mutation caught: `work_branch = ?2` (drop the COALESCE) — it would write
+    /// NULL over the seeded `camp/pre`, so `gc.work_branch` disappears → RED.
+    #[test]
+    fn claim_with_no_branch_preserves_a_pre_existing_work_branch_coalesce() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-2".into()),
+                data: serde_json::json!({ "title": "work", "assignee": "gc.publisher" }),
+            })
+            .unwrap();
+        // Seed a work_branch on the still-OPEN bead (artificial — the product
+        // cannot reach this state, which is exactly why the COALESCE guard is
+        // untestable via the public API).
+        ledger
+            .conn
+            .execute(
+                "UPDATE beads SET work_branch = 'camp/pre' WHERE id = 'gc-2'",
+                [],
+            )
+            .unwrap();
+
+        // Claim it WITHOUT a work_branch (the `camp claim` path).
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClaimed,
+                rig: None,
+                actor: "cli".into(),
+                bead: Some("gc-2".into()),
+                data: serde_json::json!({ "session": "t/gc.publisher/1" }),
+            })
+            .unwrap();
+
+        // The claim flipped the bead but LEFT the pre-existing branch intact.
+        let meta = ledger.bead_metadata("gc-2").unwrap();
+        assert_eq!(
+            meta.get("gc.work_branch").map(String::as_str),
+            Some("camp/pre"),
+            "COALESCE must not clobber a pre-existing work_branch with NULL"
+        );
+    }
 }

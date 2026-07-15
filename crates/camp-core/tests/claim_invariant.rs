@@ -97,11 +97,18 @@ fn claim_stamps_session_and_work_branch_and_leaves_the_cooked_route_intact() {
 }
 
 #[test]
-fn claim_without_work_branch_leaves_the_column_untouched() {
-    // camp's own `camp claim {session}` path: no work_branch field. The column
-    // must stay NULL (absent from the projection), NOT be nulled by a
-    // COALESCE-less UPDATE. Mutation caught: an UPDATE that always writes
-    // work_branch (nulling it when the field is absent).
+fn claim_without_work_branch_succeeds_and_stamps_no_branch() {
+    // camp's own `camp claim {session}` path: no work_branch field. The claim
+    // succeeds, flips the bead, and leaves the column ABSENT from the
+    // projection (it does not invent a branch).
+    //
+    // NOTE: this does NOT catch the `work_branch = ?2` (COALESCE-dropped)
+    // mutation — on a FRESH bead the column is already NULL, so writing NULL is
+    // indistinguishable from leaving it absent. That mutant is EQUIVALENT on
+    // every state reachable through `Ledger::append` (an open bead never
+    // carries a work_branch), so it is killed only by the directly-seeded
+    // in-crate test `fold::tests::claim_with_no_branch_preserves_a_pre_existing_\
+    // work_branch_coalesce`. This test guards the no-error / no-stamp behavior.
     let (dir, mut ledger) = temp_ledger();
     cook_one_step_routed_to(dir.path(), &mut ledger, "gc.publisher");
 
