@@ -1,7 +1,14 @@
 # cp-3 — `can_use_tool` end to end, the permission flow — Implementation Plan
 
 ## Plan-gate approval
-PENDING — this plan is the planner's sole deliverable under the wave-2 two-session split. A fresh Opus implementer executes it after the adversarial plan gate approves. Do NOT begin implementation from this document until the gate line above reads APPROVED.
+PENDING — round 1 REJECT (architecture ruled SOUND; 4 blocking findings, all test-design or wiring, fixed in this revision). A fresh 4-panel gate audits the revision. Do NOT begin implementation until this line reads APPROVED.
+
+### Round-1 gate revisions (each verified against the code before fixing)
+- **CP3-B1 (real):** `Response::Interrupt` is `{ok, request_id}` (socket.rs:182-185) in the `#[serde(untagged)]` enum — a bare `PermissionDecided {ok, request_id}` shadows it. FIXED (Task 7): `PermissionDecided { ok, request_id, decision }` — the `decision` key disambiguates untagged resolution; placed BEFORE `Interrupt`; a new wire-pin test proves BOTH round-trip to their own variant.
+- **CP3-B2 (real, test-design):** the disarm and the `declare_stalls` skip mutually mask (verified against `declare_stalls`/`fire_due`). FIXED (Task 8): two INDEPENDENT unit tests — the disarm's invariant-1 guard (no armed timer after `permission.pending`) and the skip (a blocked session WITH an armed timer declares zero `agent.stalled`) — plus concretized heart-tests.
+- **CP3-B3 (real, wiring):** verified `session_ended(…,"crashed")` reopens the bead UNCONDITIONALLY (`UPDATE beads SET status='open', claimed_by=NULL … WHERE claimed_by=<session> AND status='in_progress'`, fold.rs:1167), independent of reason and of patrol tracking; and `observe`'s re-hook needs `tracked.get(name)` Some + reason `starts_with("patrol restart")` (patrol.rs:308-321), which the untracked adopt arm never satisfies. FIXED (Task 11): the adoption kill mirrors the existing `"adopt: process not found"` append EXACTLY — key `"name"` (NOT `"session"`; `SessionEnd` is `deny_unknown_fields`, so `"session"` fails loud), `bead: None` — and the bead re-hook rides the FOLD crash-reopen; the `observe`/`reason_rehooks` change is DROPPED as inert; the test asserts the bead becomes dispatchable (`status='open'`, `claimed_by=NULL`).
+- **CP3-B4 (real, coverage):** FIXED (Task 11): a test for the post-adoption-DISCOVERED pending taking the NAMED kill, not the stall ladder.
+- **Non-blocking, folded in:** Task 13 moved to `tests/e2e.rs` under `CAMP_E2E`/`make e2e` (NOT `claude_compat.rs`, the $0 `make compat` tier); NoPipe inverse-window and re-arm are now numbered assertions; the no-watch harness affordance is confirmed to exist (`read_channel.rs:183-212`); the pre-ladder double-fanout is acknowledged; the `control.rs:2121`/`:2149` test destructures need the new `tool_use_id` binding (compile-caught).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -77,8 +84,8 @@ Deliberate boundaries where the spec's end-state is richer than cp-3's slice. Do
 - **Modify `crates/camp/src/main.rs`** — one additive command variant + dispatch arm (contended file; additive only).
 - **Modify `crates/camp/tests/fake-agent.sh`** — a `FAKE_AGENT_CAN_USE_TOOL` mode that emits a `can_use_tool` then waits for the `control_response`.
 - **Modify `crates/camp/tests/control.rs`** — the end-to-end permission round-trip against a real campd + fake worker.
-- **Modify `crates/camp/tests/daemon_patrol.rs`** — blocked-forever-not-killed, ladder-drains-first, adoption both ways.
-- **Modify `crates/camp/tests/claude_compat.rs`** — the paid `can_use_tool` round-trip on `make e2e`; exercise the `dialog_refusal`/`permission_*` fixtures against the real CLI.
+- **Modify `crates/camp/tests/daemon_patrol.rs`** — blocked-forever-not-killed, ladder-drains-first, the disarm/skip/re-arm unit guards, adoption both ways + post-adoption-discovered.
+- **Modify `crates/camp/tests/e2e.rs`** — the PAID `can_use_tool` round-trip against the real CLI, under `CAMP_E2E`/`make e2e` (NOT `claude_compat.rs`, the $0 tier).
 
 ---
 
@@ -513,7 +520,7 @@ Widen the parse, then replace cp-1's stopgap fault arm with the real producer: e
         tool_use_id: body["tool_use_id"].as_str().map(str::to_owned),
     }),
 ```
-Keep `can_use_tool_with_unknown_extra_keys_still_parses` (`control.rs:2146`) green — extend its match arm to bind `tool_use_id`.
+Widening the variant is compile-forcing: BOTH existing test destructures — `worker_messages_parse_from_the_pinned_fixtures` (`control.rs:2121`) and `can_use_tool_with_unknown_extra_keys_still_parses` (`control.rs:2146`) — must add the `tool_use_id` binding, and both stay green (the fixture carries no `tool_use_id`, so it parses to `None`; the extra-keys test still proves the permissive envelope tolerates unknown keys).
 
 - [ ] **Step 2: Write the failing ingest test**
 
@@ -717,7 +724,7 @@ The write path. Append `permission.decided` FIRST (the serialization point), the
 - Consumes: `ParentMessage::PermissionAllow/Deny` (Task 6), `dispatcher.write_control` (`dispatch.rs:258`), `ledger.permission_decider` (Task 2), `EventType::PermissionDecided`.
 - Produces:
   - `Request::SessionPermissionDecision { session: String, request_id: String, decision: String, #[serde(default)] message: Option<String> }` renamed `"session.permission_decision"`.
-  - `Response::PermissionDecided { ok: bool, request_id: String }` (placed BEFORE `Interrupt`/`Ok`/`Error` in the untagged enum — a distinguishing `request_id` key, same slot discipline as `Interrupt`).
+  - `Response::PermissionDecided { ok: bool, request_id: String, decision: String }` — the `decision` key is the untagged DISCRIMINANT (CP3-B1): `Response::Interrupt` is `{ok, request_id}` (socket.rs:182), so a bare `{ok, request_id}` would shadow it. `PermissionDecided` is placed BEFORE `Interrupt`; its extra REQUIRED `decision` field means an interrupt ack `{"ok":..,"request_id":..}` fails to match it (no `decision`) and falls through to `Interrupt`, while a decision reply `{"ok":..,"request_id":..,"decision":".."}` matches `PermissionDecided` first. `decision` also echoes what was recorded — useful, not a bare marker.
   - `pub fn serve_permission_decision(&mut self, session: &str, request_id: &str, decision: &str, message: Option<&str>, ledger: &mut Ledger, dispatcher: &mut Dispatcher) -> Response`.
 
 - [ ] **Step 1: Write the failing handler test** (in `control.rs` tests):
@@ -736,12 +743,42 @@ fn permission_decision_appends_decided_before_writing_and_first_answer_wins() {
     match r2 { Response::Error { error, .. } => assert!(error.contains("already decided by operator")),
         other => panic!("expected already-decided error, got {other:?}") }
 }
+
+#[test]
+fn a_decision_is_durable_even_when_the_pipe_is_gone_inverse_window() {
+    // §5.3.4 inverse window: the decision is recorded FIRST, so a worker whose
+    // stdin campd no longer holds still shows ANSWERED in the ledger.
+    let (mut rt, mut led, mut disp, session) = permission_scaffold_no_pipe("cli-5"); // pending, but write_control → NoPipe
+    let r = rt.serve_permission_decision(&session, "cli-5", "allow", None, &mut led, &mut disp);
+    assert!(matches!(r, Response::Error { .. }), "delivery failed, so the caller is told so");
+    assert_eq!(led.permission_decider("cli-5").unwrap().as_deref(), Some("operator"),
+        "but the decision is DURABLE — ledger-before-pipe means answered-in-ledger even when undelivered");
+    assert!(led.blocked_sessions().unwrap().is_empty(), "and the session is no longer BLOCKED");
+}
 ```
-(`permission_scaffold`/`last_control_written` are small helpers mirroring the interrupt-test dispatcher scaffold.)
+(`permission_scaffold`/`permission_scaffold_no_pipe`/`last_control_written` are small helpers mirroring the interrupt-test dispatcher scaffold — the no-pipe variant registers the session but seeds no held stdin, so `write_control` returns `NoPipe`.)
 
 - [ ] **Step 2: Run — expect FAIL**
 
-- [ ] **Step 3: Add the `Request`/`Response` variants + wire-pin test** in `socket.rs`. Add `SessionPermissionDecision` to `Request` (internally-tagged on `op`, so additive) and `PermissionDecided` to `Response` BEFORE `Ok`/`Error`. Extend `control_plane_verbs_wire_format_is_pinned` with the new verb's exact bytes.
+- [ ] **Step 3: Add the `Request`/`Response` variants + the disambiguation wire-pin test** in `socket.rs`. Add `SessionPermissionDecision` to `Request` (internally-tagged on `op`, so additive) and `PermissionDecided { ok, request_id, decision }` to `Response` placed BEFORE `Interrupt` (CP3-B1). Extend `control_plane_verbs_wire_format_is_pinned` with the new verb's exact request bytes, AND add a dedicated untagged-resolution test that is the CP3-B1 regression guard:
+
+```rust
+#[test]
+fn interrupt_and_permission_decided_do_not_shadow_each_other() {
+    // the interrupt ack bytes must round-trip to Interrupt, not PermissionDecided
+    let ack: Response = serde_json::from_str(r#"{"ok":true,"request_id":"camp-1"}"#).unwrap();
+    assert!(matches!(ack, Response::Interrupt { .. }), "an interrupt ack must not be captured by PermissionDecided");
+    // the decision reply bytes must round-trip to PermissionDecided
+    let dec: Response = serde_json::from_str(r#"{"ok":true,"request_id":"cli-2","decision":"allow"}"#).unwrap();
+    assert!(matches!(dec, Response::PermissionDecided { .. }), "the decision reply must resolve to its own variant");
+    // and each serializes back to exactly its own bytes (the pin)
+    assert_eq!(serde_json::to_string(&Response::Interrupt { ok: true, request_id: "camp-1".into() }).unwrap(),
+        r#"{"ok":true,"request_id":"camp-1"}"#);
+    assert_eq!(serde_json::to_string(&Response::PermissionDecided { ok: true, request_id: "cli-2".into(), decision: "allow".into() }).unwrap(),
+        r#"{"ok":true,"request_id":"cli-2","decision":"allow"}"#);
+}
+```
+Run BOTH this and the pre-existing `control_plane_verbs_wire_format_is_pinned` — the latter (socket.rs:912) must stay green, proving the placement did not mis-type any cp-1 response.
 
 - [ ] **Step 4: Implement `serve_permission_decision`** (the §5.3.4 ordering — ledger FIRST):
 
@@ -787,7 +824,7 @@ pub fn serve_permission_decision(
         Err(e) => return Response::Error { ok: false, error: format!("building the permission response: {e}") },
     };
     match dispatcher.write_control(session, &line) {
-        ControlWrite::Delivered => Response::PermissionDecided { ok: true, request_id: request_id.to_owned() },
+        ControlWrite::Delivered => Response::PermissionDecided { ok: true, request_id: request_id.to_owned(), decision: decision.to_owned() },
         // The decision is DURABLE (answered) but we could not hand it to the
         // worker. §5.3.4's inverse window: the worker is no longer answerable —
         // its re-armed stall timer (Task 8) fires, the ladder drains, finds NO
@@ -818,7 +855,7 @@ Re-arm of the stall timer is NOT done here — Task 8's `reconcile_blocked` re-a
 
 - [ ] **Step 8: Commit** `git commit -am "feat(control): session.permission_decision — ledger-before-pipe, first-answer-wins"`
 
-**Mutation caught:** swapping the order (pipe before ledger) breaks the "recorded before delivered" guarantee — a test asserting `permission_decider` is `Some` even when `write_control` returns `NoPipe` dies. Dropping the first-answer-wins error handling makes the second decider return `PermissionDecided` (double-answer) — the scaffold test dies.
+**Mutation caught:** swapping the order (pipe before ledger) breaks the "recorded before delivered" guarantee — `a_decision_is_durable_even_when_the_pipe_is_gone_inverse_window` asserts `permission_decider` is `Some` even when `write_control` returns `NoPipe`, and dies. Dropping the first-answer-wins error handling makes the second decider return `PermissionDecided` (double-answer) — the scaffold test dies. Placing `PermissionDecided` after `Interrupt`, or dropping its `decision` field, breaks `interrupt_and_permission_decided_do_not_shadow_each_other` (CP3-B1).
 
 ---
 
@@ -832,30 +869,49 @@ Re-arm of the stall timer is NOT done here — Task 8's `reconcile_blocked` re-a
 - Test: `crates/camp/tests/daemon_patrol.rs`
 
 **Interfaces:**
-- Consumes: `ledger.blocked_sessions` (Task 2), `patrol.timers.{arm,disarm}` (`timers.rs:56/86`), `read_channel.drain_all` + `control_step`.
-- Produces: `pub fn reconcile_blocked(&mut self, ledger: &Ledger, now: Timestamp) -> anyhow::Result<()>` on `PatrolRuntime`.
+- Consumes: `ledger.blocked_sessions` (Task 2), `self.timers.{arm,disarm}` (the `PatrolTimers` API patrol already uses in `rearm`/`declare_stalls`), `read_channel.drain_all` + `control_step`.
+- Produces: `pub fn reconcile_blocked(&mut self, ledger: &Ledger, now: Timestamp) -> anyhow::Result<()>` on `PatrolRuntime`; a test accessor `#[cfg(test)] pub fn is_armed(&self, session: &str) -> bool` (reads `self.timers`) for the invariant-1 disarm guard.
 
-- [ ] **Step 1: Write the two failing integration tests** (`daemon_patrol.rs`, using the existing daemon+fake-worker harness):
+- [ ] **Step 1: Write the two failing INTEGRATION heart-tests** (`daemon_patrol.rs`, using the existing daemon+fake-worker harness). Mirror `ladder_exhaustion_emits_and_stops`'s assertion style — count events and assert the daemon is still live — rather than a comment sketch:
 
 ```rust
 #[test]
 fn a_blocked_worker_is_never_nudged_restarted_or_killed_past_the_stall_threshold() {
-    // Spawn a worker (fake-agent CAN_USE_TOOL mode) that emits a can_use_tool
-    // and then goes silent. Let campd ingest it (→ permission.pending → BLOCKED).
-    // Advance the clock past the stall threshold; pump wakes.
-    // Assert: NO agent.stalled, NO nudge, NO restart, NO session.crashed for it —
-    // the worker is still live and still blocked. (§5.3.3 disarm.)
+    // Worker (fake-agent CAN_USE_TOOL mode) emits a can_use_tool then goes silent.
+    let d = Daemon::scaffold(/* command = fake-agent CAN_USE_TOOL, short stall_after */);
+    d.dispatch_one("b-1");
+    d.wait_until(|| d.sessions_list().iter().any(|s| s.blocked)); // BLOCKED reached
+    let before = d.events_of_type("agent.stalled").len();
+    // Advance WELL past the stall threshold and pump several wakes.
+    d.advance_and_pump(/* 3 × stall_after */);
+    // §5.3.3: exempt from the ENTIRE ladder.
+    assert_eq!(d.events_of_type("agent.stalled").len(), before, "a BLOCKED worker is never declared stalled");
+    assert_eq!(d.events_of_type("session.crashed").iter().filter(|e| e.data["name"] == sess).count(), 0,
+        "a BLOCKED worker is never killed");
+    assert_eq!(d.events_of_type("session.woke").iter().filter(|e| e.data["name"] == sess).count(), 1,
+        "a BLOCKED worker is never respawned");
+    assert!(d.sessions_list().iter().any(|s| s.blocked), "still blocked, still live");
+    assert!(d.is_alive(), "campd did not wedge");
 }
 
 #[test]
 fn the_ladder_drains_the_read_channel_first_and_a_lost_notify_surfaces_as_blocked() {
     // Write a can_use_tool line into the worker's stdout FILE with its notify
-    // event SUPPRESSED (the harness's no-watch write). Arm+fire the stall timer.
-    // Assert: on the fire wake the session transitions to BLOCKED and NO
-    // agent.stalled / nudge / restart is declared — the ladder's first act was
-    // to drain, which found the pending request.
+    // event SUPPRESSED — the affordance the read-channel suite already uses
+    // (read_channel.rs:183-212 appends to a tailed stdout file WITHOUT firing
+    // the notify watcher). Arm+fire the stall timer with the pending unread.
+    let d = Daemon::scaffold(/* short stall_after */);
+    d.dispatch_one("b-1");
+    d.append_stream_line_suppressed(&sess, CAN_USE_TOOL_LINE); // no notify
+    d.advance_and_pump(/* past stall_after → a stall fire is due */);
+    // The ladder's FIRST act drained the channel, surfacing the pending BEFORE
+    // any stall was declared.
+    assert!(d.sessions_list().iter().any(|s| s.blocked), "the lost can_use_tool surfaced as BLOCKED");
+    assert_eq!(d.events_of_type("agent.stalled").len(), 0, "no stall was declared against the waiting worker");
+    assert_eq!(d.events_of_type("session.crashed").iter().filter(|e| e.data["name"] == sess).count(), 0);
 }
 ```
+(`advance_and_pump`/`is_alive`/`append_stream_line_suppressed` are thin wrappers over the harness's existing clock-advance, liveness, and the `read_channel.rs:183` suppressed-append helper — add them if not already exposed on `Daemon`.)
 
 - [ ] **Step 2: Run — expect FAIL (today the ladder restarts a silent worker)**
 
@@ -914,13 +970,52 @@ pub fn reconcile_blocked(&mut self, ledger: &Ledger, now: Timestamp) -> anyhow::
     }
     wake_ledger_work |= patrol.declare_stalls(ledger, &stall_fires, now)?;
 ```
-And add `patrol.reconcile_blocked(ledger, now)?;` in the common post-harvest path (after the main `control_step` ~500) so the NORMAL path (a can_use_tool that arrived this wake, or a decision this wake) disarms/re-arms same-wake. `reconcile_blocked` is idempotent, so both call sites are safe.
+And add `patrol.reconcile_blocked(ledger, now)?;` in the common post-harvest path (after the main `control_step` ~500) so the NORMAL path (a can_use_tool that arrived this wake, or a decision this wake) disarms/re-arms same-wake. `reconcile_blocked` is idempotent, so both call sites are safe. **Acknowledged (non-blocking):** the pre-ladder `control_step` re-runs the full harvest INCLUDING subscriber fanout, so on a stall-fire wake fanout runs twice; this is idempotent (fanout pumps only NEW file bytes to subscribers, and the second call finds none — the byte cursor advanced), so no double-delivery. If a future profile shows this matters, narrow the pre-ladder call to an ingest-only drain; for cp-3 the guarded (`!stall_fires.is_empty()`) double-harvest is correct and rare.
 
-- [ ] **Step 6: Run the two heart-tests — PASS.** `cargo test -p camp --test daemon_patrol a_blocked_worker the_ladder_drains`
+- [ ] **Step 6: Write the two INDEPENDENT unit tests that pin the two mechanisms SEPARATELY (CP3-B2)** — the integration heart-tests above pass under either single mutation (removing the disarm leaves the skip; removing the skip leaves the disarm's un-fired timer), so each mechanism needs its own guard:
 
-- [ ] **Step 7: Commit** `git commit -am "feat(patrol): BLOCKED disarms the stall ladder; ladder drains the read channel first (§5.3.3)"`
+```rust
+#[test]
+fn permission_pending_disarms_the_stall_timer_so_a_blocked_worker_adds_no_wakeup() {
+    // The INVARIANT-1 guard: a BLOCKED session must contribute NOTHING to the
+    // poll deadline. Track a session (armed), then reconcile it as blocked.
+    let mut patrol = /* PatrolRuntime with session s tracked+armed */;
+    let led = /* ledger where s has a pending permission */;
+    assert!(patrol.is_armed("s"), "precondition: an armed stall timer");
+    patrol.reconcile_blocked(&led, now).unwrap();
+    assert!(!patrol.is_armed("s"), "permission.pending DISARMS — a blocked worker adds no wakeup (invariant 1)");
+}
 
-**Mutation caught:** blocked-forever test dies if the `declare_stalls` skip OR `reconcile_blocked`'s disarm is removed (the silent worker gets restarted). Ladder-drains-first dies if the pre-ladder drain is removed (the fire is declared before the pending surfaces). Add a re-arm assertion: after a decision the timer is armed again (a subsequent silence stalls normally).
+#[test]
+fn declare_stalls_declares_nothing_for_a_blocked_session_even_with_an_armed_timer() {
+    // The SKIP guard, exercised on its own: feed declare_stalls a Stall fire for
+    // a session that is in patrol.blocked. Assert ZERO agent.stalled and the
+    // timer ends disarmed.
+    let mut patrol = /* PatrolRuntime, s tracked, s ∈ patrol.blocked, an armed timer */;
+    let mut led = /* empty ledger */;
+    let fire = /* a synthetic StallFire for s at `now` */;
+    let declared = patrol.declare_stalls(&mut led, &[fire], now).unwrap();
+    assert!(!declared, "a blocked session declares nothing");
+    assert_eq!(led.events_of_type(EventType::AgentStalled).unwrap().len(), 0);
+    assert!(!patrol.is_armed("s"), "the swallowed fire disarms the timer");
+}
+
+#[test]
+fn a_decision_re_arms_the_stall_timer_from_zero() {
+    // The re-arm edge: a blocked-then-decided session gets a fresh armed timer,
+    // and subsequent silence stalls normally.
+    let mut patrol = /* s tracked, s ∈ patrol.blocked, disarmed */;
+    let led = /* ledger where s's permission is now DECIDED (not blocked) */;
+    patrol.reconcile_blocked(&led, now).unwrap();
+    assert!(patrol.is_armed("s"), "a decision re-arms from zero — the worker is presumed working again");
+}
+```
+
+- [ ] **Step 7: Run all four patrol tests — PASS.** `cargo test -p camp --test daemon_patrol a_blocked_worker the_ladder_drains` and `cargo test -p camp permission_pending_disarms declare_stalls_declares_nothing a_decision_re_arms`
+
+- [ ] **Step 8: Commit** `git commit -am "feat(patrol): BLOCKED disarms the stall ladder; ladder drains the read channel first (§5.3.3)"`
+
+**Mutation caught (each mechanism pinned INDEPENDENTLY per CP3-B2):** removing `reconcile_blocked`'s disarm — the integration test still passes (the skip covers it), but `permission_pending_disarms_the_stall_timer…` dies (the timer stays armed → invariant-1 violation caught). Removing the `declare_stalls` skip — `declare_stalls_declares_nothing_for_a_blocked_session…` dies (an armed blocked session declares `agent.stalled`). Removing the pre-ladder drain — `the_ladder_drains_the_read_channel_first…` dies (the fire is declared before the pending surfaces). Removing the re-arm — `a_decision_re_arms_the_stall_timer_from_zero` dies.
 
 ---
 
@@ -1046,70 +1141,105 @@ Mirror in `resume_argv` (spawn.rs:141) using `pins.permission_mode` — a resume
 §5.3.4. A worker campd can no longer answer is killed with a named, greppable cause and its bead re-hooked; an *answered* quiet worker is NOT killed by adoption (the stall ladder owns it).
 
 **Files:**
-- Modify: `crates/camp/src/daemon/patrol.rs` (`adopt` Some(pid) arm ~1192-1245; `observe` re-hook predicate ~307-325; reuse `restart_non_child`'s probe+kill)
+- Modify: `crates/camp/src/daemon/patrol.rs` (`adopt` Some(pid) arm ~1192-1245; a shared `crash_unanswerable_permission` helper reusing `kill_pid`/`probe_alive`)
 - Modify: `crates/camp/src/daemon/event_loop.rs` (steady-state: a blocked NON-child is killed after the harvest)
 - Test: `crates/camp/tests/daemon_patrol.rs`
 
 **Interfaces:**
-- Consumes: `ledger.pending_permission_for_session` (Task 2), `dispatcher.is_child`, `restart_non_child`'s probe+kill (`patrol.rs:968`).
-- Produces: `const ADOPTION_PERMISSION_REASON: &str = "adoption: unanswerable permission request";` and the re-hook.
+- Consumes: `ledger.pending_permission_for_session` (Task 2), `ledger.session_by_name(&name).pid` (`mod.rs:428`), `dispatcher.is_child` (`dispatch.rs:204`), `kill_pid` (`patrol.rs:1457`) + `probe_alive`.
+- Produces: `const ADOPTION_PERMISSION_REASON: &str = "adoption: unanswerable permission request";` and a helper that kills + appends the named `SessionCrashed`.
+
+**The re-hook mechanism, verified (CP3-B3):** the bead re-hook rides the FOLD's crash-reopen, NOT `observe→Respawn`. `session_ended(…,"crashed")` runs `UPDATE beads SET status='open', claimed_by=NULL … WHERE claimed_by=<session> AND status='in_progress'` (fold.rs:1167) for ANY crash reason, whether or not the session is tracked. `observe`'s re-hook needs the session to be in `patrol.tracked` AND the reason to `starts_with("patrol restart")` (patrol.rs:308-321) — the adopt arm never tracks the killed worker, so broadening `reason_rehooks` would be INERT. So this task appends `SessionCrashed` exactly like the existing `"adopt: process not found"` append (patrol.rs:1181-1191) — **`data:{"name":…, "reason":ADOPTION_PERMISSION_REASON}`, `bead:None`** — and the fold reopens the bead. (Key MUST be `"name"`: `SessionEnd` is `deny_unknown_fields`, so a `"session"` key fails loud at append.) No `observe` change is made.
 
 - [ ] **Step 1: Write the failing tests:**
 
 ```rust
 #[test]
 fn adoption_kills_a_worker_with_an_unanswered_permission_and_re_hooks_the_bead() {
-    // Ledger shows: live session (woke_actor=campd) + a pending permission, and
-    // NO live child (a previous campd's worker). Run patrol::adopt.
-    // Assert: session.crashed with reason "adoption: unanswerable permission request",
-    // AND the bead is dispatchable again (open, retry decremented — the restart path).
+    // Ledger: live session (woke_actor=campd, a real killable pid) with an
+    // in_progress bead it claimed + a PENDING permission, and NO live child.
+    let (mut led, ...) = /* seed woke(campd) + bead in_progress claimed_by=sess + permission.pending */;
+    let summary = patrol::adopt(&mut led, &mut patrol, &mut dispatcher).unwrap();
+    assert_eq!(summary.crashed, 1);
+    // the NAMED, greppable crash:
+    let crash = led.events_of_type(EventType::SessionCrashed).unwrap().pop().unwrap();
+    assert_eq!(crash.data["name"], sess);
+    assert_eq!(crash.data["reason"], "adoption: unanswerable permission request");
+    // the bead is DISPATCHABLE AGAIN via the fold crash-reopen:
+    let bead = led.get_bead("b-1").unwrap().unwrap();
+    assert_eq!(bead.status, "open");
+    assert!(bead.claimed_by.is_none(), "reopened + unclaimed → the readiness processor re-dispatches it");
 }
 
 #[test]
 fn adoption_does_not_kill_an_answered_but_quiet_worker() {
-    // Ledger shows the request DECIDED (answered) + a quiet adopted worker.
-    // Run adopt. Assert: NO "adoption: unanswerable" crash — it is re-armed like
-    // any other living adopted worker; the stall ladder owns its silence.
+    // Ledger: the request is DECIDED (answered) + a quiet adopted worker with an
+    // open bead. Run adopt. Assert: NO "adoption: unanswerable" crash — it is
+    // re-armed like any living adopted worker (summary.rearmed == 1); the stall
+    // ladder owns its silence (§5.3.4 inverse window).
+    assert!(!led.events_of_type(EventType::SessionCrashed).unwrap().iter()
+        .any(|e| e.data["reason"] == "adoption: unanswerable permission request"));
+    assert_eq!(summary.rearmed, 1);
+}
+
+#[test]
+fn a_pending_discovered_after_adoption_takes_the_named_kill_not_the_stall_ladder() {
+    // CP3-B4: an ADOPTED worker (re-armed at startup, no held stdin) emits a
+    // can_use_tool via tailing AFTER adoption. The steady-state event-loop branch
+    // must give it the SAME named kill, not the generic ladder.
+    let d = Daemon::scaffold_with_adopted_worker(&sess, "b-1"); // tracked, non-child, no pipe
+    d.append_stream_line_suppressed(&sess, CAN_USE_TOOL_LINE);
+    d.advance_and_pump(/* one wake: harvest → BLOCKED → non-child kill */);
+    let crash = d.events_of_type("session.crashed").into_iter()
+        .find(|e| e.data["name"] == sess).expect("the discovered pending was killed");
+    assert_eq!(crash.data["reason"], "adoption: unanswerable permission request");
+    assert_eq!(d.events_of_type("agent.stalled").len(), 0, "NOT the stall ladder");
+    assert_eq!(d.get_bead("b-1").status, "open"); // re-hooked
 }
 ```
 
 - [ ] **Step 2: Run — expect FAIL**
 
-- [ ] **Step 3: The startup adoption branch.** In `adopt`'s `Some(pid)` arm, BEFORE the `bead_open` re-arm (`patrol.rs:1197`), check the ledger for an unanswered permission:
+- [ ] **Step 3: Add the shared kill helper + the startup adoption branch.** Define the helper (mirrors the existing `"adopt: process not found"` append EXACTLY — key `"name"`, `bead: None`):
+
+```rust
+/// §5.3.4: a worker campd cannot answer (no live stdin) with an unanswered
+/// permission. Kill it and record the NAMED, greppable crash. The fold reopens
+/// the bead (session_ended-on-crash), so it becomes dispatchable to a fresh
+/// worker — no observe/Respawn is involved (the worker is not, or no longer,
+/// tracked for a Respawn; the fold crash-reopen is the mechanism).
+fn crash_unanswerable_permission(
+    ledger: &mut Ledger, session: &str, rig: Option<String>, pid: i64, exec_timeout: Duration,
+) -> Result<()> {
+    kill_pid(pid, exec_timeout)?;
+    ledger.append(EventInput {
+        kind: EventType::SessionCrashed, rig, actor: "campd".into(), bead: None,
+        data: serde_json::json!({ "name": session, "reason": ADOPTION_PERMISSION_REASON }),
+    })?;
+    Ok(())
+}
+```
+In `adopt`'s `Some(pid)` arm, BEFORE the `bead_open` re-arm (`patrol.rs:1197`):
 
 ```rust
     if ledger.pending_permission_for_session(&row.name)?.is_some() {
-        // §5.3.4: campd holds no stdin for an adopted worker, so a pending
-        // permission can never be answered. Kill it with a NAMED cause and let
-        // the bead re-hook exactly as a patrol restart does. (The ledger-before-
-        // pipe ordering of §5.3 proves pending ⇒ the response was never sent, so
-        // this never kills an answered worker.)
-        kill_pid(pid, exec_timeout)?;               // probe_alive already verified this pid
-        ledger.append(EventInput { kind: EventType::SessionCrashed, rig: row.rig.clone(),
-            actor: "campd".into(), bead: row.bead.clone(),
-            data: serde_json::json!({ "session": row.name, "reason": ADOPTION_PERMISSION_REASON }) })?;
+        // §5.3.4: the ledger-before-pipe ordering of §5.3 proves pending ⇒ the
+        // response was never sent, so this never kills an ANSWERED worker.
+        crash_unanswerable_permission(ledger, &row.name, row.rig.clone(), pid, exec_timeout)?;
         summary.crashed += 1;
-        continue;
+        continue; // do NOT adopt_from_row: it is dead; the fold reopened its bead
     }
 ```
-(Match the exact `SessionCrashed` payload shape the reap/observe path expects — grep the `session.crashed` fold struct and the existing `"adopt: process not found"` append at `patrol.rs:1178` for the field set and any `cause_seq` convention.)
 
-- [ ] **Step 4: Extend `observe` to re-hook on the named reason** (`patrol.rs:309`). Today it queues `Respawn` when `reason.starts_with("patrol restart")`. Add the adoption-permission reason:
+- [ ] **Step 4: (No `observe` change.)** CP3-B3 confirmed that broadening `observe`'s `reason_rehooks` is inert for the untracked adoption case — the bead re-hook is the fold crash-reopen (Step 3's `SessionCrashed` → `session_ended` → `UPDATE beads SET status='open'`). Do NOT touch `observe`. This step exists to record the deliberate decision so a later reviewer does not "add" the re-hook that is already handled by the fold.
 
-```rust
-    fn reason_rehooks(reason: &str) -> bool {
-        reason.starts_with("patrol restart") || reason == ADOPTION_PERMISSION_REASON
-    }
-```
-and route both through it, so the bead lands back in the dispatchable set (not the dispatched-once dead zone §5.3.4 warns about).
+- [ ] **Step 5: The steady-state (post-adoption-discovered) branch.** In the event loop, after the harvest + `reconcile_blocked`, for any session in `ledger.blocked_sessions()` that is NOT a live child (`!dispatcher.is_child(&s)`), look up its pid (`ledger.session_by_name(&s)?.and_then(|r| r.pid)`) and call the SAME `crash_unanswerable_permission` — a `can_use_tool` that arrived via tailing for an adopted worker takes the same named kill, not the generic stall ladder. The `crashed` session leaves `blocked_sessions` next wake (the live-join in `blocked_sessions`), so the set-shrink dedups a re-kill; if `pid` is `None` (already reaped) skip it — there is nothing to kill and the session is no longer live.
 
-- [ ] **Step 5: The steady-state (post-adoption-discovered) branch.** In the event loop, after the harvest + `reconcile_blocked`, for any session in `ledger.blocked_sessions()` that is NOT a live child (`!dispatcher.is_child(&s)`), kill it with the named reason (reusing the safe probe+kill) — a `can_use_tool` that arrived via tailing for an adopted worker takes the same named kill, not the generic stall ladder. The `crashed` session leaves `blocked_sessions` next wake (the live-join), so the set-shrink dedups; add a one-shot in-flight guard if a same-wake double is possible.
+- [ ] **Step 6: Run — PASS.** `cargo test -p camp --test daemon_patrol adoption_kills adoption_does_not_kill a_pending_discovered_after_adoption`
 
-- [ ] **Step 6: Run — PASS.** `cargo test -p camp --test daemon_patrol adoption_kills adoption_does_not_kill`
+- [ ] **Step 7: Commit** `git commit -am "feat(patrol): adoption kills an unanswerable permission worker with a named cause; bead re-hooks via the fold crash-reopen (§5.3.4)"`
 
-- [ ] **Step 7: Commit** `git commit -am "feat(patrol): adoption kills an unanswerable permission worker with a named cause + re-hook (§5.3.4)"`
-
-**Mutation caught:** the positive test dies if the pending check or the named-reason append is removed. The inverse test dies if the kill fires on an *answered* worker (proving the check keys on `pending`, not merely "has a permission row"). The re-hook assertion dies if `observe` is not extended (the bead strands).
+**Mutation caught:** the positive test dies if the pending check or the named-reason append is removed, AND its `bead.status=="open"`/`claimed_by.is_none()` assertions die if the append uses the wrong key `"session"` (loud fold failure) or if the fold crash-reopen is somehow bypassed. The inverse test dies if the kill fires on an *answered* worker (the check keys on `pending`, not "has a permission row"). The CP3-B4 test dies if the steady-state branch routes a discovered pending to the ladder instead of the named kill.
 
 ---
 
@@ -1156,14 +1286,15 @@ fn a_worker_blocks_on_can_use_tool_is_answered_and_continues() {
 
 ## Task 13: The real-`claude` compat gate (§8) — the paid tier + fixture exercise
 
-§8: a fake worker validates the state machine but "can never validate the contract with a binary camp does not control." Move the permission fixtures from "pinned but not exercised" toward exercised.
+§8: a fake worker validates the state machine but "can never validate the contract with a binary camp does not control." Move the permission fixtures from "pinned but not exercised" toward exercised. **The `can_use_tool` round-trip needs a REAL TURN, so it spends API money — it MUST live in the paid `make e2e` tier, NOT `claude_compat.rs`** (whose header documents it as the $0 `CAMP_COMPAT`/`make compat` tier that "spends NO API money"; a real-turn test there would make `make compat` silently spend — flagged by both gate panels).
 
 **Files:**
-- Modify: `crates/camp/tests/claude_compat.rs` (the `#[ignore]`d gate that already sends `interrupt_request.json` to the real CLI)
+- Modify: `crates/camp/tests/e2e.rs` (the `CAMP_E2E`-gated, opt-in, local-only real-`claude` suite — the sanctioned envelope for API spend)
+- Modify: `crates/camp/tests/fixtures/control/PROVENANCE.md`
 
-- [ ] **Step 1: Add the paid `can_use_tool` round-trip** to `make e2e` (opt-in, local-only, `#[ignore]` + the harness's env gate). Spawn the real pinned CLI under `--permission-prompt-tool stdio` with a mode that can ask, force a tool call the allowlist does not cover, receive the `can_use_tool`, answer with camp's `PermissionAllow` bytes, and assert the worker continues. This is the only test that can prove `permission_allow_response.json`'s bytes are ACCEPTED (PROVENANCE lists it "pinned but not exercised").
+- [ ] **Step 1: Add the paid `can_use_tool` round-trip** to `tests/e2e.rs` under the existing `CAMP_E2E` env gate (`make e2e`, opt-in, local-only). Spawn the real pinned CLI under `--permission-prompt-tool stdio` with a mode that can ask, force a tool call the allowlist does not cover, receive the `can_use_tool`, answer with camp's `PermissionAllow` bytes, and assert the worker continues. This is the only test that can prove `permission_allow_response.json`'s bytes are ACCEPTED (PROVENANCE lists it "pinned but not exercised"). Do NOT add any real-turn assertion to `claude_compat.rs`.
 
-- [ ] **Step 2: Add the `dialog_refusal` exercise** if reachable under `stdio` — assert camp's deterministic refusal does not hang the worker (PROVENANCE's phase-3 obligation: "if the shape is wrong the CLI ignores it and the worker hangs forever").
+- [ ] **Step 2: Add the `dialog_refusal` exercise** to the same `e2e.rs` tier if reachable under `stdio` — assert camp's deterministic refusal does not hang the worker (PROVENANCE's phase-3 obligation: "if the shape is wrong the CLI ignores it and the worker hangs forever"). If it can only be reached with a real turn, it too rides `make e2e`.
 
 - [ ] **Step 3: Update `PROVENANCE.md`** — move `permission_allow_response.json`/`permission_deny_response.json` from "PINNED BUT NOT EXERCISED" to "VERIFIED" once the gate is green, exactly as it did for the interrupt bytes. Keep the pin bumpable.
 
