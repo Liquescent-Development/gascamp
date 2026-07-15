@@ -1914,3 +1914,153 @@ fn a_restart_after_the_worker_also_died_still_faults_the_unanswered_interrupt() 
     );
     drop(campd);
 }
+
+// ===== cp-2: fleet.subscribe / camp watch =================================
+
+/// Open a fleet.subscribe connection and read + assert its hello. Mirrors the
+/// SubConn idiom used for session.subscribe.
+fn fleet_subscribe(root: &Path) -> std::io::BufReader<UnixStream> {
+    let mut stream = connect(root);
+    stream.write_all(b"{\"op\":\"fleet.subscribe\"}\n").unwrap();
+    let mut reader = std::io::BufReader::new(stream);
+    let mut hello = String::new();
+    reader.read_line(&mut hello).unwrap();
+    let v: serde_json::Value = serde_json::from_str(hello.trim_end()).unwrap();
+    assert_eq!(v["ok"], true, "fleet hello: {v}");
+    assert!(
+        v["subscription"].as_str().is_some(),
+        "fleet hello has a subscription id: {v}"
+    );
+    reader
+}
+
+/// THE EXIT CRITERION: the fleet renders live sessions from the socket ALONE,
+/// delivered at hello time with NO client poke. Subscribe AFTER a worker is
+/// live; the snapshot (its `session` frame + `synced`) arrives push-only.
+#[test]
+fn fleet_subscribe_delivers_a_live_session_and_synced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_CONTROL_LOOP", "1")]);
+    let (_bead, session) = dispatch_one(&root); // dispatch_one returns (bead, session)
+
+    let mut reader = fleet_subscribe(&root);
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+
+    // NO poke: the snapshot is delivered by the post-hello pump.
+    let mut saw_session = false;
+    let mut saw_synced = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !(saw_session && saw_synced) {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+                if v["frame"] == "session" && v["session"]["name"] == session.as_str() {
+                    assert_eq!(v["session"]["state"], "working");
+                    assert!(
+                        !line.contains("\"pid\""),
+                        "§4.2: no pid on the wire: {line}"
+                    );
+                    saw_session = true;
+                }
+                if v["frame"] == "synced" {
+                    saw_synced = true;
+                }
+            }
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => panic!("read: {e}"),
+        }
+    }
+    assert!(
+        saw_session,
+        "the live session must appear in the fleet snapshot"
+    );
+    assert!(saw_synced, "the snapshot must end with a synced frame");
+    drop(campd);
+}
+
+/// A completion is PUSHED, not polled: a session that ends yields a `gone` frame
+/// to a live fleet subscriber with NO poke OF THE FLEET CONNECTION. The frame
+/// rides a genuine wake from the real reap (the worker's SIGCHLD, or the
+/// interrupt connection closing) — never a fleet-connection poll. Which wake
+/// carries it does not matter; that no fleet-connection poke does is the proof.
+#[test]
+fn fleet_subscribe_pushes_a_gone_on_session_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_EXIT_AFTER_CONTROL", "1")]);
+    let (_bead, session) = dispatch_one(&root);
+
+    let mut reader = fleet_subscribe(&root);
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+
+    // Drain the snapshot (session + synced) so the next frame we see is the delta.
+    for _ in 0..8 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        if serde_json::from_str::<serde_json::Value>(line.trim_end())
+            .map(|v| v["frame"] == "synced")
+            .unwrap_or(false)
+        {
+            break;
+        }
+    }
+
+    // Trigger the worker's exit: interrupt it (CAUSE of the transition), exactly
+    // as a_worker_that_answers_and_exits_immediately's test does. The worker
+    // answers and exits -> SIGCHLD.
+    {
+        let mut ctl = connect(&root);
+        let _ = request(
+            &mut ctl,
+            &format!(r#"{{"op":"session.interrupt","session":"{session}"}}"#),
+        );
+    }
+
+    // NO poke of the fleet connection: the `gone` must ride the SIGCHLD wake.
+    let mut saw_gone = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !saw_gone {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+                if v["frame"] == "gone" && v["name"] == session.as_str() {
+                    saw_gone = true;
+                }
+            }
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => panic!("read: {e}"),
+        }
+    }
+    assert!(
+        saw_gone,
+        "a session that ends must PUSH a gone frame — no poke"
+    );
+    drop(campd);
+}
