@@ -3235,18 +3235,19 @@ mod tests {
         );
     }
 
-    /// Drive one fleet subscriber to a quiet point against a fixed model.
+    /// Drive one fleet subscriber to a quiet point against a fixed model. ONE
+    /// `pump_with_model` call runs the whole FILL→FLUSH driver until the socket
+    /// WouldBlocks or the delta is fully delivered, so a single call reaches the
+    /// quiet point for the room-available sockets these tests use.
     fn pump_fleet_to_quiet(
         rt: &mut ControlRuntime,
         token: Token,
         conn: &mut Conn,
         model: &[SessionInfo],
     ) {
-        for _ in 0..64 {
-            match rt.pump_with_model(token, conn, jiff::Timestamp::now(), model) {
-                PumpOutcome::Ok | PumpOutcome::Gone => break,
-                PumpOutcome::Drop(_) => panic!("unexpected drop"),
-            }
+        match rt.pump_with_model(token, conn, jiff::Timestamp::now(), model) {
+            PumpOutcome::Ok | PumpOutcome::Gone => {}
+            PumpOutcome::Drop(_) => panic!("unexpected drop"),
         }
     }
 
@@ -3411,10 +3412,21 @@ mod tests {
             last_activity: "2026-07-14T00:00:00Z".into(),
             blocked: false,
         };
-        let model: Vec<SessionInfo> = (0..500).map(row).collect();
+        // The model must exceed the socket's send+recv buffer so the first pump
+        // WouldBlocks and stamps blocked_since. macOS's buffer is ~8 KiB, but
+        // Linux's default is ~200 KiB PER DIRECTION — a 500-row model (~75 KiB)
+        // drained clean there and the drop never fired (CI-only failure). 8000
+        // rows (~1.2 MiB) overflow any realistic buffer.
+        let model: Vec<SessionInfo> = (0..8000).map(row).collect();
         let t0 = jiff::Timestamp::now();
-        // First pump: fills the socket, stamps blocked_since at t0. Client NOT read.
+        // First pump: the driver loops FILL→FLUSH until WouldBlock, filling the
+        // socket and stamping blocked_since=t0. Client NOT read.
         let _ = control.pump_with_model(T, &mut conn, t0, &model);
+        assert!(
+            control.test_sub(T).out.blocked_since.is_some(),
+            "the socket must fill and stamp blocked_since at t0 — enlarge the model if this fails \
+             on a runner with an even larger socket buffer"
+        );
         // A pump 60ms later — past the 50ms window — drops the peer LOUDLY.
         let later = t0 + jiff::SignedDuration::from_millis(60);
         match control.pump_with_model(T, &mut conn, later, &model) {
@@ -3911,6 +3923,7 @@ pub struct Subscriber {
 /// Test-only: reach the file source, so cp-1's subscriber tests keep reading
 /// `.held`/`.cursor`/`.scan`/`.tail` (now nested under `Source::File`).
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 impl Subscriber {
     fn file(&self) -> &FileSource {
         match &self.source {
