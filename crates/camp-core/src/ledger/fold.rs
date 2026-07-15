@@ -274,6 +274,13 @@ use crate::vocab::{CAMP_FINAL_DISPOSITIONS, CAMP_OUTCOMES, CAMP_RUN_DISPOSITIONS
 #[serde(deny_unknown_fields)]
 struct BeadClaimed {
     session: String,
+    /// compat §6.1 — the dispatch branch, projected as `gc.work_branch`
+    /// (`beads.work_branch`). The route is NOT here: cook owns `beads.assignee`
+    /// (= `gc.routed_to`) and the claim must not re-derive it from `GC_AGENT`
+    /// env (round-1 B1). `None` (camp's own `camp claim`) leaves the column
+    /// untouched.
+    #[serde(default)]
+    work_branch: Option<String>,
 }
 
 fn bead_claimed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
@@ -282,10 +289,15 @@ fn bead_claimed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
     match bead_status(conn, id)?.as_deref() {
         None => Err(CoreError::UnknownBead(id.to_owned())),
         Some("open") => {
+            // `assignee` (the cooked route → `gc.routed_to`) is deliberately
+            // NOT in this UPDATE — cook owns it. `COALESCE` leaves work_branch
+            // untouched when the claim carries none.
             conn.execute(
-                "UPDATE beads SET status = 'in_progress', claimed_by = ?1, updated_ts = ?2
-                 WHERE id = ?3",
-                params![p.session, event.ts, id],
+                "UPDATE beads SET status = 'in_progress', claimed_by = ?1,
+                                  work_branch = COALESCE(?2, work_branch),
+                                  updated_ts = ?3
+                 WHERE id = ?4",
+                params![p.session, p.work_branch, event.ts, id],
             )?;
             // Phase 3 (#48 finding 2): a claim means the work is under way
             // — the fail-fast dispatch marker no longer describes reality.
