@@ -691,6 +691,10 @@ impl Dispatcher {
             // (the live nudge path; fake agents tolerate it, C3). NOT
             // command-sniffed — a mode fallback would be a hidden branch.
             spawn::StdinMode::HeldStream,
+            // §2.2 (cp-4): the per-agent opt-in, resolved from agent.toml.
+            // Default false → autonomous dispatch stays flag-free; only an
+            // attach-enabled agent emits token deltas.
+            agent.partial_messages,
         )?;
         Ok(Prep {
             spec,
@@ -4788,6 +4792,66 @@ mod tests {
                 ControlWrite::NoPipe
             ),
             "after a failed write the torn pipe must be DROPPED"
+        );
+    }
+
+    /// §2.2 composition: the PROD dispatch call site passes `agent.partial_messages`
+    /// to build_spec -- NOT a hardcoded value. Driven THROUGH `prepare` so a
+    /// constant at dispatch.rs:697 fails: a hardcoded `true` reddens the
+    /// default-agent case; a hardcoded `false` reddens the opted-in case. (The
+    /// daemon's full-history-then-`end` replay guarantee is pinned separately by
+    /// tests/control.rs:1387; this pins only the field→argv wiring.)
+    #[test]
+    fn dispatch_wires_the_agent_partial_messages_field_into_the_worker_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("rig")).unwrap();
+        let dev = root.join("agents/dev");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("prompt.md"), "Work.\n").unwrap();
+        std::fs::write(
+            root.join("camp.toml"),
+            format!(
+                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+                 [dispatch]\ncommand = \"claude\"\ndefault_agent = \"dev\"\n\n\
+                 [agent_defaults]\ntools = [\"Read\"]\n",
+                root.join("rig").display()
+            ),
+        )
+        .unwrap();
+
+        // Toggle ONLY the opt-in in agent.toml; resolve + prepare and inspect the
+        // produced worker argv. isolation=none keeps prepare on the live-tree path.
+        let has_flag = |partial: bool| -> bool {
+            std::fs::write(
+                dev.join("agent.toml"),
+                format!("isolation = \"none\"\npartial_messages = {partial}\n"),
+            )
+            .unwrap();
+            let config = CampConfig::load(&root.join("camp.toml")).unwrap();
+            let dispatcher = Dispatcher::new(
+                CampDir {
+                    root: root.to_path_buf(),
+                },
+                config,
+            );
+            let mut ledger = Ledger::open(&root.join("camp.db")).unwrap();
+            let prep = dispatcher.prepare(&mut ledger, &bead(None)).unwrap();
+            prep.spec
+                .argv
+                .iter()
+                .any(|a| a == "--include-partial-messages")
+        };
+
+        // (i) default agent (partial_messages = false) => NO flag in the argv.
+        assert!(
+            !has_flag(false),
+            "the default agent must not emit token deltas (a hardcoded true fails here)"
+        );
+        // (ii) an opted-in agent (partial_messages = true) => the flag IS present.
+        assert!(
+            has_flag(true),
+            "an attach-enabled agent carries --include-partial-messages (a hardcoded false fails here)"
         );
     }
 }
