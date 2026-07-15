@@ -2702,23 +2702,33 @@ mod tests {
 
     #[test]
     fn status_summary_reports_unread_mail_separately_from_task_counts() {
-        // compat §8.2: unread mail is its OWN axis, never a task count. One
-        // fixture with one task + one mail bead must show open==1 AND
-        // unread_mail==1 — a task-scoped source would give unread_mail==0; a
-        // mail-including task source would give open==2.
+        // compat §8.2: unread mail is its OWN axis, never a task count. The
+        // fixture is TWO open+ready task beads + ONE mail bead, so the task
+        // counts (open==2, ready==2, stuck==0) all DIFFER from unread_mail==1.
+        // That makes this test SELF-SUFFICIENT: the named mutation — populate
+        // `unread_mail` from any task count (`open_task_count`/`ready_task_count`
+        // /`stuck_task_count`) — yields 2/2/0 ≠ 1 and reddens THIS test, not just
+        // its siblings.
         let (_dir, mut ledger) = temp_ledger();
         ledger
-            .append(created("gc-1", serde_json::json!({ "title": "work" })))
+            .append(created("gc-1", serde_json::json!({ "title": "work one" })))
+            .unwrap();
+        ledger
+            .append(created("gc-2", serde_json::json!({ "title": "work two" })))
             .unwrap();
         ledger
             .append(crate::mail::mail_bead_event(
-                "gc", "hi", "body", "from", "cli", "gc-2",
+                "gc", "hi", "body", "from", "cli", "gc-3",
             ))
             .unwrap();
         let s = ledger.status_summary().unwrap();
-        assert_eq!(s.open, 1, "mail is NOT a task and must not inflate open");
-        assert_eq!(s.ready, 1);
-        assert_eq!(s.unread_mail, 1, "the mail surfaces on its own axis");
+        assert_eq!(s.open, 2, "two open tasks; mail must not inflate this to 3");
+        assert_eq!(s.ready, 2, "both tasks are ready");
+        assert_eq!(s.stuck, 0);
+        assert_eq!(
+            s.unread_mail, 1,
+            "the mail surfaces on its own axis — NOT any task count (2/2/0)"
+        );
     }
 
     #[test]

@@ -246,12 +246,23 @@ mod tests {
             "read flag projects true"
         );
         // A task bead is NOT a mail message → None (Task 7's read/archive reject).
+        // Plant `mail.to_display='human'` so ONLY the `type='mail'` guard in
+        // MAIL_PROJECTION excludes it: named mutation — drop `b.type='mail'` from
+        // MAIL_PROJECTION → gc-2 resolves as a mail message → this assert reddens.
         l.append(EventInput {
             kind: EventType::BeadCreated,
             rig: Some("gc".into()),
             actor: "cli".into(),
             bead: Some("gc-2".into()),
             data: serde_json::json!({ "title": "work", "type": "task" }),
+        })
+        .unwrap();
+        l.append(EventInput {
+            kind: EventType::BeadUpdated,
+            rig: None,
+            actor: "cli".into(),
+            bead: Some("gc-2".into()),
+            data: serde_json::json!({ "metadata": { MAIL_TO_KEY: HUMAN } }),
         })
         .unwrap();
         assert!(
@@ -279,7 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn a_task_bead_is_never_mail() {
+    fn the_type_mail_filter_excludes_a_non_mail_bead_that_carries_human_mail_metadata() {
+        // ISOLATION for the `b.type = 'mail'` discriminant. `type='mail'` and
+        // `mail.to_display='human'` are INDEPENDENT guards: a plain task bead
+        // (lacking both) is excluded redundantly, so removing either alone still
+        // excludes it — a task-only fixture pins NEITHER. Here the task bead is
+        // planted with `mail.to_display='human'`, so ONLY the type filter can
+        // exclude it. Named mutation: delete `b.type = 'mail'` from
+        // `unread_human_mail_count` (and `MAIL_PROJECTION`) → this bead counts /
+        // lists → RED. That proves `type='mail'` is load-bearing, not dead code.
         let (_d, mut l) = ledger();
         l.append(EventInput {
             kind: EventType::BeadCreated,
@@ -289,7 +308,55 @@ mod tests {
             data: serde_json::json!({ "title": "real work", "type": "task" }),
         })
         .unwrap();
+        // Plant human-mailbox metadata a real task never carries, so the type
+        // filter is the SOLE thing excluding this bead.
+        l.append(EventInput {
+            kind: EventType::BeadUpdated,
+            rig: None,
+            actor: "cli".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({ "metadata": { MAIL_TO_KEY: HUMAN } }),
+        })
+        .unwrap();
         assert_eq!(unread_human_mail_count(l.conn_for_test()).unwrap(), 0);
+        assert!(unread_human_mail(l.conn_for_test()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_human_scope_excludes_a_mail_bead_addressed_to_a_non_human() {
+        // ISOLATION for the `mail.to_display = 'human'` discriminant. A real
+        // `type='mail'` bead addressed to a NON-human recipient (constructed
+        // directly — `mail_bead_event` only ever writes `human`, and the shim
+        // refuses non-human) must NOT appear in the HUMAN mailbox. Named
+        // mutation: delete `AND t.value = 'human'` (accept any `mail.to_display`)
+        // → this `mayor` bead counts → RED. Clean semantic mutation, no param
+        // change — proves the human-scope filter is load-bearing (v2 forward).
+        let (_d, mut l) = ledger();
+        l.append(EventInput {
+            kind: EventType::BeadCreated,
+            rig: Some("gc".into()),
+            actor: "gc-shim".into(),
+            bead: Some("gc-1".into()),
+            data: serde_json::json!({
+                "title": "agent-to-agent",
+                "description": "v2 traffic",
+                "type": "mail",
+                "metadata": { MAIL_FROM_KEY: "t/gc.publisher/1", MAIL_TO_KEY: "mayor" },
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            unread_human_mail_count(l.conn_for_test()).unwrap(),
+            0,
+            "mail to a non-human is not in the human's mailbox"
+        );
+        assert!(unread_human_mail(l.conn_for_test()).unwrap().is_empty());
+        assert!(
+            mail_message_by_id(l.conn_for_test(), "gc-1")
+                .unwrap()
+                .is_none(),
+            "a non-human mail bead does not resolve as a human mail message"
+        );
     }
 
     #[test]
