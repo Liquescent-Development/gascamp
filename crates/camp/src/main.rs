@@ -17,6 +17,7 @@ mod cmd {
     pub mod import;
     pub mod init;
     pub mod ls;
+    pub mod mail;
     pub mod nudge;
     pub mod order;
     pub mod recall;
