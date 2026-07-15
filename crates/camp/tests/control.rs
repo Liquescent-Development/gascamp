@@ -1476,6 +1476,60 @@ fn a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends() 
     drop(campd);
 }
 
+// ===== cp-4: camp attach (per-agent view) =================================
+
+/// EXIT CRITERION 1: attach + detach without the worker noticing. Subscribe to a
+/// LIVE worker, read a frame if any (non-asserting), then DETACH (drop the
+/// SubClient). The worker must be unaffected: still `working` in the registry
+/// afterward, and a FRESH subscribe still succeeds. campd appends no fault on the
+/// detach (a peer-gone flush is silent -- cp-1, control.rs:3833-3835).
+///
+/// The replay-of-a-finished-session exit criterion is proven by an OWNED SPLIT
+/// (no duplicate here): the DAEMON full-history-then-`end` delivery is cp-1's
+/// `a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends`
+/// (above, control.rs), and the CLIENT replay-render is cp-4's
+/// `client_renders_a_full_finished_replay_in_order_then_the_end_marker`
+/// (crates/camp/src/cmd/attach.rs).
+#[test]
+fn attach_then_detach_leaves_the_worker_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    let campd = Daemon::spawn(&root, &[("FAKE_AGENT_CONTROL_LOOP", "1")]);
+    let (_bead, session) = dispatch_one(&root);
+
+    // Attach from cursor 0 (history-then-follow), read a frame if one is ready
+    // (content is NOT the point — this must not hard-assert a pushed frame), then
+    // DETACH by dropping the SubClient at the end of the scope.
+    {
+        let mut sub = SubClient::open(&root, &session, Some(0)).unwrap();
+        // Non-asserting single read: a Frame, a Timeout, or an Eof are all fine —
+        // the detach test turns on non-interference, not on content.
+        let _ = sub.read_frame_or_eof(Duration::from_millis(500));
+        // drop(sub) here detaches.
+    }
+
+    // The worker is still live: sessions.list (request/response, self-driving)
+    // shows it `working` — the detach did not disturb its held pipe or stream file.
+    let mut ctl = connect(&root);
+    let resp = request(&mut ctl, r#"{"op":"sessions.list"}"#);
+    let live = resp["sessions"].as_array().unwrap();
+    assert!(
+        live.iter()
+            .any(|s| s["name"] == session.as_str() && s["state"] == "working"),
+        "the worker must still be live and working after a detach: {resp}"
+    );
+
+    // A FRESH subscribe still succeeds (the stream file was never disturbed).
+    let sub2 = SubClient::open(&root, &session, Some(0));
+    assert!(
+        sub2.is_ok(),
+        "a fresh attach after a detach still works: {:?}",
+        sub2.err()
+    );
+
+    drop(campd);
+}
+
 /// The steady state of every long-lived watch: a subscriber CAUGHT UP AT THE TAIL,
 /// with nothing buffered and nothing to pump. It must still get its `end` frame
 /// when the session is reaped.
