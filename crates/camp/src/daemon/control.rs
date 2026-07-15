@@ -90,6 +90,35 @@ struct ErrorResponseBody<'a> {
     error: &'a str,
 }
 
+// cp-3 (§5.3 step 5): the permission answer. `{type:"control_response",
+// response:{subtype:"success", request_id, response:{behavior:"allow"|"deny",
+// message?}}}` — declaration order pins the fixture bytes (permission_*_
+// response.json), exactly as the interrupt/error structs above.
+#[derive(Serialize)]
+struct PermissionResponseEnvelope<'a, D: Serialize> {
+    #[serde(rename = "type")]
+    kind: &'static str, // "control_response"
+    response: PermissionSuccessBody<'a, D>,
+}
+
+#[derive(Serialize)]
+struct PermissionSuccessBody<'a, D: Serialize> {
+    subtype: &'static str, // "success"
+    request_id: &'a str,
+    response: D, // the decision object
+}
+
+#[derive(Serialize)]
+struct AllowDecision {
+    behavior: &'static str, // {"behavior":"allow"}
+}
+
+#[derive(Serialize)]
+struct DenyDecision<'a> {
+    behavior: &'static str, // "deny"
+    message: &'a str,
+}
+
 /// A message campd sends INTO a worker's stdin.
 pub enum ParentMessage {
     /// §4.1 `session.interrupt`. The CLI acks it with a `control_response`
@@ -100,6 +129,13 @@ pub enum ParentMessage {
     /// alternative is a worker blocked forever waiting for an answer that
     /// can never come, holding a dispatch slot.
     DialogRefusal { request_id: String },
+    /// §5.3 step 5: answer a `can_use_tool` with `{behavior:"allow"}`. Both
+    /// `allow` and `allow_always` send these bytes (scoping decision 1) — the
+    /// CLI validator names no `allow_always` on the wire.
+    PermissionAllow { request_id: String },
+    /// §5.3 step 5: answer with `{behavior:"deny", message:…}`. The message is
+    /// the operator's reason and is REQUIRED (the CLI validator demands it).
+    PermissionDeny { request_id: String, message: String },
 }
 
 impl ParentMessage {
@@ -126,6 +162,30 @@ impl ParentMessage {
                     },
                 })?
             }
+            ParentMessage::PermissionAllow { request_id } => {
+                serde_json::to_string(&PermissionResponseEnvelope {
+                    kind: "control_response",
+                    response: PermissionSuccessBody {
+                        subtype: "success",
+                        request_id,
+                        response: AllowDecision { behavior: "allow" },
+                    },
+                })?
+            }
+            ParentMessage::PermissionDeny {
+                request_id,
+                message,
+            } => serde_json::to_string(&PermissionResponseEnvelope {
+                kind: "control_response",
+                response: PermissionSuccessBody {
+                    subtype: "success",
+                    request_id,
+                    response: DenyDecision {
+                        behavior: "deny",
+                        message,
+                    },
+                },
+            })?,
         };
         line.push('\n');
         Ok(line)
@@ -2082,6 +2142,30 @@ mod tests {
             refusal,
             format!("{DIALOG_REFUSAL_RESPONSE}\n"),
             "the dialog refusal camp sends must be byte-equal to its fixture"
+        );
+
+        // cp-3 (§5.3 step 5): the permission answers camp sends are byte-equal
+        // to their recovered fixtures. `allow_always` sends the allow bytes.
+        let allow = ParentMessage::PermissionAllow {
+            request_id: "cli-fixture-2".into(),
+        }
+        .to_line()
+        .unwrap();
+        assert_eq!(
+            allow,
+            format!("{PERMISSION_ALLOW_RESPONSE}\n"),
+            "the allow answer camp sends must be byte-equal to its recovered fixture"
+        );
+        let deny = ParentMessage::PermissionDeny {
+            request_id: "cli-fixture-2".into(),
+            message: "denied by the operator".into(),
+        }
+        .to_line()
+        .unwrap();
+        assert_eq!(
+            deny,
+            format!("{PERMISSION_DENY_RESPONSE}\n"),
+            "the deny answer camp sends must be byte-equal to its recovered fixture"
         );
 
         // C1: the fixture is the ACTUAL output of the shipped code path.
