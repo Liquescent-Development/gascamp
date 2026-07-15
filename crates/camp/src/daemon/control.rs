@@ -416,6 +416,12 @@ pub struct ControlRuntime {
     /// construction; a phase that makes them common must prune it with the session.
     degraded_seen: HashSet<(String, u64)>,
     next_subscription: u64,
+    /// The most recently computed fleet model, refreshed by `fanout` and by
+    /// `serve_fleet_subscribe`. It is what the WRITABLE-edge `pump` diffs against
+    /// when it continues a cap-STOPped fleet delta (that path has no ledger in
+    /// scope). Empty when no fleet subscriber exists — computing it then would be
+    /// pure waste (invariant 1).
+    fleet_model: Vec<SessionInfo>,
 }
 
 impl ControlRuntime {
@@ -443,6 +449,7 @@ impl ControlRuntime {
             pending_events: Vec::new(),
             degraded_seen: HashSet::new(),
             next_subscription: 0,
+            fleet_model: Vec::new(),
         }
     }
 
@@ -1240,6 +1247,59 @@ impl ControlRuntime {
                 bead: row.bead,
             })
             .collect())
+    }
+
+    /// §4.1/§4.4 `fleet.subscribe`: the hello. It REGISTERS and refreshes the cached
+    /// model so the FIRST post-hello pump (event_loop) emits the full snapshot; it
+    /// never writes — `respond()` writes the hello, then the loop pumps (B11).
+    pub fn serve_fleet_subscribe(
+        &mut self,
+        token: Token,
+        ledger: &Ledger,
+        patrol: &PatrolRuntime,
+        read_channel: &ReadChannelRuntime,
+    ) -> Response {
+        if self.subscribers.len() >= MAX_SUBSCRIBERS {
+            return Response::Error {
+                ok: false,
+                error: format!(
+                    "campd already has {MAX_SUBSCRIBERS} subscriptions open (the MAX_SUBSCRIBERS \
+                     cap). Each holds up to {SUBSCRIBER_BUFFER_BYTES} bytes of outbound buffer."
+                ),
+            };
+        }
+        match self.fleet_model(ledger, patrol, read_channel) {
+            Ok(model) => self.fleet_model = model,
+            Err(e) => {
+                return Response::Error {
+                    ok: false,
+                    error: format!("building the fleet model: {e}"),
+                };
+            }
+        }
+        self.next_subscription += 1;
+        let id = format!("fleet-{}", self.next_subscription);
+        self.subscribers.insert(
+            token,
+            Subscriber {
+                id: id.clone(),
+                out: OutBuf::new(),
+                source: Source::Fleet(FleetSource::new()),
+            },
+        );
+        Response::FleetSubscribed {
+            ok: true,
+            v: 1,
+            subscription: id,
+        }
+    }
+
+    /// True when at least one fleet subscriber is registered — the guard that keeps
+    /// the model recompute off the hot path when nobody is watching.
+    fn has_fleet_subscribers(&self) -> bool {
+        self.subscribers
+            .values()
+            .any(|s| matches!(s.source, Source::Fleet(_)))
     }
 
     /// The INBOUND half: everything the read channel drained this wake.
@@ -3417,6 +3477,25 @@ mod tests {
         drop(ca);
         drop(cb);
     }
+
+    /// cp-2 (§4.1/§4.4): the hello registers a fleet subscriber and answers
+    /// synchronously with `FleetSubscribed` (bounded by REQUEST_TIMEOUT, like every
+    /// other verb). MAX_SUBSCRIBERS bounds it.
+    #[test]
+    fn serve_fleet_subscribe_registers_and_answers_the_hello() {
+        let (_dir, ledger, patrol, read_channel) = fleet_fixture();
+        let mut control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+        let response = control.serve_fleet_subscribe(Token(7), &ledger, &patrol, &read_channel);
+        assert!(matches!(
+            response,
+            Response::FleetSubscribed { ok: true, v: 1, .. }
+        ));
+        assert_eq!(
+            control.subscriber_count(),
+            1,
+            "a fleet subscriber is registered"
+        );
+    }
 }
 
 // ===========================================================================
@@ -4373,12 +4452,29 @@ impl ControlRuntime {
     /// plus any `over_cap` `patrol.degraded` from the collector).
     pub fn fanout(
         &mut self,
+        ledger: &Ledger,
+        patrol: &PatrolRuntime,
         read_channel: &ReadChannelRuntime,
         conns: &mut HashMap<Token, Conn>,
         now: Timestamp,
     ) -> (Vec<Token>, Vec<EventInput>) {
+        // §4.3: recompute the fleet model ONCE per wake, and ONLY when a fleet
+        // subscriber exists — computing it with nobody watching is pure waste
+        // (invariant 1).
+        if self.has_fleet_subscribers() {
+            match self.fleet_model(ledger, patrol, read_channel) {
+                Ok(model) => self.fleet_model = model,
+                Err(e) => self.pending_events.push(degraded_event(
+                    "(fleet)",
+                    format!("fleet model refresh: {e}"),
+                )),
+            }
+        }
         let cap = self.subscriber_buffer_bytes;
         let stall = self.stall_timeout;
+        // Take the model so the pump loop can borrow it immutably while
+        // `&mut self.pending_events`/`&mut self.degraded_seen` stay disjoint.
+        let model = std::mem::take(&mut self.fleet_model);
         let mut gone = Vec::new();
         let mut events = Vec::new();
 
@@ -4422,7 +4518,7 @@ impl ControlRuntime {
                 stall,
                 &mut self.pending_events,
                 &mut self.degraded_seen,
-                &[], // Task 5 supplies the real fleet model
+                &model,
             ) {
                 PumpOutcome::Ok => {}
                 PumpOutcome::Gone => gone.push(token),
@@ -4432,12 +4528,30 @@ impl ControlRuntime {
                 }
             }
         }
+        self.fleet_model = model; // restore
         events.append(&mut self.pending_events);
         (gone, events)
     }
 
     /// Pump ONE subscriber (the WRITABLE-edge path, and the hello's first bytes).
     pub fn pump(&mut self, token: Token, conn: &mut Conn, now: Timestamp) -> PumpOutcome {
+        // Take/restore the cached model so a resumed cap-STOPped fleet delta diffs
+        // against the SAME model `fanout` computed (this path has no ledger in
+        // scope). A forgotten restore would re-fill against an empty model → a
+        // spurious `gone` per row.
+        let model = std::mem::take(&mut self.fleet_model);
+        let outcome = self.pump_inner(token, conn, now, &model);
+        self.fleet_model = model; // restore
+        outcome
+    }
+
+    fn pump_inner(
+        &mut self,
+        token: Token,
+        conn: &mut Conn,
+        now: Timestamp,
+        model: &[SessionInfo],
+    ) -> PumpOutcome {
         let cap = self.subscriber_buffer_bytes;
         let stall = self.stall_timeout;
         let Some(sub) = self.subscribers.get_mut(&token) else {
@@ -4451,7 +4565,7 @@ impl ControlRuntime {
             stall,
             &mut self.pending_events,
             &mut self.degraded_seen,
-            &[], // Task 5 supplies the real fleet model
+            model,
         )
     }
 
