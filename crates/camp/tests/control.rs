@@ -640,7 +640,8 @@ fn sessions_list_reports_live_sessions_by_name() {
     );
     assert_eq!(
         s["blocked"], false,
-        "`blocked`'s producer is phase 3 (§5.3); cp-1 never flips it quietly"
+        "this worker asked no permission, so BLOCKED stays false (the baseline; \
+         cp-3's positive case is a can_use_tool round-trip)"
     );
 
     // An RFC3339 timestamp campd can actually parse back.
