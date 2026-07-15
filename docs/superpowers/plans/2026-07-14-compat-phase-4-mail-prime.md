@@ -39,11 +39,40 @@ Measured by BUILDING/READING gc at `GASCITY_REF` and the corpus at `GCPACKS_REF`
 
 **A5 — `gc prime`** (`cmd/gc/cmd_prime.go:59-120`, name resolution `primeInvocationAgentName:155-174`): "Output the behavioral prompt for an agent." Agent name = `args[0]`, else `$GC_ALIAS`, else `$GC_AGENT`. If the agent has a `prompt_template`, render+print it; else a default worker prompt. Non-strict exit 0. **Camp's prompt is already materialized** at import (`AgentDef.prompt`, `pack.rs:41`) and campd exports `GC_AGENT = GC_TEMPLATE = agent.name` (the qualified name) to the worker (`spawn.rs:263-264`). So camp's `prime` resolves the agent via `resolve_agent(cfg, name)` (`pack.rs:251`) and prints `AgentDef.prompt`. **No default-prompt fallback** — the shim is dispatch-only (§6.3); an unresolvable agent is a hard error (house rule: no fallbacks).
 
-**A6 — `</system-reminder>` sanitizer** (`internal/promptsafe/promptsafe.go:44-64`, applied at `cmd_mail.go:772-780`): `SanitizeForSystemReminder` strips the literal sequences `</system-reminder>` AND `<system-reminder>`, **repeating to a fixpoint** — each pass deletes both, loop until a pass changes nothing (terminates: length strictly decreases). The interleaved payload `</system-</system-reminder>reminder>` collapses to `</system-reminder>` after one inner removal, so a single pass is NOT enough. gc sanitizes at the RENDER edge (when interpolating into a `<system-reminder>` block), storing the raw body — camp does the same (ledger fidelity, invariant 3).
+**A6 — `</system-reminder>` sanitizer, RE-MEASURED at `GASCITY_REF`** (`internal/promptsafe/promptsafe.go:44-64`, applied at `cmd_mail.go:772-780`). The FULL body, read at the pinned ref:
+```go
+func SanitizeForSystemReminder(s string) string {
+    if s == "" { return s }
+    for {
+        stripped := strings.ReplaceAll(s, "</system-reminder>", "")
+        stripped = strings.ReplaceAll(stripped, "<system-reminder>", "")
+        if stripped == s { return stripped }
+        s = stripped
+    }
+}
+```
+Measured properties (each load-bearing for camp's port — do not soften):
+- **Exact-literal, CASE-SENSITIVE.** `strings.ReplaceAll` matches byte-for-byte. gc strips ONLY the two lowercase literals `</system-reminder>` and `<system-reminder>`. It does NOT strip `</SYSTEM-REMINDER>`, `</system-reminder >` (interior space), `< /system-reminder>`, a tag with an embedded newline, or any unicode look-alike — those pass through UNCHANGED.
+- **Fixpoint loop** — deletes both tags each pass, loops until a pass changes nothing (terminates: length strictly decreases). Robust against the reconstruction class (`</system-</system-reminder>reminder>` → `</system-reminder>` → `""`).
+- **Rendered at the edge, raw stored** — gc sanitizes when interpolating into a `<system-reminder>` block, keeping the raw body in the store. Camp does the same (ledger fidelity, invariant 3).
+
+**Why case-sensitive exact-literal is the CORRECT boundary (not a weaker one):** the real breakout consumer is the camp:operator overseer agent's context, into which the **Claude Code harness** injects `<system-reminder>` blocks. That harness emits and interprets ONLY the exact lowercase literal token; a `</SYSTEM-REMINDER>` or `</system-reminder >` in a mail body is inert text the harness never treats as a reminder boundary, so stripping it would be theater. Camp's `str::replace` (exact, case-sensitive, byte-for-byte) is therefore **already identical to measured gc** — matching gc is the fix, and a case-INSENSITIVE strip would DIVERGE from both gc and the harness. Task 1's test matrix pins this boundary in both directions (strips the exact tags; leaves the variants intact).
 
 **A7 — corpus usage at `GCPACKS_REF`** (v1 target packs = `bmad`, `gstack`, `compound-engineering` + transitive `gascity` + `gascity/roles`):
 - `gc mail send human ...` appears in **8 workflow-asset files** as PROSE instructing the agent to escalate to the human (e.g. `superpowers/assets/workflows/superpowers-brainstorming/{target}.confirm-spec-approval.md:66`, `gascity/assets/workflows/github-issue-fix-base/publish-pr.md:36`, `.../implementation-plan.md:52`, `.../create-beads.md:46`, `.../resume-or-create-run.md:37`, `github-pr-review/human-gate-comment.md:38`, `github-issue-triage-base/human-gate-sensitive-output.md:32`, `superpowers-brainstorming/{target}.confirm-design-approval.md:33`). The `...` is LLM-filled subject/body; the LLM may use either grammar (positional or `-s`/`-m`). **Every v1 mail call addresses `human`** (compat §16). The "10 refs" split = 6 workflow assets (this set, de-duplicated across packs) + 4 in gc's own tests.
 - `gc prime` appears in the v1 packs ONLY in PROHIBITION prose ("Do not run `gc prime`…") inside the `gc-role-worker` fragment (e.g. `bmad/template-fragments/gc-role-worker.template.md:24`, every `gascity/roles/agents/*/prompt.template.md:23`). The actual `gc prime` INVOCATIONS live in NON-v1 packs only (`discord/formulas/mol-discord-fix-issue.formula.toml:70`, `github/formulas/mol-github-fix-issue.formula.toml:67`, `oversight-rig/agents/project-lead/prompt.template.md:3`). **Prime is on NO executed v1 worker path** — this matches compat-3's `gc-role-worker.observed.json` recording prime among `refused_loudly_by_camp` / `static_outside_executed`. Task 6 promotes prime from refused to served; Task 11 guards the corpus invariant so a future corpus that starts executing prime on the worker path trips the gate.
+
+**A8 — WHERE `gc mail send` lives, corpus-wide, RE-MEASURED at `GCPACKS_REF`** (this is the ground truth Task 11's guard must scan; round-1's `V1_PACKS` list was WRONG — it named `gascity/roles`, which holds the fragments/agents, NOT the workflow assets where sends live). `grep -rn "gc mail send"` over the whole corpus, grouped by top dir:
+
+| location | count | recipient(s) | v1-served? |
+|---|---|---|---|
+| `gascity/assets/workflows/…` | **6** | all `human` | **YES** (transitive gascity content layer) |
+| `superpowers/assets/workflows/…` | **2** | all `human` | **YES** (v1 importing pack) |
+| `gastown/agents` + `gastown/assets` + `gastown/formulas` + `gastown/template-fragments` | **41** | NON-human (`mayor/`, `$WITNESS_TARGET`, `-s`…) — agent-to-agent | **NO — v2** (66-mail-call gastown, compat §16) |
+| `oversight-rig/agents` | 1 | — | NO (not a v1 target) |
+| `docs/design` | 3 | — | NO (not a pack) |
+
+**The 8 v1-served sends are all `gc mail send human`.** `gascity/tests/` exists in the corpus but contains ZERO sends (the "4 in gc's own tests" of compat §16 live in the gascity SOURCE repo, not the packs). The guard MUST scan the v1-served roots `{bmad, gstack, compound-engineering, superpowers, gascity}` (scanning `gascity` covers both `gascity/assets` and `gascity/roles`) and MUST NOT scan `gastown`/`oversight-rig` (their non-human sends are legitimately v2 and would false-positive). Floor for the anti-vacuity assertion: **8** human sends.
 
 ---
 
@@ -51,7 +80,7 @@ Measured by BUILDING/READING gc at `GASCITY_REF` and the corpus at `GCPACKS_REF`
 
 **camp-core (the domain layer):**
 - **Create** `crates/camp-core/src/promptsafe.rs` — `sanitize_for_system_reminder(&str) -> String` (A6). Dependency-free leaf. Registered in `lib.rs`.
-- **Create** `crates/camp-core/src/mail.rs` — the mail domain: `MailMessage` row struct; `mail_bead_event(rig, subject, body, from, bead_id) -> EventInput` (the one confined mail-bead constructor, shared by shim + CLI — mirrors gc's single `createMessageBead` edge); `unread_human_mail(&Connection) -> Result<Vec<MailMessage>>`; `unread_human_mail_count(&Connection) -> Result<u64>`. Registered in `lib.rs`.
+- **Create** `crates/camp-core/src/mail.rs` — the mail domain: `MailMessage` row struct; `mail_bead_event(rig, subject, body, from, actor, bead_id) -> EventInput` (the one confined mail-bead constructor, shared by shim + CLI — mirrors gc's single `createMessageBead` edge); `unread_human_mail(&Connection)`; `unread_human_mail_count(&Connection)`; `mail_message_by_id(&Connection, id)`. Registered in `lib.rs`.
 - **Modify** `crates/camp-core/src/lib.rs` — `pub mod mail;` and `pub mod promptsafe;`.
 - **Modify** `crates/camp-core/src/ledger/mod.rs` — `StatusSummary` gains `pub unread_mail: u64`; `status_summary()` populates it via `crate::mail::unread_human_mail_count`; thin `Ledger::unread_mail`/`unread_mail_count` methods.
 
@@ -160,6 +189,48 @@ mod tests {
             ""
         );
     }
+
+    #[test]
+    fn nested_and_repeated_reconstruction_all_collapse() {
+        // Doubly-nested open tag, and a repeated interleave — both must reach "".
+        assert_eq!(
+            sanitize_for_system_reminder("<system-<system-<system-reminder>reminder>reminder>"),
+            ""
+        );
+        // Removing the inner exact tag splices `</sys` + `tem-reminder>` into a
+        // fresh `</system-reminder>`, which pass 2 then deletes → "".
+        assert_eq!(
+            sanitize_for_system_reminder("</sys</system-reminder>tem-reminder>"),
+            ""
+        );
+        // A payload with both a close and an open, reconstructable, collapses fully.
+        assert_eq!(
+            sanitize_for_system_reminder("A</system-<system-reminder>reminder>B<system-<system-reminder>reminder>C"),
+            "ABC"
+        );
+    }
+
+    #[test]
+    fn the_measured_gc_boundary_is_exact_literal_and_case_sensitive() {
+        // A6: gc's `strings.ReplaceAll` matches the two LOWERCASE literals only,
+        // byte-for-byte. Camp's `str::replace` must be identical — NOT case-
+        // insensitive, NOT whitespace-tolerant. These variants are NOT breakout
+        // tokens for the Claude Code harness (which emits/interprets only the
+        // exact literal), so leaving them intact is faithful to gc AND correct.
+        for variant in [
+            "</SYSTEM-REMINDER>",   // uppercase
+            "</System-Reminder>",   // mixed case
+            "</system-reminder >",  // trailing interior space
+            "< /system-reminder>",  // leading interior space
+            "</system-\nreminder>", // embedded newline
+        ] {
+            assert_eq!(
+                sanitize_for_system_reminder(variant),
+                variant,
+                "gc is exact-literal case-sensitive; {variant:?} is not a real breakout token and passes through unchanged"
+            );
+        }
+    }
 }
 ```
 
@@ -167,10 +238,11 @@ mod tests {
 
 - [ ] **Step 3: Run the tests to verify they pass.**
   Run: `cargo test -p camp-core promptsafe`
-  Expected: 3 passed. (Pure leaf; if you prefer strict red-first, temporarily replace the loop body with `return s.to_owned();` and watch `interleaved_payload…` FAIL with left `"</system-reminder>"` ≠ right `""`, then restore.)
+  Expected: 5 passed. (Pure leaf; if you prefer strict red-first, temporarily replace the loop body with `return s.to_owned();` and watch `interleaved_payload…` FAIL with left `"</system-reminder>"` ≠ right `""`, then restore.)
 
 - [ ] **Step 4: Name the mutation each test catches.**
-  `interleaved_payload_cannot_reconstruct_a_tag_via_single_pass` DIES if the loop is replaced by a single `replace` pass (returns `</system-reminder>`). `strips_both_literal_tags` DIES if only the closing tag is stripped. Confirm by temporarily making each mutation and re-running.
+  `interleaved_payload_cannot_reconstruct_a_tag_via_single_pass` and `nested_and_repeated_reconstruction_all_collapse` DIE if the loop is replaced by a single `replace` pass (the reconstruction class survives). `strips_both_literal_tags` DIES if only the closing tag is stripped. `the_measured_gc_boundary_is_exact_literal_and_case_sensitive` DIES if someone "hardens" the strip into a case-insensitive or whitespace-tolerant match — which would DIVERGE from measured gc (A6) and from the harness's actual token, a false security boundary. Confirm each by mutation.
+  NOTE (security-boundary rationale, A6): the breakout consumer is the camp:operator overseer agent's context, where the Claude Code harness injects `<system-reminder>` blocks using ONLY the exact lowercase literal. Matching gc's exact-literal case-sensitive strip is the correct and measured boundary — this is a PORT of a verified gc control, not a re-invention.
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -190,7 +262,8 @@ git commit -m "compat-4: the </system-reminder> sanitizer — fixpoint strip, mi
 **Interfaces:**
 - Consumes: `camp_core::promptsafe::sanitize_for_system_reminder` (Task 1); `camp_core::event::{EventInput, EventType}`.
 - Produces:
-  - `camp_core::mail::mail_bead_event(rig: &str, subject: &str, body: &str, from: &str, bead_id: &str) -> EventInput` — the ONE confined mail-bead constructor. Raw subject/body stored (fidelity); `mail.from_display`/`mail.to_display` metadata set; `type="mail"`; `assignee` UNSET (mail is never routed). Consumed by Task 4 (shim send) and Task 7 (CLI send).
+  - `camp_core::mail::mail_bead_event(rig: &str, subject: &str, body: &str, from: &str, actor: &str, bead_id: &str) -> EventInput` — the ONE confined mail-bead constructor. Raw subject/body stored (fidelity); `mail.from_display`/`mail.to_display` metadata set; `type="mail"`; `assignee` UNSET (mail is never routed). `actor` is the event actor (`"gc-shim"` for the shim, `"cli"` for `camp mail`) — not a folded discriminant, just honest provenance. Consumed by Task 4 (shim send) and Task 7 (CLI send).
+  - `camp_core::mail::mail_message_by_id(conn, id) -> Result<Option<MailMessage>>` — the full projection (subject/body/from + true read-state) for ONE `type='mail'` bead, or `None` if the id is not a mail bead. Consumed by Task 7 (`read`/`archive`) so those paths never touch `BeadRow` (which has `kind`, not `bead_type`, and NO `description` field — see C4-B3).
   - `camp_core::mail::MailMessage { pub id, pub from, pub subject, pub body, pub read }` with `fn sanitized(&self) -> MailMessage` (from/subject/body passed through the sanitizer). Consumed by Task 7 render.
   - `camp_core::mail::unread_human_mail(conn) -> Result<Vec<MailMessage>>` and `unread_human_mail_count(conn) -> Result<u64>`. Consumed by Tasks 3, 5, 7.
   - Constants `MAIL_FROM_KEY`/`MAIL_TO_KEY`/`MAIL_READ_KEY`/`HUMAN`.
@@ -252,11 +325,11 @@ impl MailMessage {
 /// already allocated `bead_id` (per-rig, `ledger.next_bead_id`). Subject/body
 /// are stored RAW; sanitization happens at render.
 #[must_use]
-pub fn mail_bead_event(rig: &str, subject: &str, body: &str, from: &str, bead_id: &str) -> EventInput {
+pub fn mail_bead_event(rig: &str, subject: &str, body: &str, from: &str, actor: &str, bead_id: &str) -> EventInput {
     EventInput {
         kind: EventType::BeadCreated,
         rig: Some(rig.to_owned()),
-        actor: "gc-shim".into(),
+        actor: actor.to_owned(),
         bead: Some(bead_id.to_owned()),
         data: serde_json::json!({
             "title": subject,
@@ -267,27 +340,47 @@ pub fn mail_bead_event(rig: &str, subject: &str, body: &str, from: &str, bead_id
     }
 }
 
+// NB: the metadata table is `bead_meta` (schema.rs:52; fold.rs:264 `INSERT INTO
+// bead_meta`; readiness.rs:203 `SELECT … FROM bead_meta`; `Ledger::bead_metadata`
+// reads it — all shipped, CI-green in compat-3). There is NO table named `n`.
+// The column names are `bead_id`/`key`/`value`.
+
+/// Map one full mail-projection row → `MailMessage`. Column order MUST match the
+/// SELECTs below: 0 id, 1 title(subject), 2 description(body), 3 from_display,
+/// 4 read_flag ("true"/NULL). The ONE row-mapper (DRY) for both queries.
+fn map_mail_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MailMessage> {
+    Ok(MailMessage {
+        id: r.get(0)?,
+        subject: r.get(1)?,
+        body: r.get(2)?,
+        from: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        read: r.get::<_, Option<String>>(4)?.as_deref() == Some("true"),
+    })
+}
+
+/// The shared column list + join. `?1`=mail.from_display, `?2`=mail.read. A mail
+/// bead is to `human` (send refuses any other recipient, Task 4), and the
+/// `mail.to_display='human'` filter makes the query name honest.
+const MAIL_PROJECTION: &str = "
+    SELECT b.id, b.title, b.description,
+           (SELECT value FROM bead_meta m WHERE m.bead_id = b.id AND m.key = ?1),
+           (SELECT value FROM bead_meta r WHERE r.bead_id = b.id AND r.key = ?2)
+    FROM beads b
+    WHERE b.type = 'mail'
+      AND EXISTS (SELECT 1 FROM bead_meta t WHERE t.bead_id = b.id AND t.key = ?3 AND t.value = ?4)";
+
 /// Unread mail for `human`: open `type='mail'` beads with no `mail.read=true`.
 pub fn unread_human_mail(conn: &Connection) -> Result<Vec<MailMessage>, CoreError> {
-    let mut stmt = conn.prepare(
-        "SELECT b.id, b.title, b.description,
-                (SELECT value FROM bead_meta m WHERE m.bead_id = b.id AND m.key = ?1) AS from_display
-         FROM beads b
-         WHERE b.type = 'mail' AND b.status = 'open'
-           AND NOT EXISTS (
-             SELECT 1 FROM bead_meta r
-             WHERE r.bead_id = b.id AND r.key = ?2 AND r.value = 'true')
-         ORDER BY b.id",
+    let sql = format!(
+        "{MAIL_PROJECTION} AND b.status = 'open' \
+         AND NOT EXISTS (SELECT 1 FROM bead_meta rr WHERE rr.bead_id = b.id AND rr.key = ?2 AND rr.value = 'true') \
+         ORDER BY b.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params![MAIL_FROM_KEY, MAIL_READ_KEY, MAIL_TO_KEY, HUMAN],
+        map_mail_row,
     )?;
-    let rows = stmt.query_map([MAIL_FROM_KEY, MAIL_READ_KEY], |r| {
-        Ok(MailMessage {
-            id: r.get(0)?,
-            subject: r.get(1)?,
-            body: r.get(2)?,
-            from: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            read: false,
-        })
-    })?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -295,15 +388,31 @@ pub fn unread_human_mail(conn: &Connection) -> Result<Vec<MailMessage>, CoreErro
     Ok(out)
 }
 
+/// The full projection for ONE mail bead (any status), or `None` if the id is
+/// not a `type='mail'` bead. Task 7's `read`/`archive` use this instead of
+/// `BeadRow` (no `description` field; type column is `kind`).
+pub fn mail_message_by_id(conn: &Connection, id: &str) -> Result<Option<MailMessage>, CoreError> {
+    use rusqlite::OptionalExtension;
+    let sql = format!("{MAIL_PROJECTION} AND b.id = ?5");
+    let mut stmt = conn.prepare(&sql)?;
+    Ok(stmt
+        .query_row(
+            rusqlite::params![MAIL_FROM_KEY, MAIL_READ_KEY, MAIL_TO_KEY, HUMAN, id],
+            map_mail_row,
+        )
+        .optional()?)
+}
+
 /// The unread-`human`-mail count — the statusline/`/status` badge.
 pub fn unread_human_mail_count(conn: &Connection) -> Result<u64, CoreError> {
     let n: i64 = conn.query_row(
         "SELECT count(*) FROM beads b
          WHERE b.type = 'mail' AND b.status = 'open'
+           AND EXISTS (SELECT 1 FROM bead_meta t WHERE t.bead_id = b.id AND t.key = ?2 AND t.value = 'human')
            AND NOT EXISTS (
              SELECT 1 FROM bead_meta r
              WHERE r.bead_id = b.id AND r.key = ?1 AND r.value = 'true')",
-        [MAIL_READ_KEY],
+        rusqlite::params![MAIL_READ_KEY, MAIL_TO_KEY],
         |r| r.get(0),
     )?;
     u64::try_from(n).map_err(|_| CoreError::Corrupt(format!("negative unread-mail count {n}")))
@@ -322,7 +431,15 @@ mod tests {
     }
 
     fn send(l: &mut Ledger, id: &str, subject: &str, body: &str, from: &str) {
-        l.append(mail_bead_event("gc", subject, body, from, id)).unwrap();
+        l.append(mail_bead_event("gc", subject, body, from, "gc-shim", id)).unwrap();
+    }
+
+    fn mark_read(l: &mut Ledger, id: &str) {
+        l.append(EventInput {
+            kind: EventType::BeadUpdated, rig: None, actor: "cli".into(),
+            bead: Some(id.into()),
+            data: serde_json::json!({ "metadata": { MAIL_READ_KEY: "true" } }),
+        }).unwrap();
     }
 
     #[test]
@@ -342,13 +459,26 @@ mod tests {
     fn marking_read_drops_it_from_unread() {
         let (_d, mut l) = ledger();
         send(&mut l, "gc-1", "s", "b", "from");
-        l.append(EventInput {
-            kind: EventType::BeadUpdated, rig: None, actor: "cli".into(),
-            bead: Some("gc-1".into()),
-            data: serde_json::json!({ "metadata": { MAIL_READ_KEY: "true" } }),
-        }).unwrap();
+        mark_read(&mut l, "gc-1");
         assert_eq!(unread_human_mail_count(l.conn_for_test()).unwrap(), 0);
         assert!(unread_human_mail(l.conn_for_test()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mail_message_by_id_projects_read_state_and_rejects_non_mail() {
+        let (_d, mut l) = ledger();
+        send(&mut l, "gc-1", "Approve?", "the spec", "t/gc.publisher/1");
+        let m = mail_message_by_id(l.conn_for_test(), "gc-1").unwrap().unwrap();
+        assert_eq!((m.subject.as_str(), m.body.as_str(), m.read), ("Approve?", "the spec", false));
+        mark_read(&mut l, "gc-1");
+        assert!(mail_message_by_id(l.conn_for_test(), "gc-1").unwrap().unwrap().read, "read flag projects true");
+        // A task bead is NOT a mail message → None (Task 7's read/archive reject).
+        l.append(EventInput {
+            kind: EventType::BeadCreated, rig: Some("gc".into()), actor: "cli".into(),
+            bead: Some("gc-2".into()), data: serde_json::json!({ "title": "work", "type": "task" }),
+        }).unwrap();
+        assert!(mail_message_by_id(l.conn_for_test(), "gc-2").unwrap().is_none());
+        assert!(mail_message_by_id(l.conn_for_test(), "nope").unwrap().is_none());
     }
 
     #[test]
@@ -383,10 +513,10 @@ pub(crate) fn conn_for_test(&self) -> &rusqlite::Connection { &self.conn }
 
 - [ ] **Step 3: Run the tests to verify they fail, then pass.**
   Run: `cargo test -p camp-core mail::tests`
-  Before Step 1/2 exist: compile error. After: 4 passed.
+  Before Step 1/2 exist: compile error. After: 5 passed.
 
 - [ ] **Step 4: Name the mutations.**
-  `marking_read_drops_it_from_unread` DIES if the `NOT EXISTS … mail.read` clause is dropped. `a_task_bead_is_never_mail` DIES if the `type='mail'` filter is dropped. `raw_body_is_stored_and_sanitized_only_at_render` DIES if `mail_bead_event` sanitizes at ingest.
+  `marking_read_drops_it_from_unread` DIES if the `NOT EXISTS … mail.read` clause is dropped. `a_task_bead_is_never_mail` DIES if the `type='mail'` filter is dropped. `raw_body_is_stored_and_sanitized_only_at_render` DIES if `mail_bead_event` sanitizes at ingest. `mail_message_by_id_projects_read_state_and_rejects_non_mail` DIES if the read-flag projection (column 4) is wrong, or if the `type='mail'` guard is dropped (a task bead would resolve as mail).
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -418,7 +548,7 @@ fn status_summary_reports_unread_mail_separately_from_task_counts() {
         bead: Some("gc-1".into()),
         data: serde_json::json!({ "title": "work", "type": "task" }),
     }).unwrap();
-    l.append(crate::mail::mail_bead_event("gc", "hi", "body", "from", "gc-2")).unwrap();
+    l.append(crate::mail::mail_bead_event("gc", "hi", "body", "from", "cli", "gc-2")).unwrap();
     let s = l.status_summary().unwrap();
     assert_eq!(s.open, 1, "mail is NOT a task and must not inflate open");
     assert_eq!(s.ready, 1);
@@ -452,6 +582,12 @@ fn status_summary_reports_unread_mail_separately_from_task_counts() {
     /// The unread-`human`-mail count, for the status surfaces and `mail check`.
     pub fn unread_mail_count(&self) -> Result<u64, CoreError> {
         crate::mail::unread_human_mail_count(&self.conn)
+    }
+    /// One mail message by id (any status), or `None` if not a mail bead —
+    /// for `camp mail read`/`archive` (Task 7), which must avoid `BeadRow`
+    /// (no `description`; type column is `kind`).
+    pub fn mail_message(&self, id: &str) -> Result<Option<crate::mail::MailMessage>, CoreError> {
+        crate::mail::mail_message_by_id(&self.conn, id)
     }
 ```
 
@@ -574,7 +710,7 @@ fn send(camp: &CampDir, args: &[String]) -> Result<ShimExit> {
     let rig = worker_rig(&ledger)?;
     let prefix = rig_prefix(camp, &rig)?;
     let id = ledger.next_bead_id(&prefix)?;
-    let seq = ledger.append(mail_bead_event(&rig, &subject, &body, &sender, &id))?;
+    let seq = ledger.append(mail_bead_event(&rig, &subject, &body, &sender, "gc-shim", &id))?;
     crate::daemon::socket::poke_best_effort(camp, seq);
     Ok(ShimExit(0))
 }
@@ -721,6 +857,23 @@ mod tests {
         let l = Ledger::open(&camp.db_path()).unwrap();
         assert!(l.events_of_type(EventType::ShimRefused).unwrap().iter().any(|e| e.data["verb"] == "mail check"));
     }
+
+    #[test]
+    fn documented_send_flags_pass_through_not_refused() {
+        // gc's send grammar carries --json and --notify/--nudge (A1). If a
+        // future edit dropped their accept arms, they'd fall into the
+        // `starts_with('-')` refuse branch and silently break gc compat. This
+        // test guards that: the mail bead is still created.
+        let (_d, camp) = worker_camp();
+        run(&camp, &s(&["send", "human", "--json", "--notify", "-s", "Green", "-m", "build passed"])).unwrap();
+        let l = Ledger::open(&camp.db_path()).unwrap();
+        let inbox = camp_core::mail::unread_human_mail(l.conn_for_test()).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].subject, "Green");
+        assert_eq!(inbox[0].body, "build passed");
+        // No refusal was recorded for a documented flag.
+        assert!(l.events_of_type(EventType::ShimRefused).unwrap().is_empty());
+    }
 }
 ```
 
@@ -728,11 +881,11 @@ mod tests {
   In `crates/camp/src/cmd/shim/mod.rs`: add `pub mod mail;` and add `Some("mail") => mail::mail::run(camp, &args[1..]),` — NB the path is `mail::run` (module `shim::mail`); write `Some("mail") => mail::run(camp, &args[1..]),`. Place it BEFORE the catch-all `_ => refuse(…)` in `gc_shim`. Update the module doc note (`mod.rs:71`) to drop `mail` from the refused list.
 
 - [ ] **Step 3: Confirm the `BeadRow.rig` field name.**
-  `worker_rig` reads `row.rig`. Confirm `bead_row` returns a struct with a `rig: String` field (grep the `BeadRow`/`bead_row` definition in `ledger/mod.rs`; the `worker_contract.rs` test already relies on `bead_row`). If the field has another name, use it.
+  `worker_rig` reads `row.rig`. CONFIRMED: `BeadRow` (readiness.rs:17) has `pub rig: String`, and `Ledger::bead_row` returns `Option<BeadRow>` (compat-3's `bd-shim show` uses it). No change expected.
 
 - [ ] **Step 4: Run the tests to verify they fail, then pass.**
   Run: `cargo test -p camp shim::mail`
-  First: FAIL (module missing). After: 8 passed.
+  First: FAIL (module missing). After: 9 passed.
   NOTE on `set_var`: the env writes are process-global. If parallel tests interfere, either (a) if `serial_test` is already a dev-dependency (grep `Cargo.toml`), annotate these with `#[serial_test::serial]`, or (b) keep each test self-contained (they set CAMP_BEAD/CAMP_SESSION at entry) and rely on the same fixed values across tests so a race is harmless.
 
 - [ ] **Step 5: Name the mutations.**
@@ -832,6 +985,28 @@ mod tests {
     }
 
     #[test]
+    fn prime_resolves_a_QUALIFIED_gc_agent_name() {
+        // The REAL worker's GC_AGENT is qualified (e.g. `gc.publisher`), NOT a
+        // bare name. Mirror compat-1's import fixture (pack.rs
+        // `qualified_route_resolves_through_binding`): a git-source binding
+        // materializes at <root>/imports/<binding>/agents/<agent>/.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n[imports.gc]\nsource=\"file:///unused\"\n").unwrap();
+        let a = root.join("imports/gc/agents/publisher");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("prompt.md"), "QUALIFIED_PRIME: publish it.").unwrap();
+        let camp = CampDir { root };
+        let cfg = camp_core::config::CampConfig::load(&camp.config_path()).unwrap();
+        assert_eq!(
+            camp_core::pack::resolve_agent(&cfg, "gc.publisher").unwrap().prompt,
+            "QUALIFIED_PRIME: publish it."
+        );
+        assert_eq!(run(&camp, &["gc.publisher".to_owned()]).unwrap().0, 0);
+    }
+
+    #[test]
     fn prime_falls_back_to_gc_agent_env_when_no_arg() {
         let (_d, camp) = camp_with_agent();
         unsafe { std::env::set_var("GC_AGENT", "dev"); }
@@ -864,10 +1039,10 @@ mod tests {
 
 - [ ] **Step 3: Run the tests to verify they fail, then pass.**
   Run: `cargo test -p camp shim::prime`
-  Expected after impl: 4 passed.
+  Expected after impl: 5 passed.
 
 - [ ] **Step 4: Name the mutations.**
-  `prime_with_no_name_anywhere_is_a_hard_error_not_a_default_prompt` DIES if a gc-style default-prompt fallback is added. `prime_on_an_unknown_agent_fails_fast_naming_it` DIES if `resolve_agent`'s error is swallowed. `prime_falls_back_to_gc_agent_env_when_no_arg` DIES if the env chain is dropped.
+  `prime_with_no_name_anywhere_is_a_hard_error_not_a_default_prompt` DIES if a gc-style default-prompt fallback is added. `prime_on_an_unknown_agent_fails_fast_naming_it` DIES if `resolve_agent`'s error is swallowed. `prime_falls_back_to_gc_agent_env_when_no_arg` DIES if the env chain is dropped. `prime_resolves_a_QUALIFIED_gc_agent_name` DIES if prime mangles the qualified name before handing it to `resolve_agent` (the real worker's `GC_AGENT` is always qualified).
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -884,7 +1059,7 @@ git commit -m "compat-4: gc-shim prime — renders the resolved agent's material
 - Modify: `crates/camp/src/cmd/mod.rs` (`pub mod mail;`)
 
 **Interfaces:**
-- Consumes: `camp_core::mail::{mail_bead_event, unread_human_mail, MailMessage, MAIL_READ_KEY, MAIL_FROM_KEY, HUMAN}`; `crate::cmd::create::resolve_rig`; `crate::cmd::close::run`; `Ledger::{unread_mail, unread_mail_count, bead_row, bead_metadata}`.
+- Consumes: `camp_core::mail::{mail_bead_event, MAIL_READ_KEY, HUMAN}` + `MailMessage::sanitized`; `crate::cmd::create::resolve_rig`; `crate::cmd::close::run`; `Ledger::{unread_mail, unread_mail_count, mail_message, next_bead_id, bead_row}` (`bead_row` only in a test's status assertion — `read`/`archive` use `mail_message`, never `BeadRow`).
 - Produces: `crate::cmd::mail::{send, inbox, read, archive, count}` free functions. `main.rs` (Task 8) routes to them.
 
 - [ ] **Step 1: Write the failing tests + module.** Create `crates/camp/src/cmd/mail.rs`:
@@ -901,7 +1076,7 @@ use anyhow::{Result, anyhow, bail};
 use camp_core::config::CampConfig;
 use camp_core::event::{EventInput, EventType};
 use camp_core::ledger::Ledger;
-use camp_core::mail::{HUMAN, MAIL_FROM_KEY, MAIL_READ_KEY, mail_bead_event};
+use camp_core::mail::{HUMAN, MAIL_READ_KEY, mail_bead_event};
 
 use crate::campdir::CampDir;
 
@@ -924,6 +1099,7 @@ pub fn send(camp: &CampDir, recipient: &str, subject: Option<String>, body: Stri
         subject.as_deref().unwrap_or_default(),
         &body,
         HUMAN, // operator-authored mail is from the human
+        "cli", // event actor: operator-issued, not a worker shim
         &id,
     ))?;
     crate::daemon::socket::poke_best_effort(camp, seq);
@@ -950,21 +1126,20 @@ pub fn inbox(camp: &CampDir, json: bool) -> Result<()> {
 }
 
 /// `camp mail read <id>` — print the (sanitized) message and mark it read
-/// (metadata `mail.read=true` via bead.updated; the bead stays open, A3).
+/// (metadata `mail.read=true` via bead.updated; the bead stays open, A3). Uses
+/// `Ledger::mail_message` (NOT `BeadRow`, which has `kind` not `bead_type` and
+/// no `description` — C4-B3); a non-mail id resolves to `None` and is rejected.
 pub fn read(camp: &CampDir, id: &str) -> Result<()> {
     let mut ledger = Ledger::open(&camp.db_path())?;
-    let row = ledger.bead_row(id)?.ok_or_else(|| anyhow!("camp mail read: no such message {id}"))?;
-    if row.bead_type != "mail" {
-        bail!("camp mail read: bead {id} is type {:?}, not mail", row.bead_type);
-    }
-    let meta = ledger.bead_metadata(id)?;
-    use camp_core::promptsafe::sanitize_for_system_reminder as san;
-    let from = meta.get(MAIL_FROM_KEY).cloned().unwrap_or_default();
-    println!("from: {}", san(&from));
-    println!("subject: {}", san(&row.title));
+    let msg = ledger
+        .mail_message(id)?
+        .ok_or_else(|| anyhow!("camp mail read: no such mail message {id}"))?;
+    let s = msg.sanitized(); // neutralize the breakout at the render edge (A6)
+    println!("from: {}", s.from);
+    println!("subject: {}", s.subject);
     println!();
-    println!("{}", san(&row.description));
-    if meta.get(MAIL_READ_KEY).map(String::as_str) != Some("true") {
+    println!("{}", s.body);
+    if !msg.read {
         let seq = ledger.append(EventInput {
             kind: EventType::BeadUpdated, rig: None, actor: "cli".into(), bead: Some(id.to_owned()),
             data: serde_json::json!({ "metadata": { MAIL_READ_KEY: "true" } }),
@@ -979,9 +1154,8 @@ pub fn read(camp: &CampDir, id: &str) -> Result<()> {
 pub fn archive(camp: &CampDir, ids: &[String]) -> Result<()> {
     for id in ids {
         let ledger = Ledger::open(&camp.db_path())?;
-        let row = ledger.bead_row(id)?.ok_or_else(|| anyhow!("camp mail archive: no such message {id}"))?;
-        if row.bead_type != "mail" {
-            bail!("camp mail archive: bead {id} is type {:?}, not mail", row.bead_type);
+        if ledger.mail_message(id)?.is_none() {
+            bail!("camp mail archive: {id} is not a mail message");
         }
         drop(ledger);
         // Reuse camp's close path (vocabulary validation). No work_outcome/commit.
@@ -1053,24 +1227,43 @@ mod tests {
         drop(ledger);
         read(&camp, &id).unwrap(); // prints sanitized; Task 10 asserts the stripped stdout
     }
+
+    #[test]
+    fn read_and_archive_reject_a_non_mail_id() {
+        let (_d, camp) = camp_gc();
+        // A real task bead (via camp create) is NOT a mail message.
+        let mut l = Ledger::open(&camp.db_path()).unwrap();
+        l.append(camp_core::event::EventInput {
+            kind: EventType::BeadCreated, rig: Some("gc".into()), actor: "cli".into(),
+            bead: Some("gc-1".into()), data: serde_json::json!({ "title": "work", "type": "task" }),
+        }).unwrap();
+        drop(l);
+        assert!(format!("{:#}", read(&camp, "gc-1").unwrap_err()).contains("not a mail message") ||
+                format!("{:#}", read(&camp, "gc-1").unwrap_err()).contains("no such mail"));
+        assert!(format!("{:#}", archive(&camp, &["gc-1".to_owned()]).unwrap_err()).contains("not a mail"));
+    }
 }
 ```
 
-- [ ] **Step 2: Confirm the `BeadRow` fields + `close::run` signature.**
-  `read`/`archive` read `row.bead_type`, `row.title`, `row.description`, `row.status`. Grep the `BeadRow` struct (`ledger/mod.rs`) and confirm those field names (the type column may be named `bead_type`/`kind`/`r#type` — use the real one; if `BeadRow` lacks the `type` column, add it to the SELECT + struct, additive). The `archive` call copies `bd.rs:174`'s exact `close::run(camp, id, outcome, reason, false, None, None, None, None)` shape — open `crates/camp/src/cmd/close.rs`, confirm the parameter list, and match it byte-for-byte. Add `pub mod mail;` to `crates/camp/src/cmd/mod.rs`.
+- [ ] **Step 2: Confirm the `close::run` signature + register the module.**
+  `read`/`archive` no longer touch `BeadRow` — they use `Ledger::mail_message` (Task 3), sidestepping C4-B3 (`BeadRow` has `kind` not `bead_type`, and NO `description`). The `archive_closes_the_mail_bead` test reads `bead_row(id).status` only, which is a real `BeadRow` field. The `archive` close call copies `bd.rs:174`'s exact `close::run(camp, id, outcome, reason, false, None, None, None, None)` shape — open `crates/camp/src/cmd/close.rs`, confirm the parameter list, and match it byte-for-byte. Add `pub mod mail;` to `crates/camp/src/cmd/mod.rs`.
 
 - [ ] **Step 3: Run the tests to verify they fail, then pass.**
   Run: `cargo test -p camp cmd::mail`
-  Expected after impl: 4 passed.
+  Expected after impl: 5 passed.
 
 - [ ] **Step 4: Name the mutations.**
-  `send_then_read_marks_read_and_drops_unread_count` DIES if `read` omits the `bead.updated` mail.read write. `archive_closes_the_mail_bead` DIES if archive marks metadata instead of closing. `send_to_non_human_is_refused` DIES if the recipient guard is dropped.
+  `send_then_read_marks_read_and_drops_unread_count` DIES if `read` omits the `bead.updated` mail.read write. `archive_closes_the_mail_bead` DIES if archive marks metadata instead of closing. `send_to_non_human_is_refused` DIES if the recipient guard is dropped. `read_and_archive_reject_a_non_mail_id` DIES if `mail_message`'s `type='mail'` guard is dropped (a task bead would be read/archived as mail).
 
 - [ ] **Step 5: Commit.**
 ```bash
 git add crates/camp/src/cmd/mail.rs crates/camp/src/cmd/mod.rs
 git commit -m "compat-4: camp mail CLI — send/inbox/read/archive/count, sanitized at render"
 ```
+
+**NOTE — export/differential fidelity (v2 concern, documented, not a v1 blocker):**
+- `camp mail archive` CLOSES the mail bead (status=closed, outcome=pass); gc's `Archive` DELETES it. Camp never deletes (invariant 3 — nothing hidden). So a post-archive differential against gc will show camp RETAINING a `message` bead (`export.rs:189` maps `mail → message`) where gc has none. This is the deliberate camp↔gc divergence, not a defect — record it wherever a mail differential is added.
+- Camp v1 stores only `mail.from_display`/`mail.to_display` (A4); gc also stores `mail.from_session_id`/`mail.to_session_id` (routing back to a session). v1 has no agent recipient, so those keys are unused — but a v2 (gastown) agent-to-agent mail, and full export fidelity, will need them. Left for v2.
 
 ---
 
@@ -1411,8 +1604,10 @@ git commit -m "compat-4: hermetic gate — 10 send-human shapes, prime stdout, b
 - Modify: `.github/workflows/ci.yml` (run it in the `gcpacks-compat` job)
 
 **Interfaces:**
-- Consumes: the corpus checkout at `GCPACKS_REF` (the CI job checks it into `gcpacks-src`, `ci.yml:82-93`).
-- Produces: a gate that trips if a future `GCPACKS_REF` move introduces a non-human `gc mail send` in a v1 pack OR puts `gc prime` on an executed v1 worker path.
+- Consumes: the corpus checkout at `GCPACKS_REF` (the CI job checks it into `gcpacks-src`).
+- Produces: a gate that trips if a future `GCPACKS_REF` move introduces a non-human `gc mail send` in a v1-served pack, scans TOO FEW sends (a vacuous pass), OR turns a `gc prime` prohibition into an invocation.
+
+**C4-B1 fix — round-1 was VACUOUS and mis-targeted** (confirmed against `GCPACKS_REF`, A8): its `V1_PACKS = [bmad, gstack, compound-engineering, gascity/roles]` contain ZERO sends — the real sends live under `gascity/assets` (6) and `superpowers/assets` (2), roots the old guard never scanned, so it printed "OK" having examined NOTHING. This version scans the correct roots AND asserts a floor.
 
 - [ ] **Step 1: Write the guard script.**
   Create `ci/gc-compat/mail_prime_corpus.py` (structure modeled on `ci/gc-compat/worker_contract.py` — arg = corpus dir):
@@ -1421,26 +1616,32 @@ git commit -m "compat-4: hermetic gate — 10 send-human shapes, prime stdout, b
 #!/usr/bin/env python3
 """usage: mail_prime_corpus.py <corpus-checkout>
 
-The compat-4 drift guard (measured at GCPACKS_REF, compat §8.2 + A7). Two
-invariants the mail/prime shim relies on:
+compat-4 drift guard (MEASURED at GCPACKS_REF; A7/A8), over the V1-SERVED packs.
+Two invariants the mail/prime shim relies on:
 
-  1. Every concrete `gc mail send` in a v1 target pack addresses `human`. A
-     non-human recipient means agent-to-agent mail arrived in v1 — which the
-     shim REFUSES (gastown/v2). The gate trips so the refusal is revisited.
-  2. `gc prime` is on NO executed v1 worker path (it appears only in
-     prohibition prose). A prime invocation in a non-prose v1 file means
-     Task 6's serve-shape must be re-measured.
+  1. Every concrete `gc mail send` addresses `human`, AND at least
+     MIN_HUMAN_SENDS such sends are actually examined — so a run that scanned
+     the WRONG roots (and saw zero sends) is a HARD FAILURE, not a silent
+     "OK". This is the C4-B1 anti-vacuity floor.
+  2. Every `gc prime` occurrence is prohibition prose ("Do not run gc prime");
+     a bare invocation means prime reached an executed v1 path → re-measure
+     Task 6's serve-shape.
 
-Exits nonzero on any violation, naming the file. Coarse by design: its job is
-to force a re-measure on a corpus move, not to parse gc.
+V1-served roots (A8) = the packs camp v1 imports + transitive `gascity` content.
+Scanning `gascity` covers `gascity/assets` (the 6 sends) AND `gascity/roles`.
+`gastown` (v2 — 41 legitimately non-human sends) and `oversight-rig` are
+DELIBERATELY NOT scanned. Exits nonzero on any violation or a below-floor
+count, naming the file.
 """
 import pathlib, re, sys
 
-V1_PACKS = ["bmad", "gstack", "compound-engineering", "gascity/roles"]
+V1_ROOTS = ["bmad", "gstack", "compound-engineering", "superpowers", "gascity"]
+MIN_HUMAN_SENDS = 8  # measured at GCPACKS_REF (A8): 6 gascity/assets + 2 superpowers/assets
 SEND_RE = re.compile(r"gc\s+mail\s+send\s+(?:--to\s+)?(\S+)")
+PROHIBITION = re.compile(r"do not|don't|never", re.IGNORECASE)
 
 def v1_files(root: pathlib.Path):
-    for pack in V1_PACKS:
+    for pack in V1_ROOTS:
         base = root / pack
         if not base.is_dir():
             continue
@@ -1450,41 +1651,54 @@ def v1_files(root: pathlib.Path):
 
 def main() -> int:
     root = pathlib.Path(sys.argv[1])
-    problems = []
+    problems, human_sends, prime_prohibitions, files = [], 0, 0, 0
     for p in v1_files(root):
+        files += 1
         text = p.read_text(encoding="utf-8", errors="replace")
         for m in SEND_RE.finditer(text):
             rcpt = m.group(1)
-            # Placeholder/prose recipients ("send human ...", "send {{x}}") are
-            # not concrete; only a concrete NON-human recipient is a violation.
-            if rcpt.startswith(("-", "{{", "...", "<", "`", '"', "'")):
+            # A flag/placeholder/variable token is not a concrete recipient.
+            if rcpt.startswith(("-", "{{", "...", "<", "`", '"', "'", "$")):
                 continue
-            if rcpt != "human":
+            if rcpt == "human":
+                human_sends += 1
+            else:
                 problems.append(f"{p}: `gc mail send {rcpt}` is not `human` (v1 is send-human only)")
-        # prime executed on a v1 worker path = a bare `gc prime` in a non-.md
-        # (a formula .toml command / .tmpl script), not prohibition prose.
         for ln in text.splitlines():
-            if "gc prime" in ln and p.suffix != ".md":
-                problems.append(f"{p}: `gc prime` in a non-prose file (v1 worker path must not run prime)")
+            if "gc prime" in ln:
+                if PROHIBITION.search(ln):
+                    prime_prohibitions += 1
+                else:
+                    problems.append(
+                        f"{p}: `gc prime` invoked, not prohibited ({ln.strip()!r}) — "
+                        "prime reached a v1 path; re-measure Task 6")
+    # THE anti-vacuity assertion (C4-B1): a guard that examined too few sends
+    # scanned the wrong roots or the corpus moved. Either way, do NOT pass.
+    if human_sends < MIN_HUMAN_SENDS:
+        problems.append(
+            f"VACUOUS: examined only {human_sends} `send human` calls across {files} v1 files "
+            f"(floor {MIN_HUMAN_SENDS}); the guard scanned the wrong roots or the corpus moved — "
+            "re-measure (A8) before touching this.")
     if problems:
         print("compat-4 corpus drift:", *problems, sep="\n  ")
         return 1
-    print(f"compat-4 corpus guard OK ({len(V1_PACKS)} v1 packs): all sends → human; prime prose-only")
+    print(f"compat-4 corpus guard OK: {human_sends} `send human` (floor {MIN_HUMAN_SENDS}), "
+          f"0 non-human; {prime_prohibitions} `gc prime` all prohibition-prose, across {files} v1 files")
     return 0
 
 if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 2: Validate against the real corpus locally.**
-  Clone the corpus at `GCPACKS_REF` (shallow; the drift procedure in `ci/gc-compat/README.md` is the reference), then:
+- [ ] **Step 2: Validate against the real corpus locally — CONFIRM A NONZERO COUNT.**
+  Shallow-clone the corpus at `GCPACKS_REF` (the drift procedure in `ci/gc-compat/README.md` is the reference), then:
   Run: `python3 ci/gc-compat/mail_prime_corpus.py <gcpacks-checkout>`
-  Expected: `compat-4 corpus guard OK …` exit 0. If a known-good line (A7's 8 workflow prose sends, all `human`) trips it, widen the placeholder skip-set — do NOT weaken the non-human assertion. If a v1 `.toml`/`.tmpl` legitimately contains `gc prime` (none do at `GCPACKS_REF`), the guard has found a real scope change — STOP and escalate.
+  Expected (measured, A8): exit 0 with **`compat-4 corpus guard OK: 8 send human (floor 8), 0 non-human; …`**. The implementer MUST see the literal `8 send human` — a printout of `0 send human` (or any number `< 8`) means the guard is vacuous/mis-targeted and MUST be fixed before commit (this is the exact C4-B1 failure round-1 shipped). Sanity-check the floor by temporarily pointing `V1_ROOTS` at a send-free root (e.g. `["oversight-rig"]`) and confirming the guard FAILS with the `VACUOUS` message; restore.
 
 - [ ] **Step 3: Wire into CI.**
-  In `.github/workflows/ci.yml`, `gcpacks-compat` job, after the existing corpus steps (~line 103):
+  In `.github/workflows/ci.yml`, `gcpacks-compat` job, insert the step immediately AFTER the `phase-3 WORKER CONTRACT gate` step (`worker_contract.py`) and BEFORE the `read pinned gascity ref` step:
 ```yaml
-      - name: compat-4 mail/prime corpus guard
+      - name: compat-4 mail/prime corpus guard (v1 sends stay send-human; prime stays prose-only)
         run: python3 ci/gc-compat/mail_prime_corpus.py gcpacks-src
 ```
 
@@ -1559,9 +1773,11 @@ EOF
 - 10 corpus send-human calls through the shim (exit criterion) → Task 10. ✓
 - no polling / CI green (exit criteria) → Task 12 + Task 11. ✓
 
-**Placeholder scan:** every code step carries complete code. Three deliberate implementation-time confirmations, each with an exact fallback: the test-connection accessor name (Task 2 Step 2), the `BeadRow` field names + `close::run` argument shape pinned to `bd.rs:174` (Task 4 Step 3, Task 7 Step 2), and the badge argument types (Task 9 Step 3). These are "use the real name/shape and adjust," not open design.
+**Placeholder scan:** every code step carries complete code. Two deliberate implementation-time confirmations, each with an exact fallback: the test-connection accessor name (Task 2 Step 2) and the `close::run` argument shape pinned to `bd.rs:174` (Task 7 Step 2). The `BeadRow` question is now RESOLVED in-plan (C4-B3): `read`/`archive` use `Ledger::mail_message` and never touch `BeadRow`; `worker_rig` reads `BeadRow.rig` (verified present, readiness.rs:17). The badge arg types (Task 9) are pinned to `StatusSummary`'s `u64`/`usize`.
 
-**Type consistency:** `mail_bead_event(rig, subject, body, from, bead_id)`, `MailMessage{id,from,subject,body,read}`, `unread_human_mail`/`unread_human_mail_count` (camp-core free fns) + `Ledger::unread_mail`/`unread_mail_count` (thin methods), `StatusSummary.unread_mail`, `sanitize_for_system_reminder`, `badge(live,ready,red,unread_mail)` are used identically across Tasks 2–10. Metadata keys are the single `MAIL_FROM_KEY`/`MAIL_TO_KEY`/`MAIL_READ_KEY` constants (Task 2), reused everywhere (invariant 7). The shim `mail` dispatch (`Some("mail") => mail::run`) and the `check` reference are consistent within `shim/mail.rs`.
+**Round-1 gate fixes verified against code/corpus:** metadata table is `bead_meta` (C4-B2's `n`/`ndata` claim is wrong — schema.rs:52, fold.rs:264, readiness.rs:203); `BeadRow` is `kind`+no-`description` (C4-B3 confirmed → `mail_message` path added); gc `promptsafe` is exact-literal case-sensitive fixpoint (C4-B4 re-measured at GASCITY_REF → camp's `str::replace` already matches, boundary tests added); the corpus guard now scans `{bmad,gstack,compound-engineering,superpowers,gascity}` with a floor of 8 and was RUN against `GCPACKS_REF` (prints `8 send human`, and trips `VACUOUS` on a send-free root) (C4-B1 fixed).
+
+**Type consistency:** `mail_bead_event(rig, subject, body, from, actor, bead_id)`, `MailMessage{id,from,subject,body,read}` + `MailMessage::sanitized`, `unread_human_mail`/`unread_human_mail_count`/`mail_message_by_id` (camp-core free fns) + `Ledger::unread_mail`/`unread_mail_count`/`mail_message` (thin methods), `StatusSummary.unread_mail`, `sanitize_for_system_reminder`, `badge(live,ready,red,unread_mail)` are used identically across Tasks 2–10. Metadata keys are the single `MAIL_FROM_KEY`/`MAIL_TO_KEY`/`MAIL_READ_KEY` constants (Task 2), reused everywhere (invariant 7). The shim `mail` dispatch (`Some("mail") => mail::run`) and the `check` reference are consistent within `shim/mail.rs`.
 
 ## Execution Handoff
 
