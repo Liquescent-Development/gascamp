@@ -1,5 +1,10 @@
 # cp-2 — `camp watch`, the fleet view — Implementation Plan
 
+## Plan-gate approval (2026-07-14)
+APPROVED by the adversarial 4-panelist plan gate. Rounds: R1 REJECT (8 findings, all fixed in e111076) → R2 REJECT on 1 trivial forward-reference compile defect (fixed in 3aefdd1) → R3 confirm APPROVE. Final lens verdicts: contract/execution/critic APPROVE (round 2), interface APPROVE (round 3).
+Architecture ruled CORRECT, not a deviation: the model-diff source for fleet.subscribe was decisively verified (patrol.rs stall-recovery and read_channel last_activity are un-evented, so a ledger-cursor replay cannot reconstruct STATE/LAST). LAST rendered as relative-time is faithful to §7's phase-4 assignment of typed-stream rendering; FOR is client-side; fleet.subscribe carries no cursor. All ruled faithful to the spec by the contract panel.
+Non-blocking notes carried into execution (do NOT skip): (1) exercise or explicitly leave-as-known-gap the `pump` take/restore against the cached self.fleet_model — a forgotten restore re-fills a resumed cap-STOPped delta against an empty model → spurious per-row `gone`; (2) the two degraded_event defensive branches (oversized single frame; fleet_model() refresh error) are live but untested — follow-up candidates; (3) the `gone`-frame proof is the absence of a fleet-connection poke, and the frame rides a genuine reap wake (SIGCHLD or the interrupt connection closing) — keep the test docstring precise.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship `camp watch` — a push-driven fleet monitor that renders one line per live session (agent, bead, state, FOR, LAST) from campd's socket alone, driven by a new `fleet.subscribe` connection mode. No client file access, zero polling.
