@@ -50,8 +50,14 @@ FROM debian:bookworm-slim
 # ca-certificates for the worker you wire into [dispatch].command (a real
 #                 Claude Code worker talks TLS). camp itself opens no sockets
 #                 but the unix one.
+# python3         a HARD runtime dependency of the gc worker contract (compat
+#                 §6.1): every gc pack agent's shared gc-role-worker fragment
+#                 parses `hook --claim --json` and `bd show --json` with an
+#                 inline `python3`, and refuses (CONFIG_REJECTED — drain-ack,
+#                 exit 0, doing nothing) if it is absent. No python3, no gc
+#                 worker.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git tini \
+ && apt-get install -y --no-install-recommends ca-certificates git tini python3 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/target/release/camp /usr/local/bin/camp
