@@ -8,7 +8,11 @@ PENDING — round 1 REJECT (architecture ruled SOUND; 4 blocking findings, all t
 - **CP3-B2 (real, test-design):** the disarm and the `declare_stalls` skip mutually mask (verified against `declare_stalls`/`fire_due`). FIXED (Task 8): two INDEPENDENT unit tests — the disarm's invariant-1 guard (no armed timer after `permission.pending`) and the skip (a blocked session WITH an armed timer declares zero `agent.stalled`) — plus concretized heart-tests.
 - **CP3-B3 (real, wiring):** verified `session_ended(…,"crashed")` reopens the bead UNCONDITIONALLY (`UPDATE beads SET status='open', claimed_by=NULL … WHERE claimed_by=<session> AND status='in_progress'`, fold.rs:1167), independent of reason and of patrol tracking; and `observe`'s re-hook needs `tracked.get(name)` Some + reason `starts_with("patrol restart")` (patrol.rs:308-321), which the untracked adopt arm never satisfies. FIXED (Task 11): the adoption kill mirrors the existing `"adopt: process not found"` append EXACTLY — key `"name"` (NOT `"session"`; `SessionEnd` is `deny_unknown_fields`, so `"session"` fails loud), `bead: None` — and the bead re-hook rides the FOLD crash-reopen; the `observe`/`reason_rehooks` change is DROPPED as inert; the test asserts the bead becomes dispatchable (`status='open'`, `claimed_by=NULL`).
 - **CP3-B4 (real, coverage):** FIXED (Task 11): a test for the post-adoption-DISCOVERED pending taking the NAMED kill, not the stall ladder.
-- **Non-blocking, folded in:** Task 13 moved to `tests/e2e.rs` under `CAMP_E2E`/`make e2e` (NOT `claude_compat.rs`, the $0 `make compat` tier); NoPipe inverse-window and re-arm are now numbered assertions; the no-watch harness affordance is confirmed to exist (`read_channel.rs:183-212`); the pre-ladder double-fanout is acknowledged; the `control.rs:2121`/`:2149` test destructures need the new `tool_use_id` binding (compile-caught).
+- **Non-blocking, folded in:** Task 13 moved to `tests/e2e.rs` under `CAMP_E2E`/`make e2e` (NOT `claude_compat.rs`, the $0 `make compat` tier); NoPipe inverse-window and re-arm are now numbered assertions; the pre-ladder double-fanout is acknowledged; the `control.rs:2121`/`:2149` test destructures need the new `tool_use_id` binding (compile-caught).
+
+### Round-2 gate revision (one blocking finding — the ladder-drains-first heart-test could confirm-but-not-falsify)
+- **CP3-R2-B1 (real).** Verified: `src/daemon/read_channel.rs:183` is the `StreamLine` struct, NOT a suppression helper — my round-1 note ("no-watch affordance confirmed at read_channel.rs:183-212") was FALSE and is retracted. The genuine suppression property is macOS-specific and lives in a DIFFERENT place: `tests/control.rs:183-186` measures that FSEvents delivers NO event for a worker's append through its **long-lived inherited stdout fd**, while a **fresh open+write+close by another process DOES fire one**. Two consequences the fix must honor: (1) a naive test-side `append().open().write()` (exactly what `tests/read_channel.rs`'s UNIT test does — which works only because it then calls `drain_all` DIRECTLY with no watcher running) FIRES notify in the integration harness → campd drains early → BLOCKED surfaces and the timer disarms BEFORE any `StallFire` pops → the test passes EVEN WITH the pre-ladder drain removed; (2) even genuine inherited-fd suppression is macOS-only — on Linux/CI, inotify delivers the append, so an INTEGRATION ladder-drains-first test cannot falsify the pre-ladder-drain removal there either. FIX (Task 8): the ladder-drains-first property is now pinned by a **platform-independent COMPONENT test** that drives the REAL event-loop ordering seam (an extracted `stall_step`) with NO watcher running — the unread line is genuinely unread by construction, and the test asserts a `StallFire` was popped AND BLOCKED surfaced AND zero `agent.stalled`; removing the pre-ladder drain makes `declare_stalls` see a not-blocked session and append `agent.stalled` (RED) on every platform. The fake-worker end-to-end is kept as a macOS-genuine confirm, no longer claimed as the falsifying guard.
+- **Non-blocking (round 2), folded in:** the three disarm/skip/re-arm unit guards move INLINE to `patrol.rs`'s `#[cfg(test)] mod tests` (they seed the private `blocked` field and read `#[cfg(test)] is_armed`, both invisible to an external test) using `fixture()` (patrol.rs:1487); the adopt-arm pending kill gains the `row.woke_actor == "campd"` guard the sibling release-kill carries (patrol.rs:1200), aligning with §10 "never kill in the TUI"; the crash-reopen re-hook is noted as an implicit fold coupling, not a dedicated code path; `rearm` confirmed as the real method name (patrol.rs:734).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -864,27 +868,68 @@ Re-arm of the stall timer is NOT done here — Task 8's `reconcile_blocked` re-a
 §5.3.3. The two heart-tests live here: **blocked-forever-not-killed** and **ladder-drains-first**.
 
 **Files:**
-- Modify: `crates/camp/src/daemon/patrol.rs` (add `blocked: HashSet<String>`; `reconcile_blocked`; `declare_stalls` skip ~664-676)
-- Modify: `crates/camp/src/daemon/event_loop.rs` (the pre-ladder drain before ~214; `reconcile_blocked` each wake)
-- Test: `crates/camp/tests/daemon_patrol.rs`
+- Modify: `crates/camp/src/daemon/patrol.rs` (add `blocked: HashSet<String>`; `reconcile_blocked`; `declare_stalls` skip ~664-676; `#[cfg(test)] pub fn is_armed`; the three inline unit guards in `mod tests`)
+- Modify: `crates/camp/src/daemon/event_loop.rs` (extract `stall_step`; call it at ~214-215; `reconcile_blocked` each wake; the `stall_step` component test in `mod tests`)
+- Test: `crates/camp/src/daemon/event_loop.rs` `#[cfg(test)]` (component, falsifiable); `crates/camp/src/daemon/patrol.rs` `#[cfg(test)]` (the three unit guards); `crates/camp/tests/daemon_patrol.rs` (the integration confirm)
 
 **Interfaces:**
 - Consumes: `ledger.blocked_sessions` (Task 2), `self.timers.{arm,disarm}` (the `PatrolTimers` API patrol already uses in `rearm`/`declare_stalls`), `read_channel.drain_all` + `control_step`.
 - Produces: `pub fn reconcile_blocked(&mut self, ledger: &Ledger, now: Timestamp) -> anyhow::Result<()>` on `PatrolRuntime`; a test accessor `#[cfg(test)] pub fn is_armed(&self, session: &str) -> bool` (reads `self.timers`) for the invariant-1 disarm guard.
 
-- [ ] **Step 1: Write the two failing INTEGRATION heart-tests** (`daemon_patrol.rs`, using the existing daemon+fake-worker harness). Mirror `ladder_exhaustion_emits_and_stops`'s assertion style — count events and assert the daemon is still live — rather than a comment sketch:
+- [ ] **Step 1a: Write the failing COMPONENT test for ladder-drains-first — the platform-independent, genuinely FALSIFIABLE guard (CP3-R2-B1).** It lives in `event_loop.rs`'s `#[cfg(test)] mod tests` and drives the REAL `stall_step` seam (Step 5) with NO watcher running, so the unread `can_use_tool` line is unread BY CONSTRUCTION on every platform — no dependence on FSEvents vs inotify. Removing the pre-ladder drain from `stall_step` makes `declare_stalls` see a not-blocked session and append `agent.stalled` → RED everywhere.
+
+```rust
+#[test]
+fn stall_step_drains_the_read_channel_before_declaring_a_stall() {
+    // Build the runtimes in-process (no mio watcher runs in this test):
+    let dir = tempfile::tempdir().unwrap();
+    let mut led = /* Ledger::open under dir; append a live session `s` (woke campd)
+                     that has claimed an in_progress bead `b-1` */;
+    let sessions_dir = dir.path().join("sessions");
+    let stdout = sessions_dir.join("s.json"); // the tailed stream file
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    std::fs::write(&stdout, b"").unwrap();
+    let mut read_channel = ReadChannelRuntime::new(sessions_dir.clone(), MAX_STREAM_BYTES_DEFAULT).unwrap();
+    read_channel.register(&mut led, "s").unwrap();
+    let mut control = ControlRuntime::new(SUBSCRIBER_BUFFER_BYTES_DEFAULT);
+    let mut dispatcher = /* test Dispatcher that reports `s` as a live child */;
+    let mut patrol = /* PatrolRuntime with `s` tracked and its stall timer armed
+                        with a deadline ALREADY IN THE PAST at `now` */;
+    let mut conns: HashMap<Token, Conn> = HashMap::new();
+    let mut poll = Poll::new().unwrap();
+    let now = /* past the armed deadline */;
+
+    // A can_use_tool is sitting UNREAD in the stream file — no watcher, no drain yet.
+    std::fs::OpenOptions::new().append(true).open(&stdout).unwrap()
+        .write_all(b"{\"type\":\"control_request\",\"request_id\":\"cli-9\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\"}}\n").unwrap();
+    assert!(patrol.is_armed("s"), "precondition: the stall timer is armed and past-deadline");
+
+    // Drive the REAL seam.
+    stall_step(&mut led, &mut patrol, &mut control, &mut dispatcher, &mut read_channel, &mut conns, &mut poll, now).unwrap();
+
+    // The ladder's FIRST act drained the channel: the pending surfaced BEFORE the stall.
+    assert!(led.blocked_sessions().unwrap().contains(&"s".to_owned()), "the unread can_use_tool surfaced as BLOCKED");
+    assert_eq!(led.events_of_type(EventType::AgentStalled).unwrap().len(), 0, "no stall was declared against the waiting worker");
+    // The StallFire was genuinely POPPED-and-skipped (not disarmed early by a phantom
+    // notify): the timer is now disarmed by reconcile_blocked/the skip.
+    assert!(!patrol.is_armed("s"), "the popped fire was skipped and the timer disarmed");
+}
+```
+
+- [ ] **Step 1b: Write the failing INTEGRATION confirm** (`daemon_patrol.rs`) — the end-to-end "a BLOCKED worker is never killed," mirroring `ladder_exhaustion_emits_and_stops`'s style (count events + daemon still live). This is a CONFIRM, not the falsifying guard (its falsifiability is platform-dependent — see the mechanism note); the falsifiability lives in Step 1a + the three unit guards (Step 6).
 
 ```rust
 #[test]
 fn a_blocked_worker_is_never_nudged_restarted_or_killed_past_the_stall_threshold() {
-    // Worker (fake-agent CAN_USE_TOOL mode) emits a can_use_tool then goes silent.
+    // The fake worker (CAN_USE_TOOL mode) emits the can_use_tool through its OWN
+    // long-lived inherited stdout fd — genuinely notify-suppressed on macOS
+    // (tests/control.rs:183-186); on Linux inotify surfaces it, which still
+    // reaches BLOCKED, just via the notify path.
     let d = Daemon::scaffold(/* command = fake-agent CAN_USE_TOOL, short stall_after */);
     d.dispatch_one("b-1");
     d.wait_until(|| d.sessions_list().iter().any(|s| s.blocked)); // BLOCKED reached
     let before = d.events_of_type("agent.stalled").len();
-    // Advance WELL past the stall threshold and pump several wakes.
     d.advance_and_pump(/* 3 × stall_after */);
-    // §5.3.3: exempt from the ENTIRE ladder.
     assert_eq!(d.events_of_type("agent.stalled").len(), before, "a BLOCKED worker is never declared stalled");
     assert_eq!(d.events_of_type("session.crashed").iter().filter(|e| e.data["name"] == sess).count(), 0,
         "a BLOCKED worker is never killed");
@@ -893,27 +938,10 @@ fn a_blocked_worker_is_never_nudged_restarted_or_killed_past_the_stall_threshold
     assert!(d.sessions_list().iter().any(|s| s.blocked), "still blocked, still live");
     assert!(d.is_alive(), "campd did not wedge");
 }
-
-#[test]
-fn the_ladder_drains_the_read_channel_first_and_a_lost_notify_surfaces_as_blocked() {
-    // Write a can_use_tool line into the worker's stdout FILE with its notify
-    // event SUPPRESSED — the affordance the read-channel suite already uses
-    // (read_channel.rs:183-212 appends to a tailed stdout file WITHOUT firing
-    // the notify watcher). Arm+fire the stall timer with the pending unread.
-    let d = Daemon::scaffold(/* short stall_after */);
-    d.dispatch_one("b-1");
-    d.append_stream_line_suppressed(&sess, CAN_USE_TOOL_LINE); // no notify
-    d.advance_and_pump(/* past stall_after → a stall fire is due */);
-    // The ladder's FIRST act drained the channel, surfacing the pending BEFORE
-    // any stall was declared.
-    assert!(d.sessions_list().iter().any(|s| s.blocked), "the lost can_use_tool surfaced as BLOCKED");
-    assert_eq!(d.events_of_type("agent.stalled").len(), 0, "no stall was declared against the waiting worker");
-    assert_eq!(d.events_of_type("session.crashed").iter().filter(|e| e.data["name"] == sess).count(), 0);
-}
 ```
-(`advance_and_pump`/`is_alive`/`append_stream_line_suppressed` are thin wrappers over the harness's existing clock-advance, liveness, and the `read_channel.rs:183` suppressed-append helper — add them if not already exposed on `Daemon`.)
+(`advance_and_pump`/`is_alive` are thin wrappers over the harness's clock-advance + liveness; add them if not already on `Daemon`. Do NOT use a test-side open+write+close to inject the can_use_tool — per CP3-R2-B1 that FIRES notify and defeats the point; the worker self-emits.)
 
-- [ ] **Step 2: Run — expect FAIL (today the ladder restarts a silent worker)**
+- [ ] **Step 2: Run — expect FAIL (today `stall_step` does not exist and the ladder restarts a silent worker)**
 
 - [ ] **Step 3: Add the blocked set + `reconcile_blocked` to patrol.** Add `blocked: HashSet<String>` beside `stalled`/`activity` (`patrol.rs:147-155`). Reconcile edge-triggered from ledger truth:
 
@@ -952,27 +980,38 @@ pub fn reconcile_blocked(&mut self, ledger: &Ledger, now: Timestamp) -> anyhow::
     let tracked = tracked.clone();
 ```
 
-- [ ] **Step 5: Wire the pre-ladder drain + reconcile into the event loop.** Before `patrol.fire_due`/`declare_stalls` (`event_loop.rs:214`), when a stall fire is due, drain the read channel and ingest so a lost `can_use_tool` becomes BLOCKED first:
+- [ ] **Step 5: Extract the pre-ladder drain + declare into a TESTABLE seam `stall_step`, and call it from the event loop.** The ordering must be pinned by a test that drives the REAL sequence, not one that re-implements it (that is the confirm-but-not-falsify trap of CP3-R2-B1). So factor the `fire_due` → (drain+ingest+reconcile) → `declare_stalls` sequence into one function and have the loop call it in place of the current lines 214-215:
 
 ```rust
+/// §5.3.3: pop due stall fires, and — the ladder's FIRST act — drain the read
+/// channel so a `can_use_tool` whose notify event was lost surfaces as BLOCKED
+/// before any stall is declared against a worker that is only waiting on us.
+/// Returns whether ledger work was appended (drives `wake_ledger_work`).
+/// Guarded on `!is_empty` so the idle path pays nothing (invariant 1).
+#[allow(clippy::too_many_arguments)]
+fn stall_step(
+    ledger: &mut Ledger, patrol: &mut PatrolRuntime, control: &mut ControlRuntime,
+    dispatcher: &mut Dispatcher, read_channel: &mut ReadChannelRuntime,
+    conns: &mut HashMap<Token, Conn>, poll: &mut Poll, now: Timestamp,
+) -> anyhow::Result<bool> {
     let stall_fires = patrol.fire_due(now);
     if !stall_fires.is_empty() {
-        // §5.3.3 "the ladder's first act is always to drain the read channel":
-        // a can_use_tool whose notify event was lost may be sitting unread in
-        // the stream file. Surface it as BLOCKED before any stall is declared,
-        // so a worker that is only waiting on us is never mistaken for stalled.
-        // Guarded on `!is_empty` so the idle path pays nothing (invariant 1).
         if let Err(e) = read_channel.drain_all(ledger) {
             eprintln!("campd: pre-ladder drain failed: {e:#}");
         }
-        control_step(ledger, control, dispatcher, patrol, read_channel, &mut conns, &mut poll)?;
+        control_step(ledger, control, dispatcher, patrol, read_channel, conns, poll)?;
         patrol.reconcile_blocked(ledger, now)?;
     }
-    wake_ledger_work |= patrol.declare_stalls(ledger, &stall_fires, now)?;
+    Ok(patrol.declare_stalls(ledger, &stall_fires, now)?)
+}
 ```
-And add `patrol.reconcile_blocked(ledger, now)?;` in the common post-harvest path (after the main `control_step` ~500) so the NORMAL path (a can_use_tool that arrived this wake, or a decision this wake) disarms/re-arms same-wake. `reconcile_blocked` is idempotent, so both call sites are safe. **Acknowledged (non-blocking):** the pre-ladder `control_step` re-runs the full harvest INCLUDING subscriber fanout, so on a stall-fire wake fanout runs twice; this is idempotent (fanout pumps only NEW file bytes to subscribers, and the second call finds none — the byte cursor advanced), so no double-delivery. If a future profile shows this matters, narrow the pre-ladder call to an ingest-only drain; for cp-3 the guarded (`!stall_fires.is_empty()`) double-harvest is correct and rare.
+In the loop (replacing event_loop.rs:214-215):
+```rust
+    wake_ledger_work |= stall_step(ledger, patrol, control, dispatcher, read_channel, &mut conns, &mut poll, now)?;
+```
+And add `patrol.reconcile_blocked(ledger, now)?;` in the common post-harvest path (after the main `control_step` ~500) so the NORMAL path (a can_use_tool that arrived this wake, or a decision this wake) disarms/re-arms same-wake. `reconcile_blocked` is idempotent, so both call sites are safe. **Acknowledged (non-blocking):** the `stall_step` `control_step` re-runs the full harvest INCLUDING subscriber fanout, so on a stall-fire wake fanout runs twice; this is idempotent (fanout pumps only NEW file bytes, and the second call finds none — the byte cursor advanced), so no double-delivery. If a future profile shows this matters, narrow it to an ingest-only drain; for cp-3 the guarded double-harvest is correct and rare.
 
-- [ ] **Step 6: Write the two INDEPENDENT unit tests that pin the two mechanisms SEPARATELY (CP3-B2)** — the integration heart-tests above pass under either single mutation (removing the disarm leaves the skip; removing the skip leaves the disarm's un-fired timer), so each mechanism needs its own guard:
+- [ ] **Step 6: Write the three INDEPENDENT unit guards INLINE in `patrol.rs`'s `#[cfg(test)] mod tests`** (beside `declare_stalls_appends…`, using `fixture()` at patrol.rs:1487) — NOT `daemon_patrol.rs`. They seed the PRIVATE `blocked` field and read the `#[cfg(test)] pub fn is_armed` accessor, both invisible to an external integration test. Each pins one mechanism SEPARATELY (CP3-B2) — the integration confirm (Step 1b) passes under either single mutation:
 
 ```rust
 #[test]
@@ -1011,11 +1050,11 @@ fn a_decision_re_arms_the_stall_timer_from_zero() {
 }
 ```
 
-- [ ] **Step 7: Run all four patrol tests — PASS.** `cargo test -p camp --test daemon_patrol a_blocked_worker the_ladder_drains` and `cargo test -p camp permission_pending_disarms declare_stalls_declares_nothing a_decision_re_arms`
+- [ ] **Step 7: Run every Task-8 test — PASS.** `cargo test -p camp --lib stall_step_drains_the_read_channel_before_declaring` (component), `cargo test -p camp --test daemon_patrol a_blocked_worker` (integration confirm), and `cargo test -p camp --lib permission_pending_disarms declare_stalls_declares_nothing a_decision_re_arms` (the inline unit guards).
 
-- [ ] **Step 8: Commit** `git commit -am "feat(patrol): BLOCKED disarms the stall ladder; ladder drains the read channel first (§5.3.3)"`
+- [ ] **Step 8: Commit** `git commit -am "feat(patrol): BLOCKED disarms the stall ladder; stall_step drains the read channel first (§5.3.3)"`
 
-**Mutation caught (each mechanism pinned INDEPENDENTLY per CP3-B2):** removing `reconcile_blocked`'s disarm — the integration test still passes (the skip covers it), but `permission_pending_disarms_the_stall_timer…` dies (the timer stays armed → invariant-1 violation caught). Removing the `declare_stalls` skip — `declare_stalls_declares_nothing_for_a_blocked_session…` dies (an armed blocked session declares `agent.stalled`). Removing the pre-ladder drain — `the_ladder_drains_the_read_channel_first…` dies (the fire is declared before the pending surfaces). Removing the re-arm — `a_decision_re_arms_the_stall_timer_from_zero` dies.
+**Mutation caught (each mechanism pinned INDEPENDENTLY):** removing the pre-ladder drain from `stall_step` — `stall_step_drains_the_read_channel_before_declaring_a_stall` dies on EVERY platform (no watcher, so the line is unread until `stall_step` drains it; without the drain, `declare_stalls` appends `agent.stalled`). Removing `reconcile_blocked`'s disarm — `permission_pending_disarms_the_stall_timer…` dies (timer stays armed → invariant-1 violation). Removing the `declare_stalls` skip — `declare_stalls_declares_nothing_for_a_blocked_session…` dies. Removing the re-arm — `a_decision_re_arms_the_stall_timer_from_zero` dies.
 
 ---
 
@@ -1188,8 +1227,12 @@ fn a_pending_discovered_after_adoption_takes_the_named_kill_not_the_stall_ladder
     // can_use_tool via tailing AFTER adoption. The steady-state event-loop branch
     // must give it the SAME named kill, not the generic ladder.
     let d = Daemon::scaffold_with_adopted_worker(&sess, "b-1"); // tracked, non-child, no pipe
-    d.append_stream_line_suppressed(&sess, CAN_USE_TOOL_LINE);
-    d.advance_and_pump(/* one wake: harvest → BLOCKED → non-child kill */);
+    // Append a can_use_tool to the adopted worker's stdout. The SURFACING
+    // mechanism is irrelevant here (a plain test-side append fires notify, which
+    // is fine — this test pins the KILL ROUTING, not the drain trigger): once
+    // BLOCKED, a non-child must take the NAMED kill, not the ladder.
+    d.append_can_use_tool(&sess, CAN_USE_TOOL_LINE);
+    d.pump(/* harvest → BLOCKED → steady-state non-child kill */);
     let crash = d.events_of_type("session.crashed").into_iter()
         .find(|e| e.data["name"] == sess).expect("the discovered pending was killed");
     assert_eq!(crash.data["reason"], "adoption: unanswerable permission request");
@@ -1219,10 +1262,12 @@ fn crash_unanswerable_permission(
     Ok(())
 }
 ```
-In `adopt`'s `Some(pid)` arm, BEFORE the `bead_open` re-arm (`patrol.rs:1197`):
+In `adopt`'s `Some(pid)` arm, BEFORE the `bead_open` re-arm (`patrol.rs:1197`). The `row.woke_actor == "campd"` guard mirrors the sibling release-kill (patrol.rs:1200) — §10 "never kill in the TUI" (an attended session never gets `--permission-prompt-tool`, so it never folds a `permission.pending`, but the guard is the defensive belt-and-braces):
 
 ```rust
-    if ledger.pending_permission_for_session(&row.name)?.is_some() {
+    if row.woke_actor == "campd"
+        && ledger.pending_permission_for_session(&row.name)?.is_some()
+    {
         // §5.3.4: the ledger-before-pipe ordering of §5.3 proves pending ⇒ the
         // response was never sent, so this never kills an ANSWERED worker.
         crash_unanswerable_permission(ledger, &row.name, row.rig.clone(), pid, exec_timeout)?;
@@ -1230,6 +1275,7 @@ In `adopt`'s `Some(pid)` arm, BEFORE the `bead_open` re-arm (`patrol.rs:1197`):
         continue; // do NOT adopt_from_row: it is dead; the fold reopened its bead
     }
 ```
+**Note — implicit fold coupling:** the bead re-hook here is not a dedicated code path; it is an implicit coupling to `session_ended`'s crash-reopen (ANY `SessionCrashed` reopens the bead via `claimed_by`, fold.rs:1167). The `adoption_kills_…` test's `bead.status=="open"`/`claimed_by.is_none()` assertions are what pin that coupling so a future fold change cannot silently strand the bead.
 
 - [ ] **Step 4: (No `observe` change.)** CP3-B3 confirmed that broadening `observe`'s `reason_rehooks` is inert for the untracked adoption case — the bead re-hook is the fold crash-reopen (Step 3's `SessionCrashed` → `session_ended` → `UPDATE beads SET status='open'`). Do NOT touch `observe`. This step exists to record the deliberate decision so a later reviewer does not "add" the re-hook that is already handled by the fold.
 
