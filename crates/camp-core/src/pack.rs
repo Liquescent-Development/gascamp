@@ -38,6 +38,10 @@ pub struct AgentDef {
     /// duration string ("5m"), validated at parse. `None` uses the camp
     /// `[patrol] stall_after` default.
     pub stall_after: Option<String>,
+    /// §2.2 (cp-4): spawn this agent's workers with --include-partial-messages so
+    /// a live `camp attach` sees token deltas. Default false -- autonomous-only
+    /// agents never emit deltas. Parsed from `agent.toml`'s `partial_messages`.
+    pub partial_messages: bool,
     pub prompt: String,
 }
 
@@ -61,6 +65,9 @@ pub struct RawAgent {
     /// `isolation = "none"` opt-out (spec §12 dispatch-lifecycle Q1): the
     /// agent runs on the rig's live tree. `None` → the DEFAULT (`Worktree`).
     pub isolation: Option<Isolation>,
+    /// §2.2 (cp-4): the raw `partial_messages` bool from `agent.toml` (default
+    /// false). Threaded to `AgentDef.partial_messages`, then to the spawn gate.
+    pub partial_messages: bool,
 }
 
 /// §5.4 refused keys (umbrella §5.4): camp reads none of these. They are
@@ -123,6 +130,7 @@ pub fn parse_agent_dir(dir: &Path) -> Result<(RawAgent, Vec<AgentRefusal>), Core
     let mut scope = None;
     let mut stall_after = None;
     let mut isolation = None;
+    let mut partial_messages = false;
     let mut refusals = Vec::new();
     let agent_toml = dir.join("agent.toml");
     if agent_toml.is_file() {
@@ -163,6 +171,11 @@ pub fn parse_agent_dir(dir: &Path) -> Result<(RawAgent, Vec<AgentRefusal>), Core
                             }
                         });
                     }
+                    "partial_messages" => {
+                        partial_messages = value.as_bool().ok_or_else(|| {
+                            pack_err(dir, "agent.toml key \"partial_messages\" must be a boolean")
+                        })?;
+                    }
                     k if REFUSED_KEYS.contains(&k) => {
                         refusals.push(AgentRefusal {
                             agent: name.clone(),
@@ -182,6 +195,7 @@ pub fn parse_agent_dir(dir: &Path) -> Result<(RawAgent, Vec<AgentRefusal>), Core
             scope,
             stall_after,
             isolation,
+            partial_messages,
         },
         refusals,
     ))
@@ -219,6 +233,7 @@ pub fn resolve_agent_def(
         permission_mode: defaults.permission_mode.clone(),
         isolation: raw.isolation.unwrap_or(Isolation::Worktree),
         stall_after: raw.stall_after.clone(),
+        partial_messages: raw.partial_messages,
         prompt: raw.prompt.clone(),
     })
 }
@@ -419,6 +434,7 @@ mod tests {
             scope: None,
             stall_after: None,
             isolation: None,
+            partial_messages: false,
         }
     }
     #[test]
@@ -658,6 +674,54 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("isolation")
+        );
+    }
+
+    #[test]
+    fn partial_messages_defaults_false_and_reads_from_agent_toml() {
+        // §2.2 (cp-4): `partial_messages = true` in agent.toml resolves to true;
+        // an agent without the key resolves to false (autonomous-only default).
+        let dir = tempfile::tempdir().unwrap();
+        write_agent_dir(
+            dir.path(),
+            "attachable",
+            Some("partial_messages = true\n"),
+            "prompt.md",
+            "p",
+        );
+        let def = resolve_agent_def(
+            &defaults(Some(vec!["Read"])),
+            &parse_agent_dir(&dir.path().join("attachable")).unwrap().0,
+            "gc.attachable",
+            false,
+        )
+        .unwrap();
+        assert!(def.partial_messages, "the key opts in");
+
+        // undeclared → false (autonomous dispatch never emits token deltas)
+        write_agent_dir(dir.path(), "dflt", None, "prompt.md", "p");
+        let def = resolve_agent_def(
+            &defaults(Some(vec!["Read"])),
+            &parse_agent_dir(&dir.path().join("dflt")).unwrap().0,
+            "gc.dflt",
+            false,
+        )
+        .unwrap();
+        assert!(!def.partial_messages, "default is off");
+
+        // a non-boolean value is a hard error naming the key (fail fast)
+        write_agent_dir(
+            dir.path(),
+            "bad",
+            Some("partial_messages = \"yes\"\n"),
+            "prompt.md",
+            "p",
+        );
+        assert!(
+            parse_agent_dir(&dir.path().join("bad"))
+                .unwrap_err()
+                .to_string()
+                .contains("partial_messages")
         );
     }
 }

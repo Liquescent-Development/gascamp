@@ -1476,6 +1476,120 @@ fn a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends() 
     drop(campd);
 }
 
+// ===== cp-4: camp attach (per-agent view) =================================
+
+/// EXIT CRITERION 1: attach + detach without the worker noticing. Subscribe to a
+/// LIVE worker, read a frame if any (non-asserting), then DETACH (drop the
+/// SubClient). The worker must be unaffected: still `working` in the registry
+/// afterward, and a FRESH subscribe still succeeds. campd appends no fault on the
+/// detach (a peer-gone flush is silent -- cp-1, control.rs:3833-3835).
+///
+/// The replay-of-a-finished-session exit criterion is proven by an OWNED SPLIT
+/// (no duplicate here): the DAEMON full-history-then-`end` delivery is cp-1's
+/// `a_subscriber_gets_the_full_history_then_an_end_frame_when_its_session_ends`
+/// (above, control.rs), and the CLIENT replay-render is cp-4's
+/// `client_renders_a_full_finished_replay_in_order_then_the_end_marker`
+/// (crates/camp/src/cmd/attach.rs).
+#[test]
+fn attach_then_detach_leaves_the_worker_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig) = scaffold(dir.path(), 4);
+    // SPAM_ON_TURN makes the worker emit a large backlog on a user turn, then
+    // LINGER (still `working`, bead un-closed). The backlog is load-bearing: it is
+    // what forces the detach onto the REAL §5.2 path. An unread subscriber's `out`
+    // stays non-empty (socket buffer full, cap-STOPPED), so the FIRST pump AFTER
+    // the drop writes to a now-closed socket -> EPIPE -> FlushStep::Gone -> the
+    // peer-gone cleanup (a SILENT forget, no event: control.rs `Err(_) =>
+    // FlushStep::Gone`). Without the backlog `out` is empty at drop and campd never
+    // pumps the gone peer at all — which is exactly the blind spot the earlier
+    // version of this test had: it asserted non-interference without ever making
+    // campd OBSERVE the detach, so a destructive gone-cleanup (or a panic in it)
+    // went undetected.
+    let campd = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_SPAM_ON_TURN", "30000"),
+            ("FAKE_AGENT_SPAM_LINGER", "60"),
+        ],
+    );
+    let mut ctl = connect(&root);
+    let (_bead, session) = dispatch_one(&root);
+
+    // Attach from cursor 0 and DO NOT read: after the turn, the worker's backlog
+    // fills the socket buffer and cap-STOPS the subscriber, leaving `out` non-empty
+    // and un-drainable (the peer never reads).
+    let sub = SubClient::open(&root, &session, Some(0)).unwrap();
+    request(
+        &mut ctl,
+        &serde_json::json!({"op":"session.send_turn","session":session,"text":"go"}).to_string(),
+    );
+    // Poke campd so it drains the worker's spam and pumps the (silent) subscriber
+    // until it is backpressured — `out` is now non-empty and cannot drain.
+    for _ in 0..6 {
+        let r = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+        assert_eq!(r["ok"], true, "campd answers while it builds the backlog");
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    // DETACH mid-stream: the peer vanishes with bytes still buffered for it.
+    drop(sub);
+
+    // Force campd to OBSERVE the detach IN-WINDOW. Each poke is a wake; the first
+    // post-drop pump against the now-closed socket takes the peer-gone cleanup
+    // path. THIS is what the earlier test skipped, and it is why the two review
+    // mutations — a destructive fold (SessionStopped) on subscriber-gone, and a
+    // panic in the gone-cleanup — now have somewhere to bite. campd must keep
+    // answering across every one of these wakes (a panic in the cleanup would kill
+    // it, and these `assert_eq!`s would then fail to get a reply).
+    for _ in 0..8 {
+        let r = request(&mut connect(&root), r#"{"op":"poke","seq":1}"#);
+        assert_eq!(
+            r["ok"], true,
+            "campd must keep answering across the detach it just processed"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    // The worker is STILL live and `working` — the detach folded no stop/crash.
+    // A destructive gone-cleanup that appended SessionStopped would drop the
+    // session from live_sessions and REDDEN this.
+    let resp = request(&mut connect(&root), r#"{"op":"sessions.list"}"#);
+    let live = resp["sessions"].as_array().unwrap();
+    assert!(
+        live.iter()
+            .any(|s| s["name"] == session.as_str() && s["state"] == "working"),
+        "the worker must still be live and working after a detach campd actually \
+         processed: {resp}"
+    );
+
+    // §5.2: a normal detach is SILENT — never a session.stopped / session.crashed,
+    // and never a subscriber.dropped libel (that is backpressure, which this is
+    // not). Any of those folded on the gone-cleanup must REDDEN this.
+    let evs = events_json(&root);
+    assert!(
+        !evs.iter().any(
+            |e| (e["type"] == "session.stopped" || e["type"] == "session.crashed")
+                && e["data"]["name"] == session.as_str()
+        ),
+        "a benign detach must not stop or crash the session: {evs:#?}"
+    );
+    assert!(
+        !evs.iter()
+            .any(|e| e["type"] == "subscriber.dropped" && e["data"]["session"] == session.as_str()),
+        "a normal detach is NOT backpressure — no subscriber.dropped libel: {evs:#?}"
+    );
+
+    // A FRESH subscribe still succeeds (campd is healthy; the stream file intact).
+    let sub2 = SubClient::open(&root, &session, Some(0));
+    assert!(
+        sub2.is_ok(),
+        "a fresh attach after a detach still works: {:?}",
+        sub2.err()
+    );
+
+    drop(campd);
+}
+
 /// The steady state of every long-lived watch: a subscriber CAUGHT UP AT THE TAIL,
 /// with nothing buffered and nothing to pump. It must still get its `end` frame
 /// when the session is reaped.
