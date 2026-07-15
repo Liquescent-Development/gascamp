@@ -524,7 +524,10 @@ pub(crate) fn conn_for_test(&self) -> &rusqlite::Connection { &self.conn }
   Before Step 1/2 exist: compile error. After: 5 passed.
 
 - [ ] **Step 4: Name the mutations.**
-  `marking_read_drops_it_from_unread` DIES if the `NOT EXISTS … mail.read` clause is dropped. `a_task_bead_is_never_mail` DIES if the `type='mail'` filter is dropped. `raw_body_is_stored_and_sanitized_only_at_render` DIES if `mail_bead_event` sanitizes at ingest. `mail_message_by_id_projects_read_state_and_rejects_non_mail` DIES if the read-flag projection (column 4) is wrong, or if the `type='mail'` guard is dropped (a task bead would resolve as mail).
+  `marking_read_drops_it_from_unread` DIES if the `NOT EXISTS … mail.read` clause is dropped. `raw_body_is_stored_and_sanitized_only_at_render` DIES if `mail_bead_event` sanitizes at ingest.
+  DISCRIMINANT ISOLATION (execution correction — the original single "task bead" fixture was excluded by BOTH `type='mail'` AND `mail.to_display='human'` redundantly, so dropping EITHER filter alone left it excluded; the "dies if type='mail' dropped" claim was FALSE, verified). The filters are now each pinned by a fixture where it is the SOLE excluder, with a CLEAN semantic mutation (params preserved):
+  - `the_type_mail_filter_excludes_a_non_mail_bead_that_carries_human_mail_metadata` — a `type='task'` bead with a planted `mail.to_display='human'` DIES if `b.type='mail'` is dropped from `unread_human_mail_count` OR `MAIL_PROJECTION` (proven RED both ways).
+  - `the_human_scope_excludes_a_mail_bead_addressed_to_a_non_human` — a real `type='mail'` bead to `mayor` DIES if `AND value = 'human'/?4` is dropped from the count query OR `MAIL_PROJECTION` (proven RED both ways). `mail_message_by_id`'s `type='mail'` guard is likewise pinned (its task bead now carries the planted human metadata).
 
 - [ ] **Step 5: Commit.**
 ```bash
@@ -608,7 +611,7 @@ fn status_summary_reports_unread_mail_separately_from_task_counts() {
   Expected: the new test passes; no other test regresses (Task 9 rewrites top.rs; run it after Task 9 if top.rs's literals block compilation now — add `unread_mail: 0` there provisionally).
 
 - [ ] **Step 6: Name the mutation.**
-  `status_summary_reports_unread_mail_separately_from_task_counts` DIES if `unread_mail` is populated from a task-count helper (asserts `open==1` AND `unread_mail==1` from one fixture — a task-scoped source gives `unread_mail==0`; a mail-including source gives `open==2`).
+  `status_summary_reports_unread_mail_separately_from_task_counts` DIES if `unread_mail` is populated from a task-count helper. SELF-SUFFICIENCY correction: the fixture is TWO open+ready task beads + ONE mail bead, so `open==2`, `ready==2`, `stuck==0` all DIFFER from `unread_mail==1`. Sourcing `unread_mail` from `open_task_count`/`ready_task_count` (→2) or `stuck_task_count` (→0) reddens THIS test independently (proven RED with the `open_task_count` mutation), not only its sibling `status_summary` tests.
 
 - [ ] **Step 7: Commit.**
 ```bash
