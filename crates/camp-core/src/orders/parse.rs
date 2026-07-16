@@ -6,7 +6,10 @@
 //! compat §14: `compile_all_orders` also scans materialized imported
 //! orders (`<root>/imports/<binding>/orders/*.toml`), namespaced
 //! `<binding>.<stem>`. An imported order is INERT until `[orders] enabled`
-//! names it — the money invariant.
+//! names it — the money invariant. An imported order camp cannot compile
+//! (a Gas City trigger outside camp's cron/event subset, an unresolvable
+//! formula) is INERT-and-`unsupported` when disabled — listed, never armed,
+//! never fatal — and a hard error only when `[orders] enabled` names it.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -114,7 +117,14 @@ pub struct DisabledOrder {
     pub name: String,
     /// The binding the order was imported under (`<binding>.<stem>`).
     pub source: String,
+    /// Best-effort formula name (empty when the file was too broken to carry
+    /// one).
     pub formula: String,
+    /// `Some(reason)` when camp CANNOT compile this order — a Gas City feature
+    /// outside camp's cron/event subset (`trigger = "cooldown"`), an
+    /// unresolvable formula, or a broken file. It stays inert and is refused
+    /// by `camp order enable`; `None` is a normal, armable disabled order.
+    pub unsupported: Option<String>,
 }
 
 /// The full order inventory: armed (`active`) + inert-imported (`disabled`).
@@ -183,10 +193,66 @@ fn parse_gc_order(binding: &str, stem: &str, raw: GcOrderRaw) -> Result<Order, C
     })
 }
 
+/// Why camp could not compile one imported order file, plus the formula name
+/// if the file parsed far enough to carry one. The caller decides fatal
+/// (ENABLED) vs inert-unsupported (DISABLED) from the order's enabled state.
+struct OrderCompileFailure {
+    reason: String,
+    formula: Option<String>,
+}
+
+/// The bare reason of a `CoreError::Order` — the caller re-adds the order name,
+/// so the redundant prefix is dropped; any other error uses its display.
+fn order_error_reason(e: &CoreError) -> String {
+    match e {
+        CoreError::Order { reason, .. } => reason.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Read + compile one imported gc order file into a camp `Order`. Every error
+/// is an `OrderCompileFailure` carrying the bare reason (no order-name prefix)
+/// and the best-effort formula, so the caller can treat it as fatal-when-armed
+/// or inert-when-disabled.
+fn compile_imported_order(
+    cfg: &CampConfig,
+    binding: &str,
+    stem: &str,
+    path: &std::path::Path,
+) -> Result<Order, OrderCompileFailure> {
+    let text = std::fs::read_to_string(path).map_err(|e| OrderCompileFailure {
+        reason: format!("cannot read {}: {e}", path.display()),
+        formula: None,
+    })?;
+    let file: GcOrderFile = toml::from_str(&text).map_err(|e| OrderCompileFailure {
+        reason: format!("invalid TOML: {e}"),
+        formula: None,
+    })?;
+    // The formula survives even when a later stage (an unsupported trigger)
+    // fails, so the operator sees WHAT the pack meant to run.
+    let formula = file.order.formula.clone();
+    let order = parse_gc_order(binding, stem, file.order).map_err(|e| OrderCompileFailure {
+        reason: order_error_reason(&e),
+        formula: Some(formula.clone()),
+    })?;
+    // A missing formula is a hard error at load, not a silent fire-time miss.
+    crate::orders::resolve_formula(cfg, &order.formula).map_err(|e| OrderCompileFailure {
+        reason: format!("formula {:?}: {e}", order.formula),
+        formula: Some(order.formula.clone()),
+    })?;
+    Ok(order)
+}
+
 /// Compile every active order — local `[[order]]` tables plus the imported
 /// orders that `[orders] enabled` names — and list the inert imported ones.
-/// An imported order whose formula does not resolve is a hard error at load
-/// (fail fast, naming the order + formula).
+///
+/// The money invariant is symmetric: an ENABLED imported order that camp
+/// cannot compile is a hard error at load (fail fast — the operator armed
+/// money-spending work camp cannot actually run). A DISABLED one that camp
+/// cannot compile is recorded as `unsupported` and listed, NEVER fatal —
+/// camp never runs it, so a Gas City feature outside camp's cron/event subset
+/// (`trigger = "cooldown"`, an unresolvable formula) must not brick load,
+/// campd startup, or export. `camp order enable` refuses to arm one.
 pub fn compile_all_orders(cfg: &CampConfig) -> Result<OrderInventory, CoreError> {
     let mut active = compile_orders(cfg)?;
     let mut disabled = Vec::new();
@@ -232,29 +298,44 @@ pub fn compile_all_orders(cfg: &CampConfig) -> Result<OrderInventory, CoreError>
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_owned();
-            let text = std::fs::read_to_string(&order_file).map_err(|e| CoreError::Order {
-                order: format!("{binding}.{stem}"),
-                reason: format!("cannot read {}: {e}", order_file.display()),
-            })?;
-            let file: GcOrderFile = toml::from_str(&text).map_err(|e| CoreError::Order {
-                order: format!("{binding}.{stem}"),
-                reason: format!("invalid TOML: {e}"),
-            })?;
-            let order = parse_gc_order(&binding, &stem, file.order)?;
-            // Verify the formula resolves before arming — a missing formula
-            // is a hard error at load, not a silent fire-time miss.
-            crate::orders::resolve_formula(cfg, &order.formula).map_err(|e| CoreError::Order {
-                order: order.name.clone(),
-                reason: format!("formula {:?}: {e}", order.formula),
-            })?;
-            if cfg.orders_section.enabled.contains(&order.name) {
-                active.push(order);
-            } else {
-                disabled.push(DisabledOrder {
-                    name: order.name,
-                    source: binding.clone(),
-                    formula: order.formula,
-                });
+            let name = format!("{binding}.{stem}");
+            let is_enabled = cfg.orders_section.enabled.contains(&name);
+            match compile_imported_order(cfg, &binding, &stem, &order_file) {
+                Ok(order) => {
+                    if is_enabled {
+                        active.push(order);
+                    } else {
+                        disabled.push(DisabledOrder {
+                            name,
+                            source: binding.clone(),
+                            formula: order.formula,
+                            unsupported: None,
+                        });
+                    }
+                }
+                Err(failure) => {
+                    // ENABLED + uncompilable: the operator armed money-spending
+                    // work camp cannot run — fail fast, naming the order + why.
+                    if is_enabled {
+                        return Err(CoreError::Order {
+                            order: name,
+                            reason: format!(
+                                "[orders] enabled names it, but camp cannot run it: {}",
+                                failure.reason
+                            ),
+                        });
+                    }
+                    // DISABLED + uncompilable: inert. Record it as `unsupported`
+                    // so it is visible (nothing hidden) but unarmable — a Gas
+                    // City feature outside camp's cron/event subset must never
+                    // brick load (the money invariant: disabled means disabled).
+                    disabled.push(DisabledOrder {
+                        name,
+                        source: binding.clone(),
+                        formula: failure.formula.unwrap_or_default(),
+                        unsupported: Some(failure.reason),
+                    });
+                }
             }
         }
     }
@@ -548,6 +629,80 @@ formula = "fix-ci"
         assert!(
             inv.disabled.iter().any(|d| d.name == "bmad.nightly"),
             "namespaced imported order name must be accepted: {inv:?}"
+        );
+    }
+
+    // ---- unsupported imported orders: inert, not a hard error ----------
+
+    /// A camp whose `bmad` import ships an order camp CANNOT compile — a gc
+    /// `trigger = "cooldown"` with `interval`/`pool` keys, outside camp's
+    /// cron/event subset (exactly the shape the real gastown pack ships).
+    /// `enabled` toggles whether `[orders] enabled` names it.
+    pub(crate) fn camp_with_unsupported_order(enabled: bool) -> (tempfile::TempDir, CampConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut toml = String::from(
+            "[camp]\nname=\"t\"\n\n[[rigs]]\nname=\"gc\"\npath=\"/p\"\nprefix=\"gc\"\n\n[imports.bmad]\nsource=\"file:///x\"\n",
+        );
+        if enabled {
+            toml.push_str("\n[orders]\nenabled = [\"bmad.cooldown\"]\n");
+        }
+        std::fs::write(root.join("camp.toml"), &toml).unwrap();
+        let od = root.join("imports/bmad/orders");
+        std::fs::create_dir_all(&od).unwrap();
+        std::fs::write(
+            od.join("cooldown.toml"),
+            "[order]\ndescription = \"gc-only\"\nformula = \"digest\"\ntrigger = \"cooldown\"\ninterval = \"24h\"\npool = \"dog\"\n",
+        )
+        .unwrap();
+        let cfg = CampConfig::load(&root.join("camp.toml")).unwrap();
+        (dir, cfg)
+    }
+
+    /// compat §14 (money invariant): a DISABLED imported order camp cannot
+    /// compile — a Gas City trigger outside camp's cron/event subset — is
+    /// INERT, listed as `unsupported`, NEVER a hard error. Otherwise merely
+    /// IMPORTING a real gc pack (gastown ships `trigger = "cooldown"`) would
+    /// brick every load path, including campd startup.
+    #[test]
+    fn an_unsupported_disabled_imported_order_is_inert_not_a_hard_error() {
+        let (_d, cfg) = camp_with_unsupported_order(false);
+        let inv = compile_all_orders(&cfg)
+            .expect("a disabled order camp cannot compile must NOT be a hard error");
+        assert!(
+            inv.active.iter().all(|o| o.name != "bmad.cooldown"),
+            "an uncompilable order never arms"
+        );
+        let d = inv
+            .disabled
+            .iter()
+            .find(|d| d.name == "bmad.cooldown")
+            .expect("the unsupported order must still be LISTED as disabled");
+        assert_eq!(d.source, "bmad");
+        let reason = d
+            .unsupported
+            .as_deref()
+            .expect("it must be MARKED unsupported, with the reason");
+        assert!(
+            reason.contains("cooldown"),
+            "reason names the trigger: {reason}"
+        );
+        assert_eq!(d.formula, "digest", "best-effort formula still surfaced");
+    }
+
+    /// The other half of the money invariant: an ENABLED order camp cannot
+    /// compile is a HARD ERROR at load (fail fast) — the operator armed
+    /// money-spending work camp cannot actually run. The error names the
+    /// order and why.
+    #[test]
+    fn an_enabled_unsupported_imported_order_is_a_hard_error() {
+        let (_d, cfg) = camp_with_unsupported_order(true);
+        let err = compile_all_orders(&cfg).unwrap_err().to_string();
+        assert!(err.contains("bmad.cooldown"), "names the order: {err}");
+        assert!(err.contains("cooldown"), "names the reason: {err}");
+        assert!(
+            err.contains("cannot run it"),
+            "explains it is armed but unrunnable: {err}"
         );
     }
 }

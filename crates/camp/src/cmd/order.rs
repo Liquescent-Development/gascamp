@@ -2,20 +2,25 @@
 //! `order.fired` declaration and pokes campd — the daemon cooks it, so a
 //! manual fire exercises literally the away-mode pipeline (Phase 10 plan
 //! Decision D). compat §14 adds `enable`/`disable` to arm imported orders
-//! (the money invariant) and a source + disabled column to `ls`.
+//! (the money invariant) and a source + disabled column to `ls`. `ls` and
+//! `run` both resolve the ACTIVE inventory (local `[[order]]` tables plus
+//! the enabled imported pack orders), so an enabled imported order runs
+//! and fires exactly like a local one.
 
 use anyhow::{Context, Result, bail};
 use camp_core::config::CampConfig;
 use camp_core::ledger::Ledger;
 use camp_core::orders::parse::compile_all_orders;
-use camp_core::orders::parse::compile_orders;
 use camp_core::orders::{FireCause, Order, Trigger, fired_input};
 
 use crate::campdir::CampDir;
 
 fn load_orders(camp: &CampDir) -> Result<Vec<Order>> {
     let config = CampConfig::load(&camp.config_path())?;
-    Ok(compile_orders(&config)?)
+    // ACTIVE orders only — local `[[order]]` tables plus the imported pack
+    // orders `[orders] enabled` names (the money invariant). Disabled
+    // imported orders are inert and must not resolve for `camp order run`.
+    Ok(compile_all_orders(&config)?.active)
 }
 
 /// The raw trigger string for display (inverse of trigger parsing).
@@ -73,6 +78,9 @@ pub fn ls(camp: &CampDir, json: bool) -> Result<()> {
                 "formula": d.formula,
                 "source": d.source,
                 "state": "disabled",
+                // The reason camp cannot run it (a Gas City feature outside
+                // camp's cron/event subset), or null for a normal armable one.
+                "unsupported": d.unsupported,
             }));
         }
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -99,9 +107,16 @@ pub fn ls(camp: &CampDir, json: bool) -> Result<()> {
         );
     }
     for d in &inv.disabled {
+        // An order camp cannot run (a Gas City feature outside camp's
+        // cron/event subset) is shown as `disabled` with the reason in the ON
+        // column — visible and honest, but plainly unarmable.
+        let on = match &d.unsupported {
+            None => "(imported)".to_owned(),
+            Some(reason) => format!("(unsupported: {reason})"),
+        };
         println!(
             "{:<24} {:<10} {:<40} {:<14} {:<8}",
-            d.name, "disabled", "(imported)", d.formula, d.source,
+            d.name, "disabled", on, d.formula, d.source,
         );
     }
     Ok(())
@@ -134,21 +149,28 @@ pub fn enable_order(camp_root: &std::path::Path, name: &str) -> Result<()> {
         bail!("no order named {name:?} — available orders: {known:?}");
     }
 
+    // Refuse to arm an order camp cannot run: enabling it would make the next
+    // `compile_all_orders` (campd startup, export) a hard error — a fail-fast
+    // brick. Say so at the moment of intent, naming the reason.
+    if let Some(reason) = inv
+        .disabled
+        .iter()
+        .find(|d| d.name == name)
+        .and_then(|d| d.unsupported.as_deref())
+    {
+        bail!(
+            "cannot enable order {name:?}: camp cannot run it ({reason}). It uses a Gas City \
+             feature outside camp's cron/event order subset — arming it would refuse campd \
+             startup. Run it in Gas City, or remove it from the pack."
+        );
+    }
+
     let mut enabled = cfg.orders_section.enabled.clone();
     if !enabled.iter().any(|n| n == name) {
         enabled.push(name.to_owned());
     }
     rewrite_orders_block(&camp_toml, &enabled)?;
     println!("enabled order {name}");
-    // Phase-1 honesty: the daemon's fire loop still compiles LOCAL `[[order]]`
-    // tables only, so arming an IMPORTED order records the operator's intent
-    // without yet scheduling it. Say so rather than imply work is now firing.
-    if name.contains('.') {
-        println!(
-            "note: imported orders are armed in camp.toml but are not yet fired by campd — \
-             the imported-order fire path ships in phase 2"
-        );
-    }
     Ok(())
 }
 
@@ -294,6 +316,89 @@ mod compat_tests {
         assert!(
             cfg.orders_section.enabled.is_empty(),
             "a refused enable must not have written the name"
+        );
+    }
+
+    /// #117: after enabling an imported order, `run_order` must RESOLVE it
+    /// and append its `order.fired` declaration. Pre-fix `load_orders`
+    /// compiled inline `[[order]]` tables only, so `run_order` bailed with
+    /// "no order named bmad.nightly" even once enabled.
+    #[test]
+    fn run_order_resolves_an_enabled_imported_order() {
+        let dir = tempfile::tempdir().unwrap();
+        camp_with_an_imported_order(dir.path());
+        enable_order(dir.path(), "bmad.nightly").unwrap();
+        // A ledger must exist at <root>/camp.db for run_order to append to.
+        Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let camp = CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        run_order(&camp, "bmad.nightly").unwrap();
+        // the fire was declared for the imported order
+        let ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let fired = ledger
+            .events_of_type(camp_core::event::EventType::OrderFired)
+            .unwrap();
+        assert_eq!(fired.len(), 1, "run_order must declare exactly one fire");
+        assert_eq!(fired[0].data["order"], "bmad.nightly");
+    }
+
+    /// #117 money invariant on the `run` surface: a DISABLED imported order
+    /// must NOT resolve for `camp order run` — it stays inert until enabled.
+    /// `load_orders` returns only the ACTIVE inventory, so the disabled name
+    /// is unknown and no `order.fired` is ever declared.
+    #[test]
+    fn run_order_refuses_a_disabled_imported_order() {
+        let dir = tempfile::tempdir().unwrap();
+        camp_with_an_imported_order(dir.path()); // imported but NOT enabled
+        Ledger::open(&dir.path().join("camp.db")).unwrap();
+        let camp = CampDir {
+            root: dir.path().to_path_buf(),
+        };
+        let err = run_order(&camp, "bmad.nightly").unwrap_err().to_string();
+        assert!(
+            err.contains("no order named"),
+            "a disabled imported order must not resolve: {err}"
+        );
+        // and nothing was fired — the money invariant, not just the message
+        let ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        assert!(
+            ledger
+                .events_of_type(camp_core::event::EventType::OrderFired)
+                .unwrap()
+                .is_empty(),
+            "no fire may be declared for a disabled imported order"
+        );
+    }
+
+    /// compat §14 money invariant: `camp order enable` must REFUSE an order
+    /// camp cannot run (a Gas City trigger outside camp's cron/event subset),
+    /// naming the reason — arming it would brick campd startup. Nothing is
+    /// written to `[orders] enabled` on the refusal.
+    #[test]
+    fn enable_refuses_an_unsupported_imported_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("camp.toml"),
+            "[camp]\nname=\"t\"\n[imports.bmad]\nsource=\"file:///x\"\n",
+        )
+        .unwrap();
+        let od = dir.path().join("imports/bmad/orders");
+        std::fs::create_dir_all(&od).unwrap();
+        std::fs::write(
+            od.join("cooldown.toml"),
+            "[order]\nformula = \"digest\"\ntrigger = \"cooldown\"\ninterval = \"24h\"\n",
+        )
+        .unwrap();
+        let err = enable_order(dir.path(), "bmad.cooldown")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot enable"), "must refuse: {err}");
+        assert!(err.contains("cooldown"), "must name the reason: {err}");
+        let cfg = CampConfig::load(&dir.path().join("camp.toml")).unwrap();
+        assert!(
+            cfg.orders_section.enabled.is_empty(),
+            "a refused enable must write nothing to [orders] enabled"
         );
     }
 

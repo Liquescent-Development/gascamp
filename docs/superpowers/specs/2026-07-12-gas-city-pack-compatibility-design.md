@@ -534,6 +534,8 @@ AGENTS.md forbids re-litigating the record without one. Five changes (rev 3's in
 
 Imported orders load, validate, and appear in `camp order ls` as **disabled**, with their source.
 
+An imported order camp **cannot compile** — a Gas City trigger outside camp's cron/event subset (`trigger = "cooldown"`, which real corpus packs ship), or an unresolvable formula — is **inert-and-`unsupported`** while disabled: it is listed (nothing hidden), never armed, and never a hard error, so merely *importing* such a pack never bricks a load path (campd startup, `camp order ls`, `camp export`). `camp order enable` **refuses** to arm one, naming the reason. Only an order that `[orders] enabled` **names** yet camp cannot compile is a hard error at load — the operator armed money-spending work camp cannot run, so it fails fast (both halves of the money invariant: what is disabled stays fully inert; what is armed must be runnable).
+
 ## 14. Testing
 
 - **No network.** Git-backed imports run against local `file://` repos in a temp dir — the real clone/lock/materialize path, including a fixture repo with a `bmad`-shaped pack declaring `[imports.gc] source = "../gascity"`, so transitive resolution, dedupe, and the repo-escape error are all exercised.
