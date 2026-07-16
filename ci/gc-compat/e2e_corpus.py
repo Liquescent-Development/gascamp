@@ -50,26 +50,44 @@ import time
 # t=5s and is stable to t=90s with zero duplicates across 12 consecutive runs.
 EXPECTED_DISPATCHED = 14
 
-# The ROUTE each of those 14 dispatches resolves to, as an agent multiset. The count
-# above proves 14 workers EXIST; this proves each went to the RIGHT agent — BD-A is a
-# routing defect, so a valid-but-wrong agent (same count) must fail. DERIVED from the
-# real dispatch stream on the pinned GCPACKS_REF, identical across repeated runs, NOT
-# hand-transcribed. Sums to EXPECTED_DISPATCHED (asserted at import below).
-EXPECTED_AGENTS = collections.Counter(
-    {
-        "bmad.acceptance-auditor": 1,
-        "bmad.blind-hunter-reviewer": 1,
-        "bmad.bmad-review-synthesizer": 1,
-        "bmad.edge-case-reviewer": 1,
-        "bmad.prd-writer": 1,
-        "bmad.story-implementer": 1,
-        "bmad.story-self-checker": 1,
-        "gc.run-operator": 2,
-        "superpowers.code-quality-reviewer": 1,
-        "superpowers.implementer": 3,
-        "superpowers.spec-reviewer": 1,
-    }
-)
+# The ROUTE each of those 14 dispatches resolves to, as an agent multiset — pinned
+# PER RUN (issue #102). The count above proves 14 workers EXIST; this proves each went
+# to the RIGHT agent IN THE RIGHT RUN — BD-A is a routing defect, so a valid-but-wrong
+# agent (same count) must fail, AND a correctly-agented dispatch attributed to the WRONG
+# one of the two runs must fail too. A single global multiset is BLIND to that swap:
+# `gc.run-operator` occurs in BOTH runs, so a bmad-build gc.run-operator miscounted
+# under superpowers-development leaves the global multiset unchanged and slips through.
+# Splitting the pin by run closes it — a swap moves a count from one run's multiset to
+# the other's. DERIVED from the real per-run dispatch stream on the pinned GCPACKS_REF
+# (measured 1/1 for the two gc.run-operator), identical across repeated runs, NOT
+# hand-transcribed. Keyed by FORMULA (stable) rather than the ledger-assigned run_id
+# (dynamic); the run_id is mapped back to its formula at check time via `results`.
+EXPECTED_AGENTS_BY_FORMULA = {
+    "bmad-build": collections.Counter(
+        {
+            "bmad.acceptance-auditor": 1,
+            "bmad.blind-hunter-reviewer": 1,
+            "bmad.bmad-review-synthesizer": 1,
+            "bmad.edge-case-reviewer": 1,
+            "bmad.prd-writer": 1,
+            "bmad.story-implementer": 1,
+            "bmad.story-self-checker": 1,
+            "gc.run-operator": 1,
+        }
+    ),
+    "superpowers-development": collections.Counter(
+        {
+            "gc.run-operator": 1,
+            "superpowers.code-quality-reviewer": 1,
+            "superpowers.implementer": 3,
+            "superpowers.spec-reviewer": 1,
+        }
+    ),
+}
+# The global multiset is now DERIVED from the per-run pins (single source of truth), so
+# the import-time count invariant still guards the pinned numbers: the two runs' routes
+# must sum to exactly EXPECTED_DISPATCHED.
+EXPECTED_AGENTS = sum(EXPECTED_AGENTS_BY_FORMULA.values(), collections.Counter())
 assert sum(EXPECTED_AGENTS.values()) == EXPECTED_DISPATCHED, (
     f"EXPECTED_AGENTS sums to {sum(EXPECTED_AGENTS.values())}, not {EXPECTED_DISPATCHED}"
 )
@@ -337,28 +355,46 @@ try:
         if "{{" in agent:
             die(f"campd dispatched with an unsubstituted route {agent!r} (BD-A)")
 
-    # ⭐ PIN THE ROUTE IDENTITY, not just its COUNT. Everything above proves 14 distinct
-    # workers, each with SOME non-empty, substituted route — and is BLIND to WHICH agent
-    # each bead went to. BD-A is a ROUTING defect: a binding-namespace regression can
-    # resolve a var to a valid-but-WRONG agent (the corpus makes `superpowers.implementer`
-    # vs `bmad.story-implementer` confusable), yielding a real name, non-empty, no `{{`,
-    # count still 14 — and the gate above waves it through. Measured: re-pointing all 13
-    # non-named beads to `bmad.story-implementer` left the count-and-shape gate GREEN.
+    # ⭐ PIN THE ROUTE IDENTITY PER RUN, not just its COUNT. Everything above proves 14
+    # distinct workers, each with SOME non-empty, substituted route — and is BLIND to
+    # WHICH agent each bead went to, and UNDER WHICH RUN. BD-A is a ROUTING defect: a
+    # binding-namespace regression can resolve a var to a valid-but-WRONG agent (the
+    # corpus makes `superpowers.implementer` vs `bmad.story-implementer` confusable),
+    # yielding a real name, non-empty, no `{{`, count still 14 — and the count gate above
+    # waves it through. Measured: re-pointing all 13 non-named beads to
+    # `bmad.story-implementer` left the count-and-shape gate GREEN.
     #
-    # The mapping is fully deterministic at the pinned GCPACKS_REF, so pin the AGENT
-    # MULTISET. Beads (`gc-N`) are ledger-assigned and order-sensitive — brittle — but the
-    # agent each route resolves to is stable and is the thing BD-A would corrupt. This
-    # closes both `misroute` (wrong agent) and `swap` (foreign bead: it changes the
-    # multiset). EXPECTED_AGENTS was DERIVED from the real dispatch stream on the pinned
-    # corpus, identical across repeated runs — not hand-transcribed.
-    got_agents = collections.Counter(e["data"]["agent"] for e in dispatched)
-    if got_agents != EXPECTED_AGENTS:
-        die(
-            "campd's dispatch ROUTES do not match the pinned corpus. Same count can hide "
-            "a misroute to a valid-but-wrong agent (BD-A is a routing defect).\n"
-            f"  unexpected/extra: {dict(got_agents - EXPECTED_AGENTS)}\n"
-            f"  missing:          {dict(EXPECTED_AGENTS - got_agents)}"
-        )
+    # The mapping is fully deterministic at the pinned GCPACKS_REF, so pin the per-run
+    # AGENT MULTISET. Each dispatched bead is attributed to its run via its AUTHORITATIVE
+    # `bead.created.run_id` (already collected in `bead_run` above, and every dispatched
+    # bead was proven non-`foreign` — i.e. present in `bead_run` with one of our two
+    # run_ids). The run_id is mapped back to the formula it was slung from via `results`.
+    # This closes `misroute` (wrong agent — the multiset changes), `swap` (foreign bead —
+    # it changes the multiset), AND the #102 residual: a correctly-agented dispatch
+    # attributed to the WRONG one of the two runs (the GLOBAL multiset is unchanged, but a
+    # count moves between the two per-run multisets, so the per-run check fails).
+    formula_of_run = {run_id: formula for formula, run_id in results.items()}
+    got_by_formula = collections.defaultdict(collections.Counter)
+    for e in dispatched:
+        formula = formula_of_run.get(bead_run.get(e["data"]["bead"]))
+        got_by_formula[formula][e["data"]["agent"]] += 1
+    # Iterate the UNION of expected and observed formulas: a dispatch attributed to an
+    # unexpected run (formula not in the pin, or `None`) surfaces as an extra bucket the
+    # expected side does not have, rather than being silently dropped.
+    for formula in sorted(
+        set(EXPECTED_AGENTS_BY_FORMULA) | set(got_by_formula), key=lambda f: f or ""
+    ):
+        expected = EXPECTED_AGENTS_BY_FORMULA.get(formula, collections.Counter())
+        got = got_by_formula.get(formula, collections.Counter())
+        if got != expected:
+            die(
+                f"run {formula!r}: dispatch ROUTES do not match the pinned per-run "
+                f"corpus multiset. Same GLOBAL count/agents can still hide a misroute to "
+                f"a valid-but-wrong agent, or a dispatch attributed to the WRONG run "
+                f"(BD-A is a routing defect; #102 is the cross-run residual).\n"
+                f"  unexpected/extra: {dict(got - expected)}\n"
+                f"  missing:          {dict(expected - got)}"
+            )
 
     # ⭐ THE NAMED ONE, and its scope stated HONESTLY.
     #
