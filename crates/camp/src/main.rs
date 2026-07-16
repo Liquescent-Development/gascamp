@@ -518,6 +518,11 @@ enum ImportCommand {
         /// A pinned ref (sha:<sha>, tag, branch) — overrides any #ref in the source
         #[arg(long)]
         version: Option<String>,
+        /// Install the pack's skills/ into dispatched worktrees (§5.3). Omit for
+        /// the default (install when the pack ships skills/); `--skills false`
+        /// opts out even when it does.
+        #[arg(long)]
+        skills: Option<bool>,
     },
     /// Re-materialize every locked import (never re-resolves a ref)
     Install,
@@ -870,7 +875,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     source,
                     name,
                     version,
-                } => cmd::import::run_add(&camp.root, &source, name.as_deref(), version.as_deref()),
+                    skills,
+                } => cmd::import::run_add(
+                    &camp.root,
+                    &source,
+                    name.as_deref(),
+                    version.as_deref(),
+                    skills,
+                ),
                 ImportCommand::Install => cmd::import::run_install(&camp.root),
                 ImportCommand::Upgrade { name } => {
                     cmd::import::run_upgrade(&camp.root, name.as_deref())

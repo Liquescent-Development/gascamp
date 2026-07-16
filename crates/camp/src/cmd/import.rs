@@ -233,11 +233,51 @@ pub fn run_add(
     source: &str,
     name: Option<&str>,
     version: Option<&str>,
+    skills: Option<bool>,
 ) -> Result<()> {
     let src = normalize(source, version).with_context(|| format!("source {source:?}"))?;
     let binding = derive_binding(name, &src)?;
     let lock_path = camp_root.join("packs.lock");
     let mut lock = PacksLock::read(&lock_path).context("packs.lock")?;
+
+    // gc parity: `add` NEVER mutates an existing import — gc errors on any
+    // re-add at all (`importsvc.ErrImportExists`). camp keeps the identical
+    // re-add idempotent (the container entrypoint re-runs it), but an explicit
+    // `--skills` that DIFFERS from the recorded decl is a real operator intent
+    // `add` cannot honor: `append_import_decl` is idempotent on the header, so
+    // the value would be silently discarded — shipping the very defect #118
+    // exists to fix, an opt-out that opts out of nothing. Fail fast instead,
+    // naming both remedies.
+    //
+    // Keyed on the camp.toml DECLARATION, not the lock: a local-path import is
+    // layered in place and gets NO lock entry at all (§5/D7), so a lock-based
+    // guard silently misses every local import — which is exactly how the first
+    // cut of this check passed its file:// test and still did nothing in a real
+    // local re-add. camp.toml is also the state `pack.rs` actually reads.
+    //
+    // Compared on EFFECTIVE values: the sole consumer is
+    // `decl.skills != Some(false)` (pack.rs), so an absent key and
+    // `skills = true` are the SAME state (install). Comparing raw Options would
+    // fail `--skills true` on a default import as though it could not be changed
+    // when nothing needs changing — breaking the re-add idempotency the
+    // entrypoint depends on.
+    if let Some(want) = skills {
+        let camp_toml = camp_root.join("camp.toml");
+        if camp_toml.exists() {
+            let cfg = camp_core::config::CampConfig::load(&camp_toml)?;
+            if let Some(decl) = cfg.imports.get(&binding) {
+                let current = decl.skills.unwrap_or(true);
+                if current != want {
+                    bail!(
+                        "import {binding:?} already exists — `camp import add --skills {want}` \
+                         cannot change it (add never mutates an existing import). Set \
+                         `skills = {want}` under [imports.{binding}] in camp.toml, or \
+                         `camp import remove {binding}` and add it again with --skills {want}."
+                    );
+                }
+            }
+        }
+    }
 
     // Idempotency / conflict on DIRECT entries (via = None) for this binding.
     if let Some(direct) = lock
@@ -249,6 +289,8 @@ pub fn run_add(
             && direct.subpath == src.subpath
             && direct.version == src.reference.clone().unwrap_or_default();
         if same {
+            // The explicit-`--skills` conflict is already refused above, keyed on
+            // the camp.toml decl (which a local import has and the lock does not).
             return Ok(()); // idempotent
         }
         bail!(
@@ -286,6 +328,7 @@ pub fn run_add(
         &commit,
         &mut lock,
         source,
+        skills,
     )?;
     lock.write(&lock_path).context("write packs.lock")?;
     Ok(())
@@ -350,6 +393,7 @@ fn run_add_materialize(
     commit: &str,
     lock: &mut PacksLock,
     source_str: &str,
+    skills: Option<bool>,
 ) -> Result<()> {
     // `anchor_sub` is where the pack sits INSIDE `repo_dir` — the anchor for
     // transitive `..` resolution. For a remote it is the source's `//subpath`;
@@ -415,7 +459,7 @@ fn run_add_materialize(
         subpath: src.subpath.clone(),
         version: src.reference.clone(),
         trust_exec: false,
-        skills: None,
+        skills,
     };
     // Where each resolved import's content lives on disk (D7/D8).
     let layer_of = |imp: &ResolvedImport| -> PathBuf {
@@ -756,6 +800,9 @@ pub fn run_install(camp_root: &Path) -> Result<()> {
             &entry.commit,
             &mut lock,
             &entry.source,
+            // install never rewrites camp.toml (append_import_decl is idempotent
+            // on the header), so the operator's existing `skills` value stands.
+            None,
         )?;
     }
     lock.write(&lock_path).context("write packs.lock")?;
@@ -803,6 +850,9 @@ pub fn run_upgrade(camp_root: &Path, name: Option<&str>) -> Result<()> {
             &commit,
             &mut lock,
             &entry.source,
+            // upgrade moves the commit, not the operator's `skills` opt-out;
+            // append_import_decl is idempotent, so the existing value stands.
+            None,
         )?;
     }
     lock.write(&lock_path).context("write packs.lock")?;
@@ -1168,7 +1218,14 @@ mod verb_tests {
         let root = camp_at(camp.path());
         let base = format!("file://{}", repo.path().display());
 
-        run_add(root, &format!("{base}//bmad"), Some("bmad"), Some("v1")).unwrap();
+        run_add(
+            root,
+            &format!("{base}//bmad"),
+            Some("bmad"),
+            Some("v1"),
+            None,
+        )
+        .unwrap();
 
         let prompt =
             std::fs::read_to_string(root.join("imports/bmad/agents/architect/prompt.md")).unwrap();
@@ -1195,7 +1252,7 @@ mod verb_tests {
         let camp = tempfile::tempdir().unwrap();
         let root = camp_at(camp.path());
         let base = format!("file://{}", repo.path().display());
-        run_add(root, &format!("{base}//bmad"), Some("bmad"), None).unwrap();
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), None, None).unwrap();
 
         // Simulate the container's empty (gitignored) imports/ dir.
         std::fs::remove_dir_all(root.join("imports")).unwrap();
@@ -1226,7 +1283,7 @@ mod verb_tests {
         let camp = tempfile::tempdir().unwrap();
         let root = camp_at(camp.path());
         let base = format!("file://{}", repo.path().display());
-        run_add(root, &format!("{base}//bmad"), Some("bmad"), None).unwrap();
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), None, None).unwrap();
         let before = PacksLock::read(&root.join("packs.lock")).unwrap();
         let old_commit = before
             .imports
@@ -1289,8 +1346,8 @@ mod verb_tests {
         let camp = tempfile::tempdir().unwrap();
         let root = camp_at(camp.path());
         let base = format!("file://{}", repo.path().display());
-        run_add(root, &format!("{base}//bmad"), Some("bmad"), None).unwrap();
-        run_add(root, &format!("{base}//gstack"), Some("gstack"), None).unwrap();
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), None, None).unwrap();
+        run_add(root, &format!("{base}//gstack"), Some("gstack"), None, None).unwrap();
 
         let shared = camp_core::config::transitive_layer_dir(root, "gc");
         assert!(shared.is_dir(), "both imports share one gc layer");
@@ -1345,7 +1402,7 @@ mod verb_tests {
         let root = camp_at(camp.path());
 
         let bmad = packs.path().join("bmad");
-        run_add(root, &bmad.display().to_string(), Some("bmad"), None)
+        run_add(root, &bmad.display().to_string(), Some("bmad"), None, None)
             .expect("a local import of a pack declaring [imports.*] must resolve");
 
         let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
@@ -1397,7 +1454,7 @@ mod verb_tests {
         .unwrap();
         camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
         let url = format!("file://{}//bmad", repo.path().display());
-        run_add(camp.path(), &url, Some("bmad"), None).unwrap();
+        run_add(camp.path(), &url, Some("bmad"), None, None).unwrap();
 
         let cfg = camp_core::config::CampConfig::load(&camp.path().join("camp.toml")).unwrap();
         assert!(cfg.imports.contains_key("bmad"));
@@ -1442,6 +1499,140 @@ mod verb_tests {
         );
     }
 
+    /// issue #118: `camp import add --skills false` must PERSIST `skills = false`
+    /// into the written camp.toml's [imports.<binding>] — the opt-out the
+    /// dispatcher's skills-install honors. The default (`--skills` omitted =
+    /// None) writes no `skills` key.
+    #[test]
+    fn add_persists_the_skills_opt_out_into_camp_toml() {
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                ("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n"),
+                ("bmad/agents/architect/prompt.md", "architect"),
+                ("bmad/skills/bmad-arch/SKILL.md", "# skill"),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp_at(camp.path());
+        let url = format!("file://{}//bmad", repo.path().display());
+
+        run_add(root, &url, Some("bmad"), None, Some(false)).unwrap();
+
+        let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+        assert_eq!(
+            cfg.imports["bmad"].skills,
+            Some(false),
+            "--skills false must persist skills = false into camp.toml"
+        );
+    }
+
+    /// #118 review finding 1: a re-add carrying an explicit `--skills` that
+    /// DIFFERS from the recorded decl must FAIL, not exit 0 having applied
+    /// nothing (the natural path: add the pack, notice skills landing, re-run
+    /// with --skills false). gc parity: `add` never mutates an existing import
+    /// (gc errors on any re-add: importsvc.ErrImportExists).
+    ///
+    /// Review round 2: the comparison is on EFFECTIVE values. An absent
+    /// `skills` key and `skills = true` are the same state (pack.rs's sole
+    /// consumer reads `!= Some(false)`), so `--skills true` on a default import
+    /// asks for what already holds and MUST stay an idempotent no-op — a
+    /// provisioning script that passes it must not fail on its second run.
+    #[test]
+    fn re_adding_with_a_differing_explicit_skills_fails_instead_of_silently_ignoring_it() {
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                ("bmad/pack.toml", "[pack]\nname=\"bmad\"\nschema=2\n"),
+                ("bmad/agents/architect/prompt.md", "architect"),
+                ("bmad/skills/bmad-arch/SKILL.md", "# skill"),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp_at(camp.path());
+        let url = format!("file://{}//bmad", repo.path().display());
+
+        // first add: no explicit opt-out recorded (skills key absent)
+        run_add(root, &url, Some("bmad"), None, None).unwrap();
+        let before = std::fs::read_to_string(root.join("camp.toml")).unwrap();
+
+        // --skills false DIFFERS from the effective state (install) → refuse,
+        // naming the remedy, and change nothing.
+        let err = run_add(root, &url, Some("bmad"), None, Some(false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "must refuse: {err}");
+        assert!(err.contains("skills"), "must name the knob: {err}");
+        assert!(
+            err.contains("camp.toml") || err.contains("import remove"),
+            "must name a remedy: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("camp.toml")).unwrap(),
+            before,
+            "a refused re-add must leave camp.toml byte-identical"
+        );
+
+        // --skills true MATCHES the effective state (absent == install), so it
+        // is a no-op, NOT a failure. MUTATION: comparing the raw Option
+        // (`current != Some(want)`) fails here — None != Some(true).
+        run_add(root, &url, Some("bmad"), None, Some(true))
+            .expect("--skills true on a default import asks for what already holds");
+        // and a bare re-add stays idempotent
+        run_add(root, &url, Some("bmad"), None, None).unwrap();
+    }
+
+    /// The same contract for a LOCAL-PATH import — the case a lock-keyed guard
+    /// silently misses. A local import is layered in place and gets NO
+    /// `packs.lock` entry at all (§5/D7), so `run_add`'s lock-based idempotency
+    /// branch never fires for it: the re-add falls through to the fresh-add
+    /// path, `append_import_decl` early-returns on the existing header, and an
+    /// explicit `--skills` is silently discarded — exit 0, nothing applied,
+    /// which is exactly the #118 defect. Caught by driving the real binary, not
+    /// by the file:// test above. MUTATION: keying the guard on the lock entry
+    /// instead of the camp.toml decl makes this test fail.
+    #[test]
+    fn a_local_path_import_also_refuses_a_differing_explicit_skills() {
+        let camp = tempfile::tempdir().unwrap();
+        let root = camp_at(camp.path());
+        // a local pack DIRECTORY (not file://) — layered in place, no lock entry
+        let pack = camp.path().join("bmadpack");
+        std::fs::create_dir_all(pack.join("skills/bmad-arch")).unwrap();
+        std::fs::create_dir_all(pack.join("agents/architect")).unwrap();
+        std::fs::write(pack.join("pack.toml"), "[pack]\nname=\"bmad\"\nschema=2\n").unwrap();
+        std::fs::write(pack.join("agents/architect/prompt.md"), "architect").unwrap();
+        std::fs::write(pack.join("skills/bmad-arch/SKILL.md"), "# skill").unwrap();
+        let src = pack.display().to_string();
+
+        run_add(root, &src, Some("bmad"), None, None).unwrap();
+        // a local import really does get no lock entry — the reason the guard
+        // cannot live on the lock
+        let lock = PacksLock::read(&root.join("packs.lock")).unwrap();
+        assert!(
+            !lock.imports.iter().any(|e| e.name == "bmad"),
+            "a local import has no lock entry (§5/D7): {:?}",
+            lock.imports
+        );
+        let before = std::fs::read_to_string(root.join("camp.toml")).unwrap();
+
+        let err = run_add(root, &src, Some("bmad"), None, Some(false))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("already exists") && err.contains("skills"),
+            "a local re-add must refuse a differing --skills, not exit 0: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("camp.toml")).unwrap(),
+            before,
+            "a refused re-add must leave camp.toml byte-identical"
+        );
+        // matching value stays idempotent
+        run_add(root, &src, Some("bmad"), None, Some(true)).unwrap();
+    }
+
     #[test]
     fn re_adding_same_source_is_idempotent_and_different_source_errors() {
         let repo = tempfile::tempdir().unwrap();
@@ -1460,8 +1651,8 @@ mod verb_tests {
         .unwrap();
         camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
         let url = format!("file://{}//bmad", repo.path().display());
-        run_add(camp.path(), &url, Some("bmad"), None).unwrap();
-        run_add(camp.path(), &url, Some("bmad"), None).unwrap(); // idempotent
+        run_add(camp.path(), &url, Some("bmad"), None, None).unwrap();
+        run_add(camp.path(), &url, Some("bmad"), None, None).unwrap(); // idempotent
         let repo2 = tempfile::tempdir().unwrap();
         testsupport::init_repo(
             repo2.path(),
@@ -1472,7 +1663,7 @@ mod verb_tests {
         );
         let other = format!("file://{}//bmad", repo2.path().display());
         assert!(
-            run_add(camp.path(), &other, Some("bmad"), None).is_err(),
+            run_add(camp.path(), &other, Some("bmad"), None, None).is_err(),
             "same name, different source"
         );
     }
@@ -1529,8 +1720,15 @@ mod verb_tests {
         let base = format!("file://{}", repo.path().display());
 
         // The two commands (§3), against LOCAL file:// (never the network):
-        run_add(root, &format!("{base}//bmad"), Some("bmad"), None).unwrap();
-        run_add(root, &format!("{base}//gascity/roles"), Some("gc"), None).unwrap();
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), None, None).unwrap();
+        run_add(
+            root,
+            &format!("{base}//gascity/roles"),
+            Some("gc"),
+            None,
+            None,
+        )
+        .unwrap();
 
         let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
         assert_eq!(
@@ -1558,7 +1756,7 @@ mod verb_tests {
         );
 
         // add gstack too: the cross-binding collision coexists:
-        run_add(root, &format!("{base}//gstack"), Some("gstack"), None).unwrap();
+        run_add(root, &format!("{base}//gstack"), Some("gstack"), None, None).unwrap();
         let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
         assert!(
             camp_core::pack::resolve_agent(&cfg, "gstack.review-synthesizer")
@@ -1612,7 +1810,14 @@ mod verb_tests {
         camp_core::ledger::Ledger::open(&root.join("camp.db")).unwrap();
 
         // An ABSOLUTE local path (no scheme) — a local source, not a fetch.
-        run_add(root, &house.display().to_string(), Some("house"), None).unwrap();
+        run_add(
+            root,
+            &house.display().to_string(),
+            Some("house"),
+            None,
+            None,
+        )
+        .unwrap();
 
         // No fetch, no copy: `imports/house/` must not exist at all.
         assert!(
@@ -1691,7 +1896,7 @@ mod verb_tests {
         let base = format!("file://{}", repo.path().display());
 
         // 1. bmad → transitively binds `gc` to gascity (a CONTENT layer).
-        run_add(root, &format!("{base}//bmad"), Some("bmad"), None).unwrap();
+        run_add(root, &format!("{base}//bmad"), Some("bmad"), None, None).unwrap();
         assert!(
             root.join("imports")
                 .join(camp_core::config::TRANSITIVE_DIR)
@@ -1703,7 +1908,14 @@ mod verb_tests {
         );
 
         // 2. the operator DIRECTLY binds `gc` to the roles pack — the override.
-        run_add(root, &format!("{base}//gascity/roles"), Some("gc"), None).unwrap();
+        run_add(
+            root,
+            &format!("{base}//gascity/roles"),
+            Some("gc"),
+            None,
+            None,
+        )
+        .unwrap();
 
         let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
 
@@ -1758,7 +1970,7 @@ mod verb_tests {
         .unwrap();
         camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
         let url = format!("file://{}//bmad", repo.path().display());
-        let err = run_add(camp.path(), &url, Some("bmad"), None)
+        let err = run_add(camp.path(), &url, Some("bmad"), None, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1793,7 +2005,7 @@ mod verb_tests {
         .unwrap();
         camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
         let url = format!("file://{}//bmad", repo.path().display());
-        let err = run_add(camp.path(), &url, Some("bmad"), None)
+        let err = run_add(camp.path(), &url, Some("bmad"), None, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1826,7 +2038,7 @@ mod verb_tests {
         .unwrap();
         camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
         let url = format!("file://{}//bmad", repo.path().display());
-        run_add(camp.path(), &url, Some("bmad"), None).unwrap();
+        run_add(camp.path(), &url, Some("bmad"), None, None).unwrap();
         let led = camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
         let added = led
             .events_of_type(camp_core::event::EventType::ImportAdded)
@@ -1865,7 +2077,7 @@ mod verb_tests {
         .unwrap();
         camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
         let url = format!("file://{}//bmad", repo.path().display());
-        run_add(camp.path(), &url, Some("bmad"), None).unwrap();
+        run_add(camp.path(), &url, Some("bmad"), None, None).unwrap();
         let led = camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
         let added = led
             .events_of_type(camp_core::event::EventType::ImportAdded)
