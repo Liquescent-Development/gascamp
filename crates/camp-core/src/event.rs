@@ -17,6 +17,10 @@ pub enum EventType {
     BeadUpdated,
     BeadClosed,
     SessionWoke,
+    /// The worker's OS pid, appended once the child exists (issue #99):
+    /// `session.woke` is committed BEFORE the spawn, so its pid is unknowable
+    /// then. Additive, camp-specific — an OS/adoption detail gc does not track.
+    SessionPid,
     SessionStopped,
     SessionCrashed,
     SessionNudged,
@@ -123,6 +127,7 @@ impl EventType {
         EventType::BeadUpdated,
         EventType::BeadClosed,
         EventType::SessionWoke,
+        EventType::SessionPid,
         EventType::SessionStopped,
         EventType::SessionCrashed,
         EventType::SessionNudged,
@@ -168,6 +173,7 @@ impl EventType {
             EventType::BeadUpdated => "bead.updated",
             EventType::BeadClosed => "bead.closed",
             EventType::SessionWoke => "session.woke",
+            EventType::SessionPid => "session.pid",
             EventType::SessionStopped => "session.stopped",
             EventType::SessionCrashed => "session.crashed",
             EventType::SessionNudged => "session.nudged",
