@@ -212,48 +212,109 @@ camp sling "add a --json flag to ls, TDD it"
 ```
 
 This needs two things the free lifecycle did not: an **authenticated `claude`
-CLI** and a **routable agent**. Install the [starter pack](packs/starter/) and
-name a default agent in `camp.toml` — here is the full file for the `demo` camp
-above, `packs` added:
+CLI** and a **routable agent**. Agents come from a **pack** you *import* under a
+binding. Import the bundled [starter pack](packs/starter/) into the `demo` camp:
 
-```toml
-# Gas Camp configuration (spec §7.1)
-packs = ["/absolute/path/to/gascamp/packs/starter"]
-
-[camp]
-name = "demo"
-
-[[rigs]]
-name = "demo"
-path = "/absolute/path/to/demo"
-prefix = "demo"
-
-[dispatch]
-default_agent = "dev"          # packs/starter/agents/dev.md
+```sh
+# run from inside the demo camp (the directory holding .camp/)
+camp import add /absolute/path/to/gascamp/packs/starter --name starter
 ```
 
-Two things to get right, both easy to miss:
+`camp import add` clones/materializes the pack, writes an `[imports.starter]`
+block into `camp.toml`, and makes the pack's agents resolvable by their
+**qualified name** `<binding>.<agent>` — here `starter.dev`, `starter.reviewer`,
+`starter.committer` (the directories under `packs/starter/agents/`). Then point
+`[dispatch].default_agent` at one and declare the **operator-owned** worker pins
+in `[agent_defaults]`:
 
-- **`packs` is a top-level key, and it must come before every `[section]`
-  header** (`[camp]`, `[[rigs]]`, `[dispatch]`) — TOML binds a bare key to
-  whichever table precedes it, not to the file as a whole. `camp init` writes
-  `[camp]` first and `camp rig add` appends `[[rigs]]` after it, so if you
-  paste `packs = [...]` at the *bottom* of the file (as you'd naturally do
-  after running those commands), TOML attaches it to the last `[[rigs]]`
-  entry instead of the top level. Since `camp.toml` rejects unknown fields,
-  that surfaces as a confusing `` unknown field `packs` `` error rather than
-  anything mentioning placement — add the line above `[camp]`, not below
-  `[[rigs]]`.
-- **Relative pack paths resolve against the directory holding `camp.toml`**
-  (the `.camp/` directory `camp init` creates), not your shell's cwd. A bare
-  `packs = ["packs/starter"]` in the `demo` camp above would look for
-  `demo/.camp/packs/starter`, which doesn't exist. Use an absolute path to
-  your gascamp clone's `packs/starter` (as above), or copy the pack directory
-  into `.camp/` instead.
+```toml
+[dispatch]
+command = "claude"              # the worker binary campd spawns
+default_agent = "starter.dev"   # <binding>.<agent>
+
+[agent_defaults]
+model = "sonnet"
+permission_mode = "acceptEdits"
+tools = ["Read", "Edit", "Write", "Bash"]
+```
+
+Two things worth knowing:
+
+- **Agents resolve as `<binding>.<agent>`.** The binding is the `--name` you
+  imported under; the agent is a directory under the pack's `agents/`.
+  `camp sling --agent starter.reviewer "…"` routes a bead to a specific role.
+- **Model, permission mode, and tools live in `[agent_defaults]` — never in the
+  pack.** A pack you import can't silently grant its agents `Bash`; you decide
+  the allowlist. An agent from a pack that ships `skills/` needs `"Skill"` in
+  the allowlist to resolve, and no resolvable `tools` means no spawn (a loud
+  refusal that names the remedy).
 
 Then `camp sling "…"` (or `/camp:sling "…"`) creates the bead and campd
-dispatches the worker. Route to a specific role with `--agent reviewer`.
-Watch the fleet with `camp top` or `/camp:status`.
+dispatches the worker. Route to a specific role with `--agent starter.reviewer`.
+Watch the fleet live with `camp watch` (or `camp top`, or `/camp:status`), and
+talk to a running worker with `camp nudge` / `camp attach` (see [Talking to
+workers](#talking-to-workers--the-control-plane)).
+
+## Verify it yourself
+
+Want to confirm each capability actually works before trusting it? Walk these
+tiers against a throwaway camp. **The first three spend no API money and need no
+`claude` at all** — only the last one dispatches a real worker.
+
+**Tier 0 — the bead lifecycle ($0, no daemon).** By hand, start to finish:
+
+```sh
+mkdir /tmp/campcheck && cd /tmp/campcheck
+camp init --no-service --no-import
+camp rig add . --prefix demo
+camp create "try camp"                 # -> demo-1
+camp ls --ready                        # demo-1  open  campcheck  try camp
+camp claim demo-1 --session me
+camp close demo-1 --outcome pass --reason "works"
+camp show demo-1                       # current state + full event history
+camp doctor --refold                   # -> refold: replayed 4 events; 0 drift rows
+camp remember "camp stores memories as beads" && camp recall camp
+camp events --json | tail              # the raw append-only log
+```
+
+**Packs & formulas ($0, no worker).** Prove the pack/formula machinery — and
+real Gas City compatibility — end to end:
+
+```sh
+make demo-pack                         # fetches the pinned corpus, imports the real bmad + gstack
+                                       # packs, compiles them vs gc's own compiler, cooks a bead graph
+```
+
+…or by hand against the bundled starter pack (from your `/tmp/campcheck` camp):
+
+```sh
+camp import add /path/to/gascamp/packs/starter --name starter
+camp import list
+camp doctor --formula /path/to/gascamp/packs/starter/formulas/guarded-change.toml
+# -> formula ok: guarded-change (2 step(s))
+```
+
+**The daemon ($0 idle).** Start campd yourself and watch it cost nothing:
+
+```sh
+camp daemon --camp .camp &             # or `camp service install` on a desktop
+camp top                               # pid, live/ready/open/red
+camp watch                             # live fleet view — Ctrl-C to leave
+camp stop                              # graceful shutdown
+```
+
+**The AI step (spends real API money).** With an authenticated `claude` and a
+routed agent (see [The AI step](#the-ai-step)), sling a real worker and drive it:
+
+```sh
+camp sling "add a --version flag; keep it tiny"
+camp watch                             # watch it claim → work → close
+camp attach <session>                  # tail its typed stream; a line is a turn, /interrupt, /q
+camp mail inbox                        # anything the worker escalated to you
+```
+
+Everything above lands in the one ledger — `camp events` and `camp show` replay
+the whole story at any point.
 
 ## Concepts
 
@@ -262,11 +323,11 @@ directions ([AGENTS.md](AGENTS.md), design § 6):
 
 | Primitive | In camp |
 |---|---|
-| **Agent** (who) | a Claude Code agent definition file in a pack — frontmatter (model, tools, permissions) + prompt |
+| **Agent** (who) | an agent **directory** in a pack — `agents/<name>/` with a `prompt.md` and an optional `agent.toml`. Model, permission mode, and tools are operator-owned in `camp.toml`'s `[agent_defaults]`, never pack-owned. Resolved by its qualified name `<binding>.<agent>` |
 | **Bead** (what) | a ledger record: append-only events + current state. Tasks, mail, and memory are all beads that differ by `type`; `needs` are dependency edges; *ready* = open ∧ no open blockers |
 | **Formula** (how) | a TOML file, a strict subset of Gas City formula-v2; cooking materializes a run into the ledger |
 | **Rig** (where) | a registered repo path; beads carry a rig; dispatch sets the worker's cwd (or a worktree) |
-| **Pack** (configures) | a directory of agents, formulas, and orders — optionally installed as a Claude Code plugin |
+| **Pack** (configures) | a directory (`pack.toml` + `agents/`, `formulas/`, `orders/`, optional `skills/`) **imported** under a binding with `camp import add`; a pack may itself import others (transitive) |
 | **Event** (observe) | a row in the ledger's event log, which is simultaneously the store's history and the bus |
 
 ## Features
@@ -521,7 +582,12 @@ the last step finalizes the run. `campd` executes structure; agents and your
 
 ### Orders & automation
 
-An **order** is a cron- or event-triggered formula, declared in `camp.toml`:
+An **order** is a cron- or event-triggered formula. Camp still schedules by
+cron; the compat work made the *pack* path Gas City-compatible. Orders come from
+two places:
+
+**Your own, inline in `camp.toml`** (`[[order]]`) — camp's native form, with the
+trigger in a single `on = "cron:…" | "event:…"` string:
 
 ```toml
 [[order]]
@@ -536,10 +602,38 @@ on      = "event:bead.closed[label=ci-red]"
 formula = "fix-ci"
 ```
 
-```sh
-camp order ls                                # NAME  ON  FORMULA  RIG  WINDOW  NEXT
-camp order run morning-triage                # fire now (campd cooks and dispatches it)
+**From a pack** — a pack ships each order as `orders/<name>.toml` in **Gas
+City's own on-disk format** (a `[order]` table with `trigger` + `schedule`/`on`),
+so an order is a portable, gc-compatible file rather than camp-only config:
+
+```toml
+# packs/<pack>/orders/morning-triage.toml
+[order]
+formula  = "guarded-change"
+trigger  = "cron"
+schedule = "0 7 * * 1-5"
 ```
+
+Pack orders are namespaced `<binding>.<stem>` and — the **money invariant** —
+**inert until you arm them**: an imported pack's cron order fires *nothing* until
+you opt it in, so importing a pack can never start spending on your behalf. Arming
+is recorded as `[orders] enabled` in `camp.toml` and managed with the verbs:
+
+```sh
+camp order ls                                # every order + next fire time (disabled state shown)
+camp order enable starter.morning-triage     # arm an imported order (adds it to [orders] enabled)
+camp order disable starter.morning-triage    # disarm it
+camp order run morning-triage                # fire one now (campd cooks and dispatches it)
+```
+
+> **Where this stands today.** Inline `[[order]]` orders in `camp.toml` are live:
+> they fire on schedule, and `camp order run <name>` triggers one now. For
+> **imported pack orders**, the *configuration* machinery is in place — import,
+> `camp order ls`, `enable`/`disable`, and the money-invariant gate — but campd
+> does **not fire them yet** (neither on schedule nor via `camp order run`); the
+> imported-order fire path is a later compat phase, and arming one prints a note
+> saying so. So a pack's orders are visible and armable, but only your own
+> `[[order]]` entries actually run until then.
 
 Cron orders are a min-heap of deadlines — a timer, not a tick — with a
 catch-up window for fires missed while asleep. Event orders match on the same
@@ -553,25 +647,97 @@ keep running — orders fire only while a `camp daemon` you started is alive. An
 a powered-off or sleeping machine fires nothing until wake, when the catch-up
 window applies.
 
-### Packs & the Claude Code plugin
+### Packs & imports — the binding namespace
 
-A **pack is a directory** of Claude Code content — `agents/`, `formulas/`,
-`orders.toml`, optional `skills/`/`commands/` — imported by path in
-`camp.toml`. Layering is last-wins with your local definitions highest. The
-[starter pack](packs/starter/) ships `dev` and `reviewer` roles and a
-gc-validated formula as an example to copy, not a dependency.
+A **pack is a directory** — a `pack.toml` manifest plus `agents/`, `formulas/`,
+`orders/`, and optional `skills/`. You bring one into a camp with `camp import
+add <source> --name <binding>`, which clones/materializes it, records it in a
+`packs.lock` (git sources) or layers it in place (local paths), and writes an
+`[imports.<binding>]` block into `camp.toml`. Everything the pack provides is
+then addressed through that **binding**:
+
+```sh
+camp import add /path/to/gascamp/packs/starter --name starter   # local path
+camp import add https://github.com/org/repo//somepack --name team   # git source
+camp import list                              # locked imports + provenance
+camp import check                             # offline: every materialized tree is present
+camp import upgrade team                      # re-resolve the ref, move the pinned commit
+camp import remove team                       # drop the lock entry + materialized tree
+```
+
+**Importing the official Gas City packs from GitHub.** They live in a monorepo
+([`gastownhall/gascity-packs`](https://github.com/gastownhall/gascity-packs)), so
+you select a pack with a `//<subpath>` and pin a branch or tag with `#<ref>`:
+
+```sh
+# bmad (it transitively pulls gascity), then the gascity roles as the `gc` binding
+camp import add "https://github.com/gastownhall/gascity-packs//bmad#main" --name bmad
+camp import add "https://github.com/gastownhall/gascity-packs//gascity/roles#main" --name gc
+```
+
+- `//bmad` is the pack's subpath inside the repo; `#main` pins the **ref** — a
+  branch or tag, **not a raw commit sha** (camp resolves the ref with
+  `git ls-remote` and records the resolved commit in `packs.lock`, so the import
+  is reproducible even though `main` moves).
+- Import pulls a full clone, so `bmad`'s own `[imports.gc] source = "../gascity"`
+  resolves **transitively**; importing `gascity/roles` as `gc` supplies the
+  roles/agents its routes (`gc.run-operator`, …) resolve through.
+- `bmad` ships `skills/`, so its agents need `"Skill"` in `[agent_defaults].tools`.
+  Then it compiles against gc's own compiler:
+
+```sh
+camp doctor --formula .camp/imports/bmad/formulas/bmad-build.formula.toml
+# -> formula ok: bmad-build (19 step(s))
+```
+
+- **Agents resolve as `<binding>.<agent>`** — so two packs can each ship a
+  `review-synthesizer` and they coexist as `gstack.review-synthesizer` and
+  `gc.review-synthesizer`. Routes in formulas and `default_agent` use the
+  qualified name.
+- **Transitive imports.** A pack can declare `[imports.*]` of its own; camp
+  materializes the transitive layer so the pack's formulas resolve their
+  `extends`/routes. (Real Gas City packs do exactly this — `bmad` and `gstack`
+  each import `gascity` as `gc`.)
+- **`trust_exec` default-deny.** A pack's executable content (`check.path`
+  scripts, `pre_start`, `condition` shells) is inventoried at import and does
+  **not** run unless you set `trust_exec = true` on that import.
+- **`camp.toml` is the source of truth**; the materialized trees under
+  `.camp/imports/` are runtime state (gitignored).
+
+The bundled [starter pack](packs/starter/) ships `dev`, `reviewer`, and
+`committer` agent directories, a gc-validated `guarded-change` formula, and two
+example orders — a template to copy, not a dependency. `camp init` offers to
+import it for you (or `camp init --import <source>` / `--no-import`).
+
+**Real Gas City packs load, compile, and cook in camp** — the compatibility is
+measured, not asserted. `make demo-pack` is an opt-in, **$0** local check that
+fetches the pinned Gas City corpus, imports the real `bmad` and `gstack` packs,
+compiles their formulas against gc's own compiler, and cooks one into a bead
+graph:
+
+```sh
+make demo-pack        # clones the pinned corpus; no API spend, never starts a worker
+```
+
+See [docs/demos/2026-07-15-real-gc-packs.md](docs/demos/2026-07-15-real-gc-packs.md)
+for what it proves and how to read the output.
+
+### The Claude Code plugin
 
 The **camp plugin** ([plugin/](plugin/)) makes a Claude Code session the
 control plane. It is machinery only — it ships **zero roles**:
 
-- Slash commands `/camp:sling`, `/camp:status`, `/camp:adopt`, `/camp:events` (thin wrappers over
-  the `camp` CLI — the session's scripting surface is identical to the
-  terminal's).
+- Slash commands `/camp:sling`, `/camp:status`, `/camp:adopt`, `/camp:events`,
+  and `/camp:nudge` (thin wrappers over the `camp` CLI — the session's scripting
+  surface is identical to the terminal's).
 - SessionStart / SessionEnd lifecycle hooks that register and end attended
   sessions.
 - An opt-in statusline rendering the fleet badge from a read-only socket query.
-- The **worker skill** (`skills/worker/SKILL.md`): the worker lifecycle
-  contract — recall → claim → work → emit milestones → remember → close → exit.
+- Two skills: the **worker skill** (`skills/worker/SKILL.md`) — the worker
+  lifecycle contract, recall → claim → work → emit milestones → remember →
+  close → exit — and the **operator skill** (`skills/operator/SKILL.md`), which
+  teaches your overseer session to drive the fleet (watch, attach, nudge, decide,
+  mail) as a socket-only control-plane client.
 
 Install it from this repo (see the [quickstart](#use-camp-from-inside-claude-code-recommended)):
 
@@ -589,6 +755,45 @@ when `campd` is down.
 ```json
 { "statusLine": { "type": "command",
                   "command": "\"${CLAUDE_PLUGIN_ROOT}\"/statusline/statusline.sh" } }
+```
+
+### Talking to workers — the control plane
+
+A dispatched worker is not a black box. campd holds each worker's stdin and
+tails its output, so you can watch, steer, and answer any worker **live** through
+the socket. Each of these is a **pure client** — it reads only the socket and
+needs campd running:
+
+```sh
+camp watch                       # the fleet, live: one line per session, push-driven (zero polling)
+camp sessions                    # one-shot snapshot of live sessions (--json for the raw array)
+camp attach <session>            # one worker's typed stream live: tool calls, results, text, usage
+camp nudge <session> "<turn>"    # send a turn into a running worker (or `claude --resume` after it exits)
+camp interrupt <session>         # stop a worker's current turn
+camp top                         # a single status snapshot (campd pid, live/ready/open/red)
+```
+
+`camp watch` is the thing you leave open on a second monitor. `camp attach`
+renders one worker's stream live; while attached, a line you type is a turn,
+`/interrupt` stops the turn, and `/q` detaches.
+
+**Permissions.** When a worker asks to use a tool it is not pre-allowed (a
+`can_use_tool` request), it BLOCKS — holding no dispatch slot — and `camp watch`
+shows the BLOCKED row with a request id. Answer it out of band:
+
+```sh
+camp decide <session> <request-id> allow             # or: allow_always | deny
+camp decide <session> <request-id> deny --reason "not on prod"
+```
+
+**Mail.** A worker escalates to you (the human) by sending mail — how it reports
+a blocker or something you should see. Read the operator mailbox:
+
+```sh
+camp mail inbox                  # unread messages
+camp mail read <id>              # print one and mark it read
+camp mail count                  # unread count
+camp mail archive <id>           # close it
 ```
 
 ### Export / graduation to Gas City
