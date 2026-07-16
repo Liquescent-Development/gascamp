@@ -1410,8 +1410,10 @@ fn stop(ledger: &mut Ledger, socket_path: &Path) -> Result<()> {
         bead: None,
         data: serde_json::json!({}),
     })?;
-    std::fs::remove_file(socket_path)
-        .with_context(|| format!("removing {}", socket_path.display()))?;
+    // Unlink the socket campd ACTUALLY bound (the relocated address for a deep
+    // camp, not the natural path it never created — issue #53) plus its pointer.
+    super::socket::remove_socket_artifacts(socket_path)
+        .with_context(|| format!("removing socket for {}", socket_path.display()))?;
     Ok(())
 }
 

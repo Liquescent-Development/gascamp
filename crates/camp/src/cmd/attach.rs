@@ -10,7 +10,6 @@
 //! `/allow`//deny action is a separate cp-4 deferral.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 
 use anyhow::{Result, bail};
 use serde::Deserialize;
@@ -343,7 +342,7 @@ pub fn run(
     // campd fails fast, like every verb); a down campd is the standard loud
     // error. A pure client never starts campd.
     let path = camp.socket_path();
-    let mut stream = match UnixStream::connect(&path) {
+    let mut stream = match socket::connect_stream(&path) {
         Ok(s) => s,
         Err(_) => {
             socket::require(
