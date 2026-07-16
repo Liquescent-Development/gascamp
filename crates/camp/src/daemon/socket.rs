@@ -276,7 +276,8 @@ pub fn bind_or_replace(path: &Path) -> Result<UnixListener> {
             }
             std::fs::remove_file(&bindable)
                 .with_context(|| format!("removing stale socket {}", bindable.display()))?;
-            UnixListener::bind(&bindable).with_context(|| format!("binding {}", bindable.display()))?
+            UnixListener::bind(&bindable)
+                .with_context(|| format!("binding {}", bindable.display()))?
         }
         Err(e) => return Err(e).with_context(|| format!("binding {}", bindable.display())),
     };
@@ -368,12 +369,14 @@ fn resolve_bindable(natural: &Path) -> std::io::Result<PathBuf> {
     let camp_root = natural.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("socket path {} has no parent camp directory", natural.display()),
+            format!(
+                "socket path {} has no parent camp directory",
+                natural.display()
+            ),
         )
     })?;
     let canonical = std::fs::canonicalize(camp_root)?;
-    let digest =
-        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, canonical.as_os_str().as_bytes());
+    let digest = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, canonical.as_os_str().as_bytes());
     let hash: String = digest.simple().to_string().chars().take(16).collect();
     let short = runtime_dir().join(format!("campd-{hash}.sock"));
     if exceeds_sun_path(&short) {
@@ -412,17 +415,42 @@ fn clear_pointer(natural: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The socket path campd recorded in the pointer, or `None` when no pointer file
+/// exists. The single reader of the pointer; `connect_addr` and
+/// `remove_socket_artifacts` layer their own pointer-absent policy on top.
+fn read_pointer(natural: &Path) -> std::io::Result<Option<PathBuf>> {
+    match std::fs::read(pointer_path(natural)) {
+        Ok(bytes) => Ok(Some(PathBuf::from(std::ffi::OsString::from_vec(
+            trim_trailing_newline(&bytes).to_vec(),
+        )))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The address a CLIENT connects to: the pointer's target when the pointer file
 /// exists (campd relocated the socket — the deep-camp case), else the natural
 /// `<camp>/campd.sock` (the common case). campd is the source of truth, so a
 /// client never re-derives the runtime dir.
 fn connect_addr(natural: &Path) -> std::io::Result<PathBuf> {
-    match std::fs::read(pointer_path(natural)) {
-        Ok(bytes) => Ok(PathBuf::from(std::ffi::OsString::from_vec(
-            trim_trailing_newline(&bytes).to_vec(),
-        ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(natural.to_path_buf()),
-        Err(e) => Err(e),
+    match read_pointer(natural)? {
+        Some(bound) => Ok(bound),
+        // A running deep-camp campd ALWAYS writes the pointer when it binds, so an
+        // absent pointer for a deep camp means campd is not up. Returning the
+        // over-long natural path here would make `connect` fail with
+        // `InvalidInput` (SUN_LEN) instead of `NotFound` — and only `NotFound` /
+        // `ConnectionRefused` drive the graceful "not running" degrade in
+        // `request_if_up` and the `camp service` pre-flight probe, so a down deep
+        // camp would hard-error `camp status` / `camp service install` (issue #53
+        // review). Report the `NotFound` the callers already handle.
+        None if exceeds_sun_path(natural) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "campd is not running (no socket pointer at {})",
+                pointer_path(natural).display()
+            ),
+        )),
+        None => Ok(natural.to_path_buf()),
     }
 }
 
@@ -442,9 +470,11 @@ pub(crate) fn connect_stream(natural: &Path) -> std::io::Result<UnixStream> {
 /// Remove the socket campd bound plus its pointer, tolerating their absence
 /// (crash-only, spec §5). Called by the graceful-stop path so a relocated socket
 /// is unlinked at the address campd actually bound — not the natural path it
-/// never created.
+/// never created. Unlike `connect_addr`, a missing pointer here falls back to the
+/// natural path (a harmless `NotFound` unlink for a deep camp already cleaned),
+/// so a repeat call is idempotent.
 pub(crate) fn remove_socket_artifacts(natural: &Path) -> std::io::Result<()> {
-    let bound = connect_addr(natural)?;
+    let bound = read_pointer(natural)?.unwrap_or_else(|| natural.to_path_buf());
     match std::fs::remove_file(&bound) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -982,7 +1012,10 @@ mod tests {
         // it never re-derives the runtime dir (which may differ from campd's).
         let listener = bind_or_replace(&natural).unwrap();
         let pointer = pointer_path(&natural);
-        assert!(pointer.is_file(), "bind must write the pointer for a deep camp");
+        assert!(
+            pointer.is_file(),
+            "bind must write the pointer for a deep camp"
+        );
         assert_eq!(
             connect_addr(&natural).unwrap(),
             bindable,
@@ -1024,6 +1057,35 @@ mod tests {
         drop(listener);
         remove_socket_artifacts(&natural).unwrap();
         assert!(!natural.exists(), "stop unlinks the natural socket");
+    }
+
+    /// Issue #53 review finding: a DEEP camp whose campd is DOWN must DEGRADE
+    /// GRACEFULLY, not hard-error. campd always writes the pointer when it binds,
+    /// so an absent pointer for a deep camp means "not up" — `connect_addr` must
+    /// report `NotFound` (which callers map to the graceful degrade) rather than
+    /// hand back the over-long natural path, whose `connect` fails with a
+    /// SUN_LEN `InvalidInput` and would break `camp status` / `camp service
+    /// install` for exactly the deep camps this fix serves.
+    #[test]
+    fn a_deep_camp_with_no_daemon_degrades_to_not_running() {
+        let _no_spawns = crate::daemon::spawn_probe_guard();
+        let base = tempfile::tempdir().unwrap();
+        let mut deep = base.path().to_path_buf();
+        while deep.as_os_str().len() < SUN_PATH_CAP + 40 {
+            deep.push("a-nested-camp-directory-segment");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let natural = deep.join("campd.sock");
+        assert!(exceeds_sun_path(&natural));
+
+        // No pointer + deep => NotFound, NOT the un-connectable natural path.
+        let err = connect_addr(&natural).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        // Through the real caller: the designed degrade, Ok(None) — the same as a
+        // shallow down camp — instead of a hard SUN_LEN error.
+        let camp = crate::campdir::CampDir { root: deep };
+        assert!(request_if_up(&camp, &Request::Status).unwrap().is_none());
     }
 
     #[test]
