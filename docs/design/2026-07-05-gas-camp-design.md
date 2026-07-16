@@ -175,7 +175,16 @@ agent definitions.
   other service. What it costs is one process per camp — which is why one
   standalone camp with many rigs is the recommended shape (§12).
 - **Liveness is an answered request, per the no-status-files principle:**
-  `campd` serves a unix socket at `<camp>/campd.sock`. Alive means a
+  `campd` serves a unix socket at `<camp>/campd.sock` — except when that
+  path would exceed the kernel's `sockaddr_un.sun_path` limit (~104 bytes
+  on macOS, 108 on Linux) for a deeply nested camp directory (issue #53).
+  There, campd and every client independently RELOCATE the socket to a
+  short, deterministic per-camp path under the runtime directory
+  (`$XDG_RUNTIME_DIR`, else `$TMPDIR`, else `/tmp`), derived by hashing the
+  CANONICAL camp root — so `--camp .camp`, an absolute path and a symlinked
+  path all resolve to the same socket, with no pointer file. The `.lock`
+  bind-serialization file stays at `<camp>/campd.sock.lock` (a regular
+  file, unbounded by `sun_path`). Alive means a
   request on the socket gets a response — an event-loop round-trip (e.g.
   the status op), never a bare connect: the kernel's listen backlog
   accepts connections even while the event loop is wedged, so

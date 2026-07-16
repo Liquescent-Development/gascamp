@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 
 use anyhow::{Result, bail};
 use jiff::Timestamp;
@@ -37,7 +36,7 @@ pub fn run(camp: &CampDir) -> Result<()> {
     // every verb); after it, the stream is timeout-exempt. A pure client never
     // starts campd — a down campd is the standard loud error.
     let path = camp.socket_path();
-    let mut stream = match UnixStream::connect(&path) {
+    let mut stream = match socket::connect_stream(&path) {
         Ok(s) => s,
         Err(_) => {
             socket::require(camp, &Request::FleetSubscribe)?; // returns Err(CampdNotRunning)
