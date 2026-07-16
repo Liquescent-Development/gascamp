@@ -299,7 +299,8 @@ fn git_init_commit(rig: &Path) {
 /// A camp with TWO rigs (fresh copies of the toy-project — scenario 1 uses
 /// `toy`, scenario 2 uses `toy2` so it is not polluted by scenario 1's change),
 /// the real claude as the worker binary, a non-interactive `dev` worker + a
-/// read-only `reviewer`, and the e2e-guarded formula. Returns (root, rig1, rig2).
+/// prompt-enforced read-only `reviewer` (tools are camp-wide under compat-1),
+/// and the e2e-guarded formula. Returns (root, rig1, rig2).
 fn scaffold_e2e(dir: &Path, claude: &str) -> (PathBuf, PathBuf, PathBuf) {
     let root = dir.join(".camp");
     std::fs::create_dir_all(&root).unwrap();
@@ -321,7 +322,9 @@ fn scaffold_e2e(dir: &Path, claude: &str) -> (PathBuf, PathBuf, PathBuf) {
             "[camp]\nname = \"e2e\"\n\n\
              [[rigs]]\nname = \"toy\"\npath = \"{}\"\nprefix = \"toy\"\n\n\
              [[rigs]]\nname = \"toy2\"\npath = \"{}\"\nprefix = \"toy2\"\n\n\
-             [dispatch]\nmax_workers = 2\ncommand = \"{}\"\ndefault_agent = \"dev\"\n",
+             [dispatch]\nmax_workers = 2\ncommand = \"{}\"\ndefault_agent = \"dev\"\n\n\
+             [agent_defaults]\nmodel = \"sonnet\"\npermission_mode = \"bypassPermissions\"\n\
+             tools = [\"Read\", \"Edit\", \"Write\", \"Bash\", \"Grep\", \"Glob\"]\n",
             rig1.display(),
             rig2.display(),
             claude,
@@ -329,29 +332,32 @@ fn scaffold_e2e(dir: &Path, claude: &str) -> (PathBuf, PathBuf, PathBuf) {
     )
     .unwrap();
 
-    // Non-interactive worker pinning (F7): explicit model, permission mode,
-    // and tool allowlist so worker capability does not silently vary. The
-    // agent BODY becomes --append-system-prompt; the task arrives via the
-    // held stdin (the WORKER_CONTRACT).
+    // Non-interactive worker pinning (F7): model, permission mode, and tool
+    // allowlist are OPERATOR-owned in `[agent_defaults]` (compat-1 §5.2),
+    // camp-wide — an agent directory no longer carries them. So the read-only
+    // `reviewer` and the read-write `dev` share one allowlist; the reviewer's
+    // read-only discipline is prompt-enforced (its body says "do not edit"),
+    // not tool-enforced. Agents are DIRECTORIES now (§5.1): `prompt.md` is the
+    // body that becomes --append-system-prompt; the task arrives via the held
+    // stdin (the WORKER_CONTRACT). Neither agent writes an `agent.toml`, so
+    // both keep the shipped default worktree isolation (spec §8.4) — the path
+    // a real worker sees.
     let agents = root.join("agents");
-    std::fs::create_dir_all(&agents).unwrap();
-    // Phase 3 defined "landed" (worker-contract delivery, spec §8.4): e2e
-    // runs the DEFAULT worktree isolation — the shipped path a real worker sees.
+    let dev = agents.join("dev");
+    std::fs::create_dir_all(&dev).unwrap();
     std::fs::write(
-        agents.join("dev.md"),
-        "---\nname: dev\nmodel: sonnet\npermissionMode: bypassPermissions\n\
-         tools: Read, Edit, Write, Bash, Grep, Glob\n---\n\
-         You are a camp worker. Do the assigned bead with TDD: write the failing \
+        dev.join("prompt.md"),
+        "You are a camp worker. Do the assigned bead with TDD: write the failing \
          test first, then the minimal change to pass it, keeping existing behavior \
          intact. Run the project's tests to confirm green before you close. \
          Fail fast; do not linger after closing.\n",
     )
     .unwrap();
+    let reviewer = agents.join("reviewer");
+    std::fs::create_dir_all(&reviewer).unwrap();
     std::fs::write(
-        agents.join("reviewer.md"),
-        "---\nname: reviewer\nmodel: sonnet\npermissionMode: bypassPermissions\n\
-         tools: Read, Bash, Grep, Glob\n---\n\
-         You are a read-only camp reviewer. Inspect the change (e.g. `git diff`) for \
+        reviewer.join("prompt.md"),
+        "You are a read-only camp reviewer. Inspect the change (e.g. `git diff`) for \
          the assigned bead, confirm it is sound and existing behavior is intact, then \
          close pass with a one-line reason (or fail with the reason). Do not edit files.\n",
     )
@@ -369,6 +375,35 @@ fn scaffold_e2e(dir: &Path, claude: &str) -> (PathBuf, PathBuf, PathBuf) {
 
     camp_ok(&root, &["events", "--json"]); // create the ledger
     (root, rig1, rig2)
+}
+
+/// $0 guard for issue #110: the scaffold must produce agents in the CURRENT
+/// compat-1 directory format (`agents/<name>/prompt.md` + `[agent_defaults]`),
+/// so the real loader resolves them. This is NOT `#[ignore]`d — it spends no
+/// API money and runs in CI, exactly the coverage the ignored `e2e_full`
+/// lacked: the scaffold rotted to the retired `agents/<name>.md` frontmatter
+/// after compat-1 and nothing caught it because the only test that used it
+/// never ran. Resolution never invokes the worker command, so a placeholder
+/// path stands in for the real claude.
+#[test]
+fn scaffold_agents_resolve_in_the_current_directory_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _rig1, _rig2) = scaffold_e2e(dir.path(), "/bin/echo");
+    let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
+    for name in ["dev", "reviewer"] {
+        let agent = camp_core::pack::resolve_agent(&cfg, name).unwrap_or_else(|e| {
+            panic!("agent {name:?} must resolve in the current directory format: {e}")
+        });
+        let tools = agent
+            .tools
+            .unwrap_or_else(|| panic!("{name} tools must resolve from [agent_defaults]"));
+        assert!(tools.iter().any(|t| t == "Read"), "{name} tools: {tools:?}");
+        assert!(!agent.prompt.trim().is_empty(), "{name} has a prompt body");
+    }
+    // dev carries no agent.toml, so it keeps the shipped default a real worker
+    // sees: worktree isolation (the scaffold's whole point per §8.4).
+    let dev = camp_core::pack::resolve_agent(&cfg, "dev").unwrap();
+    assert_eq!(dev.isolation, camp_core::pack::Isolation::Worktree);
 }
 
 /// campd as a real child in its OWN process group (`process_group(0)`), so the
