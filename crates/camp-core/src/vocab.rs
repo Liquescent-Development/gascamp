@@ -40,6 +40,10 @@ pub const CAMP_SPECIFIC_EVENTS: &[&str] = &[
     "patrol.degraded",
     "session.stream_capped",
     "session.nudged",
+    // issue #99: the worker's OS pid, recorded after the spawn (session.woke is
+    // committed before it, so its pid is unknowable). An OS/adoption detail gc
+    // does not model — additive, never a redefinition.
+    "session.pid",
     // cp-1 (control-plane spec §2.1/§4.4): the control plane. None of these
     // four names exists in gc's registry, so all four are additive.
     "session.interrupted",

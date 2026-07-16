@@ -854,8 +854,10 @@ impl Dispatcher {
                         return Ok(());
                     }
                 }
+                let pid = child.id();
+                let session_name = prep.spec.session_name.clone();
                 self.children.insert(
-                    child.id(),
+                    pid,
                     Worker {
                         child,
                         session: prep.spec.session_name,
@@ -870,6 +872,23 @@ impl Dispatcher {
                         kill_reason: None,
                     },
                 );
+                // issue #99: the worker's OS pid is knowable only now — session.woke
+                // is committed BEFORE the spawn, so its `pid` column is NULL. Record
+                // it AFTER the child is tracked, so a ledger error here surfaces
+                // without orphaning a running worker (it is already in
+                // `self.children`, reaped on teardown). Fills the sessions.pid that
+                // was always NULL for a campd-spawned worker.
+                ledger.append(EventInput {
+                    kind: EventType::SessionPid,
+                    rig: Some(bead.rig.clone()),
+                    actor: "campd".into(),
+                    bead: Some(bead.id.clone()),
+                    data: serde_json::json!({
+                        "name": session_name,
+                        "pid": pid,
+                        "bead": bead.id,
+                    }),
+                })?;
                 Ok(())
             }
             Err(e) => {
@@ -4267,6 +4286,79 @@ mod tests {
             patrol_kill: None,
             kill_reason: None,
         }
+    }
+
+    /// issue #99: a real dispatch populates `sessions.pid`. `session.woke` is
+    /// committed BEFORE `spawn` (the pid is unknowable then), so campd appends a
+    /// `session.pid` fact once the child exists — filling the column that was
+    /// always NULL for a campd-spawned worker.
+    #[test]
+    fn dispatch_populates_sessions_pid_after_the_spawn() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("rig")).unwrap();
+        let dev = root.join("agents/dev");
+        std::fs::create_dir_all(&dev).unwrap();
+        // live-tree opt-out so a plain-dir rig dispatches (isolation is not the subject).
+        std::fs::write(dev.join("agent.toml"), "isolation = \"none\"\n").unwrap();
+        std::fs::write(dev.join("prompt.md"), "Work.\n").unwrap();
+        // A worker that STAYS ALIVE long enough to accept the held-stdin task
+        // write, so dispatch reaches the children.insert + session.pid append (a
+        // fast-exiting /bin/echo races the write). It never reads stdin — the
+        // small task fits the pipe buffer — and is killed at the end.
+        let worker = root.join("worker.sh");
+        std::fs::write(&worker, "#!/bin/sh\nsleep 30\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            root.join("camp.toml"),
+            format!(
+                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+                 [dispatch]\nmax_workers = 1\ncommand = \"{}\"\ndefault_agent = \"dev\"\n\n\
+                 [agent_defaults]\ntools = [\"Read\"]\n",
+                root.join("rig").display(),
+                worker.display(),
+            ),
+        )
+        .unwrap();
+        let config = CampConfig::load(&root.join("camp.toml")).unwrap();
+        let mut ledger = Ledger::open(&root.join("camp.db")).unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({ "title": "do it" }),
+            })
+            .unwrap();
+
+        let mut dispatcher = Dispatcher::new(
+            CampDir {
+                root: root.to_path_buf(),
+            },
+            config,
+        );
+        dispatcher.dispatch_bead(&mut ledger, "gc-1").unwrap();
+
+        // Exactly one worker was spawned; its OS pid is what sessions.pid must hold.
+        let pids: Vec<u32> = dispatcher.known_pids().into_iter().collect();
+        assert_eq!(pids.len(), 1, "one worker dispatched");
+        let pid = pids[0];
+
+        let live = ledger.live_sessions().unwrap();
+        assert_eq!(live.len(), 1, "one live session");
+        let row = ledger.session_by_name(&live[0].name).unwrap().unwrap();
+        assert_eq!(
+            row.pid,
+            Some(i64::from(pid)),
+            "session.pid must fill sessions.pid with the worker's real pid (issue #99)"
+        );
+
+        dispatcher.test_kill_and_wait(pid); // reap the sleeper
     }
 
     /// ROUND-2 LOW 2: a cap-full patrol respawn must QUEUE and retry when

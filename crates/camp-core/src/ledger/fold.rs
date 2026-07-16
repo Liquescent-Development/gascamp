@@ -21,6 +21,7 @@ pub(crate) fn apply(conn: &Connection, event: &Event) -> Result<(), CoreError> {
         EventType::BeadUpdated => bead_updated(conn, event),
         EventType::BeadClosed => bead_closed(conn, event),
         EventType::SessionWoke => session_woke(conn, event),
+        EventType::SessionPid => session_pid(conn, event),
         EventType::SessionStopped => session_ended(conn, event, "stopped"),
         EventType::SessionCrashed => session_ended(conn, event, "crashed"),
         EventType::SessionNudged => session_nudged(conn, event),
@@ -1131,6 +1132,36 @@ fn session_nudged(conn: &Connection, event: &Event) -> Result<(), CoreError> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SessionPid {
+    name: String,
+    pid: i64,
+    /// Audit context: the bead this worker runs. Not folded (the row already
+    /// carries the bead from `session.woke`); present so the event is
+    /// self-describing in the ledger.
+    #[serde(default)]
+    #[allow(dead_code)]
+    bead: Option<String>,
+}
+
+/// `session.pid` records the worker's OS pid once the child exists (issue #99):
+/// `session.woke` is committed BEFORE `spawn`, so its `pid` column is NULL then.
+/// The session must already exist — `session.woke` always precedes the spawn
+/// that yields the pid — so a pid for an unknown session is a fail-fast typo,
+/// like `session.nudged`.
+fn session_pid(conn: &Connection, event: &Event) -> Result<(), CoreError> {
+    let p: SessionPid = payload(event)?;
+    let updated = conn.execute(
+        "UPDATE sessions SET pid = ?1 WHERE name = ?2",
+        params![p.pid, p.name],
+    )?;
+    if updated == 0 {
+        return Err(CoreError::UnknownSession(p.name));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionEnd {
     name: String,
     /// Audit-only (Phase 8, F4 evidence): how the process ended.
@@ -1873,6 +1904,49 @@ mod tests {
             data: serde_json::json!({"session":"ghost","request_id":"cli-1","tool_name":"Bash"}),
         });
         assert!(bad.is_err(), "a pending for a non-live session is refused");
+    }
+
+    /// issue #99: `session.woke` is committed before the spawn, so it leaves the
+    /// `pid` column NULL; `session.pid`, appended once the child exists, fills it.
+    /// A pid for an unknown session is a fail-fast typo, like `session.nudged`.
+    #[test]
+    fn session_pid_fills_the_column_and_rejects_an_unknown_session() {
+        let (_tmp, mut led) = temp_ledger();
+        woke_session(&mut led, "t/dev/1");
+        assert!(
+            led.session_by_name("t/dev/1")
+                .unwrap()
+                .unwrap()
+                .pid
+                .is_none(),
+            "session.woke leaves pid NULL (the pid is unknowable before the spawn)"
+        );
+
+        led.append(EventInput {
+            kind: EventType::SessionPid,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "t/dev/1", "pid": 4242}),
+        })
+        .unwrap();
+        assert_eq!(
+            led.session_by_name("t/dev/1").unwrap().unwrap().pid,
+            Some(4242),
+            "session.pid populates the column"
+        );
+
+        let unknown = led.append(EventInput {
+            kind: EventType::SessionPid,
+            rig: None,
+            actor: "campd".into(),
+            bead: None,
+            data: serde_json::json!({"name": "ghost", "pid": 1}),
+        });
+        assert!(
+            unknown.is_err(),
+            "a pid for a session that never woke is refused (fail fast on a typo)"
+        );
     }
 
     #[test]
