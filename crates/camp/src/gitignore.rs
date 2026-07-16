@@ -19,13 +19,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 /// Runtime files inside the camp dir: the ledger and its WAL/SHM sidecars, the
-/// daemon socket and its bind lock, and the daemon log (spec §7.1, §5).
+/// daemon socket, its bind lock, its relocation pointer (issue #53), and the
+/// daemon log (spec §7.1, §5).
 const RUNTIME_FILES: &[&str] = &[
     "camp.db",
     "camp.db-wal",
     "camp.db-shm",
     "campd.sock",
     "campd.sock.lock",
+    "campd.sock.path",
     "campd.log",
 ];
 

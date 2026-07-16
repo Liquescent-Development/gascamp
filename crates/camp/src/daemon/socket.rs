@@ -8,7 +8,7 @@
 //! wedged daemon is the operator's kill -9, never a silent takeover).
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -265,8 +265,8 @@ pub fn bind_or_replace(path: &Path) -> Result<UnixListener> {
     // lock still serializes them.
     let bindable =
         resolve_bindable(path).with_context(|| format!("resolving socket {}", path.display()))?;
-    match UnixListener::bind(&bindable) {
-        Ok(listener) => Ok(listener),
+    let listener = match UnixListener::bind(&bindable) {
+        Ok(listener) => listener,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             if UnixStream::connect(&bindable).is_ok() {
                 bail!(
@@ -276,11 +276,20 @@ pub fn bind_or_replace(path: &Path) -> Result<UnixListener> {
             }
             std::fs::remove_file(&bindable)
                 .with_context(|| format!("removing stale socket {}", bindable.display()))?;
-            UnixListener::bind(&bindable)
-                .with_context(|| format!("binding {}", bindable.display()))
+            UnixListener::bind(&bindable).with_context(|| format!("binding {}", bindable.display()))?
         }
-        Err(e) => Err(e).with_context(|| format!("binding {}", bindable.display())),
+        Err(e) => return Err(e).with_context(|| format!("binding {}", bindable.display())),
+    };
+    // Record the real address for clients when the socket was relocated (issue
+    // #53), else clear any stale pointer from a camp that used to be deeper.
+    if exceeds_sun_path(path) {
+        write_pointer(path, &bindable)
+            .with_context(|| format!("writing socket pointer {}", pointer_path(path).display()))?;
+    } else {
+        clear_pointer(path)
+            .with_context(|| format!("clearing socket pointer {}", pointer_path(path).display()))?;
     }
+    Ok(listener)
 }
 
 /// How long one CLI request may wait on campd before the CLI declares
@@ -298,13 +307,17 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 // `<camp>/campd.sock` under a deeply nested camp directory fails outright with
 // "path must be shorter than SUN_LEN". The socket's location is spec-pinned at
 // `<camp>/campd.sock` (design §5) and stays there for every camp that fits.
-// When it does NOT fit, campd and every client independently RELOCATE the
-// socket to a short, deterministic path under the runtime directory. Both sides
-// derive it from the CANONICAL camp root, so `--camp .camp`, an absolute path,
-// and a symlinked path all resolve to the SAME socket (the same reason
-// `CampId::for_camp` canonicalizes). No pointer file, no `chdir` (which would be
-// a process-global side effect unsound under concurrent threads): the path is a
-// pure function of the camp's real location.
+//
+// When it does NOT fit, campd RELOCATES the socket to a short path under its
+// runtime directory and RECORDS the real address in a pointer file,
+// `<camp>/campd.sock.path` (a regular file, unbounded by `sun_path`). campd is
+// the single source of truth: clients read the pointer to find the socket
+// rather than re-deriving it. That matters because the runtime directory comes
+// from environment (`$XDG_RUNTIME_DIR` / `$TMPDIR`) that legitimately DIFFERS
+// between a supervised campd and a terminal client — a derived address would
+// silently disagree (issue #53 review, finding B). No `chdir` (a process-global
+// side effect unsound under concurrency): the socket is a plain file the pointer
+// names.
 
 /// `sockaddr_un.sun_path` capacity for this platform. A path plus its NUL
 /// terminator must fit within it.
@@ -318,9 +331,17 @@ fn exceeds_sun_path(path: &Path) -> bool {
     path.as_os_str().as_bytes().len() + 1 > SUN_PATH_CAP
 }
 
-/// The per-user runtime directory the relocated socket lives under: a per-user,
-/// short location. `$XDG_RUNTIME_DIR` (Linux, 0700 tmpfs) if set; else `$TMPDIR`
-/// (macOS's per-user `/var/folders/…`); else `/tmp`.
+/// The pointer file next to the natural socket: `<camp>/campd.sock.path`.
+fn pointer_path(natural: &Path) -> PathBuf {
+    let mut os = natural.as_os_str().to_owned();
+    os.push(".path");
+    PathBuf::from(os)
+}
+
+/// campd's runtime directory for a relocated socket: `$XDG_RUNTIME_DIR` (Linux,
+/// 0700 tmpfs) if set; else `$TMPDIR` (macOS's per-user `/var/folders/…`); else
+/// `/tmp`. campd may pick a different one than a client would — that is exactly
+/// why campd records the result in the pointer instead of anyone re-deriving it.
 fn runtime_dir() -> PathBuf {
     for var in ["XDG_RUNTIME_DIR", "TMPDIR"] {
         if let Ok(v) = std::env::var(var)
@@ -332,15 +353,14 @@ fn runtime_dir() -> PathBuf {
     PathBuf::from("/tmp")
 }
 
-/// The bindable/connectable socket address for the natural `<camp>/campd.sock`
-/// path: the natural path itself when it fits `sun_path` (the common case, no
-/// I/O, behaviour unchanged), else a short deterministic relocation (issue #53).
-///
-/// The relocation hashes the CANONICAL camp root — the same UUIDv5-over-the-path
-/// scheme `CampId` uses — so campd and every client agree on the address no
-/// matter how each spelled `--camp`. `canonicalize` requires the camp dir to
-/// exist, which it always does at bind/connect time (it holds `camp.toml`); a
-/// missing dir surfaces as a loud error, never a fabricated address.
+/// The address campd BINDS for the natural `<camp>/campd.sock` path: the natural
+/// path when it fits `sun_path` (the common case, no I/O, behaviour unchanged),
+/// else a short relocation under the runtime dir (issue #53). The relocated name
+/// hashes the CANONICAL camp root (the same UUIDv5-over-the-path scheme `CampId`
+/// uses) so it is STABLE across campd restarts — a restart rebinds the same
+/// address, and `bind_or_replace`'s stale-socket detection still applies.
+/// `canonicalize` requires the camp dir to exist, which it does at bind time (it
+/// holds `camp.toml`); a missing dir is a loud error, never a fabricated address.
 fn resolve_bindable(natural: &Path) -> std::io::Result<PathBuf> {
     if !exceeds_sun_path(natural) {
         return Ok(natural.to_path_buf());
@@ -369,11 +389,68 @@ fn resolve_bindable(natural: &Path) -> std::io::Result<PathBuf> {
     Ok(short)
 }
 
-/// Connect a `UnixStream` to the natural `<camp>/campd.sock` path, relocating
-/// the same way as [`bind_listener`]. Preserves the underlying `io::Error` kind
-/// (e.g. `NotFound` / `ConnectionRefused`), which callers match on.
+/// Write the pointer atomically (temp + rename) so a client never reads a torn
+/// path; called by `bind_or_replace` AFTER a successful bind.
+fn write_pointer(natural: &Path, bindable: &Path) -> std::io::Result<()> {
+    let pointer = pointer_path(natural);
+    let tmp = {
+        let mut os = pointer.as_os_str().to_owned();
+        os.push(".tmp");
+        PathBuf::from(os)
+    };
+    std::fs::write(&tmp, bindable.as_os_str().as_bytes())?;
+    std::fs::rename(&tmp, &pointer)
+}
+
+/// Remove the pointer if present (tolerating its absence): a camp that used to be
+/// deep and is now shallow, or a graceful stop.
+fn clear_pointer(natural: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(pointer_path(natural)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The address a CLIENT connects to: the pointer's target when the pointer file
+/// exists (campd relocated the socket — the deep-camp case), else the natural
+/// `<camp>/campd.sock` (the common case). campd is the source of truth, so a
+/// client never re-derives the runtime dir.
+fn connect_addr(natural: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::read(pointer_path(natural)) {
+        Ok(bytes) => Ok(PathBuf::from(std::ffi::OsString::from_vec(
+            trim_trailing_newline(&bytes).to_vec(),
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(natural.to_path_buf()),
+        Err(e) => Err(e),
+    }
+}
+
+fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\n").unwrap_or(bytes)
+}
+
+/// Connect a `UnixStream` for the natural `<camp>/campd.sock` path, following the
+/// pointer to a relocated socket when campd recorded one (issue #53). Preserves
+/// the underlying `io::Error` kind (`NotFound` / `ConnectionRefused`), which
+/// callers match on — a missing socket OR a missing pointer both read as "not
+/// listening".
 pub(crate) fn connect_stream(natural: &Path) -> std::io::Result<UnixStream> {
-    UnixStream::connect(resolve_bindable(natural)?)
+    UnixStream::connect(connect_addr(natural)?)
+}
+
+/// Remove the socket campd bound plus its pointer, tolerating their absence
+/// (crash-only, spec §5). Called by the graceful-stop path so a relocated socket
+/// is unlinked at the address campd actually bound — not the natural path it
+/// never created.
+pub(crate) fn remove_socket_artifacts(natural: &Path) -> std::io::Result<()> {
+    let bound = connect_addr(natural)?;
+    match std::fs::remove_file(&bound) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    clear_pointer(natural)
 }
 
 /// campd accepted the connection and then went away before answering: it
@@ -866,10 +943,12 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     /// Issue #53: a camp directory deep enough that `<camp>/campd.sock` overflows
-    /// `sun_path` still binds and connects — the address is transparently
-    /// relocated, and campd and the client derive the SAME relocated address.
+    /// `sun_path` still binds and connects — campd relocates the socket, records
+    /// the real address in the pointer, and the client follows the pointer. Then
+    /// graceful cleanup unlinks the RELOCATED socket and the pointer, not the
+    /// natural path campd never created (review finding A).
     #[test]
-    fn a_camp_deeper_than_sun_path_still_binds_and_connects() {
+    fn a_camp_deeper_than_sun_path_binds_connects_and_cleans_up_via_the_pointer() {
         let base = tempfile::tempdir().unwrap();
         let mut deep = base.path().to_path_buf();
         while deep.as_os_str().len() < SUN_PATH_CAP + 40 {
@@ -890,18 +969,25 @@ mod tests {
             "a plain bind at this depth must fail SUN_LEN"
         );
 
-        // The relocation fits, and is DETERMINISTIC: campd (bind) and a client
-        // (connect) both derive it from the canonical camp root, so they agree.
+        // The relocation fits and is stable across restarts (same name).
         let bindable = resolve_bindable(&natural).unwrap();
         assert!(
             !exceeds_sun_path(&bindable),
             "relocated address must fit: {}",
             bindable.display()
         );
-        assert_eq!(resolve_bindable(&natural).unwrap(), bindable, "must be stable");
+        assert_ne!(bindable, natural, "a deep camp must relocate");
 
-        // The production bind path and a client connect round-trip a byte.
+        // The production bind path records the pointer; a client FOLLOWS it —
+        // it never re-derives the runtime dir (which may differ from campd's).
         let listener = bind_or_replace(&natural).unwrap();
+        let pointer = pointer_path(&natural);
+        assert!(pointer.is_file(), "bind must write the pointer for a deep camp");
+        assert_eq!(
+            connect_addr(&natural).unwrap(),
+            bindable,
+            "the client resolves the bound address via the pointer"
+        );
         let mut client = connect_stream(&natural).unwrap();
         let (mut server, _) = listener.accept().unwrap();
         client.write_all(b"ping\n").unwrap();
@@ -909,9 +995,35 @@ mod tests {
         server.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"ping\n");
 
-        // The relocated socket lives outside the tempdir; clean it up.
+        // Graceful stop (finding A): unlink the RELOCATED socket + the pointer,
+        // both at the address campd actually bound.
         drop(listener);
-        let _ = std::fs::remove_file(&bindable);
+        remove_socket_artifacts(&natural).unwrap();
+        assert!(!bindable.exists(), "stop must unlink the relocated socket");
+        assert!(!pointer.exists(), "stop must remove the pointer");
+        // Idempotent / crash-only: a second removal tolerates the absence.
+        remove_socket_artifacts(&natural).unwrap();
+    }
+
+    /// A shallow camp is byte-for-byte unchanged: the socket is the natural path,
+    /// no pointer file is written, and a client connects to the natural path.
+    #[test]
+    fn a_shallow_camp_uses_the_natural_socket_with_no_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let natural = dir.path().join("campd.sock");
+        assert!(!exceeds_sun_path(&natural));
+        assert_eq!(resolve_bindable(&natural).unwrap(), natural);
+
+        let listener = bind_or_replace(&natural).unwrap();
+        assert!(natural.exists(), "the socket is the natural path");
+        assert!(
+            !pointer_path(&natural).exists(),
+            "a shallow camp writes no pointer"
+        );
+        assert_eq!(connect_addr(&natural).unwrap(), natural);
+        drop(listener);
+        remove_socket_artifacts(&natural).unwrap();
+        assert!(!natural.exists(), "stop unlinks the natural socket");
     }
 
     #[test]

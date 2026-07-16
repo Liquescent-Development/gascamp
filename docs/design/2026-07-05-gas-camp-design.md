@@ -178,13 +178,16 @@ agent definitions.
   `campd` serves a unix socket at `<camp>/campd.sock` — except when that
   path would exceed the kernel's `sockaddr_un.sun_path` limit (~104 bytes
   on macOS, 108 on Linux) for a deeply nested camp directory (issue #53).
-  There, campd and every client independently RELOCATE the socket to a
-  short, deterministic per-camp path under the runtime directory
-  (`$XDG_RUNTIME_DIR`, else `$TMPDIR`, else `/tmp`), derived by hashing the
-  CANONICAL camp root — so `--camp .camp`, an absolute path and a symlinked
-  path all resolve to the same socket, with no pointer file. The `.lock`
-  bind-serialization file stays at `<camp>/campd.sock.lock` (a regular
-  file, unbounded by `sun_path`). Alive means a
+  There, campd RELOCATES the socket to a short path under its runtime
+  directory (`$XDG_RUNTIME_DIR`, else `$TMPDIR`, else `/tmp`) and RECORDS
+  the real address in a pointer file, `<camp>/campd.sock.path`; clients read
+  the pointer to find the socket. campd is the single source of truth — the
+  runtime directory comes from environment that legitimately differs between
+  a supervised campd and a terminal client, so a re-derived address could
+  disagree; the pointer removes the guess. The `.lock` bind-serialization
+  file and the pointer are regular files at `<camp>/campd.sock.lock` /
+  `<camp>/campd.sock.path`, unbounded by `sun_path`; graceful stop unlinks
+  the bound socket and the pointer. Alive means a
   request on the socket gets a response — an event-loop round-trip (e.g.
   the status op), never a bare connect: the kernel's listen backlog
   accepts connections even while the event loop is wedged, so
