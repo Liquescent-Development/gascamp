@@ -10,7 +10,18 @@
 PREFIX ?= $(HOME)/.local
 BINDIR := $(PREFIX)/bin
 
-.PHONY: install uninstall perf e2e compat service-e2e container-smoke
+.PHONY: install uninstall perf e2e compat service-e2e container-smoke demo-pack
+
+# Opt-in $0 real-pack demo (docs/demos/2026-07-15-real-gc-packs.md). LOCAL-ONLY.
+# Fetches the real Gas City corpus at ci/gc-compat/GCPACKS_REF, proves the bmad
+# and gstack packs LOAD, COMPILE against gc's real compiler, and COOK into a
+# bead graph — then reads the graph back. Spends NO API money: it never starts
+# campd and never spawns a worker (that is `make e2e`). Needs git + python3;
+# runs the gc-real-compiler differential too when Go is on PATH.
+#   make demo-pack                       # clone the pinned corpus
+#   make demo-pack CORPUS=/path/to/gcpacks-src   # reuse a checkout
+demo-pack:
+	scripts/demo-pack.sh $(CORPUS)
 
 # Build the release binary and install `camp` into $(BINDIR), plus the
 # `campd` symlink that argv0 dispatch uses to run the daemon (main.rs keys
