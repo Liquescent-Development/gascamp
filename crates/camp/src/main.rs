@@ -729,13 +729,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cmd::doctor::run_orphan_runs(&camp, sweep_orphan_runs)
         }
         Command::Doctor {
-            refold: _,
             repair,
             formula,
             json,
             drain_reservations,
             release_orphans,
-            compiled: _,
             ..
         } if drain_reservations => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
@@ -743,7 +741,6 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cmd::doctor::run_drain_reservations(&camp, release_orphans)
         }
         Command::Doctor {
-            refold: _,
             repair,
             formula,
             json,
