@@ -565,6 +565,16 @@ impl ControlRuntime {
     ///    WRITABLE edge, not an EOF — so the stall drop needs its own deadline,
     ///    and it is the ONLY thing that can ever fire for that subscriber.
     ///
+    /// R1b (#121) DELIBERATELY ADDS NO FOURTH SOURCE, and needs none — a second
+    /// armed timer here would be a tick nothing asked for (invariant 1). Any
+    /// subscriber whose at-cap clock is running has a NON-EMPTY `out`, and the pump
+    /// loop only comes to rest on WouldBlock, which STAMPS `blocked_since` — so (3)
+    /// is already armed for it, and re-armed at most one `stall_timeout` out every
+    /// time the peer accepts a byte and resets that clock. The at-cap drop therefore
+    /// fires on the next wake the peer itself causes (its own trickle raises a
+    /// WRITABLE edge) or on (3) at the latest: within one interval of its deadline,
+    /// from timers that already exist.
+    ///
     /// G2 — A NON-EMPTY `out` MUST NOT ARM ANYTHING. It means the last write
     /// returned WouldBlock, and the correct wakeup for that is the WRITABLE EDGE,
     /// which is already registered. Arming ZERO on top of it turns every blocked
@@ -3374,15 +3384,17 @@ mod tests {
         assert_eq!(data(&event)["cap_bytes"], 64 * 1024);
     }
 
-    /// THE CONVERSE, and it is the accepted residual: a client that accepts even
-    /// ONE byte CLEARS `blocked_since` and is never dropped.
+    /// THE CONVERSE of R1: a client that accepts even ONE byte CLEARS
+    /// `blocked_since`, and R1 alone will never drop it however far behind it is.
     ///
-    /// A peer dripping one byte per interval can hold a buffer and a slot
-    /// indefinitely. That is a DECISION — it IS reading, and any byte-rate floor is
-    /// a policy number nobody has evidence for — recorded in the §4.4 amendment and
-    /// as a cp-2 obligation, not an oversight.
+    /// That is still exactly right — R1 asks ONE question ("has this peer stopped
+    /// reading?") and one byte answers it. What it is NOT, any more, is the whole
+    /// policy: a peer dripping one byte per interval used to hold a buffer and a slot
+    /// indefinitely on the strength of this, and R1b's `at_cap_since` now bounds that
+    /// (#121). The two rules are tested apart on purpose, so the day R1's clock stops
+    /// resetting this test fails and names the reason.
     #[test]
-    fn a_peer_that_accepts_even_one_byte_is_never_dropped() {
+    fn a_peer_that_accepts_even_one_byte_is_never_dropped_by_the_zero_accept_rule() {
         let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
         let content = line.repeat(20_000);
         let (_d, file, tail) = stream_file(content.as_bytes());
@@ -3430,6 +3442,169 @@ mod tests {
                  must not survive, or a slow reader is eventually killed for being slow"
             );
         }
+    }
+
+    /// R1b (#121) — THE TRICKLE READER, which R1 alone can never catch.
+    ///
+    /// This peer accepts bytes on EVERY interval, so `blocked_since` is cleared on
+    /// every wake and R1's zero-accept rule can never fire — yet the source refills
+    /// `out` to the cap instantly, so the buffer never drops below it. It holds one
+    /// of `MAX_SUBSCRIBERS` slots and a full cap's worth of memory for as long as it
+    /// cares to. `at_cap_since` bounds exactly that: continuously at the cap for
+    /// `AT_CAP_STALL_INTERVALS` stall intervals is a DROP, with the SAME event R1's
+    /// drop uses.
+    #[test]
+    fn a_peer_that_trickles_at_the_cap_is_dropped_after_the_at_cap_window() {
+        let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
+        // ~6.4 MB of history against a 64 KiB cap: the source NEVER runs dry, so
+        // `out` is pinned at the cap for the whole test.
+        let content = line.repeat(200_000);
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let stall = Duration::from_millis(200);
+        let mut rt = ControlRuntime::with_stall_timeout(64 * 1024, stall);
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+
+        // Drive to the cap: the cap STOPS the source, and that stamps `at_cap_since`.
+        assert!(matches!(rt.pump(T, &mut conn, t0()), PumpOutcome::Ok));
+        assert_eq!(
+            rt.test_sub(T).out.at_cap_since,
+            Some(t0()),
+            "the cap stopping the source must stamp `at_cap_since` at t0"
+        );
+
+        let window = i64::from(AT_CAP_STALL_INTERVALS) * 200;
+        let mut sip = [0u8; 8192];
+        // Every interval the peer sips a socket buffer's worth — enough that campd's
+        // next write genuinely ACCEPTS bytes, which is what makes R1 blind to it.
+        for i in 1..i64::from(AT_CAP_STALL_INTERVALS) {
+            let now = t0() + SignedDuration::from_millis(200 * i);
+            assert!(
+                client.read(&mut sip).is_ok_and(|n| n > 0),
+                "the trickling peer must actually accept bytes at interval {i}"
+            );
+            assert!(
+                matches!(rt.pump(T, &mut conn, now), PumpOutcome::Ok),
+                "at interval {i} the at-cap window has not elapsed — no drop yet"
+            );
+            assert!(
+                rt.test_sub(T).out.blocked_since.is_none_or(|s| s >= now),
+                "the peer accepted bytes, so R1's clock RESTARTED at interval {i} — \
+                 if it had not, this test would be proving R1, not R1b"
+            );
+            assert_eq!(
+                rt.test_sub(T).out.at_cap_since,
+                Some(t0()),
+                "sipping never drains `out` below the cap, so the ORIGINAL at-cap \
+                 stamp must survive at interval {i}"
+            );
+        }
+
+        // Past AT_CAP_STALL_INTERVALS × stall, still reading => DROPPED anyway.
+        let later = t0() + SignedDuration::from_millis(window + 1);
+        assert!(
+            client.read(&mut sip).is_ok_and(|n| n > 0),
+            "the peer is STILL reading when it is dropped — that is the point"
+        );
+        let event = match rt.pump(T, &mut conn, later) {
+            PumpOutcome::Drop(e) => e,
+            _ => panic!(
+                "a peer pinned at the cap for {AT_CAP_STALL_INTERVALS} stall intervals \
+                 must be dropped even though it is reading"
+            ),
+        };
+        assert!(
+            rt.test_sub(T).out.blocked_since.is_none_or(|s| s >= later),
+            "R1's clock was reset by the accepted write — the drop can ONLY be R1b's"
+        );
+        // §4.4: a drop for a NEW reason is not a NEW event — same shape, same fields.
+        assert_eq!(event.kind, EventType::SubscriberDropped);
+        assert_eq!(data(&event)["session"], "t/dev/1");
+        assert!(data(&event)["subscription"].is_string());
+        assert!(data(&event)["buffered_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(data(&event)["cap_bytes"], 64 * 1024);
+    }
+
+    /// R1b's FALSE-POSITIVE GUARD, and it matters more than the drop itself: a
+    /// reaper that kills healthy peers is worse than the bug it fixes.
+    ///
+    /// A bursty peer HITS the cap (campd reads a file 256 KiB per wake; the socket
+    /// takes ~8 KiB — a file always outruns a socket, so EVERY catch-up touches the
+    /// cap) and then DRAINS it. `at_cap_since` must not survive that drain, however
+    /// long the peer then sits idle: time-at-cap is CONTINUOUS time, not a total.
+    #[test]
+    fn a_bursty_peer_that_drains_its_buffer_is_never_dropped() {
+        let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
+        // ~640 KB against a 64 KiB cap: enough to REACH the cap, little enough that
+        // a peer which really reads can drain it dry.
+        let content = line.repeat(20_000);
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let stall = Duration::from_millis(200);
+        let mut rt = ControlRuntime::with_stall_timeout(64 * 1024, stall);
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+
+        assert!(matches!(rt.pump(T, &mut conn, t0()), PumpOutcome::Ok));
+        assert_eq!(
+            rt.test_sub(T).out.at_cap_since,
+            Some(t0()),
+            "a healthy catch-up DOES touch the cap — that is exactly why the drop \
+             must key on time, not on being at the cap at all"
+        );
+
+        // The peer drains the whole history at a REAL peer's speed: ~8 KiB per
+        // socket round (macOS's `net.local.stream.sendspace`), and a local unix
+        // socket turns those rounds over in microseconds, so 1 ms per round is
+        // already pessimistic — ~8 MB/s. The whole 640 KB backlog goes in ~80 ms,
+        // two orders under the 2 s at-cap window.
+        let mut chunk = [0u8; 65536];
+        let mut now = t0();
+        for _ in 0..2_000 {
+            loop {
+                match client.read(&mut chunk) {
+                    Ok(n) if n > 0 => continue,
+                    _ => break, // EOF or WouldBlock: the socket is empty
+                }
+            }
+            now += SignedDuration::from_millis(1);
+            assert!(
+                matches!(rt.pump(T, &mut conn, now), PumpOutcome::Ok),
+                "a peer that is draining its buffer must NEVER be dropped"
+            );
+            if rt.test_sub(T).out.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            now.duration_since(t0()) < signed(AT_CAP_STALL_INTERVALS * stall),
+            "the drain must finish INSIDE the at-cap window, or this test is not \
+             about a healthy peer"
+        );
+        assert!(
+            rt.test_sub(T).out.is_empty(),
+            "the test peer must actually drain `out` dry, or it is not the bursty case"
+        );
+        assert_eq!(
+            rt.test_sub(T).out.at_cap_since,
+            None,
+            "draining the buffer CLEARS the at-cap clock — otherwise every peer that \
+             ever touched the cap dies AT_CAP_STALL_INTERVALS later, healthy or not"
+        );
+
+        // Idle for many at-cap windows, then a fresh burst: the clock must start
+        // from the NEW stamp, not the ancient one.
+        let much_later = now + SignedDuration::from_secs(3_600);
+        assert!(
+            matches!(rt.pump(T, &mut conn, much_later), PumpOutcome::Ok),
+            "an hour of idling after a drain is not a stall"
+        );
+        assert!(
+            rt.test_sub(T)
+                .out
+                .at_cap_since
+                .is_none_or(|s| s >= much_later),
+            "any NEW at-cap stamp starts a NEW clock — the pre-drain stamp is gone"
+        );
     }
 
     /// B3 — THE MECHANISM THAT NEVER FIRED.
@@ -4080,6 +4255,55 @@ pub const MAX_SUBSCRIBERS: usize = 8;
 /// behind the tail, however fast it reads.
 pub const SUBSCRIBER_STALL_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
 
+/// R1b (#121): how many `SUBSCRIBER_STALL_TIMEOUT` intervals a peer may sit
+/// CONTINUOUSLY at the buffer cap before campd drops it — 300 s at the shipped
+/// default.
+///
+/// R1 alone bounds only a peer that accepts NOTHING: one accepted byte clears
+/// `blocked_since`, so a peer sipping a socket buffer's worth per interval is
+/// invisible to it while holding one of `MAX_SUBSCRIBERS` slots and a full cap of
+/// memory forever. This bounds the ACTUAL harm — a held slot and a held buffer —
+/// rather than a proxy for it.
+///
+/// WHY A MULTIPLIER AND NOT A SECOND TUNABLE: there is ONE stall concept and one
+/// knob (`CAMP_SUBSCRIBER_STALL_TIMEOUT_MS`); this derives from it, so the stall
+/// tests' 200 ms override scales the at-cap window to 2 s with no second override
+/// to keep in step.
+///
+/// WHY A TIME BOUND AND NOT A BYTE-RATE FLOOR (the alternative cp-1 named): a
+/// floor needs a defensible bytes-per-interval number, and every number is wrong in
+/// both directions — too low and the trickle reader survives it, too high and a
+/// legitimately slow consumer on a quiet stream is killed for the stream being
+/// quiet. Time-at-cap needs no throughput number at all.
+///
+/// WHY 10: it must be > 1, or the rule is indistinguishable from R1 and a peer that
+/// is merely READING dies on the same deadline as one that is DEAD — which §4.4's
+/// amendment forbids in as many words. An order of magnitude is the smallest step
+/// that is plainly not R1 re-litigated, and it is generous against the one healthy
+/// state that IS continuously at the cap: a catch-up (a file read at 256 KiB/wake
+/// always outruns an ~8 KiB socket, so `out` sits at the cap until the backlog is
+/// consumed). To die a peer must fail to drain ONE cap's worth in 300 s — under
+/// 3.5 KiB/s at the 1 MiB default, which is not a consumer any terminal, pipe, or
+/// socket produces. Below that it is indistinguishable from a stopped peer, which
+/// is precisely R1's own standard.
+///
+/// THE BOUND THIS IMPOSES, STATED PLAINLY because it is not obvious: `out` is
+/// refilled to the cap after every partial write, so it reaches EMPTY only when the
+/// SOURCE runs dry. The window therefore bounds the time to consume the whole
+/// BACKLOG, not one cap's worth of it — at the shipped 300 s a 50 MB history needs
+/// ~170 KB/s sustained, against a local unix socket that does orders of magnitude
+/// more. This is NOT the buffer-SIZE verdict §4.4's amendment forbids: a client that
+/// joins far behind the tail is never dropped for how far behind it IS, only for
+/// failing to move that backlog AT ALL for 300 s — a peer that reads fast is never
+/// dropped, however far behind it joined.
+pub const AT_CAP_STALL_INTERVALS: u32 = 10;
+
+/// Has `since` been stamped for at least `window`? ONE deadline predicate, shared by
+/// both of `OutBuf`'s clocks — an unstamped clock has never expired.
+fn elapsed_at_least(since: Option<Timestamp>, now: Timestamp, window: Duration) -> bool {
+    since.is_some_and(|s| now.duration_since(s) >= signed(window))
+}
+
 /// Test-only override, the `CAMP_SUBSCRIBER_BUFFER_BYTES` twin. WITHOUT IT the
 /// stall tests are mandatory 30-second wall-clock tests, and their hard deadlines
 /// would have to EXCEED 30 s — which makes a deadline useless as the hang
@@ -4259,17 +4483,23 @@ pub enum FlushStep {
     Drained,
     /// The socket is full and the peer is still reading — the WRITABLE edge re-arms us.
     WouldBlock,
-    /// R1: the peer accepted ZERO bytes for `stall_timeout` with data buffered — DROP it.
+    /// DROP it. Either R1 — the peer accepted ZERO bytes for `stall_timeout` with data
+    /// buffered — or R1b (#121): it has been at the buffer cap for
+    /// `AT_CAP_STALL_INTERVALS` of them without ever draining. ONE variant on purpose:
+    /// both are "this subscriber's slot and buffer are not coming back", and §4.4's
+    /// `subscriber.dropped` already names the session and the high-water mark, which
+    /// is the forensics either way.
     Stalled,
     /// EPIPE / ECONNRESET / a zero-length write — the peer is gone.
     Gone,
 }
 
 /// The outbound half of every subscription — file OR fleet. It owns the §4.4
-/// buffer-cap policy (a STOP), the R1 backpressure-stall policy (a DROP), and
+/// buffer-cap policy (a STOP), the R1/R1b backpressure-stall policy (a DROP), and
 /// the socket write. The stall rule is the ONLY drop policy, and it lives here
-/// exactly once. "Hold the line in `partial`" is NOT here — that is a FILE
-/// concept (a fleet row has no file), so it stays in `FileSource`.
+/// exactly once — TWO CLOCKS (`blocked_since`, `at_cap_since`), one DROP. "Hold the
+/// line in `partial`" is NOT here — that is a FILE concept (a fleet row has no
+/// file), so it stays in `FileSource`.
 pub struct OutBuf {
     /// Bytes queued for this socket. Bounded by the cap (a STOP, never a kill),
     /// plus at most one small over-cap `skipped` frame (see `FileSource`).
@@ -4295,7 +4525,14 @@ pub struct OutBuf {
     /// At that rate it is indistinguishable from a stopped peer, so the reach is
     /// small — but it is a real difference between the spec's words and the code's,
     /// and it is written down rather than discovered later.
+    ///
+    /// The OTHER direction of that imprecision — a peer sipping just enough to clear
+    /// this on every wake, holding a slot and a full buffer forever — was cp-1's
+    /// accepted residual and is NO LONGER ONE: `at_cap_since` bounds it (#121).
     pub blocked_since: Option<Timestamp>,
+    /// R1b (#121): when the cap FIRST stopped this source, with NO drain to empty
+    /// since. `None` means the buffer is not being held at the cap.
+    pub at_cap_since: Option<Timestamp>,
 }
 
 impl OutBuf {
@@ -4304,6 +4541,7 @@ impl OutBuf {
             out: Vec::new(),
             high_water: 0,
             blocked_since: None,
+            at_cap_since: None,
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -4312,8 +4550,26 @@ impl OutBuf {
     /// §4.4: does one more frame fit under the cap? The cap is a STOP — a source
     /// whose next frame does not fit HOLDS it (file: in `partial`; fleet: by not
     /// advancing `sent`) rather than dropping the peer.
-    pub fn has_room(&self, frame_len: usize, cap: usize) -> bool {
-        self.out.len() + frame_len <= cap
+    ///
+    /// R1b (#121): this is ALSO the ONE place in campd that knows the cap is
+    /// currently STOPPING a source, so it is where `at_cap_since` is stamped —
+    /// every source, file and fleet, reaches the cap through here and nowhere else.
+    /// `false` is the AT-CAP condition: `out` is within one frame of the cap and
+    /// delivery has halted. (A frame too big for an EMPTY cap is not this state; both
+    /// sources rule that out BEFORE they ask — `FileSource` via its `oversize` scan,
+    /// `FleetSource` via its `frame.len() > cap` report.)
+    ///
+    /// It STAMPS but never CLEARS. Clearing belongs to `flush`, the only place `out`
+    /// shrinks, and only on a drain to EMPTY: a source that is cap-stopped re-asks
+    /// for the SAME frame on every re-fill, so "there is room for one more frame now"
+    /// says nothing about whether the peer is keeping up — the trickle reader frees
+    /// exactly one frame's worth per interval and would clear the clock forever.
+    pub fn has_room(&mut self, frame_len: usize, cap: usize, now: Timestamp) -> bool {
+        let room = self.out.len() + frame_len <= cap;
+        if !room && self.at_cap_since.is_none() {
+            self.at_cap_since = Some(now);
+        }
+        room
     }
     pub fn append(&mut self, frame: &[u8]) {
         self.out.extend_from_slice(frame);
@@ -4328,6 +4584,16 @@ impl OutBuf {
             Ok(n) => {
                 self.out.drain(..n);
                 self.blocked_since = None; // R1: it IS reading.
+                if self.out.is_empty() {
+                    // R1b: the buffer DRAINED — the cap holds nothing, so the
+                    // at-cap clock stops. This is the ONLY place `out` shrinks, and
+                    // "drained to empty" is the only shrink that proves the peer
+                    // kept up: `out` is refilled to the cap after every partial
+                    // write, so any weaker test (`len() < cap`, or "one more frame
+                    // fits") is true on EVERY accepted byte and clears the clock for
+                    // the very peer it exists to catch.
+                    self.at_cap_since = None;
+                }
                 FlushStep::Drained
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => FlushStep::Drained,
@@ -4343,8 +4609,21 @@ impl OutBuf {
                 if self.blocked_since.is_none() {
                     self.blocked_since = Some(now);
                 }
-                if let Some(since) = self.blocked_since
-                    && now.duration_since(since) >= signed(stall_timeout)
+                // TWO CLOCKS, ONE DEADLINE TEST, and this is the only place either is
+                // read. A subscriber at rest ALWAYS sits here: the pump loop leaves
+                // only on WouldBlock, Gone, Stalled, or an empty `out`, so every
+                // buffered subscriber has been through this arm — which is what lets
+                // R1b ride the existing write/stall path and arm NOTHING of its own.
+                //
+                //   R1  — zero bytes accepted for one stall interval: STOPPED reading.
+                //   R1b — continuously at the cap for AT_CAP_STALL_INTERVALS of them
+                //         (#121): reading, but never enough to give the buffer back.
+                if elapsed_at_least(self.blocked_since, now, stall_timeout)
+                    || elapsed_at_least(
+                        self.at_cap_since,
+                        now,
+                        AT_CAP_STALL_INTERVALS * stall_timeout,
+                    )
                 {
                     self.high_water = self.high_water.max(self.out.len());
                     return FlushStep::Stalled;
@@ -4466,6 +4745,7 @@ impl FileSource {
         &mut self,
         out: &mut OutBuf,
         cap: usize,
+        now: Timestamp,
         scanned: &mut usize,
         pending_events: &mut Vec<EventInput>,
         degraded_seen: &mut HashSet<(String, u64)>,
@@ -4493,7 +4773,7 @@ impl FileSource {
             // only exits the inner `for` — the `while` guard then re-reads it and
             // stops FILL from pulling another chunk on top of a held line.)
             if self.held {
-                if !self.try_emit_line(out, cap) {
+                if !self.try_emit_line(out, cap, now) {
                     break;
                 }
                 continue; // try_emit_line cleared `held`
@@ -4586,7 +4866,7 @@ impl FileSource {
                 if b == b'\n' {
                     self.partial.push(b'\n'); // B1: THE NEWLINE GOES IN.
                     self.held = true;
-                    if !self.try_emit_line(out, cap) {
+                    if !self.try_emit_line(out, cap, now) {
                         stalled = true; // R1: HOLD the line. Never Drop.
                         break;
                     }
@@ -4644,7 +4924,7 @@ impl FileSource {
     /// strips that '\n' again — so `frame.len() = frame_overhead + body.len() <= cap`
     /// and this frame ALWAYS fits an EMPTY `out`. A held line goes out the moment the
     /// socket drains what is ahead of it.
-    fn try_emit_line(&mut self, out: &mut OutBuf, cap: usize) -> bool {
+    fn try_emit_line(&mut self, out: &mut OutBuf, cap: usize, now: Timestamp) -> bool {
         // B1: `partial` INCLUDES the '\n', so `off` lands PAST the newline — which is
         // what makes it a valid §9 resume cursor (the start of the NEXT line).
         let off = self.cursor + self.partial.len() as u64;
@@ -4670,7 +4950,7 @@ impl FileSource {
             }
         };
 
-        if !out.has_room(frame.len(), cap) {
+        if !out.has_room(frame.len(), cap, now) {
             return false; // STALL (R1) — never a Drop.
         }
 
@@ -4739,6 +5019,7 @@ impl FleetSource {
         &mut self,
         out: &mut OutBuf,
         cap: usize,
+        now: Timestamp,
         model: &[SessionInfo],
         pending_events: &mut Vec<EventInput>,
     ) {
@@ -4764,7 +5045,7 @@ impl FleetSource {
                 self.sent.insert(s.name.clone(), s.clone());
                 continue;
             }
-            if !out.has_room(frame.len(), cap) {
+            if !out.has_room(frame.len(), cap, now) {
                 return; // R1 cap-STOP: `sent` unchanged; resumed next fill.
             }
             out.append(&frame);
@@ -4780,7 +5061,7 @@ impl FleetSource {
             .collect();
         for name in goners {
             let frame = fleet_gone_frame(&name);
-            if !out.has_room(frame.len(), cap) {
+            if !out.has_room(frame.len(), cap, now) {
                 return;
             }
             out.append(&frame);
@@ -4789,7 +5070,7 @@ impl FleetSource {
         // (3) the snapshot terminator, once.
         if !self.synced {
             let frame = fleet_synced_frame();
-            if !out.has_room(frame.len(), cap) {
+            if !out.has_room(frame.len(), cap, now) {
                 return;
             }
             out.append(&frame);
@@ -4858,12 +5139,13 @@ fn pump_subscriber(
             Source::File(fs) => fs.fill(
                 &mut sub.out,
                 cap,
+                now,
                 &mut scanned,
                 pending_events,
                 degraded_seen,
             ),
             Source::Fleet(fleet) => {
-                fleet.fill(&mut sub.out, cap, fleet_model, pending_events);
+                fleet.fill(&mut sub.out, cap, now, fleet_model, pending_events);
                 false // never terminal
             }
         };
