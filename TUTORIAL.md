@@ -125,19 +125,28 @@ That created just two files — nothing hidden:
 ls -A .camp        # camp.db  camp.toml
 ```
 
-**About the two flags.** On a desktop, a bare `camp init` does two extra things:
-it puts campd under your host service manager (launchd on macOS, `systemd
---user` on Linux) so it's always-on, and it *offers* to import the starter pack.
-For this tutorial we skip both — `--no-service` so we start campd by hand later
-(everything stays in the foreground and easy to reason about), and `--no-import`
-so we import the pack explicitly in step 5. Drop the flags later when you want
-the always-on, batteries-included setup.
-
-> When you're ready for always-on operation, `camp service install` puts the
-> running camp under the supervisor. See the README's
-> [Supervised campd](README.md#supervised-campd--camp-service) section — in
-> particular the note that the supervisor captures a **snapshot of your PATH**,
-> which is how campd finds `claude`.
+> **Why the two flags — and what the real default is.** A **bare `camp init`**
+> is the batteries-included desktop path, and it's what you'll most likely run
+> for real. It does two extra things this tutorial deliberately turns off:
+>
+> - **It supervises campd** — puts it under your host service manager (launchd on
+>   macOS, `systemd --user` on Linux) so it's always-on, surviving crashes,
+>   logout, and reboot. `--no-service` skips that so *you* start campd by hand in
+>   §7 and can watch it run in the foreground and `camp stop` it — a cleaner
+>   mental model for a first pass, and one that behaves the same on every OS.
+> - **It offers to import the starter pack** (an interactive prompt in a
+>   terminal). `--no-import` skips the offer so importing a pack is an explicit,
+>   deterministic step you do on purpose in §5, instead of something `init`
+>   already did behind a `y/n`.
+>
+> **For real use, drop both flags.** A supervised campd is what makes orders fire
+> while you're away and survives you closing the terminal (a foreground `camp
+> daemon` dies with its shell). To put an already-created camp under the
+> supervisor later, run `camp service install`. Two things to know about
+> supervised mode: `camp stop` refuses (use `camp service stop`), and the
+> supervisor bakes a **snapshot of your PATH** into the unit — so if `claude`
+> isn't on that PATH, campd comes up healthy but fails every dispatch. See the
+> README's [Supervised campd](README.md#supervised-campd--camp-service) section.
 
 ---
 
