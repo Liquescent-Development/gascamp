@@ -796,6 +796,147 @@ pub fn runs_dir(camp_root: &Path) -> PathBuf {
     camp_root.join(RUNS_SUBDIR)
 }
 
+/// How long a `runs/<id>/` dir must have sat UNTOUCHED before the sweep will
+/// remove it (#124).
+///
+/// THE RACE this exists for: a run dir that exists with no `run.cooked` is
+/// EXACTLY the state a healthy in-flight cook is in for the moment between its
+/// run-dir write and its `append_batch` commit (see `cook.rs`'s header — files
+/// land first, deliberately). "No `run.cooked` → delete" is therefore, on its
+/// own, a rule that deletes LIVE run state.
+///
+/// cook writes three small files and commits in the same breath — milliseconds.
+/// Ten minutes is ~5 orders of magnitude of headroom, and the cost of erring
+/// long is zero: an orphan the sweep declines today is swept tomorrow. The cost
+/// of erring short is a destroyed run. That asymmetry sets this number.
+pub const ORPHAN_RUN_SWEEP_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A `runs/<id>/` directory that no `run.cooked` event names (#124) — the
+/// leftover of a `kill -9` inside cook's files-before-ledger window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanRunDir {
+    pub run_id: String,
+    pub path: PathBuf,
+    /// How long the dir has sat untouched. `None` when the mtime is
+    /// unreadable OR in the future — an age we cannot compute is an age that
+    /// cannot clear the grace window, so it reads as NOT sweepable.
+    pub idle: Option<std::time::Duration>,
+}
+
+impl OrphanRunDir {
+    /// May the sweep remove this? Only when we can prove the dir has been
+    /// untouched longer than any cook could plausibly still be writing to it.
+    /// Unknown age → false, always: when in doubt, do not delete.
+    pub fn sweepable(&self) -> bool {
+        self.idle.is_some_and(|idle| idle >= ORPHAN_RUN_SWEEP_GRACE)
+    }
+}
+
+/// Every run id the LEDGER names in a `run.cooked` event.
+///
+/// The id set is derived from the log, never from filesystem heuristics: the
+/// log is the durable truth (invariant 3), and "this dir looks old" is not
+/// evidence about whether a run exists. Bounded by the `events_type` index.
+fn cooked_run_ids(conn: &Connection) -> Result<std::collections::BTreeSet<String>, CoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(data, '$.run_id') FROM events
+          WHERE type = 'run.cooked' AND json_extract(data, '$.run_id') IS NOT NULL",
+    )?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
+/// The `runs/<id>/` dirs no `run.cooked` event names (#124). READ-ONLY.
+///
+/// ORDERING IS THE SAFETY PROPERTY: the directories are enumerated FIRST and
+/// the ledger read SECOND. A cook that commits during the scan then lands in
+/// the cooked set and its dir is correctly excluded; a dir created after the
+/// enumeration is not considered at all. The reverse order (ledger, then dirs)
+/// would flag every dir born in between as an orphan, which is the bug this
+/// whole feature could most easily have shipped.
+///
+/// A missing `runs/` is a camp that has never cooked, not an error.
+pub fn orphaned_run_dirs(
+    conn: &Connection,
+    camp_root: &Path,
+) -> Result<Vec<OrphanRunDir>, CoreError> {
+    let root = runs_dir(camp_root);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(CoreError::Cook(format!(
+                "cannot read {}: {e}",
+                root.display()
+            )));
+        }
+    };
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| CoreError::Cook(format!("cannot read {}: {e}", root.display())))?;
+        // Directories only. A stray FILE under runs/ is not a run dir, and
+        // this sweep's job is not to have opinions about it.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Some(run_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        dirs.push((run_id, entry.path()));
+    }
+    // …dirs enumerated. NOW the ledger.
+    let cooked = cooked_run_ids(conn)?;
+    let mut orphans: Vec<OrphanRunDir> = dirs
+        .into_iter()
+        .filter(|(run_id, _)| !cooked.contains(run_id))
+        .map(|(run_id, path)| {
+            let idle = dir_idle(&path);
+            OrphanRunDir { run_id, path, idle }
+        })
+        .collect();
+    orphans.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+    Ok(orphans)
+}
+
+/// How long since this dir was last written. `None` on any unreadable mtime or
+/// an mtime in the FUTURE (a clock skew we cannot reason about) — both mean
+/// "cannot prove it is idle", which the caller reads as "do not delete".
+fn dir_idle(path: &Path) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    std::time::SystemTime::now().duration_since(modified).ok()
+}
+
+/// Remove the orphaned run dirs that clear the grace window; return exactly
+/// what was removed. NEVER called automatically — not by `reconcile`, not on
+/// campd start. The operator asks, or it does not happen (#124).
+///
+/// The caller is responsible for the OTHER half of the race defense (campd
+/// must be down); this half is the grace window, re-checked against a FRESH
+/// stat immediately before each removal so a dir a cook touched since the scan
+/// is spared.
+pub fn sweep_orphan_run_dirs(
+    conn: &Connection,
+    camp_root: &Path,
+) -> Result<Vec<OrphanRunDir>, CoreError> {
+    let mut swept = Vec::new();
+    for orphan in orphaned_run_dirs(conn, camp_root)? {
+        let fresh = OrphanRunDir {
+            idle: dir_idle(&orphan.path),
+            ..orphan
+        };
+        if !fresh.sweepable() {
+            continue;
+        }
+        std::fs::remove_dir_all(&fresh.path)
+            .map_err(|e| CoreError::Cook(format!("cannot remove {}: {e}", fresh.path.display())))?;
+        swept.push(fresh);
+    }
+    Ok(swept)
+}
+
 /// The dead-end batch for a run that can never advance (its pinned dir is
 /// unreadable, so campd has no structure to execute): close every open
 /// run bead `skipped`, the root `fail`, and finalize hard — evented,

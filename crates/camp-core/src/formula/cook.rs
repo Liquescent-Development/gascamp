@@ -11,8 +11,11 @@
 //! commit a run whose pinned formula never hit disk, breaking the
 //! file-independence property. An orphan dir references nothing, nothing
 //! references it, and the missing run.cooked event makes it
-//! self-explaining. A future `camp doctor` check may sweep run dirs that
-//! have no run.cooked event; v1 does not build it.
+//! self-explaining. `camp doctor --orphan-runs` LISTS run dirs that no
+//! run.cooked event names, and `--sweep-orphan-runs` removes them (#124) —
+//! never automatically, and never while campd is up or while a dir is fresh
+//! enough that a cook could still be writing it, because a dir in this
+//! window is indistinguishable from a healthy in-flight cook.
 
 use std::collections::BTreeMap;
 use std::path::Path;

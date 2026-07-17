@@ -1841,8 +1841,11 @@ impl GraphRuntime {
     /// ledger batch leaves `runs/<id>/` with no ledger record; the
     /// fire-dedupe re-cooks under a NEW id, so recovery is idempotent but
     /// the orphan lingers — the crash window cook.rs's header records as
-    /// the safe direction, its sweep deferred to a future `camp doctor`
-    /// check (review note 4; nothing to reconcile here).
+    /// the safe direction. Nothing to reconcile here, and DELIBERATELY so:
+    /// the sweep is `camp doctor --orphan-runs --sweep-orphan-runs`, an
+    /// operator verb that refuses to run while campd is up (#124). Startup
+    /// is the worst possible moment for it — campd is about to cook, and a
+    /// run dir with no run.cooked is exactly what a live cook looks like.
     pub fn reconcile(&mut self, ledger: &mut Ledger) -> Result<(), CoreError> {
         // (1) checks due / (2) defensive attempt respawns: every anchor
         // campd holds is a looping step mid-loop; its latest attempt's

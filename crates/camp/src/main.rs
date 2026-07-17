@@ -91,7 +91,7 @@ enum Command {
     },
     /// Verify ledger invariants
     #[command(group(
-        clap::ArgGroup::new("mode").required(true).args(["refold", "formula", "drain_reservations"])
+        clap::ArgGroup::new("mode").required(true).args(["refold", "formula", "drain_reservations", "orphan_runs"])
     ))]
     Doctor {
         /// Rebuild state from the event log and report drift (spec §13.5)
@@ -117,6 +117,16 @@ enum Command {
         /// take.
         #[arg(long, requires = "drain_reservations")]
         release_orphans: bool,
+        /// List `runs/<id>/` directories no `run.cooked` event names — the
+        /// leftovers of a kill -9 inside cook's files-before-ledger window
+        /// (#124). READ-ONLY: listing never deletes.
+        #[arg(long, conflicts_with_all = ["refold", "formula", "drain_reservations"])]
+        orphan_runs: bool,
+        /// Remove the orphans `--orphan-runs` finds. Refuses while campd is
+        /// running, and never touches a directory recently written to — that is
+        /// what a healthy in-flight cook looks like.
+        #[arg(long, requires = "orphan_runs")]
+        sweep_orphan_runs: bool,
         /// Emit camp's COMPILED steps in the differential gate's normalized shape
         /// (`ci/gc-compat/differential.py` diffs them against gc's real compiler).
         #[arg(long, requires = "formula")]
@@ -697,6 +707,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             )
         }
         Command::Doctor {
+            orphan_runs,
+            sweep_orphan_runs,
+            ..
+        } if orphan_runs => {
+            let camp = CampDir::resolve(cli.camp.as_deref())?;
+            cmd::doctor::run_orphan_runs(&camp, sweep_orphan_runs)
+        }
+        Command::Doctor {
             refold: _,
             repair,
             formula,
@@ -704,6 +722,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             drain_reservations,
             release_orphans,
             compiled: _,
+            ..
         } if drain_reservations => {
             let camp = CampDir::resolve(cli.camp.as_deref())?;
             let _ = (repair, formula, json);
