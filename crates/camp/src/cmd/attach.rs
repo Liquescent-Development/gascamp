@@ -4,17 +4,20 @@
 //! assistant text, token usage. It never opens a session file, never learns a
 //! pid; it reaches the worker only through the socket. Replay and live-follow are
 //! the SAME subscribe (cursor 0 replays history then follows; a finished session
-//! ends). From here you send a turn or interrupt. Answering a permission is
-//! out-of-band via the one-shot `camp decide` (cp-3, shipped), using the
-//! request_id this view renders on the BLOCKED line; an INTERACTIVE in-attach
-//! `/allow`//deny action is a separate cp-4 deferral.
+//! ends). From here you do §5.2's three things: send a turn, interrupt, and
+//! ANSWER A PERMISSION — `/allow`, `/allow_always`, `/deny <reason>` on the line
+//! loop (issue #120), validated by `camp decide`'s rules and delivered over the
+//! same `session.permission_decision` verb. The one-shot `camp decide` remains
+//! the out-of-band answer for an operator who is not attached.
 
 use std::io::{BufRead, BufReader, Write};
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 
 use crate::campdir::CampDir;
+use crate::cmd::decide;
 use crate::daemon::socket::{self, Request, Response};
 
 /// The KIND of a rendered line — what the `--only` filter selects on.
@@ -29,9 +32,21 @@ pub enum EventKind {
     },
     Result,
     /// A `can_use_tool` control request — a question addressed to the operator.
-    /// cp-4 renders it; cp-3 owns answering it.
-    Permission,
+    ///
+    /// It CARRIES the `request_id` the answer must quote, so the view's rendered
+    /// BLOCKED line and the id an in-view `/allow` sends come from ONE parse of
+    /// ONE frame — the operator can never answer an id different from the one
+    /// they are looking at. `None` is a control_request with no id on the wire:
+    /// still rendered (nothing hidden), but unanswerable, so no `/allow` can
+    /// quote it.
+    Permission {
+        request_id: Option<String>,
+    },
     System,
+    /// STREAM STRUCTURE, not agent content: the `skipped`/`end` markers. Like a
+    /// permission, no filter may hide one — a `--only text` view that silently
+    /// dropped "the session ended" would be lying about the stream.
+    Stream,
     Other,
 }
 
@@ -147,15 +162,18 @@ pub fn render_event(ev: &serde_json::Value) -> Vec<Rendered> {
                     .unwrap_or("a tool");
                 // §5.4/§5.3: the request_id rides THIS frame (top-level) — the
                 // only socket surface that carries it, since SessionInfo has no
-                // such field. Render it, and name the real answer path: the
-                // one-shot `camp decide` (cp-3 shipped). Attach's INTERACTIVE
-                // /allow-//deny loop is still cp-4's deferral - not wired here.
-                let request_id = ev.get("request_id").and_then(|v| v.as_str()).unwrap_or("?");
+                // such field. Render it (an out-of-band `camp decide` needs it),
+                // and name the answer the operator can type RIGHT HERE (#120).
+                let request_id = ev
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let shown = request_id.clone().unwrap_or_else(|| "?".to_owned());
                 vec![Rendered {
-                    kind: EventKind::Permission,
+                    kind: EventKind::Permission { request_id },
                     line: format!(
-                        "  !! BLOCKED -- {tool} needs your decision -- request {request_id} \
-                         -- answer: camp decide <session> {request_id} allow|deny"
+                        "  !! BLOCKED -- {tool} needs your decision -- request {shown} \
+                         -- answer: /allow, /allow_always, or /deny <reason>"
                     ),
                 }]
             } else {
@@ -203,10 +221,11 @@ impl AttachFilter {
         }
     }
 
-    /// Does this line pass? A `Permission` line ALWAYS passes -- a question
-    /// addressed to the operator must never be filtered away.
+    /// Does this line pass? A `Permission` or `Stream` line ALWAYS passes -- a
+    /// question addressed to the operator, and the shape of the stream itself,
+    /// must never be filtered away.
     pub fn matches(&self, r: &Rendered) -> bool {
-        if r.kind == EventKind::Permission {
+        if matches!(r.kind, EventKind::Permission { .. } | EventKind::Stream) {
             return true;
         }
         match self {
@@ -268,33 +287,46 @@ impl StreamFrame {
 }
 
 /// A steering action parsed from an operator input line (§6: turns and
-/// decisions, not keypresses). The overseer answers a permission out-of-band
-/// with the one-shot `camp decide` (cp-3, shipped) using the request_id this
-/// view renders on the BLOCKED line; wiring an INTERACTIVE `/allow`//deny
-/// action into this loop remains a separate cp-4 deferral.
+/// decisions, not keypresses — a `/deny <reason>` LINE is a decision, which is
+/// exactly what §6 says this loop carries).
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Turn(String),
     Interrupt,
     Detach,
-    /// A permission-answer keypress (`/allow`, `/allow_always`, `/deny`) typed at
-    /// a BLOCKED worker. attach does NOT wire the interactive decide path (cp-4's
-    /// deferral), so rather than silently delivering it as a user turn (CP5-3's
-    /// UX surprise), the steering loop points the operator at the out-of-band
-    /// answer — `camp decide <session> <request_id>` from the BLOCKED line.
-    DecideHint,
+    /// A permission answer typed at a BLOCKED worker (§5.2/#120): `/allow`,
+    /// `/allow_always`, or `/deny <reason>`.
+    ///
+    /// The request_id is NOT here BY DESIGN — the operator never retypes an id
+    /// the view already read off the frame it rendered for them. `reason` is
+    /// everything after the verb; whether it is REQUIRED is `camp decide`'s rule
+    /// to enforce (`decide::decision_request`), never a second copy here.
+    Decide {
+        decision: String,
+        reason: Option<String>,
+    },
 }
 
 /// Map an input line to an action. A blank line or `/q` detaches; `/interrupt`
-/// interrupts; a leading `/allow`//deny keypress is a decide-hint (answered
-/// out-of-band, not here); anything else is a turn.
+/// interrupts; a leading `/allow`//`/allow_always`//`/deny` is a permission
+/// answer, carrying any trailing text as its reason; anything else is a turn.
 pub fn parse_action(line: &str) -> Action {
     let trimmed = line.trim();
-    let verb = trimmed.split_whitespace().next().unwrap_or("");
+    let (verb, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .unwrap_or((trimmed, ""));
     match trimmed {
         "" | "/q" | "/quit" => Action::Detach,
         "/interrupt" => Action::Interrupt,
-        _ if matches!(verb, "/allow" | "/allow_always" | "/deny") => Action::DecideHint,
+        _ if matches!(verb, "/allow" | "/allow_always" | "/deny") => {
+            let reason = rest.trim();
+            Action::Decide {
+                // The verb IS the decision vocabulary `camp decide` validates:
+                // `/allow_always` -> "allow_always". No mapping table to drift.
+                decision: verb.trim_start_matches('/').to_owned(),
+                reason: (!reason.is_empty()).then(|| reason.to_owned()),
+            }
+        }
         other => Action::Turn(other.to_owned()),
     }
 }
@@ -302,17 +334,25 @@ pub fn parse_action(line: &str) -> Action {
 /// Turn one frame into the ready-to-print lines under `filter`. `Event` frames
 /// go through `render_event` + the filter; `Skipped`/`End` render their own
 /// marker lines UNCONDITIONALLY (they are stream structure, not agent content).
-pub fn render_frame(frame: &StreamFrame, filter: AttachFilter) -> Vec<String> {
+///
+/// Returns `Rendered`, not bare strings: the caller must SEE what it is printing
+/// — a `Permission` line hands the view the request_id an in-attach `/allow`
+/// answers (#120), and re-deriving that from the printed text, or by rendering
+/// the frame a second time, would be a second source of truth.
+pub fn render_frame(frame: &StreamFrame, filter: AttachFilter) -> Vec<Rendered> {
     match frame {
         StreamFrame::Event { event, .. } => render_event(event)
             .into_iter()
             .filter(|r| filter.matches(r) && !r.line.is_empty())
-            .map(|r| r.line)
             .collect(),
-        StreamFrame::Skipped { bytes, reason, .. } => {
-            vec![format!("  [skipped {bytes} bytes: {reason}]")]
-        }
-        StreamFrame::End { reason, .. } => vec![format!("-- session {reason} --")],
+        StreamFrame::Skipped { bytes, reason, .. } => vec![Rendered {
+            kind: EventKind::Stream,
+            line: format!("  [skipped {bytes} bytes: {reason}]"),
+        }],
+        StreamFrame::End { reason, .. } => vec![Rendered {
+            kind: EventKind::Stream,
+            line: format!("-- session {reason} --"),
+        }],
         StreamFrame::Unknown => vec![],
     }
 }
@@ -383,6 +423,12 @@ pub fn run(
     // Long-lived now: no read timeout (a quiet stream is not a wedged daemon -- §4.4).
     reader.get_ref().set_read_timeout(None)?;
 
+    // The BLOCKED question currently on the floor, as the PRINTER read it off the
+    // wire and the STEERING loop answers it (#120). This slot is why `/allow`
+    // needs no typed request_id: the view already saw the id it is showing.
+    let pending: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let pending_writer = Arc::clone(&pending);
+
     // The stream reader runs on its own thread so the main thread can read stdin
     // for steering. It OWNS the reader; on EOF (`end` frame flush, campd closing
     // the stream, or our own detach dropping the socket) it returns.
@@ -406,7 +452,20 @@ pub fn run(
                         last_offset = Some(off);
                     }
                     for out in render_frame(&frame, only) {
-                        println!("{out}");
+                        // Record the question BEFORE printing it: the operator
+                        // cannot answer a line they have not seen, so an id
+                        // stored here is always ready by the time the BLOCKED
+                        // line reaches them (same thread, program order).
+                        if let EventKind::Permission {
+                            request_id: Some(id),
+                        } = &out.kind
+                        {
+                            let mut slot = pending_writer
+                                .lock()
+                                .map_err(|_| anyhow!("the pending-permission slot is poisoned"))?;
+                            *slot = Some(id.clone());
+                        }
+                        println!("{}", out.line);
                     }
                     if matches!(frame, StreamFrame::End { .. }) {
                         if let Some(off) = last_offset {
@@ -468,16 +527,59 @@ pub fn run(
                     None => eprintln!("(campd went away; cannot interrupt)"),
                 }
             }
-            Action::DecideHint => {
-                // CP5-3: attach does NOT wire the interactive answer path (cp-4's
-                // deferral). Rather than deliver `/allow`//deny as a user turn,
-                // point the operator at the out-of-band verb, whose request_id is
-                // the one this view renders on the BLOCKED line.
-                eprintln!(
-                    "(permission answers are out-of-band from this view: run \
-                     `camp decide {session} <request_id> allow|allow_always|deny [--reason ...]` \
-                     using the request id shown on the BLOCKED line above)"
-                );
+            Action::Decide { decision, reason } => {
+                // #120: answer the question this view is showing, over the same
+                // `session.permission_decision` verb `camp decide` uses.
+                let request_id = pending
+                    .lock()
+                    .map_err(|_| anyhow!("the pending-permission slot is poisoned"))?
+                    .clone();
+                let Some(request_id) = request_id else {
+                    eprintln!(
+                        "(nothing is BLOCKED on {session} right now — there is no permission to answer)"
+                    );
+                    continue;
+                };
+                match decide::decision_request(
+                    session.clone(),
+                    request_id.clone(),
+                    decision,
+                    reason,
+                ) {
+                    // A bare `/deny` is the OPERATOR's slip, not the session's:
+                    // name the rule and stay attached. Detaching a live view over
+                    // a mistyped line would cost them the stream they are
+                    // answering from — and the worker is still safely BLOCKED.
+                    Err(e) => eprintln!("({e:#})"),
+                    Ok(request) => match socket::request_if_up(camp, &request) {
+                        Ok(Some(Response::PermissionDecided {
+                            decision: recorded, ..
+                        })) => {
+                            // Answered: the slot must not offer a stale id to the
+                            // next bare `/allow`. Clear it ONLY if the worker has
+                            // not already asked something new in the meantime.
+                            let mut slot = pending
+                                .lock()
+                                .map_err(|_| anyhow!("the pending-permission slot is poisoned"))?;
+                            if slot.as_deref() == Some(request_id.as_str()) {
+                                *slot = None;
+                            }
+                            eprintln!(
+                                "(recorded {recorded} for {request_id} on {session}, and delivered it to the worker)"
+                            );
+                        }
+                        Ok(Some(other)) => {
+                            eprintln!("(unexpected permission decision response: {other:?})")
+                        }
+                        Ok(None) => eprintln!("(campd went away; cannot deliver the decision)"),
+                        // campd REFUSED — "already decided by X" is §4's
+                        // first-answer-wins talking, i.e. campd ANSWERING the
+                        // operator, not a fault to tear the view down over. Loud
+                        // and complete (`{e:#}` carries the whole error chain),
+                        // never swallowed; the operator decides what to do next.
+                        Err(e) => eprintln!("(the decision was refused: {e:#})"),
+                    },
+                }
             }
         }
     }
@@ -580,12 +682,21 @@ mod tests {
         assert_eq!(StreamFrame::Unknown.offset(), None); // no offset to trust
     }
 
+    /// The rendered LINES of a frame — the old `render_frame` shape, kept as a
+    /// test helper so these assertions stay about rendering, not about `Rendered`.
+    fn frame_lines(frame: &StreamFrame, filter: AttachFilter) -> Vec<String> {
+        render_frame(frame, filter)
+            .into_iter()
+            .map(|r| r.line)
+            .collect()
+    }
+
     #[test]
     fn render_frame_composes_render_and_filter() {
         let line = r#"{"frame":"event","session":"s","offset":1,"event":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Bash","input":{"command":"ls"}}]}}}"#;
         let f: StreamFrame = serde_json::from_str(line).unwrap();
         assert!(render_frame(&f, AttachFilter::Edits).is_empty()); // Edits hides a Bash tool_use
-        let lines = render_frame(&f, AttachFilter::Tools); // Tools shows it
+        let lines = frame_lines(&f, AttachFilter::Tools); // Tools shows it
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("ls"));
     }
@@ -602,15 +713,80 @@ mod tests {
             reason: "stopped".into(),
         };
         assert!(
-            render_frame(&sk, AttachFilter::Edits)[0]
+            frame_lines(&sk, AttachFilter::Edits)[0]
                 .to_lowercase()
                 .contains("skipped")
         );
         assert!(
-            render_frame(&en, AttachFilter::Text)[0]
+            frame_lines(&en, AttachFilter::Text)[0]
                 .to_lowercase()
                 .contains("stopped")
         );
+    }
+
+    /// #120's load-bearing wiring: `render_frame` hands the CALLER the
+    /// request_id, so the printer thread can stock the slot a bare `/allow`
+    /// answers. A `Permission` line that renders the id for human eyes but drops
+    /// it from the `kind` would leave the steering loop with nothing to send —
+    /// and the operator back in a second terminal.
+    #[test]
+    fn render_frame_hands_the_caller_the_blocked_request_id() {
+        let wire = r#"{"frame":"event","session":"s","offset":1,"event":{"type":"control_request","request_id":"cli-gc-7","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo publish"}}}}"#;
+        let f: StreamFrame = serde_json::from_str(wire).unwrap();
+        // Under EVERY filter — the id must survive wherever the question does.
+        for filter in [
+            AttachFilter::All,
+            AttachFilter::Text,
+            AttachFilter::Tools,
+            AttachFilter::Edits,
+            AttachFilter::Failures,
+        ] {
+            let rendered = render_frame(&f, filter);
+            assert_eq!(rendered.len(), 1, "{filter:?} lost the permission line");
+            assert_eq!(
+                rendered[0].kind,
+                EventKind::Permission {
+                    request_id: Some("cli-gc-7".into())
+                },
+                "{filter:?} did not carry the request_id to the caller"
+            );
+        }
+    }
+
+    /// The id the view SHOWS and the id an in-view `/allow` SENDS are one parse
+    /// of one frame: they cannot drift apart.
+    #[test]
+    fn the_rendered_id_and_the_carried_id_are_the_same_id() {
+        let ev = json!({
+            "type": "control_request", "request_id": "cli-gc-42",
+            "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {}}
+        });
+        let r = render_event(&ev);
+        let EventKind::Permission { request_id } = &r[0].kind else {
+            panic!("expected a Permission kind, got {:?}", r[0].kind);
+        };
+        let carried = request_id.as_deref().expect("the id must be carried");
+        assert!(
+            r[0].line.contains(carried),
+            "the line shows an id the kind does not carry: {:?}",
+            r[0]
+        );
+    }
+
+    /// A control_request with NO request_id on the wire: still RENDERED (nothing
+    /// hidden — the operator must see the worker is stuck), but unanswerable, so
+    /// the kind carries no id for `/allow` to quote. Inventing a placeholder id
+    /// here would make attach send campd a request_id that never existed.
+    #[test]
+    fn a_permission_with_no_wire_id_renders_but_carries_no_answerable_id() {
+        let ev = json!({
+            "type": "control_request",
+            "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {}}
+        });
+        let r = render_event(&ev);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].kind, EventKind::Permission { request_id: None });
+        assert!(r[0].line.to_uppercase().contains("BLOCKED"), "{:?}", r[0]);
     }
 
     /// CP4's OWNED half of the "replay of a finished session" exit criterion: the
@@ -637,7 +813,7 @@ mod tests {
         let mut out: Vec<String> = Vec::new();
         for line in wire {
             let f: StreamFrame = serde_json::from_str(line).unwrap();
-            out.extend(render_frame(&f, AttachFilter::All));
+            out.extend(frame_lines(&f, AttachFilter::All));
         }
         // The FULL history rendered, IN ORDER — not a truncated prefix.
         let joined = out.join("\n");
@@ -680,23 +856,57 @@ mod tests {
         assert_eq!(parse_action(""), Action::Detach); // a blank line is a detach-safe no-op
     }
 
+    /// A permission answer typed at a BLOCKED worker parses into the DECISION
+    /// VOCABULARY `camp decide` validates, with any trailing text as the reason
+    /// (#120). Before this, every one of these lines collapsed to a hint that
+    /// told the operator to go open another terminal.
     #[test]
-    fn parse_action_intercepts_permission_keypresses_as_a_decide_hint() {
-        // CP5-3: /allow//deny typed at a BLOCKED worker must NOT be delivered as
-        // a user turn (a mild UX surprise). attach does not wire the interactive
-        // decide path (cp-4's deferral); it points the operator at the
-        // out-of-band `camp decide` instead.
-        assert_eq!(parse_action("/allow"), Action::DecideHint);
-        assert_eq!(parse_action("/allow_always"), Action::DecideHint);
-        assert_eq!(parse_action("/deny"), Action::DecideHint);
-        assert_eq!(parse_action("/deny not safe"), Action::DecideHint); // trailing args
-        assert_eq!(parse_action("  /allow  "), Action::DecideHint); // surrounding space
+    fn parse_action_maps_a_permission_keypress_to_its_decision_and_reason() {
+        let decide = |decision: &str, reason: Option<&str>| Action::Decide {
+            decision: decision.into(),
+            reason: reason.map(str::to_owned),
+        };
+        assert_eq!(parse_action("/allow"), decide("allow", None));
+        assert_eq!(parse_action("/allow_always"), decide("allow_always", None));
+        // The whole tail is the reason — a reason is a sentence, not one word.
+        assert_eq!(
+            parse_action("/deny not safe on prod"),
+            decide("deny", Some("not safe on prod"))
+        );
+        // A bare `/deny` parses; the MISSING REASON is `decide`'s rule to catch,
+        // not something this parser silently invents a value for.
+        assert_eq!(parse_action("/deny"), decide("deny", None));
+        assert_eq!(parse_action("  /allow  "), decide("allow", None)); // surrounding space
+        assert_eq!(
+            parse_action("  /deny  too risky  "),
+            decide("deny", Some("too risky"))
+        );
         // a plain turn that merely MENTIONS allow is still a turn — only the
         // leading `/allow`//deny keypress is intercepted.
         assert_eq!(
             parse_action("allow the build to run"),
             Action::Turn("allow the build to run".into())
         );
+    }
+
+    /// The verb IS the wire vocabulary: `/allow_always` must send "allow_always",
+    /// never "allow". The three decisions are NOT interchangeable — `allow_always`
+    /// widens the worker's allowlist for the rest of the session, and silently
+    /// downgrading it to a one-shot `allow` (or vice versa) is a permission bug,
+    /// not a typo. `decide::decision_request` is what pins the vocabulary itself.
+    #[test]
+    fn every_decision_verb_keeps_its_own_identity_on_the_wire() {
+        for verb in ["allow", "allow_always", "deny"] {
+            let line = format!("/{verb} a reason");
+            assert_eq!(
+                parse_action(&line),
+                Action::Decide {
+                    decision: verb.into(),
+                    reason: Some("a reason".into()),
+                },
+                "{line} did not parse to the {verb} decision"
+            );
+        }
     }
 
     #[test]
@@ -786,8 +996,16 @@ mod tests {
     fn a_permission_line_survives_every_filter() {
         // BLOCKED must be impossible to miss -- no filter may hide it (§5.3 spirit).
         let p = Rendered {
-            kind: EventKind::Permission,
+            kind: EventKind::Permission {
+                request_id: Some("r1".into()),
+            },
             line: "!! BLOCKED".into(),
+        };
+        // Stream structure is equally unhideable: a `--only text` view that
+        // dropped "the session ended" would be lying about the stream.
+        let s = Rendered {
+            kind: EventKind::Stream,
+            line: "-- session stopped --".into(),
         };
         for f in [
             AttachFilter::All,
@@ -797,6 +1015,7 @@ mod tests {
             AttachFilter::Failures,
         ] {
             assert!(f.matches(&p), "{f:?} hid a permission line");
+            assert!(f.matches(&s), "{f:?} hid a stream marker");
         }
     }
 
@@ -926,22 +1145,33 @@ mod tests {
         });
         let r = render_event(&ev);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].kind, EventKind::Permission);
+        assert_eq!(
+            r[0].kind,
+            EventKind::Permission {
+                request_id: Some("r1".into())
+            }
+        );
         assert!(r[0].line.to_uppercase().contains("BLOCKED"), "{:?}", r[0]);
         // cp-5 (§5.4): the operator's answer path needs the request_id, and the
-        // only socket surface that carries it is this stream frame. Render it.
+        // only socket surface that carries it is this stream frame. Render it —
+        // an out-of-band `camp decide` (run from a terminal that is NOT attached)
+        // still has no other way to learn it.
         let line = &r[0].line;
         assert!(
             line.contains("r1"),
             "the BLOCKED line must render the request_id: {line}"
         );
+        // #120: the answer path this VIEW names is the one typable IN this view.
+        // It used to name `camp decide` — correct then (attach could not answer),
+        // and a lie now: it sent the operator to a second terminal for something
+        // the line loop under their cursor does.
         assert!(
-            line.contains("camp decide"),
-            "the BLOCKED line must name the answer path: {line}"
+            line.contains("/allow") && line.contains("/deny"),
+            "the BLOCKED line must name the in-view answer: {line}"
         );
         assert!(
-            !line.contains("cp-3"),
-            "the BLOCKED line must not claim cp-3 is unshipped: {line}"
+            !line.contains("camp decide"),
+            "the BLOCKED line must not send an ATTACHED operator to a second terminal: {line}"
         );
     }
 
