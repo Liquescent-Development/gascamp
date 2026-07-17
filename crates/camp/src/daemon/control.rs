@@ -3444,85 +3444,221 @@ mod tests {
         }
     }
 
-    /// R1b (#121) — THE TRICKLE READER, which R1 alone can never catch.
+    /// Pump `rt` up to `at_cap_since` being stamped, with the peer reading NOTHING.
+    /// A `cap` well above one socket buffer fills to the cap over a few
+    /// `MAX_PUMP_BYTES_PER_WAKE` wakes; the socket saturates FIRST (while `out` is
+    /// still below the cap and `at_cap_since` is None), so the initial socket-fill
+    /// write is never miscounted as at-cap headway — `drained_at_cap` starts at 0.
+    fn fill_to_cap(rt: &mut ControlRuntime, conn: &mut Conn, now: Timestamp) {
+        for _ in 0..64 {
+            assert!(
+                matches!(rt.pump(T, conn, now), PumpOutcome::Ok),
+                "filling to the cap must never itself drop"
+            );
+            if rt.test_sub(T).out.at_cap_since.is_some() {
+                return;
+            }
+        }
+        panic!("the source never pinned `out` at the cap");
+    }
+
+    /// Model a consumer that accepts ~`target` bytes AT INSTANT `now`, in
+    /// socket-buffer-sized sips with a pump between each (campd's WRITABLE edge fires
+    /// many times per real interval — a fast reader is not one pump). The peer READS
+    /// FIRST so campd's follow-up write accepts bytes and `blocked_since` clears
+    /// before any deadline is read; returns the terminal `PumpOutcome`, surfacing a
+    /// drop the instant it happens. Stops early if the socket runs dry (caught up).
+    fn accept_about(
+        rt: &mut ControlRuntime,
+        client: &mut std::os::unix::net::UnixStream,
+        conn: &mut Conn,
+        now: Timestamp,
+        target: usize,
+    ) -> PumpOutcome {
+        let mut got = 0usize;
+        let mut sip = [0u8; 8192];
+        while got < target {
+            match client.read(&mut sip) {
+                Ok(n) if n > 0 => got += n,
+                _ => {
+                    // Socket empty: one pump refills it (and reads the deadline).
+                    match rt.pump(T, conn, now) {
+                        PumpOutcome::Ok => {}
+                        other => return other,
+                    }
+                    match client.read(&mut sip) {
+                        Ok(n) if n > 0 => got += n,
+                        _ => return PumpOutcome::Ok, // source dry — caught up
+                    }
+                }
+            }
+            // The WRITABLE edge the peer's read just created.
+            match rt.pump(T, conn, now) {
+                PumpOutcome::Ok => {}
+                other => return other,
+            }
+        }
+        PumpOutcome::Ok
+    }
+
+    /// R1b (#121) — THE TRICKLE READER, which R1 alone can never catch, AND which a
+    /// drain-to-empty reset would also miss.
     ///
-    /// This peer accepts bytes on EVERY interval, so `blocked_since` is cleared on
-    /// every wake and R1's zero-accept rule can never fire — yet the source refills
-    /// `out` to the cap instantly, so the buffer never drops below it. It holds one
-    /// of `MAX_SUBSCRIBERS` slots and a full cap's worth of memory for as long as it
-    /// cares to. `at_cap_since` bounds exactly that: continuously at the cap for
-    /// `AT_CAP_STALL_INTERVALS` stall intervals is a DROP, with the SAME event R1's
-    /// drop uses.
+    /// This peer accepts a little on EVERY interval, so `blocked_since` is cleared on
+    /// every wake and R1's zero-accept rule can never fire. But it never moves a
+    /// cap's worth within the window, so its buffer and its slot are stuck. It is
+    /// dropped when it has been at the cap for `AT_CAP_STALL_INTERVALS` intervals
+    /// without making a cap of headway, with the SAME event R1's drop uses.
     #[test]
-    fn a_peer_that_trickles_at_the_cap_is_dropped_after_the_at_cap_window() {
+    fn a_trickle_reader_that_never_moves_a_cap_per_window_is_dropped() {
         let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
-        // ~6.4 MB of history against a 64 KiB cap: the source NEVER runs dry, so
-        // `out` is pinned at the cap for the whole test.
-        let content = line.repeat(200_000);
+        // A cap (512 KiB) far larger than any socket buffer, so the socket fills
+        // before `out` hits the cap and there is no initial-fill credit; and a
+        // history far larger than the cap, so the source NEVER runs dry.
+        let cap = 512 * 1024;
+        let content = line.repeat(400_000); // ~13 MB
         let (_d, file, tail) = stream_file(content.as_bytes());
 
         let stall = Duration::from_millis(200);
-        let mut rt = ControlRuntime::with_stall_timeout(64 * 1024, stall);
+        let mut rt = ControlRuntime::with_stall_timeout(cap, stall);
         let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
 
-        // Drive to the cap: the cap STOPS the source, and that stamps `at_cap_since`.
-        assert!(matches!(rt.pump(T, &mut conn, t0()), PumpOutcome::Ok));
+        fill_to_cap(&mut rt, &mut conn, t0());
         assert_eq!(
             rt.test_sub(T).out.at_cap_since,
             Some(t0()),
-            "the cap stopping the source must stamp `at_cap_since` at t0"
+            "the cap stopping the source must stamp `at_cap_since`"
+        );
+        // The clock starts near-fresh: at most ONE socket buffer of the initial fill
+        // can land as headway (the write that races the stamp within a single pump),
+        // which against a 512 KiB cap is noise — the trickler below still cannot close
+        // the gap. It is emphatically NOT a whole cap's worth of spurious credit.
+        assert!(
+            rt.test_sub(T).out.drained_at_cap < cap / 4,
+            "the socket-fill write must not be miscounted as material headway (got {})",
+            rt.test_sub(T).out.drained_at_cap
         );
 
-        let window = i64::from(AT_CAP_STALL_INTERVALS) * 200;
-        let mut sip = [0u8; 8192];
-        // Every interval the peer sips a socket buffer's worth — enough that campd's
-        // next write genuinely ACCEPTS bytes, which is what makes R1 blind to it.
+        // The survival floor is one cap per 10 intervals ≈ 51 KiB/interval. This peer
+        // moves 16 KiB — above the low-water mark, so campd's writes flow and R1 stays
+        // blind, but far below the floor, so it never makes headway.
+        let per_interval = 16 * 1024;
         for i in 1..i64::from(AT_CAP_STALL_INTERVALS) {
             let now = t0() + SignedDuration::from_millis(200 * i);
             assert!(
-                client.read(&mut sip).is_ok_and(|n| n > 0),
-                "the trickling peer must actually accept bytes at interval {i}"
-            );
-            assert!(
-                matches!(rt.pump(T, &mut conn, now), PumpOutcome::Ok),
-                "at interval {i} the at-cap window has not elapsed — no drop yet"
+                matches!(
+                    accept_about(&mut rt, &mut client, &mut conn, now, per_interval),
+                    PumpOutcome::Ok
+                ),
+                "interval {i} is inside the window — no drop yet"
             );
             assert!(
                 rt.test_sub(T).out.blocked_since.is_none_or(|s| s >= now),
                 "the peer accepted bytes, so R1's clock RESTARTED at interval {i} — \
-                 if it had not, this test would be proving R1, not R1b"
+                 this test proves R1b, not R1"
             );
             assert_eq!(
                 rt.test_sub(T).out.at_cap_since,
                 Some(t0()),
-                "sipping never drains `out` below the cap, so the ORIGINAL at-cap \
-                 stamp must survive at interval {i}"
+                "16 KiB/interval never reaches a cap of headway, so the ORIGINAL \
+                 at-cap stamp must survive at interval {i}"
+            );
+            assert!(
+                rt.test_sub(T).out.drained_at_cap < cap,
+                "the trickler must stay UNDER a cap of cumulative headway at {i}"
             );
         }
 
-        // Past AT_CAP_STALL_INTERVALS × stall, still reading => DROPPED anyway.
-        let later = t0() + SignedDuration::from_millis(window + 1);
-        assert!(
-            client.read(&mut sip).is_ok_and(|n| n > 0),
-            "the peer is STILL reading when it is dropped — that is the point"
-        );
-        let event = match rt.pump(T, &mut conn, later) {
+        // At the window boundary, still trickling => DROPPED by R1b.
+        let later = t0() + SignedDuration::from_millis(200 * i64::from(AT_CAP_STALL_INTERVALS));
+        let event = match accept_about(&mut rt, &mut client, &mut conn, later, per_interval) {
             PumpOutcome::Drop(e) => e,
             _ => panic!(
-                "a peer pinned at the cap for {AT_CAP_STALL_INTERVALS} stall intervals \
-                 must be dropped even though it is reading"
+                "a peer at the cap for {AT_CAP_STALL_INTERVALS} intervals without moving \
+                 a cap of headway must be dropped even though it is reading"
             ),
         };
         assert!(
-            rt.test_sub(T).out.blocked_since.is_none_or(|s| s >= later),
-            "R1's clock was reset by the accepted write — the drop can ONLY be R1b's"
+            rt.test_sub(T).out.blocked_since.is_none_or(|s| s
+                >= t0()
+                    + SignedDuration::from_millis(200 * (i64::from(AT_CAP_STALL_INTERVALS) - 1))),
+            "R1's clock was reset by the accepted writes — the drop can ONLY be R1b's"
         );
         // §4.4: a drop for a NEW reason is not a NEW event — same shape, same fields.
         assert_eq!(event.kind, EventType::SubscriberDropped);
         assert_eq!(data(&event)["session"], "t/dev/1");
         assert!(data(&event)["subscription"].is_string());
         assert!(data(&event)["buffered_bytes"].as_u64().unwrap() > 0);
-        assert_eq!(data(&event)["cap_bytes"], 64 * 1024);
+        assert_eq!(data(&event)["cap_bytes"], cap as u64);
+    }
+
+    /// R1b's FALSE-POSITIVE GUARD — the regression this fix exists to prevent, and
+    /// the case a socket-speed drain-to-empty test could never catch (#121 review).
+    ///
+    /// A RATE-LIMITED catch-up reader joins a history FAR larger than the cap. During
+    /// catch-up a file read outruns a socket, so `out` is pinned at the cap and NEVER
+    /// empties — the state that a drain-to-empty reset would drop. But this peer keeps
+    /// moving MORE THAN a cap's worth every window, so it is making real progress and
+    /// must NEVER be dropped, however far behind it joined. Under the old
+    /// clear-on-empty rule this peer is dropped at the window; that is the bug.
+    #[test]
+    fn a_rate_limited_catch_up_that_moves_a_cap_per_window_survives() {
+        let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
+        let cap = 512 * 1024;
+        let content = line.repeat(400_000); // ~13 MB — dwarfs everything drained below
+        let (_d, file, tail) = stream_file(content.as_bytes());
+
+        let stall = Duration::from_millis(200);
+        let mut rt = ControlRuntime::with_stall_timeout(cap, stall);
+        let (mut client, mut conn) = rt.test_insert_subscriber(T, "t/dev/1", file, 0, tail);
+
+        fill_to_cap(&mut rt, &mut conn, t0());
+        // POSITIVE ANCHOR 1: the at-cap path was genuinely entered. Without this a
+        // "survived" pass could mean the peer never reached the cap at all.
+        assert_eq!(
+            rt.test_sub(T).out.at_cap_since,
+            Some(t0()),
+            "a healthy catch-up DOES pin `out` at the cap — that is the whole trap"
+        );
+
+        // The survival floor is ~51 KiB/interval (one cap per 10). This peer moves
+        // ~96 KiB — comfortably above it, but a fraction of what draining the 13 MB
+        // backlog dry would take, so it stays pinned at the cap the whole time.
+        let per_interval = 96 * 1024;
+        let mut headway_resets = 0u32;
+        let mut prev = rt.test_sub(T).out.at_cap_since;
+        // Run past a FULL window and then some (15 > 10 intervals): under the old
+        // clear-on-empty rule the drop fires at interval 10.
+        for i in 1..=15i64 {
+            let now = t0() + SignedDuration::from_millis(200 * i);
+            assert!(
+                matches!(
+                    accept_about(&mut rt, &mut client, &mut conn, now, per_interval),
+                    PumpOutcome::Ok
+                ),
+                "a peer moving a cap per window must NEVER be dropped (interval {i})"
+            );
+            // POSITIVE ANCHOR 2: `out` never empties — the peer is genuinely BEHIND,
+            // so this is the exact state the old rule would have dropped.
+            assert!(
+                !rt.test_sub(T).out.is_empty(),
+                "the backlog must outlast the drain, or this is not a catch-up (i={i})"
+            );
+            // A cap of headway RESETS the clock: `at_cap_since` clears and is then
+            // re-stamped at a LATER instant. Count those transitions.
+            let cur = rt.test_sub(T).out.at_cap_since;
+            if cur != prev {
+                headway_resets += 1;
+            }
+            prev = cur;
+        }
+        // POSITIVE ANCHOR 3: the headway-reset path actually FIRED. This is what dies
+        // under the old clear-on-empty rule (the clock never resets, the peer drops).
+        assert!(
+            headway_resets > 0,
+            "the at-cap clock must reset as the peer earns a cap of headway — if it \
+             never did, the survival above was vacuous"
+        );
     }
 
     /// R1b's FALSE-POSITIVE GUARD, and it matters more than the drop itself: a
@@ -3782,16 +3918,19 @@ mod tests {
         };
         // `client` is never read: the peer has stopped reading.
 
+        let cap = 512 * 1024;
         let mut out = OutBuf::new();
-        out.append(&vec![b'x'; 512 * 1024]); // more than one socket send buffer
+        out.append(&vec![b'x'; cap]); // more than one socket send buffer
         let t0 = jiff::Timestamp::now();
         let stall = std::time::Duration::from_millis(50);
 
-        // Flush at t0 until the socket is full and the write WouldBlocks — THIS is
-        // where blocked_since is stamped (a first Ok(n) partial write clears it, so
-        // the stamp only survives once no more bytes are accepted).
+        // This test drives R1 alone — `has_room` is never called, so `at_cap_since`
+        // stays None and the cap argument is inert. Flush at t0 until the socket is
+        // full and the write WouldBlocks — THIS is where blocked_since is stamped (a
+        // first Ok(n) partial write clears it, so the stamp only survives once no
+        // more bytes are accepted).
         loop {
-            match out.flush(&mut conn, t0, stall) {
+            match out.flush(&mut conn, t0, cap, stall) {
                 FlushStep::Drained => continue,
                 FlushStep::WouldBlock => break,
                 other => panic!("unexpected flush step before the window: {other:?}"),
@@ -3802,11 +3941,15 @@ mod tests {
             Some(t0),
             "a zero-accept write stamps blocked_since at t0"
         );
+        assert_eq!(
+            out.at_cap_since, None,
+            "R1's zero-accept path never touches the at-cap clock"
+        );
 
         // One flush 60ms later — past the 50ms window — must Stall.
         let later = t0 + jiff::SignedDuration::from_millis(60);
         assert!(
-            matches!(out.flush(&mut conn, later, stall), FlushStep::Stalled),
+            matches!(out.flush(&mut conn, later, cap, stall), FlushStep::Stalled),
             "a peer that has not read for >= stall_timeout is Stalled"
         );
         drop(client);
@@ -4255,47 +4398,51 @@ pub const MAX_SUBSCRIBERS: usize = 8;
 /// behind the tail, however fast it reads.
 pub const SUBSCRIBER_STALL_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
 
-/// R1b (#121): how many `SUBSCRIBER_STALL_TIMEOUT` intervals a peer may sit
-/// CONTINUOUSLY at the buffer cap before campd drops it — 300 s at the shipped
-/// default.
+/// R1b (#121): how many `SUBSCRIBER_STALL_TIMEOUT` intervals a peer may stay at the
+/// buffer cap WITHOUT MOVING A CAP'S WORTH before campd drops it — a 300 s window at
+/// the shipped default.
+///
+/// THE RULE, EXACTLY (see `OutBuf::flush` and `has_room` for the mechanism): the
+/// clock starts when the buffer first reaches the cap and is reset each time the peer
+/// has drained a whole cap's worth since it started. A subscriber is dropped only if
+/// it fails to move ONE CAP (~1 MiB at the default) within the window — ~3.5 KiB/s.
+/// That is a peer that is not keeping up with even a trickle; it is NOT a verdict on
+/// how far behind the peer joined.
 ///
 /// R1 alone bounds only a peer that accepts NOTHING: one accepted byte clears
-/// `blocked_since`, so a peer sipping a socket buffer's worth per interval is
-/// invisible to it while holding one of `MAX_SUBSCRIBERS` slots and a full cap of
-/// memory forever. This bounds the ACTUAL harm — a held slot and a held buffer —
-/// rather than a proxy for it.
+/// `blocked_since`, so a peer sipping just enough to keep campd's writes flowing —
+/// but never enough to make real headway — is invisible to it while holding one of
+/// `MAX_SUBSCRIBERS` slots and a full cap of memory forever. R1b bounds the ACTUAL
+/// harm: a held slot and a held buffer that the peer is not working off.
 ///
-/// WHY A MULTIPLIER AND NOT A SECOND TUNABLE: there is ONE stall concept and one
-/// knob (`CAMP_SUBSCRIBER_STALL_TIMEOUT_MS`); this derives from it, so the stall
-/// tests' 200 ms override scales the at-cap window to 2 s with no second override
-/// to keep in step.
+/// WHY "A CAP PER WINDOW" AND NOT "DRAINED TO EMPTY": `out` refills to the cap after
+/// every partial write, so it reaches empty only when the whole BACKLOG is gone.
+/// Keying the reset on empty would drop a peer for JOINING far behind — the
+/// buffer-SIZE kill §4.4's amendment forbids — because during catch-up a file read
+/// (256 KiB/wake) always outruns a socket, so `out` is pinned at the cap the entire
+/// time a large history streams, however fast the peer reads. Keying on HEADWAY (a
+/// cap's worth accepted) instead, a peer that keeps moving a cap per window is never
+/// dropped at ANY backlog size, and a trickler that cannot is — which is the bug.
 ///
-/// WHY A TIME BOUND AND NOT A BYTE-RATE FLOOR (the alternative cp-1 named): a
-/// floor needs a defensible bytes-per-interval number, and every number is wrong in
-/// both directions — too low and the trickle reader survives it, too high and a
-/// legitimately slow consumer on a quiet stream is killed for the stream being
-/// quiet. Time-at-cap needs no throughput number at all.
+/// WHY A HEADWAY BOUND AND NOT A BYTE-RATE FLOOR (the alternative cp-1 named): the
+/// threshold is DERIVED — one cap per `AT_CAP_STALL_INTERVALS` windows — from the cap
+/// and stall window that already exist, so it introduces no new tunable. A raw floor
+/// would need a defensible bytes-per-interval number, and every number is wrong in
+/// both directions: too low and the trickler survives, too high and a legitimately
+/// slow consumer on a QUIET stream is killed for the stream being quiet. Headway is
+/// self-scaling: on a quiet stream `out` never reaches the cap, so the clock never
+/// starts.
 ///
-/// WHY 10: it must be > 1, or the rule is indistinguishable from R1 and a peer that
-/// is merely READING dies on the same deadline as one that is DEAD — which §4.4's
+/// WHY A MULTIPLIER AND NOT A SECOND TUNABLE: one stall concept, one knob
+/// (`CAMP_SUBSCRIBER_STALL_TIMEOUT_MS`); this derives from it, so the stall tests'
+/// 200 ms override scales the at-cap window to 2 s with nothing else to keep in step.
+///
+/// WHY 10: it must be > 1, or the window is one stall interval and a peer merely
+/// BEHIND is dropped on the same deadline as one that is DEAD — which §4.4's
 /// amendment forbids in as many words. An order of magnitude is the smallest step
-/// that is plainly not R1 re-litigated, and it is generous against the one healthy
-/// state that IS continuously at the cap: a catch-up (a file read at 256 KiB/wake
-/// always outruns an ~8 KiB socket, so `out` sits at the cap until the backlog is
-/// consumed). To die a peer must fail to drain ONE cap's worth in 300 s — under
-/// 3.5 KiB/s at the 1 MiB default, which is not a consumer any terminal, pipe, or
-/// socket produces. Below that it is indistinguishable from a stopped peer, which
-/// is precisely R1's own standard.
-///
-/// THE BOUND THIS IMPOSES, STATED PLAINLY because it is not obvious: `out` is
-/// refilled to the cap after every partial write, so it reaches EMPTY only when the
-/// SOURCE runs dry. The window therefore bounds the time to consume the whole
-/// BACKLOG, not one cap's worth of it — at the shipped 300 s a 50 MB history needs
-/// ~170 KB/s sustained, against a local unix socket that does orders of magnitude
-/// more. This is NOT the buffer-SIZE verdict §4.4's amendment forbids: a client that
-/// joins far behind the tail is never dropped for how far behind it IS, only for
-/// failing to move that backlog AT ALL for 300 s — a peer that reads fast is never
-/// dropped, however far behind it joined.
+/// that is plainly not R1 re-litigated, and it sets the survival floor (~3.5 KiB/s at
+/// the default) far below any real terminal, pipe, or socket consumer while staying
+/// far above zero, which is precisely R1's own standard.
 pub const AT_CAP_STALL_INTERVALS: u32 = 10;
 
 /// Has `since` been stamped for at least `window`? ONE deadline predicate, shared by
@@ -4530,9 +4677,17 @@ pub struct OutBuf {
     /// this on every wake, holding a slot and a full buffer forever — was cp-1's
     /// accepted residual and is NO LONGER ONE: `at_cap_since` bounds it (#121).
     pub blocked_since: Option<Timestamp>,
-    /// R1b (#121): when the cap FIRST stopped this source, with NO drain to empty
-    /// since. `None` means the buffer is not being held at the cap.
+    /// R1b (#121): when this subscriber's buffer FIRST reached the cap in the
+    /// current at-cap period. `None` means it is not being held at the cap. It is
+    /// stamped when the cap stops the source and cleared once the peer has drained a
+    /// whole cap's worth since the stamp (`drained_at_cap`) — headway, not a drain
+    /// to empty.
     pub at_cap_since: Option<Timestamp>,
+    /// R1b (#121): bytes the peer has accepted SINCE `at_cap_since` was stamped —
+    /// cumulative HEADWAY against the cap, not a per-write figure. When it reaches a
+    /// full cap the peer has moved a cap's worth this period, so `at_cap_since`
+    /// clears and this resets. Meaningful only while `at_cap_since` is `Some`.
+    pub drained_at_cap: usize,
 }
 
 impl OutBuf {
@@ -4542,6 +4697,7 @@ impl OutBuf {
             high_water: 0,
             blocked_since: None,
             at_cap_since: None,
+            drained_at_cap: 0,
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -4560,14 +4716,17 @@ impl OutBuf {
     /// `FleetSource` via its `frame.len() > cap` report.)
     ///
     /// It STAMPS but never CLEARS. Clearing belongs to `flush`, the only place `out`
-    /// shrinks, and only on a drain to EMPTY: a source that is cap-stopped re-asks
-    /// for the SAME frame on every re-fill, so "there is room for one more frame now"
-    /// says nothing about whether the peer is keeping up — the trickle reader frees
-    /// exactly one frame's worth per interval and would clear the clock forever.
+    /// shrinks, and only once the peer has drained a whole cap's worth (see there):
+    /// a source that is cap-stopped re-asks for the SAME frame on every re-fill, so
+    /// "there is room for one more frame now" says nothing about whether the peer is
+    /// keeping up — the trickle reader frees exactly one frame's worth per interval
+    /// and a level test would clear the clock forever. The STAMP opens a fresh
+    /// accounting period, so it resets `drained_at_cap`.
     pub fn has_room(&mut self, frame_len: usize, cap: usize, now: Timestamp) -> bool {
         let room = self.out.len() + frame_len <= cap;
         if !room && self.at_cap_since.is_none() {
             self.at_cap_since = Some(now);
+            self.drained_at_cap = 0;
         }
         room
     }
@@ -4577,22 +4736,36 @@ impl OutBuf {
     }
     /// ONE write attempt. cp-1's FLUSH block (C), verbatim minus the drop-event
     /// construction (the caller owns the event shape).
-    pub fn flush(&mut self, conn: &mut Conn, now: Timestamp, stall_timeout: Duration) -> FlushStep {
+    pub fn flush(
+        &mut self,
+        conn: &mut Conn,
+        now: Timestamp,
+        cap: usize,
+        stall_timeout: Duration,
+    ) -> FlushStep {
         use std::io::Write as _;
         match conn.stream.write(&self.out) {
             Ok(0) => FlushStep::Gone,
             Ok(n) => {
                 self.out.drain(..n);
                 self.blocked_since = None; // R1: it IS reading.
-                if self.out.is_empty() {
-                    // R1b: the buffer DRAINED — the cap holds nothing, so the
-                    // at-cap clock stops. This is the ONLY place `out` shrinks, and
-                    // "drained to empty" is the only shrink that proves the peer
-                    // kept up: `out` is refilled to the cap after every partial
-                    // write, so any weaker test (`len() < cap`, or "one more frame
-                    // fits") is true on EVERY accepted byte and clears the clock for
-                    // the very peer it exists to catch.
-                    self.at_cap_since = None;
+                // R1b (#121): the at-cap clock measures HEADWAY, not level and not a
+                // drain to empty. `out` refills to the cap after every partial write,
+                // so it reaches empty only when the whole BACKLOG is gone — keying the
+                // clear on that makes the drop a verdict on how far behind the peer
+                // JOINED, which is exactly the buffer-SIZE kill §4.4 forbids. Instead:
+                // accumulate what the peer accepts, and once it has moved a whole
+                // cap's worth THIS period it has made real progress — clear the clock
+                // and open a fresh period. A peer sustaining a cap per window is never
+                // dropped at ANY backlog size; a trickler that cannot move a cap in
+                // the window still is. (Draining to empty is subsumed: a cap-full
+                // buffer cannot reach empty without a cap's worth being accepted.)
+                if self.at_cap_since.is_some() {
+                    self.drained_at_cap += n;
+                    if self.drained_at_cap >= cap {
+                        self.at_cap_since = None;
+                        self.drained_at_cap = 0;
+                    }
                 }
                 FlushStep::Drained
             }
@@ -5160,7 +5333,7 @@ fn pump_subscriber(
                 PumpOutcome::Ok
             };
         }
-        match sub.out.flush(conn, now, stall_timeout) {
+        match sub.out.flush(conn, now, cap, stall_timeout) {
             FlushStep::Drained => continue, // room freed — re-fill (scanned persists)
             FlushStep::WouldBlock => return PumpOutcome::Ok, // WRITABLE edge re-arms
             FlushStep::Gone => return PumpOutcome::Gone,
