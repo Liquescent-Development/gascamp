@@ -173,18 +173,31 @@ impl Supervisor for Systemd<'_> {
         // in-flight `claude -p` workers along with campd. That is the SIGINT
         // shape (workers die; adoption reconciles them as `session.crashed`),
         // not the SIGTERM shape this design contracts: campd alone is signalled,
-        // it appends `campd.stopped` and exits, the workers reparent to init,
-        // and `patrol::adopt` re-adopts them at the next start (spec §8.5,
+        // it appends `campd.stopped` and exits, the workers are reparented (to
+        // the `systemd --user` manager, which is a subreaper — NOT to PID 1;
+        // adoption never reads ppid, so this is orientation, not mechanism), and
+        // `patrol::adopt` re-adopts them at the next start (spec §8.5,
         // crash-only). `process` sends SIGTERM to campd ONLY and systemd never
         // signals the workers at all.
         //
         // `mixed` was considered and rejected: it SIGTERMs only the main
         // process, but once campd exits it SIGKILLs whatever remains in the
         // cgroup after `TimeoutStopSec` — i.e. it still kills the in-flight
-        // workers, which is the very bug. `process` also gives ONE stop
-        // semantics on both platforms: launchd's stop is a `bootout` of a single
-        // service target (macOS has no cgroup to sweep), so it already signals
-        // campd and nothing else.
+        // workers, which is the very bug.
+        //
+        // This also governs the CRASH path, not just `stop`: `Restart=always`
+        // tears the unit down the same way. Before this, a campd crash swept the
+        // cgroup and killed the workers with it (reconciled `session.crashed`);
+        // now they survive and `RestartSec=1` brings campd back to re-adopt
+        // them. That is safe because adoption is pid-keyed
+        // (`patrol::adopt_from_row(row, pid)`), with no ppid dependency.
+        //
+        // `process` is HALF of the parity story. The other half is
+        // `launchd.rs`'s `AbandonProcessGroup=true`: launchd has no cgroup but
+        // sweeps the job's PROCESS GROUP instead, so macOS was NEVER at parity —
+        // it had this same bug, by a different mechanism. See that file. Parity
+        // is something camp DOES on both platforms now, not something either one
+        // gives for free.
         let camp_root = escape_percent(camp_root);
         format!(
             "[Unit]\n\
@@ -543,17 +556,21 @@ mod tests {
     /// unit's cgroup, so `camp service stop` on a busy camp takes the in-flight
     /// `claude -p` workers down with campd. That is the SIGINT shape (workers
     /// die, adoption reconciles them as `session.crashed`), not the SIGTERM
-    /// shape the design contracts: campd alone gets the signal, the workers
-    /// reparent to init, and `patrol::adopt` picks them back up at the next
-    /// start.
+    /// shape the design contracts: campd alone gets the signal, the workers are
+    /// reparented to the `systemd --user` manager (a subreaper), and
+    /// `patrol::adopt` picks them back up at the next start.
     ///
     /// `mixed` is NOT good enough and must not be substituted here: it SIGTERMs
     /// only the main process, but once campd exits it SIGKILLs whatever is left
     /// in the cgroup after `TimeoutStopSec` — which is the workers, and which is
-    /// precisely the bug. Only `process` leaves them alone entirely, and it is
-    /// what makes ONE stop semantics true on both platforms: launchd's `stop`
-    /// (`bootout` of a single service target — macOS has no cgroup to sweep)
-    /// already signals campd and nothing else.
+    /// precisely the bug. Only `process` leaves them alone entirely.
+    ///
+    /// The macOS half of the same bug lives in `launchd.rs`
+    /// (`AbandonProcessGroup`): launchd sweeps the job's PROCESS GROUP. An
+    /// earlier version of this comment claimed macOS was already at parity
+    /// "because macOS has no cgroup to sweep" — false, and disproved by
+    /// experiment on a real macOS host. Both platforms need an explicit
+    /// directive; neither gives this shape for free.
     #[test]
     fn unit_text_sets_kill_mode_process_so_stopping_campd_leaves_the_workers_alone() {
         let fake = FakeRunner::new(vec![]);

@@ -169,31 +169,59 @@ manageability, reliable order firing, and native container fit.
     blocks until the process is gone") shipped this bug, having been unable to run
     the real-manager test that catches it instantly.
 
-12. **The systemd unit names `KillMode=process`** (2026-07-16, issue #119). A
-    supervisor's stop is the SIGTERM shape (decision 6, §7): campd alone is
-    signalled, appends `campd.stopped`, unlinks the socket and exits; the in-flight
-    `claude -p` workers reparent to init and `patrol::adopt` re-adopts them at the
-    next start. systemd's default `KillMode=control-group` is a different shape
-    entirely — it SIGTERMs, then SIGKILLs, **every** process in the unit's cgroup, so
-    `camp service stop` on a busy camp abandons in-flight work (reconciled as
-    `session.crashed`) rather than letting it reparent. `process` sends the signal to
-    campd only and never touches the workers.
+12. **Both units name their stop shape: systemd `KillMode=process`, launchd
+    `AbandonProcessGroup=true`** (2026-07-16, issue #119). A supervisor's stop is the
+    SIGTERM shape (decision 6, §7): campd alone is signalled, appends
+    `campd.stopped`, unlinks the socket and exits; the in-flight `claude -p` workers
+    survive, are reparented, and `patrol::adopt` re-adopts them at the next start.
+    **Neither platform gives that shape for free — each sweeps campd's children by
+    default, by a different mechanism — so each needs an explicit directive.**
 
-    `mixed` was considered and rejected: it SIGTERMs only the main process, but once
-    campd exits it SIGKILLs whatever remains in the cgroup after `TimeoutStopSec` —
-    the workers. That is the bug, arriving late rather than immediately.
+    - **systemd.** The default `KillMode=control-group` SIGTERMs, then SIGKILLs,
+      **every** process in the unit's cgroup, so `camp service stop` on a busy camp
+      abandons in-flight work (reconciled as `session.crashed`) rather than letting it
+      reparent. `process` signals the main pid only. `mixed` was rejected: it SIGTERMs
+      only the main process, but once campd exits it SIGKILLs whatever remains in the
+      cgroup after `TimeoutStopSec` — the workers. That is the same bug, arriving late
+      rather than immediately.
+    - **launchd.** `man 5 launchd.plist`, `AbandonProcessGroup`: *"When a job dies,
+      launchd kills any remaining processes with the same process group ID as the job.
+      Setting this key to true disables that behavior."* It defaults to **false**, so
+      the sweep is **on**; `daemon/spawn.rs` sets no `process_group`, so workers inherit
+      campd's pgid. `launchctl bootout` therefore killed every in-flight worker —
+      systemd's `control-group` bug wearing a different hat. `AbandonProcessGroup=true`
+      turns the sweep off.
 
-    `process` also makes the stop semantics **one thing on both platforms**: launchd
-    already signals campd alone (`bootout` of a single service target; macOS has no
-    cgroup to sweep), so this is the option under which "stop campd, keep the
-    workers" is true everywhere rather than on macOS only.
+    So parity is something camp **does**, not something it inherits.
+
+    **This is where the first attempt at this decision went wrong, and the error is
+    worth keeping.** It shipped `KillMode=process` (correct) justified by *"launchd is
+    already at parity because macOS has no cgroup to sweep"* — a non-sequitur that
+    read as a verified fact. macOS has no cgroup; it sweeps the **process group**
+    instead. The claim was checked by reading `stop` → `bootout <service target>` and
+    reasoning from the absence of one mechanism to the absence of **any** mechanism.
+    **Disproved empirically on a macOS host (2026-07-16):** a LaunchAgent mirroring
+    camp's real plist (RunAtLoad + KeepAlive, no `AbandonProcessGroup`), whose job
+    spawned a child the way `spawn.rs` does, `launchctl bootout` → the child was
+    **dead**; with `AbandonProcessGroup=true`, the same probe left it **alive** (pid
+    reparented to 1, job gone). The lesson is procedural: macOS was the one platform
+    that *was* testable on the dev host, and it was the one nobody tested. **When a
+    platform is reachable, the claim about it is an experiment, not an argument.**
+
+    **The directives govern the CRASH path too, not only `stop`** — `Restart=always` /
+    `KeepAlive` tear the job down the same way. Previously a campd crash swept the
+    cgroup (or the process group) and killed the workers with it; now they survive and
+    `RestartSec=1` brings campd back to re-adopt them. That is safe rather than a new
+    hazard because adoption is **pid-keyed** (`patrol::adopt_from_row(row, pid)`) and
+    reads no ppid — a reparented worker is found exactly as before.
 
     This decision was **forward-flagged by Phase 1 and then dropped**
     (`docs/superpowers/plans/2026-07-10-campd-service-phase-1-sigterm.md:34`: "Phase 2
     must choose `KillMode` deliberately … rather than inheriting it silently"). Phase
     2 never made it, and the unit shipped inheriting a default that contradicted the
-    design it was implementing. Named here so it stays decided: **an unnamed
-    `KillMode` is not a default, it is an unmade decision.**
+    design it was implementing — and the launchd side was never flagged at all. Named
+    here so it stays decided: **an unnamed `KillMode`, or an unnamed
+    `AbandonProcessGroup`, is not a default — it is an unmade decision.**
 
 ## 5. `camp service` — the control surface
 
@@ -202,28 +230,37 @@ A new subcommand group. Each operates on the resolved camp (`--camp` /
 
 - **`install`** — generate the unit and load it: macOS → a LaunchAgent plist
   at `~/Library/LaunchAgents/com.gascamp.campd.<camp-id>.plist`
-  (`ProgramArguments = camp daemon --camp <dir>`, `RunAtLoad` + `KeepAlive`),
+  (`ProgramArguments = camp daemon --camp <dir>`, `RunAtLoad` + `KeepAlive`,
+  `AbandonProcessGroup`),
   loaded via `launchctl bootstrap gui/$UID`; Linux → a systemd user unit
   `campd-<camp-id>.service` (`ExecStart=camp daemon --camp <dir>`,
   `KillMode=process`, `Restart=always`), `systemctl --user enable --now`.
   `<camp-id>` is a stable slug of the camp's absolute path (collision-free,
   human-readable).
 
-  **The systemd unit names `KillMode=process`, and the choice is the stop
-  semantics** (decision 12; issue #119). Left unnamed it defaults to
-  `KillMode=control-group`, and a default is not a decision: `systemctl --user
-  stop` would SIGTERM — then SIGKILL — every process in the unit's cgroup, so
-  `camp service stop` on a busy camp would take the in-flight `claude -p`
-  workers down with campd. That is the SIGINT shape (workers die; adoption
-  reconciles them as `session.crashed`), and §7's whole point is that a
+  **Each unit names its stop shape, because each platform's default is to sweep
+  campd's children** (decision 12; issue #119). §7's whole point is that a
   supervisor's stop is the SIGTERM shape: campd alone is signalled, appends
-  `campd.stopped`, unlinks the socket and exits; the workers reparent to init
-  and `patrol::adopt` re-adopts them at the next start. `mixed` does not buy
-  this — it SIGTERMs only the main process, but SIGKILLs whatever is left in the
-  cgroup once `TimeoutStopSec` elapses, which is the workers. Only `process`
-  leaves them untouched, and it is what makes the stop semantics **one thing on
-  both platforms**: launchd's stop is a `bootout` of a single service target
-  (macOS has no cgroup to sweep), so it already signals campd and nothing else.
+  `campd.stopped`, unlinks the socket and exits; the in-flight `claude -p`
+  workers survive, are reparented, and `patrol::adopt` re-adopts them at the next
+  start. A default is not a decision, and **both** defaults contradict that shape:
+
+  - systemd, unnamed, is `KillMode=control-group` — SIGTERM then SIGKILL to every
+    process in the unit's cgroup. The unit names **`KillMode=process`**, which
+    signals the main pid only. (`mixed` does not buy this: it SIGTERMs only the
+    main process, then SIGKILLs whatever is left in the cgroup once
+    `TimeoutStopSec` elapses — the workers.)
+  - launchd, unnamed, kills every process sharing the job's process group ID when
+    the job dies (`man 5 launchd.plist`, `AbandonProcessGroup`, default false) —
+    and workers inherit campd's pgid, since `spawn.rs` sets no `process_group`. The
+    plist names **`AbandonProcessGroup=true`**, which turns that sweep off.
+
+  macOS was **not** already at parity, and the first version of this section said
+  it was: "launchd's stop is a `bootout` of a single service target (macOS has no
+  cgroup to sweep), so it already signals campd and nothing else." macOS has no
+  cgroup — and sweeps the process group instead. Measured on a macOS host: without
+  the key, a bootout killed the job's child; with it, the child survived. Parity is
+  something camp **does** on both platforms, not something either one grants.
 
   **The unit must carry campd's PATH, and this is not a detail.** A supervisor
   does NOT give campd the shell's environment: launchd hands a LaunchAgent
@@ -264,9 +301,9 @@ A new subcommand group. Each operates on the resolved camp (`--camp` /
 - **`stop`** — stop the supervised campd, leaving the unit INSTALLED
   (`launchctl bootout` / `systemctl --user stop`). This is what `camp stop`
   refuses in favor of on a supervised camp (decision 10). **In-flight workers
-  survive it on both platforms** and are re-adopted at the next start — that is
-  what `KillMode=process` buys on systemd (decision 12) and what `bootout` of a
-  single service target already does on launchd.
+  survive it on both platforms** and are re-adopted at the next start — but only
+  because each unit says so explicitly (decision 12): `KillMode=process` on
+  systemd, `AbandonProcessGroup=true` on launchd. Neither default does this.
 - **`start`** — start a stopped but still-installed unit (`launchctl bootstrap` /
   `systemctl --user start`).
 
@@ -369,14 +406,26 @@ Failing test first for each:
 - **Unit generation (pure):** `install` unit-text generators produce the
   correct launchd plist and systemd unit for a given camp path
   (`ProgramArguments`/`ExecStart` = `camp daemon --camp <dir>`, KeepAlive /
-  `Restart=always`, systemd `KillMode=process` per decision 12, stable
-  `<camp-id>` slug). No live service manager needed. The `KillMode` assertion
-  pins the **value**, not merely the presence of a line: the stop semantics is
-  the difference between `process` and the `control-group` default, so a test
-  that only checked "some KillMode is set" would pass on the bug. Note the
-  rendered unit text is the whole of what CI can verify here — `KillMode`'s
-  runtime effect needs a live systemd (the opt-in `camp service` integration
-  test below), and is unobservable on a macOS dev host.
+  `Restart=always`, systemd `KillMode=process` and launchd
+  `AbandonProcessGroup=true` per decision 12, stable `<camp-id>` slug). No live
+  service manager needed. Both stop-shape assertions pin the **value**, not the
+  presence of a line: the stop semantics is the difference between `process` and
+  the `control-group` default, and between `<true/>` and the `<false/>` default,
+  so a test that only checked "the key is set" would pass on the bug. They also
+  pin **placement** — a `KillMode` outside `[Service]` is ignored by systemd
+  while reading as though the choice was made.
+- **Stop shape, at runtime:** the rendered unit is all CI can check; whether the
+  directive *works* is a per-platform experiment, and the two platforms differ in
+  what a dev host can answer:
+  - **launchd is testable on any macOS host and MUST be tested there** — bootstrap
+    a throwaway LaunchAgent mirroring camp's plist whose job spawns a child the way
+    `spawn.rs` does, `launchctl bootout`, assert the child is **alive** and the job
+    gone (and that it is **dead** without `AbandonProcessGroup`). This is exactly the
+    experiment whose absence let the false "macOS is already at parity" claim into
+    this document; it takes seconds, and it is not optional when the platform is in
+    reach. Tear the agent down afterwards.
+  - **systemd's runtime effect is unobservable on a macOS dev host** and belongs to
+    the opt-in `camp service` integration test on a real systemd box.
 - **Environment detection:** the detect-service-manager function returns
   install/skip for representative environments (macOS, systemd-user present,
   none) via injected probes.

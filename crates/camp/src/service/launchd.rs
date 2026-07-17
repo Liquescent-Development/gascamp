@@ -159,6 +159,29 @@ impl Supervisor for Launchd<'_> {
         // contain ~/.local/bin — where `claude` lives. Without this, campd
         // spawns nothing and every bead dies as `spawn failed: spawning claude:
         // No such file or directory`. See service::campd_path.
+        //
+        // AbandonProcessGroup=true is the macOS half of issue #119, and it is
+        // the mechanism nobody looked for. `man 5 launchd.plist`: "When a job
+        // dies, launchd kills any remaining processes with the same process
+        // group ID as the job. Setting this key to true disables that behavior."
+        // The default is FALSE — the sweep is ON — and `daemon/spawn.rs` sets no
+        // `process_group`, so every `claude -p` worker inherits campd's pgid.
+        // Without this key `camp service stop` (a `bootout`) kills campd and
+        // launchd then sweeps the group, killing every in-flight worker: the
+        // exact shape of systemd's `KillMode=control-group` bug, on the platform
+        // that was assumed immune to it.
+        //
+        // "macOS has no cgroup to sweep" is TRUE and was the wrong reason to
+        // feel safe: launchd sweeps the PROCESS GROUP instead. Measured on macOS
+        // 2026-07-16 — a LaunchAgent mirroring this plist, job spawns a child
+        // the way spawn.rs does, `launchctl bootout`: the child DIED. With this
+        // key, it survived. So parity with systemd's `KillMode=process` is
+        // something camp now DOES, not something it inherits.
+        //
+        // The fix is here and not `.process_group(0)` in `spawn()`: that would
+        // change worker signal/reaping semantics globally, and `tests/e2e.rs`
+        // group-kills to reap the whole worker tree, which works precisely
+        // BECAUSE workers share campd's group.
         let log = format!("{camp_root}/campd.log");
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -182,6 +205,8 @@ impl Supervisor for Launchd<'_> {
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
+  <true/>
+  <key>AbandonProcessGroup</key>
   <true/>
   <key>StandardOutPath</key>
   <string>/dev/null</string>
@@ -462,6 +487,8 @@ mod tests {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>AbandonProcessGroup</key>
+  <true/>
   <key>StandardOutPath</key>
   <string>/dev/null</string>
   <key>StandardErrorPath</key>
@@ -469,6 +496,53 @@ mod tests {
 </dict>
 </plist>
 "#
+        );
+    }
+
+    /// Issue #119 on macOS — and the claim this file's first fix got WRONG.
+    ///
+    /// The plist MUST set `AbandonProcessGroup=true`. `man 5 launchd.plist`:
+    /// *"When a job dies, launchd kills any remaining processes with the same
+    /// process group ID as the job. Setting this key to true disables that
+    /// behavior."* The default is FALSE, so the sweep is ON by default — and
+    /// `daemon/spawn.rs` sets no `process_group`, so every `claude -p` worker
+    /// inherits campd's pgid. Without this key, `camp service stop` (a
+    /// `launchctl bootout`) kills campd and then launchd sweeps the process
+    /// group, taking every in-flight worker with it: exactly systemd's
+    /// `KillMode=control-group` bug, on the other platform.
+    ///
+    /// This was NOT a theory. Measured on macOS 2026-07-16 with a LaunchAgent
+    /// mirroring this plist (RunAtLoad + KeepAlive, no `AbandonProcessGroup`)
+    /// whose job spawned a child the way `spawn.rs` does: after `launchctl
+    /// bootout` the child was DEAD. With this key set, it survived.
+    ///
+    /// The reasoning this replaces — "macOS has no cgroup to sweep, so bootout
+    /// signals campd alone" — is a non-sequitur, and it is why the bug hid: the
+    /// absence of cgroups does not imply the absence of a sweep. launchd has a
+    /// different mechanism for the same job, and it was never checked.
+    #[test]
+    fn unit_text_abandons_the_process_group_so_stopping_campd_leaves_the_workers_alone() {
+        let fake = FakeRunner::new(vec![]);
+        let launchd = Launchd::new(PathBuf::from("/units"), 501, &fake);
+        let text = launchd.unit_text(
+            &id(),
+            "/Users/x/camps/dev/.camp",
+            "/usr/local/bin/camp",
+            "/usr/local/bin:/usr/bin:/bin",
+        );
+        // Pin the VALUE, not the key's presence: `<false/>` here IS the default,
+        // i.e. the bug, and a plist naming the key while disabling it would read
+        // as though the choice had been made.
+        assert!(
+            text.contains("<key>AbandonProcessGroup</key>\n  <true/>"),
+            "the plist must set AbandonProcessGroup=true — without it launchd \
+             sweeps campd's process group on bootout and kills every in-flight \
+             worker (#119, measured on macOS): {text}"
+        );
+        assert!(
+            !text.contains("<key>AbandonProcessGroup</key>\n  <false/>"),
+            "AbandonProcessGroup=false is the default, and the default is the \
+             bug: {text}"
         );
     }
 
