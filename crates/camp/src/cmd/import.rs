@@ -616,6 +616,20 @@ fn run_add_materialize(
     // nested `pack.toml` camp did not compose (e.g. gascity/roles/). Report each
     // so the operator imports it explicitly rather than wondering why its agents
     // do not resolve.
+    // The subpaths already bound by this import (direct + transitive). A nested
+    // pack.toml whose real subpath is one of these is NOT un-composed — it is a
+    // pack already imported under a binding, so reporting it would tell the
+    // operator to import what they just did (#139: gascity/roles imports its
+    // parent `..`, whose subtree re-contains roles/).
+    // Canonicalize both sides: a transitive subpath is already clean, but the
+    // DIRECT import's subpath is the operator's verbatim `//subpath`, which may
+    // carry a trailing slash or `.` segment. Compare on the canonical form so
+    // `gascity/roles/` and `gascity/roles` are the same pack.
+    let bound_subpaths: std::collections::BTreeSet<String> = all
+        .iter()
+        .filter_map(|i| i.subpath.as_deref())
+        .map(canon_subpath)
+        .collect();
     let mut nested_packs: Vec<NestedPack> = Vec::new();
     for imp in &all {
         if imp.via.is_none() {
@@ -640,6 +654,10 @@ fn run_add_materialize(
                 Some(s) => s.clone(),
                 None => rel.clone(),
             };
+            // Already bound under some import — not an un-composed nested pack.
+            if bound_subpaths.contains(&canon_subpath(&source_subpath)) {
+                continue;
+            }
             let name = read_manifest(nested.parent().unwrap_or(&dir))
                 .map(|m| m.pack.name)
                 .unwrap_or_default();
@@ -737,6 +755,18 @@ fn run_add_materialize(
         eprintln!("{}", nested_pack_note(np));
     }
     Ok(())
+}
+
+/// Canonicalize a subpath for identity comparison: drop empty and `.`
+/// segments so `gascity/roles/`, `gascity//roles`, and `gascity/roles` are the
+/// same pack. Transitive subpaths arrive already normalized; a direct import's
+/// subpath is the operator's verbatim `//subpath`, so this is what lets the
+/// already-bound check (#139) survive a trailing slash.
+fn canon_subpath(s: &str) -> String {
+    s.split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// A nested pack (§7.3) camp materialized but did not compose. `gc` does not
@@ -2232,6 +2262,88 @@ mod verb_tests {
             std::path::Path::new(import_source).is_dir(),
             "local import_source must point at a directory that actually \
              exists, so the suggested command runs: {import_source}"
+        );
+    }
+
+    #[test]
+    fn self_referential_transitive_does_not_report_the_pack_as_its_own_nested_pack() {
+        // #139: gascity/roles imports its parent `..` (gascity), and gascity
+        // re-contains roles/ — so the transitive subtree holds a copy of the
+        // very pack being imported. camp must NOT report that already-bound
+        // pack as an un-composed nested pack (it would tell you to import what
+        // you just imported). The #137 case (a genuinely un-composed nested
+        // pack) must still be reported — guarded by the sibling test.
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                ("gascity/pack.toml", "[pack]\nname=\"gascity\"\nschema=2\n"),
+                (
+                    "gascity/roles/pack.toml",
+                    "[pack]\nname=\"gc-roles\"\nschema=2\n[imports.gc]\nsource=\"..\"\n",
+                ),
+                ("gascity/roles/agents/a/prompt.md", "a"),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            camp.path().join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n",
+        )
+        .unwrap();
+        camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let url = format!("file://{}//gascity/roles", repo.path().display());
+        run_add(camp.path(), &url, Some("gc"), None, None).unwrap();
+        let led = camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let added = led
+            .events_of_type(camp_core::event::EventType::ImportAdded)
+            .unwrap();
+        let reported = &added[0].data["reported"];
+        assert_eq!(
+            reported["nested_packs"].as_array().map(Vec::len),
+            Some(0),
+            "a pack already bound by this import must not be reported as its \
+             own nested pack: {reported}"
+        );
+    }
+
+    #[test]
+    fn self_reference_suppression_is_insensitive_to_a_trailing_slash_source() {
+        // #139 hardening: the direct import's subpath is the operator's verbatim
+        // `//subpath`, so `//gascity/roles/` yields subpath "gascity/roles/"
+        // while the rediscovered nested pack is "gascity/roles". The already-
+        // bound comparison must canonicalize both, or the false note re-fires.
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                ("gascity/pack.toml", "[pack]\nname=\"gascity\"\nschema=2\n"),
+                (
+                    "gascity/roles/pack.toml",
+                    "[pack]\nname=\"gc-roles\"\nschema=2\n[imports.gc]\nsource=\"..\"\n",
+                ),
+                ("gascity/roles/agents/a/prompt.md", "a"),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            camp.path().join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n",
+        )
+        .unwrap();
+        camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        // Note the TRAILING SLASH on the subpath.
+        let url = format!("file://{}//gascity/roles/", repo.path().display());
+        run_add(camp.path(), &url, Some("gc"), None, None).unwrap();
+        let led = camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let added = led
+            .events_of_type(camp_core::event::EventType::ImportAdded)
+            .unwrap();
+        let reported = &added[0].data["reported"];
+        assert_eq!(
+            reported["nested_packs"].as_array().map(Vec::len),
+            Some(0),
+            "a trailing-slash source must not defeat already-bound suppression: {reported}"
         );
     }
 
