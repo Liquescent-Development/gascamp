@@ -164,6 +164,40 @@ impl Supervisor for Systemd<'_> {
         // (unquoted) and `ExecStart` (quoted): every place this function
         // interpolates the camp root into a field systemd expands specifiers
         // in must see the escaped form.
+        //
+        // KillMode=process is named, not inherited (issue #119; the forward-flag
+        // Phase 1 left for Phase 2 in
+        // `docs/superpowers/plans/2026-07-10-campd-service-phase-1-sigterm.md:34`).
+        // systemd's default is `KillMode=control-group`: `systemctl --user stop`
+        // SIGTERMs, then SIGKILLs, EVERY process in the unit's cgroup — the
+        // in-flight `claude -p` workers along with campd. That is the SIGINT
+        // shape (workers die; adoption reconciles them as `session.crashed`),
+        // not the SIGTERM shape this design contracts: campd alone is signalled,
+        // it appends `campd.stopped` and exits, the workers are reparented (to
+        // the `systemd --user` manager, which is a subreaper — NOT to PID 1;
+        // adoption never reads ppid, so this is orientation, not mechanism), and
+        // `patrol::adopt` re-adopts them at the next start (spec §8.5,
+        // crash-only). `process` sends SIGTERM to campd ONLY and systemd never
+        // signals the workers at all.
+        //
+        // `mixed` was considered and rejected: it SIGTERMs only the main
+        // process, but once campd exits it SIGKILLs whatever remains in the
+        // cgroup after `TimeoutStopSec` — i.e. it still kills the in-flight
+        // workers, which is the very bug.
+        //
+        // This also governs the CRASH path, not just `stop`: `Restart=always`
+        // tears the unit down the same way. Before this, a campd crash swept the
+        // cgroup and killed the workers with it (reconciled `session.crashed`);
+        // now they survive and `RestartSec=1` brings campd back to re-adopt
+        // them. That is safe because adoption is pid-keyed
+        // (`patrol::adopt_from_row(row, pid)`), with no ppid dependency.
+        //
+        // `process` is HALF of the parity story. The other half is
+        // `launchd.rs`'s `AbandonProcessGroup=true`: launchd has no cgroup but
+        // sweeps the job's PROCESS GROUP instead, so macOS was NEVER at parity —
+        // it had this same bug, by a different mechanism. See that file. Parity
+        // is something camp DOES on both platforms now, not something either one
+        // gives for free.
         let camp_root = escape_percent(camp_root);
         format!(
             "[Unit]\n\
@@ -173,6 +207,7 @@ impl Supervisor for Systemd<'_> {
              Type=simple\n\
              ExecStart={exe} daemon --camp {camp}\n\
              Environment={path}\n\
+             KillMode=process\n\
              Restart=always\n\
              RestartSec=1\n\
              \n\
@@ -482,8 +517,8 @@ mod tests {
         assert_eq!(units[0].camp_root, PathBuf::from("/home/x/my camps/.camp"));
     }
 
-    /// Design §5: `ExecStart=camp daemon --camp <dir>`, `Restart=always`.
-    /// PURE, and pinned as a golden.
+    /// Design §5: `ExecStart=camp daemon --camp <dir>`, `KillMode=process`,
+    /// `Restart=always`. PURE, and pinned as a golden.
     #[test]
     fn unit_text_is_the_restart_always_user_unit() {
         let fake = FakeRunner::new(vec![]);
@@ -503,11 +538,74 @@ mod tests {
              Type=simple\n\
              ExecStart=\"/usr/local/bin/camp\" daemon --camp \"/home/x/camps/dev/.camp\"\n\
              Environment=\"PATH=/usr/local/bin:/usr/bin:/bin\"\n\
+             KillMode=process\n\
              Restart=always\n\
              RestartSec=1\n\
              \n\
              [Install]\n\
              WantedBy=default.target\n"
+        );
+    }
+
+    /// Issue #119, and the forward-flag Phase 1 left for Phase 2 to answer
+    /// (`docs/superpowers/plans/2026-07-10-campd-service-phase-1-sigterm.md:34`):
+    /// the unit MUST name its `KillMode`, and it must name `process`.
+    ///
+    /// Inherited silently, systemd's default is `KillMode=control-group`:
+    /// `systemctl --user stop` SIGTERMs — then SIGKILLs — EVERY process in the
+    /// unit's cgroup, so `camp service stop` on a busy camp takes the in-flight
+    /// `claude -p` workers down with campd. That is the SIGINT shape (workers
+    /// die, adoption reconciles them as `session.crashed`), not the SIGTERM
+    /// shape the design contracts: campd alone gets the signal, the workers are
+    /// reparented to the `systemd --user` manager (a subreaper), and
+    /// `patrol::adopt` picks them back up at the next start.
+    ///
+    /// `mixed` is NOT good enough and must not be substituted here: it SIGTERMs
+    /// only the main process, but once campd exits it SIGKILLs whatever is left
+    /// in the cgroup after `TimeoutStopSec` — which is the workers, and which is
+    /// precisely the bug. Only `process` leaves them alone entirely.
+    ///
+    /// The macOS half of the same bug lives in `launchd.rs`
+    /// (`AbandonProcessGroup`): launchd sweeps the job's PROCESS GROUP. An
+    /// earlier version of this comment claimed macOS was already at parity
+    /// "because macOS has no cgroup to sweep" — false, and disproved by
+    /// experiment on a real macOS host. Both platforms need an explicit
+    /// directive; neither gives this shape for free.
+    #[test]
+    fn unit_text_sets_kill_mode_process_so_stopping_campd_leaves_the_workers_alone() {
+        let fake = FakeRunner::new(vec![]);
+        let systemd = Systemd::new(PathBuf::from("/units"), &fake);
+        let text = systemd.unit_text(
+            &id(),
+            "/home/x/camps/dev/.camp",
+            "/usr/local/bin/camp",
+            "/usr/local/bin:/usr/bin:/bin",
+        );
+        let kill_mode: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("KillMode="))
+            .collect();
+        assert_eq!(
+            kill_mode,
+            ["KillMode=process"],
+            "the unit must name KillMode=process EXACTLY once — inheriting \
+             systemd's control-group default kills the in-flight workers with \
+             campd (#119), and `mixed` still SIGKILLs them after \
+             TimeoutStopSec: {text}"
+        );
+        // …and it must be a [Service] directive: systemd would ignore it in
+        // [Unit] or [Install], leaving the default in force while the unit
+        // reads as though the choice had been made.
+        let service_block = text
+            .split("[Service]\n")
+            .nth(1)
+            .expect("unit text must have a [Service] section")
+            .split("\n[")
+            .next()
+            .expect("split always yields a first element");
+        assert!(
+            service_block.contains("KillMode=process\n"),
+            "KillMode must sit in [Service], where systemd reads it: {text}"
         );
     }
 
