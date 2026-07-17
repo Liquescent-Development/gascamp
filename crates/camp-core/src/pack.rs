@@ -10,7 +10,7 @@
 //! sibling-owned consumers (`dispatch.rs`, `patrol.rs`, `sling.rs`,
 //! `spawn.rs`) never need editing — only the resolution *source* changes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::{AgentDefaults, CampConfig};
 use crate::error::CoreError;
@@ -303,7 +303,11 @@ pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError
                 });
             }
             let (raw, _refusals) = parse_agent_dir(&dir)?;
-            let pack_ships_skills = layer.join("skills").is_dir() && decl.skills != Some(false);
+            // The §5.3 gate must reflect what ACTUALLY installs — the direct
+            // layer AND every transitive one (#118). Deriving it from
+            // `resolve_agent_skill_layers` keeps one source of truth: whatever
+            // dispatch installs is exactly what the allowlist is checked against.
+            let pack_ships_skills = !resolve_agent_skill_layers(cfg, name)?.is_empty();
             resolve_agent_def(&cfg.agent_defaults, &raw, name, pack_ships_skills)
         }
         None => {
@@ -315,9 +319,67 @@ pub fn resolve_agent(cfg: &CampConfig, name: &str) -> Result<AgentDef, CoreError
                 });
             }
             let (raw, _refusals) = parse_agent_dir(&dir)?;
-            resolve_agent_def(&cfg.agent_defaults, &raw, name, false)
+            // A camp-local agent brings no binding layer, but it still receives
+            // the transitive content layers' skills — so it needs the same gate.
+            let pack_ships_skills = !resolve_agent_skill_layers(cfg, name)?.is_empty();
+            resolve_agent_def(&cfg.agent_defaults, &raw, name, pack_ships_skills)
         }
     }
+}
+
+/// The ORDERED pack-layer directories that WILL install skills into the
+/// dispatched agent `name`'s worktree (issue #118, umbrella §5.3/§7.2).
+///
+/// Each returned path is a LAYER dir — the argument `import::skills::install_skills`
+/// expects, not the `skills/` subdir (it appends `skills/` itself). Only layers
+/// that actually ship a `skills/` dir are returned, so this is the ONE answer to
+/// "will any skills install for this agent?" — `resolve_agent` derives the
+/// `Skill`-allowlist gate from it, and dispatch installs exactly these. The
+/// order is load-bearing: all TRANSITIVE content layers (§7.2 shared content)
+/// come FIRST, the agent's DIRECT binding layer LAST, so a direct import wins a
+/// skill-name collision (§7.1).
+///
+/// The direct binding layer is included only for a dotted `<binding>.<agent>`
+/// name AND only when the import does not opt out (`skills != Some(false)`). A
+/// no-dot camp-local agent contributes NO binding layer (a local agent is never
+/// a pack), yet still receives every transitive content layer — so `skills =
+/// false` on a direct import scopes to THAT import only, never to the shared
+/// transitive layers other bindings also read (§7.2). The unknown-binding and
+/// missing-root errors mirror `resolve_agent`'s shapes.
+pub fn resolve_agent_skill_layers(cfg: &CampConfig, name: &str) -> Result<Vec<PathBuf>, CoreError> {
+    let root = cfg.root.as_deref().ok_or_else(|| {
+        CoreError::Config(
+            "config has no root directory (loaded via parse, not load) — cannot resolve agent paths"
+                .to_owned(),
+        )
+    })?;
+    // Transitive content layers first (§7.2), already sorted by binding.
+    let mut layers: Vec<PathBuf> = cfg
+        .transitive_layers()?
+        .into_iter()
+        .map(|(_binding, dir)| dir)
+        .collect();
+    // Then the DIRECT binding layer for a dotted name — LAST, so it overrides a
+    // transitive skill of the same name (§7.1). Honor the `skills = false`
+    // opt-out; a no-dot local agent adds no binding layer.
+    if let Some((binding, _suffix)) = name.split_once('.') {
+        let decl = cfg.imports.get(binding).ok_or_else(|| {
+            CoreError::Pack(format!(
+                "agent {name:?}: no binding {binding:?} in camp.toml — run \
+                 `camp import add <source> --name {binding}`"
+            ))
+        })?;
+        if decl.skills != Some(false) {
+            layers.push(decl.layer_dir(root, binding));
+        }
+    }
+    // Only layers that REALLY ship skills/. Keeping this the sole definition of
+    // "skills will install" is what keeps the §5.3 allowlist gate honest: a
+    // transitive layer's skills used to install while `resolve_agent` computed
+    // `pack_ships_skills` from the direct layer alone, so the gate stayed silent
+    // and the worker got skill files it had no `Skill` tool to invoke.
+    layers.retain(|layer| layer.join("skills").is_dir());
+    Ok(layers)
 }
 
 #[cfg(test)]
@@ -723,5 +785,128 @@ mod tests {
                 .to_string()
                 .contains("partial_messages")
         );
+    }
+
+    // ---- issue #118: resolve_agent_skill_layers ---------------------------
+
+    /// A camp whose `bmad` import ships an `architect` agent AND a `skills/`
+    /// dir (a git-source import, so its layer dir is `imports/bmad`). Returns
+    /// (tempdir, loaded cfg).
+    fn camp_with_skill_import(skills_false: bool) -> (tempfile::TempDir, CampConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let opt_out = if skills_false { "skills=false\n" } else { "" };
+        let toml = format!(
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\",\"Skill\"]\n\
+             [imports.bmad]\nsource=\"https://example.com/bmad\"\n{opt_out}"
+        );
+        let a = root.join("imports/bmad/agents/architect");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("prompt.md"), "architect").unwrap();
+        let s = root.join("imports/bmad/skills/bmad-arch");
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::write(s.join("SKILL.md"), "# skill").unwrap();
+        std::fs::write(root.join("camp.toml"), &toml).unwrap();
+        let cfg = CampConfig::load(&root.join("camp.toml")).unwrap();
+        (dir, cfg)
+    }
+
+    #[test]
+    fn resolve_agent_skill_layers_returns_the_direct_binding_layer() {
+        let (dir, cfg) = camp_with_skill_import(false);
+        let layers = resolve_agent_skill_layers(&cfg, "bmad.architect").unwrap();
+        let direct = dir.path().join("imports/bmad");
+        assert!(
+            layers.contains(&direct),
+            "the direct binding layer must be a skill-install layer: {layers:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_skill_layers_honors_the_skills_false_opt_out() {
+        let (dir, cfg) = camp_with_skill_import(true);
+        let layers = resolve_agent_skill_layers(&cfg, "bmad.architect").unwrap();
+        let direct = dir.path().join("imports/bmad");
+        assert!(
+            !layers.contains(&direct),
+            "skills = false must EXCLUDE the direct binding layer: {layers:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_skill_layers_puts_transitive_layers_before_the_direct_layer() {
+        let (dir, cfg) = camp_with_skill_import(false);
+        let root = dir.path();
+        // Plant a transitive content layer (§7.2) shipping its own skills/ —
+        // transitive_layers() reads the sentinel dir live off disk.
+        let t = root.join("imports/.transitive/gc/skills/gc-skill");
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(t.join("SKILL.md"), "# gc").unwrap();
+
+        let layers = resolve_agent_skill_layers(&cfg, "bmad.architect").unwrap();
+        let transitive = root.join("imports/.transitive/gc");
+        let direct = root.join("imports/bmad");
+        let ti = layers.iter().position(|p| p == &transitive);
+        let di = layers.iter().position(|p| p == &direct);
+        assert!(
+            ti.is_some(),
+            "transitive layer must be included: {layers:?}"
+        );
+        assert!(di.is_some(), "direct layer must be included: {layers:?}");
+        assert!(
+            ti < di,
+            "transitive layers install BEFORE the direct layer: {layers:?}"
+        );
+    }
+
+    /// #118 review finding 2: the §5.3 allowlist gate must fire when a
+    /// TRANSITIVE layer's skills will install, not just the direct layer's.
+    /// Otherwise an agent whose allowlist lacks `Skill` resolves fine, then
+    /// receives transitive skill files it can never invoke — silently
+    /// under-provisioned, which is the exact failure the gate exists to make
+    /// loud. Direct layer ships NO skills/ here; the transitive layer does.
+    #[test]
+    fn transitive_skills_still_require_the_skill_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n\
+             [imports.bmad]\nsource=\"https://example.com/bmad\"\n",
+        )
+        .unwrap();
+        // direct layer: an agent, but NO skills/ of its own
+        let a = root.join("imports/bmad/agents/architect");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("prompt.md"), "architect").unwrap();
+        // a TRANSITIVE content layer that DOES ship skills/
+        let t = root.join("imports/.transitive/gc/skills/gc-skill");
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(t.join("SKILL.md"), "# gc").unwrap();
+        let cfg = CampConfig::load(&root.join("camp.toml")).unwrap();
+
+        // those transitive skills WILL install...
+        let layers = resolve_agent_skill_layers(&cfg, "bmad.architect").unwrap();
+        assert!(
+            layers.contains(&root.join("imports/.transitive/gc")),
+            "the transitive layer's skills install: {layers:?}"
+        );
+        // ...so resolving the agent must REFUSE the missing `Skill` allowlist
+        let err = resolve_agent(&cfg, "bmad.architect")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Skill"),
+            "transitive skills must trip the allowlist gate: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_skill_layers_fails_fast_on_an_unbound_binding() {
+        let (_d, cfg) = camp_with_skill_import(false);
+        let m = resolve_agent_skill_layers(&cfg, "nope.architect")
+            .unwrap_err()
+            .to_string();
+        assert!(m.contains("nope") && m.contains("camp import add"), "{m}");
     }
 }

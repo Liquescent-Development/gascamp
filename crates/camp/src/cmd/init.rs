@@ -125,7 +125,7 @@ pub fn run(
             }
         }
         ImportDecision::Install(src) => {
-            if let Err(e) = crate::cmd::import::run_add(&root, &src, None, None) {
+            if let Err(e) = crate::cmd::import::run_add(&root, &src, None, None, None) {
                 bail!(
                     "The camp at {} WAS created, but the starter pack was NOT installed ({e:#}); \
                      the camp is usable — run `camp import add <source> --name <binding>` yourself",
@@ -227,7 +227,8 @@ fn camp_name(root: &Path) -> String {
 /// disagree and the offer could never succeed. A fetch failure exits non-zero
 /// ("camp WAS created, pack was NOT installed").
 fn install_default_starter(root: &Path) -> Result<()> {
-    if let Err(e) = crate::cmd::import::run_add(root, DEFAULT_STARTER_SOURCE, Some("starter"), None)
+    if let Err(e) =
+        crate::cmd::import::run_add(root, DEFAULT_STARTER_SOURCE, Some("starter"), None, None)
     {
         bail!(
             "The camp at {} WAS created, but the starter pack was NOT installed ({e:#}); \
@@ -310,8 +311,14 @@ mod tests {
         );
         // the fix: import the LOCAL starter pack (a file source; never the network).
         let starter = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/starter");
-        crate::cmd::import::run_add(&root, &starter.to_string_lossy(), Some("starter"), None)
-            .unwrap();
+        crate::cmd::import::run_add(
+            &root,
+            &starter.to_string_lossy(),
+            Some("starter"),
+            None,
+            None,
+        )
+        .unwrap();
         let cfg = camp_core::config::CampConfig::load(&root.join("camp.toml")).unwrap();
         assert_eq!(
             camp_core::pack::resolve_agent(&cfg, "starter.dev")

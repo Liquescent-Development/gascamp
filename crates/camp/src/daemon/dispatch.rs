@@ -773,6 +773,53 @@ impl Dispatcher {
             None
         };
 
+        // compat §5.3 / §7.2 (issue #118): install the pack's skills/ into the
+        // fresh worktree — the agent's DIRECT binding layer plus every TRANSITIVE
+        // content layer, in the order resolve_agent_skill_layers returns (a direct
+        // import wins a name collision, installed last). ONLY on the worktree path:
+        // isolation=none has no worktree, and camp must never write into the
+        // operator's live tree. A failure here is a dispatch failure, EVENTED and
+        // aborting before the worker execs — a worker that ran without its skills
+        // would silently under-deliver (never a silent skip; invariant 3/5).
+        if let Some(worktree_dir) = &worktree {
+            let layers = match pack::resolve_agent_skill_layers(&self.config, &prep.agent_name) {
+                Ok(layers) => layers,
+                Err(e) => {
+                    ledger.append(EventInput {
+                        kind: EventType::DispatchFailed,
+                        rig: Some(bead.rig.clone()),
+                        actor: "campd".into(),
+                        bead: Some(bead.id.clone()),
+                        data: serde_json::json!({
+                            "reason": format!(
+                                "resolving skill layers for agent {:?} failed: {e}",
+                                prep.agent_name
+                            ),
+                        }),
+                    })?;
+                    return Ok(());
+                }
+            };
+            for layer in layers {
+                if let Err(e) = camp_core::import::skills::install_skills(&layer, worktree_dir) {
+                    ledger.append(EventInput {
+                        kind: EventType::DispatchFailed,
+                        rig: Some(bead.rig.clone()),
+                        actor: "campd".into(),
+                        bead: Some(bead.id.clone()),
+                        data: serde_json::json!({
+                            "reason": format!(
+                                "installing skills from {} for agent {:?} failed: {e}",
+                                layer.display(),
+                                prep.agent_name
+                            ),
+                        }),
+                    })?;
+                    return Ok(());
+                }
+            }
+        }
+
         let mut woke = serde_json::json!({
             "name": prep.spec.session_name,
             "agent": prep.agent_name,
@@ -4359,6 +4406,138 @@ mod tests {
         );
 
         dispatcher.test_kill_and_wait(pid); // reap the sleeper
+    }
+
+    // ---- issue #118: pack skills install into the dispatch worktree ------
+
+    /// A committed git repo (base commit + gpgsign off, hermetic against the
+    /// operator's gitconfig) usable as a worktree-capable rig.
+    fn committed_git_rig(dir: &std::path::Path) -> PathBuf {
+        let rig = dir.join("rig");
+        std::fs::create_dir_all(&rig).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&rig)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        rig
+    }
+
+    /// Set up a camp whose `bmad` import ships an `architect` agent
+    /// (isolation defaults to Worktree) AND a `skills/bmad-arch` dir, dispatch
+    /// bead gc-1, reap the worker, and return (tempdir, worktree_dir).
+    /// `skills_false` toggles the import's `skills = false` opt-out. The caller
+    /// must hold `spawn_probe_guard` (this forks git + the worker).
+    fn dispatch_pack_agent_worktree(skills_false: bool) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let rig = committed_git_rig(root);
+        // The pack agent + its skill, under the bmad binding's layer dir
+        // (a git-source import layers at imports/bmad).
+        let a = root.join("imports/bmad/agents/architect");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("prompt.md"), "architect").unwrap();
+        let sk = root.join("imports/bmad/skills/bmad-arch");
+        std::fs::create_dir_all(&sk).unwrap();
+        std::fs::write(sk.join("SKILL.md"), "# arch skill").unwrap();
+        // A worker that STAYS ALIVE long enough to accept the held-stdin task
+        // write, so launch reaches the children.insert (a fast-exiting binary
+        // races the write). It never reads stdin and is killed at the end.
+        let worker = root.join("worker.sh");
+        std::fs::write(&worker, "#!/bin/sh\nsleep 30\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let opt_out = if skills_false { "skills = false\n" } else { "" };
+        std::fs::write(
+            root.join("camp.toml"),
+            format!(
+                "[camp]\nname = \"t\"\n\n[[rigs]]\nname = \"gc\"\npath = \"{}\"\nprefix = \"gc\"\n\n\
+                 [dispatch]\nmax_workers = 1\ncommand = \"{}\"\ndefault_agent = \"bmad.architect\"\n\n\
+                 [agent_defaults]\ntools = [\"Read\", \"Skill\"]\n\n\
+                 [imports.bmad]\nsource = \"https://example.com/bmad\"\n{opt_out}",
+                rig.display(),
+                worker.display(),
+            ),
+        )
+        .unwrap();
+        let config = CampConfig::load(&root.join("camp.toml")).unwrap();
+        let mut ledger = Ledger::open(&root.join("camp.db")).unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({ "title": "do it" }),
+            })
+            .unwrap();
+        let mut dispatcher = Dispatcher::new(
+            CampDir {
+                root: root.to_path_buf(),
+            },
+            config,
+        );
+        dispatcher.dispatch_bead(&mut ledger, "gc-1").unwrap();
+        // A worker exists iff launch reached the spawn — i.e. the skills-install
+        // step did NOT early-return with a dispatch.failed. This is the guard
+        // that a broken install would trip.
+        let pids: Vec<u32> = dispatcher.known_pids().into_iter().collect();
+        assert_eq!(
+            pids.len(),
+            1,
+            "the worker must dispatch (skills install must not fail the dispatch); \
+             dispatch.failed count = {}",
+            count(&ledger, "dispatch.failed")
+        );
+        dispatcher.test_kill_and_wait(pids[0]); // reap the sleeper
+        let worktree = root.join("worktrees/gc-1");
+        (dir, worktree)
+    }
+
+    /// The bug (#118): a dispatched worktree worker never received its pack's
+    /// skills/. After launch, the worktree must carry the pack's skill at
+    /// `.claude/skills/<skill>/SKILL.md`.
+    #[test]
+    fn a_dispatched_worktree_worker_gets_its_pack_skills_installed() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (_dir, worktree) = dispatch_pack_agent_worktree(false);
+        assert!(
+            worktree.join(".claude/skills/bmad-arch/SKILL.md").exists(),
+            "the pack's skill must be installed into the worktree at {}",
+            worktree.display()
+        );
+    }
+
+    /// The `skills = false` opt-out (§5.3): a worktree-isolated agent whose
+    /// import declines skills must have NOTHING installed under .claude/skills.
+    #[test]
+    fn a_skills_false_import_installs_nothing_into_the_worktree() {
+        let _spawning = crate::daemon::spawn_probe_guard();
+        let (_dir, worktree) = dispatch_pack_agent_worktree(true);
+        assert!(
+            worktree.exists(),
+            "the worktree is still created for a worktree-isolated agent"
+        );
+        assert!(
+            !worktree.join(".claude/skills").exists(),
+            "skills = false must install NOTHING under .claude/skills"
+        );
     }
 
     /// ROUND-2 LOW 2: a cap-full patrol respawn must QUEUE and retry when
