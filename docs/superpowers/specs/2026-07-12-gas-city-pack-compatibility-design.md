@@ -291,7 +291,7 @@ source = "https://github.com/gastownhall/gascity-packs.git//gascity/roles"
 
 That import — not nested-pack magic — is where `gc.run-operator`, `gc.implementation-worker`, `gc.publisher`, and every other `gc.*` route comes from in a real city. Camp's v1 recipe (§3) is the same two commands with camp as the consumer. The roles pack is **self-contained**: it ships its own copy of the `gc-role-worker` fragment (byte-identical to gascity's — verified), so importing it alone renders its 12 agents.
 
-One obligation remains: when a materialized subtree *contains* a nested `pack.toml` camp did not compose (materializing `gascity` brings `roles/` along inside the subpath), `camp import add` **reports it**: `nested pack at roles/ ("gc-roles") — not composed; import it explicitly to use it`. Visible, never silent.
+One obligation remains: when a materialized subtree *contains* a nested `pack.toml` camp did not compose (materializing `gascity` brings `roles/` along inside the subpath), `camp import add` **reports it** with the nested pack's **real source subpath** (the transitive import's own subpath joined with the pack's path inside that layer — `gascity/roles`, not the top-level binding) and a runnable explicit import: `nested pack "gc-roles" at gascity/roles was not composed — … import it explicitly to use its agents: camp import add "<repo>//gascity/roles#<ref>" --name <binding>`. Visible, never silent.
 
 ### 7.4 Retained from the component spec, and what changes there
 
