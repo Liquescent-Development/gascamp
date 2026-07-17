@@ -273,12 +273,13 @@ impl Ledger {
     }
 
     /// Remove the orphaned run dirs old enough to prove no cook is still
-    /// writing them. See `sweep_orphan_run_dirs` — the caller owns the
-    /// campd-must-be-down half of the race defense.
+    /// writing them, reporting what was swept AND what was spared. See
+    /// `sweep_orphan_run_dirs` — the caller owns the campd-must-be-down half of
+    /// the race defense.
     pub fn sweep_orphan_run_dirs(
         &self,
         camp_root: &std::path::Path,
-    ) -> Result<Vec<crate::formula::runtime::OrphanRunDir>, CoreError> {
+    ) -> Result<crate::formula::runtime::SweepReport, CoreError> {
         crate::formula::runtime::sweep_orphan_run_dirs(&self.conn, camp_root)
     }
 

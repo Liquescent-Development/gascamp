@@ -125,7 +125,21 @@ enum Command {
         /// Remove the orphans `--orphan-runs` finds. Refuses while campd is
         /// running, and never touches a directory recently written to — that is
         /// what a healthy in-flight cook looks like.
-        #[arg(long, requires = "orphan_runs")]
+        ///
+        /// CONFLICTS, NOT `requires` — clap footgun, do not "simplify" this
+        /// back. `requires = "orphan_runs"` reads correctly and does NOTHING: a
+        /// `SetTrue` bool carries an implicit default, so clap sees
+        /// `orphan_runs` as always "present" and the requirement is always
+        /// vacuously satisfied. `camp doctor --refold --sweep-orphan-runs` then
+        /// parsed fine, dispatched to the refold arm, discarded the sweep
+        /// through `..`, and exited 0 — an operator asking to DELETE
+        /// DIRECTORIES told nothing at all. Conflicts are checked against
+        /// command-line presence, so they actually fire; `--sweep-orphan-runs`
+        /// with no mode is caught by the required `mode` group.
+        /// `cli_doctor.rs::doctor_REFUSES_a_sweep_paired_with_another_mode…`
+        /// drives the real parser over every pairing and is what keeps this
+        /// honest.
+        #[arg(long, conflicts_with_all = ["refold", "formula", "drain_reservations"])]
         sweep_orphan_runs: bool,
         /// Emit camp's COMPILED steps in the differential gate's normalized shape
         /// (`ci/gc-compat/differential.py` diffs them against gc's real compiler).

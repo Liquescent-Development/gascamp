@@ -87,6 +87,17 @@ fn age(dir: &std::path::Path, secs: u64) {
         .unwrap();
 }
 
+/// Pull a run dir's mtime into the FUTURE — a clock skew, an NFS server ahead
+/// of its client, a restored backup. `dir_idle`'s `duration_since` then returns
+/// Err, so the age is UNKNOWN, and an age we cannot compute is not an age past
+/// the grace window.
+fn age_into_the_future(dir: &std::path::Path, secs: u64) {
+    let f = std::fs::File::open(dir).unwrap();
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(secs);
+    f.set_times(std::fs::FileTimes::new().set_modified(future))
+        .unwrap();
+}
+
 fn doctor_stdout(dir: &std::path::Path, args: &[&str]) -> String {
     let out = camp().current_dir(dir).args(args).output().unwrap();
     assert!(
@@ -466,4 +477,108 @@ fn doctor_orphan_runs_on_a_camp_that_has_never_cooked_reports_clean() {
     let out = doctor_stdout(dir.path(), &["doctor", "--orphan-runs"]);
     assert!(out.contains("no orphaned run directories"), "{out}");
     assert!(!dir.path().join(".camp/runs").exists());
+}
+
+/// Review finding 1 (MEDIUM): a DESTRUCTIVE flag must never be SILENTLY
+/// DISCARDED. `requires = "orphan_runs"` looked like it guarded this and did
+/// not — clap treats a `SetTrue` bool as always "present" (it carries an
+/// implicit default), so the requirement was always vacuously satisfied. The
+/// operator asked to delete directories, got `refold: replayed 0 events`, and
+/// exit 0.
+///
+/// This drives the REAL arg parser, which is the only thing that can catch it:
+/// no unit test of the handler would ever see these argv.
+///
+/// Mutation caught: swap the conflicts back to `requires = "orphan_runs"` →
+/// the pairings are accepted and silently ignored → RED.
+#[test]
+fn doctor_REFUSES_a_sweep_paired_with_another_mode_instead_of_SILENTLY_DISCARDING_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let camp_root = seeded_camp(dir.path());
+    let orphan = make_run_dir(&camp_root, "20260705T211403-orph01", false);
+    age(&orphan, 3600);
+
+    for argv in [
+        // A destructive flag riding along with another mode…
+        vec!["doctor", "--refold", "--sweep-orphan-runs"],
+        vec!["doctor", "--drain-reservations", "--sweep-orphan-runs"],
+        vec!["doctor", "--formula", "/dev/null", "--sweep-orphan-runs"],
+        // …and entirely on its own.
+        vec!["doctor", "--sweep-orphan-runs"],
+    ] {
+        let out = camp().current_dir(dir.path()).args(&argv).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "camp {argv:?} must FAIL LOUDLY, not discard the sweep. stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            orphan.exists(),
+            "camp {argv:?} must not have swept anything either"
+        );
+    }
+}
+
+/// …and the pairing that IS the sweep still works, so the fix above is a gate
+/// and not a wall.
+#[test]
+fn doctor_orphan_runs_with_sweep_is_STILL_ACCEPTED() {
+    let dir = tempfile::tempdir().unwrap();
+    let camp_root = seeded_camp(dir.path());
+    let orphan = make_run_dir(&camp_root, "20260705T211403-orph01", false);
+    age(&orphan, 3600);
+
+    let out = doctor_stdout(
+        dir.path(),
+        &["doctor", "--orphan-runs", "--sweep-orphan-runs"],
+    );
+    assert!(out.contains("swept 1"), "{out}");
+    assert!(!orphan.exists());
+}
+
+/// Review finding 2 (MEDIUM): the delete-critical "unknown age → never delete"
+/// guard had ZERO coverage — `is_some_and` → `is_none_or` survived the FULL
+/// workspace. It is the single branch between a clock skew and deleting live
+/// run state, documented three times and defended by nothing.
+///
+/// A future mtime is not exotic: a restored backup, an NFS server ahead of its
+/// client, a VM resumed with a skewed clock. `duration_since` returns Err, the
+/// age is UNKNOWN, and UNKNOWN must never clear the window.
+///
+/// Mutation caught: `is_some_and` → `is_none_or` in `sweepable()` → the
+/// skewed dir is deleted → RED.
+#[test]
+fn doctor_sweep_orphan_runs_REFUSES_a_dir_whose_mtime_is_IN_THE_FUTURE() {
+    let dir = tempfile::tempdir().unwrap();
+    let camp_root = seeded_camp(dir.path());
+    let skewed = make_run_dir(&camp_root, "20260705T211403-skew01", false);
+    age_into_the_future(&skewed, 3600);
+
+    let out = doctor_stdout(
+        dir.path(),
+        &["doctor", "--orphan-runs", "--sweep-orphan-runs"],
+    );
+    assert!(
+        skewed.exists(),
+        "an age that cannot be computed is not an age past the grace window: {out}"
+    );
+    assert!(out.contains("swept 0"), "{out}");
+    assert!(
+        out.contains("UNKNOWN"),
+        "the operator is owed the reason: {out}"
+    );
+}
+
+/// …and the listing says so too, rather than quietly calling it sweepable.
+#[test]
+fn doctor_orphan_runs_LISTS_a_future_mtime_dir_as_UNKNOWN_age() {
+    let dir = tempfile::tempdir().unwrap();
+    let camp_root = seeded_camp(dir.path());
+    let skewed = make_run_dir(&camp_root, "20260705T211403-skew01", false);
+    age_into_the_future(&skewed, 3600);
+
+    let out = doctor_stdout(dir.path(), &["doctor", "--orphan-runs"]);
+    assert!(out.contains("ORPHAN"), "{out}");
+    assert!(out.contains("UNKNOWN"), "{out}");
+    assert!(out.contains("0 old enough to sweep"), "{out}");
 }

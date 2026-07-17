@@ -284,27 +284,23 @@ pub fn run_orphan_runs(camp: &CampDir, sweep: bool) -> Result<()> {
         );
     }
 
-    let swept = ledger.sweep_orphan_run_dirs(&camp.root)?;
-    println!("swept {} orphaned run directory(s)", swept.len());
-    for orphan in &swept {
+    let report = ledger.sweep_orphan_run_dirs(&camp.root)?;
+    println!("swept {} orphaned run directory(s)", report.swept.len());
+    for orphan in &report.swept {
         println!("  {} ({})", orphan.path.display(), describe_idle(orphan));
     }
-    // A dir the sweep DECLINED is the interesting half: say so rather than
+    // A dir the sweep DECLINED is the interesting half: say so, rather than
     // leave the operator wondering why `swept 0` followed a listing that named
-    // three orphans.
-    let spared: Vec<_> = ledger
-        .orphaned_run_dirs(&camp.root)?
-        .into_iter()
-        .filter(|o| !o.sweepable())
-        .collect();
-    if !spared.is_empty() {
+    // three orphans. Straight from the SWEEP's own record — a second scan would
+    // see a later instant and could name a dir this sweep never considered.
+    if !report.spared.is_empty() {
         println!(
             "\n{} orphaned run directory(s) left alone — TOO YOUNG TO SWEEP (a cook \
              could still be writing there; re-run once they have been idle {}s):",
-            spared.len(),
+            report.spared.len(),
             camp_core::formula::runtime::ORPHAN_RUN_SWEEP_GRACE.as_secs()
         );
-        for orphan in &spared {
+        for orphan in &report.spared {
             println!("  {} ({})", orphan.path.display(), describe_idle(orphan));
         }
     }
@@ -353,8 +349,7 @@ fn normalize_description(d: &str) -> String {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
-    use crate::daemon::socket::{Response, fake_campd};
-    use camp_core::ledger::StatusSummary;
+    use crate::daemon::socket::fake_campd;
 
     /// A sweepable orphan (well past the grace window) in a camp with a real
     /// ledger — everything the sweep needs except permission.
@@ -374,26 +369,6 @@ mod tests {
         (dir, camp, orphan)
     }
 
-    /// One answer from a live campd. `fake_campd::serve` serves exactly as many
-    /// connections as it has responses and then DROPS its listener — so a fake
-    /// built with an empty response list is a campd that is already gone, and a
-    /// test using one proves nothing about a live daemon. (It proved nothing
-    /// here, until a mutation said so.)
-    fn a_live_campd_status() -> Response {
-        Response::Status {
-            ok: true,
-            summary: StatusSummary {
-                live_sessions: Vec::new(),
-                ready: 0,
-                open: 0,
-                stuck: 0,
-                unread_mail: 0,
-            },
-            red: 0,
-            campd_pid: 4242,
-        }
-    }
-
     /// Race defense (1). campd is the thing that cooks; a run dir with no
     /// `run.cooked` is what a cook looks like MID-FLIGHT. With campd up, the
     /// sweep cannot tell a crash leftover from work in progress, so it refuses
@@ -404,7 +379,11 @@ mod tests {
     #[test]
     fn the_sweep_REFUSES_while_campd_is_LIVE_and_deletes_nothing() {
         let (_dir, camp, orphan) = camp_with_a_sweepable_orphan();
-        let campd = fake_campd::serve(&camp, vec![a_live_campd_status()]);
+        // NOT `vec![]`: `serve` answers exactly as many connections as it
+        // has responses and then DROPS its listener, so an empty-vec fake is a
+        // campd that is ALREADY GONE. This test proved nothing until a
+        // mutation said so.
+        let campd = fake_campd::serve(&camp, vec![fake_campd::status(4242)]);
 
         let err = run_orphan_runs(&camp, true).unwrap_err();
         assert!(
@@ -427,7 +406,8 @@ mod tests {
     #[test]
     fn LISTING_is_allowed_while_campd_is_live_and_still_deletes_nothing() {
         let (_dir, camp, orphan) = camp_with_a_sweepable_orphan();
-        let campd = fake_campd::serve(&camp, vec![a_live_campd_status()]);
+        // A REAL live campd (see the empty-vec note above).
+        let campd = fake_campd::serve(&camp, vec![fake_campd::status(4242)]);
 
         run_orphan_runs(&camp, false).unwrap();
         assert!(orphan.exists(), "listing is read-only");
