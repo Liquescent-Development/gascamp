@@ -623,17 +623,18 @@ is recorded as `[orders] enabled` in `camp.toml` and managed with the verbs:
 camp order ls                                # every order + next fire time (disabled state shown)
 camp order enable starter.morning-triage     # arm an imported order (adds it to [orders] enabled)
 camp order disable starter.morning-triage    # disarm it
-camp order run morning-triage                # fire one now (campd cooks and dispatches it)
+camp order run starter.morning-triage        # fire one now (campd cooks and dispatches it)
 ```
 
-> **Where this stands today.** Inline `[[order]]` orders in `camp.toml` are live:
-> they fire on schedule, and `camp order run <name>` triggers one now. For
-> **imported pack orders**, the *configuration* machinery is in place — import,
-> `camp order ls`, `enable`/`disable`, and the money-invariant gate — but campd
-> does **not fire them yet** (neither on schedule nor via `camp order run`); the
-> imported-order fire path is a later compat phase, and arming one prints a note
-> saying so. So a pack's orders are visible and armable, but only your own
-> `[[order]]` entries actually run until then.
+An order's name for `enable`/`disable`/`run` is its **qualified** name: a bare
+stem (`ci-red`) for your own inline `[[order]]` entries, and `<binding>.<stem>`
+(`starter.morning-triage`) for one that came from a pack.
+
+> **Where this stands today.** Both inline `[[order]]` orders and **imported
+> pack orders** fire: on schedule, and now via `camp order run
+> <binding>.<stem>`. An imported order stays inert until you `camp order enable`
+> it (the money invariant) — a disabled one is not runnable — but once armed it
+> cooks and dispatches exactly like an inline one.
 
 Cron orders are a min-heap of deadlines — a timer, not a tick — with a
 catch-up window for fires missed while asleep. Event orders match on the same
