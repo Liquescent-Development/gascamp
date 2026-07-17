@@ -796,6 +796,178 @@ pub fn runs_dir(camp_root: &Path) -> PathBuf {
     camp_root.join(RUNS_SUBDIR)
 }
 
+/// How long a `runs/<id>/` dir must have sat UNTOUCHED before the sweep will
+/// remove it (#124).
+///
+/// THE RACE this exists for: a run dir that exists with no `run.cooked` is
+/// EXACTLY the state a healthy in-flight cook is in for the moment between its
+/// run-dir write and its `append_batch` commit (see `cook.rs`'s header — files
+/// land first, deliberately). "No `run.cooked` → delete" is therefore, on its
+/// own, a rule that deletes LIVE run state.
+///
+/// cook writes three small files and commits in the same breath — milliseconds.
+/// Ten minutes is ~5 orders of magnitude of headroom, and the cost of erring
+/// long is zero: an orphan the sweep declines today is swept tomorrow. The cost
+/// of erring short is a destroyed run. That asymmetry sets this number.
+pub const ORPHAN_RUN_SWEEP_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A `runs/<id>/` directory that no `run.cooked` event names (#124) — the
+/// leftover of a `kill -9` inside cook's files-before-ledger window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanRunDir {
+    pub run_id: String,
+    pub path: PathBuf,
+    /// How long the dir has sat untouched. `None` when the mtime is
+    /// unreadable OR in the future — an age we cannot compute is an age that
+    /// cannot clear the grace window, so it reads as NOT sweepable.
+    pub idle: Option<std::time::Duration>,
+}
+
+impl OrphanRunDir {
+    /// May the sweep remove this? Only when we can prove the dir has been
+    /// untouched longer than any cook could plausibly still be writing to it.
+    /// Unknown age → false, always: when in doubt, do not delete.
+    pub fn sweepable(&self) -> bool {
+        self.idle.is_some_and(|idle| idle >= ORPHAN_RUN_SWEEP_GRACE)
+    }
+}
+
+/// Every run id the LEDGER names in a `run.cooked` event.
+///
+/// The id set is derived from the log, never from filesystem heuristics: the
+/// log is the durable truth (invariant 3), and "this dir looks old" is not
+/// evidence about whether a run exists. Bounded by the `events_type` index.
+fn cooked_run_ids(conn: &Connection) -> Result<std::collections::BTreeSet<String>, CoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(data, '$.run_id') FROM events
+          WHERE type = 'run.cooked' AND json_extract(data, '$.run_id') IS NOT NULL",
+    )?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
+/// The `runs/<id>/` dirs no `run.cooked` event names (#124). READ-ONLY.
+///
+/// ORDERING IS THE SAFETY PROPERTY: the directories are enumerated FIRST and
+/// the ledger read SECOND. A cook that commits during the scan then lands in
+/// the cooked set and its dir is correctly excluded; a dir created after the
+/// enumeration is not considered at all. The reverse order (ledger, then dirs)
+/// would flag every dir born in between as an orphan, which is the bug this
+/// whole feature could most easily have shipped.
+///
+/// A missing `runs/` is a camp that has never cooked, not an error.
+pub fn orphaned_run_dirs(
+    conn: &Connection,
+    camp_root: &Path,
+) -> Result<Vec<OrphanRunDir>, CoreError> {
+    let root = runs_dir(camp_root);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(CoreError::Cook(format!(
+                "cannot read {}: {e}",
+                root.display()
+            )));
+        }
+    };
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| CoreError::Cook(format!("cannot read {}: {e}", root.display())))?;
+        // Directories only. A stray FILE under runs/ is not a run dir, and
+        // this sweep's job is not to have opinions about it.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        dirs.push((run_id_of(&entry.file_name(), &entry.path())?, entry.path()));
+    }
+    // …dirs enumerated. NOW the ledger.
+    let cooked = cooked_run_ids(conn)?;
+    let mut orphans: Vec<OrphanRunDir> = dirs
+        .into_iter()
+        .filter(|(run_id, _)| !cooked.contains(run_id))
+        .map(|(run_id, path)| {
+            let idle = dir_idle(&path);
+            OrphanRunDir { run_id, path, idle }
+        })
+        .collect();
+    orphans.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+    Ok(orphans)
+}
+
+/// A run dir's name as a run id, or a HARD ERROR if it is not UTF-8.
+///
+/// Skipping it silently was the tempting move and it is wrong twice over. Such
+/// a name can never equal a UTF-8 ledger run_id, so it is NECESSARILY an
+/// orphan — and a skip means `--orphan-runs` prints "no orphaned run
+/// directories" while one sits on the disk. That is invariant 3 ("nothing
+/// hidden") violated in the exact surface whose whole job is reporting.
+/// `export.rs` already treats a non-UTF-8 run dir name as a hard error; camp
+/// gets one answer to this question, not two.
+fn run_id_of(name: &std::ffi::OsStr, path: &Path) -> Result<String, CoreError> {
+    name.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| CoreError::Cook(format!("run dir {} has a non-UTF-8 name", path.display())))
+}
+
+/// How long since this dir was last written. `None` on any unreadable mtime or
+/// an mtime in the FUTURE (a clock skew we cannot reason about) — both mean
+/// "cannot prove it is idle", which the caller reads as "do not delete".
+fn dir_idle(path: &Path) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    std::time::SystemTime::now().duration_since(modified).ok()
+}
+
+/// What one sweep did: what it removed, and what it deliberately left alone.
+///
+/// `spared` is reported BY THE SWEEP, not re-derived by a second scan. A later
+/// scan sees a different instant — it can name a dir created after the sweep
+/// finished — and a report that can disagree with the action it describes is
+/// worse than no report at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepReport {
+    pub swept: Vec<OrphanRunDir>,
+    /// Orphans left in place because their age did not clear the grace window,
+    /// or could not be computed at all.
+    pub spared: Vec<OrphanRunDir>,
+}
+
+/// Remove the orphaned run dirs that clear the grace window; return exactly
+/// what was removed AND what was spared. NEVER called automatically — not by
+/// `reconcile`, not on campd start. The operator asks, or it does not happen
+/// (#124).
+///
+/// The caller is responsible for the OTHER half of the race defense (campd
+/// must be down); this half is the grace window, re-checked against a FRESH
+/// stat immediately before each removal so a dir a cook touched since the scan
+/// is spared.
+pub fn sweep_orphan_run_dirs(
+    conn: &Connection,
+    camp_root: &Path,
+) -> Result<SweepReport, CoreError> {
+    let mut report = SweepReport {
+        swept: Vec::new(),
+        spared: Vec::new(),
+    };
+    for orphan in orphaned_run_dirs(conn, camp_root)? {
+        let fresh = OrphanRunDir {
+            idle: dir_idle(&orphan.path),
+            ..orphan
+        };
+        if !fresh.sweepable() {
+            report.spared.push(fresh);
+            continue;
+        }
+        std::fs::remove_dir_all(&fresh.path)
+            .map_err(|e| CoreError::Cook(format!("cannot remove {}: {e}", fresh.path.display())))?;
+        report.swept.push(fresh);
+    }
+    Ok(report)
+}
+
 /// The dead-end batch for a run that can never advance (its pinned dir is
 /// unreadable, so campd has no structure to execute): close every open
 /// run bead `skipped`, the root `fail`, and finalize hard — evented,
@@ -866,9 +1038,77 @@ pub fn dead_end_inputs(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
+
+    /// Review finding 2 (MEDIUM). `sweepable()`'s `is_some_and` is the single
+    /// branch between an age we cannot compute and deleting live run state, and
+    /// nothing guarded it: `is_some_and` -> `is_none_or` survived the FULL
+    /// workspace. Unknown age is NOT "old enough".
+    ///
+    /// Mutation caught: `is_some_and` -> `is_none_or` in `sweepable()` -> RED.
+    #[test]
+    fn an_orphan_of_UNKNOWN_AGE_is_NEVER_sweepable() {
+        let unknown = OrphanRunDir {
+            run_id: "20260705T211403-x".to_owned(),
+            path: PathBuf::from("/nonexistent"),
+            idle: None,
+        };
+        assert!(
+            !unknown.sweepable(),
+            "an age that could not be computed must never clear the grace window"
+        );
+    }
+
+    /// The window's two sides, pinned: one second short does not sweep.
+    #[test]
+    fn sweepable_is_exactly_the_grace_window() {
+        let at = |idle| OrphanRunDir {
+            run_id: "20260705T211403-x".to_owned(),
+            path: PathBuf::from("/nonexistent"),
+            idle: Some(idle),
+        };
+        assert!(!at(ORPHAN_RUN_SWEEP_GRACE - std::time::Duration::from_secs(1)).sweepable());
+        assert!(at(ORPHAN_RUN_SWEEP_GRACE).sweepable());
+    }
+
+    /// Review finding 3 (LOW). A non-UTF-8 run dir name can NEVER equal a UTF-8
+    /// ledger run_id, so it is necessarily an orphan — skipping it silently made
+    /// `--orphan-runs` print "no orphaned run directories" over a dir sitting on
+    /// disk. `export.rs` hard-errors on the same input; camp gets ONE answer.
+    ///
+    /// The dir cannot be CREATED on macOS (APFS rejects invalid UTF-8 with
+    /// EILSEQ), so the conversion is tested where it is decidable: on the
+    /// OsStr itself, which is constructible in memory on every platform.
+    ///
+    /// Mutation caught: return `Ok(String::new())` / restore the silent skip ->
+    /// no error -> RED.
+    #[test]
+    fn a_non_utf8_run_dir_name_is_a_HARD_ERROR_not_a_silent_skip() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(b"run-\xFF-bad");
+        assert!(
+            bad.to_str().is_none(),
+            "the fixture must really be non-UTF-8"
+        );
+
+        let err = run_id_of(bad, Path::new("/camp/runs/bad")).unwrap_err();
+        assert!(
+            format!("{err}").contains("non-UTF-8"),
+            "the error must name the reason: {err}"
+        );
+    }
+
+    #[test]
+    fn a_utf8_run_dir_name_converts_cleanly() {
+        let ok = std::ffi::OsStr::new("20260705T211403-abc123");
+        assert_eq!(
+            run_id_of(ok, Path::new("/camp/runs/x")).unwrap(),
+            "20260705T211403-abc123"
+        );
+    }
     use crate::config::RigConfig;
     use crate::event::{EventInput, EventType};
     use crate::formula::CookedRun;

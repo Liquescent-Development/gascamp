@@ -262,6 +262,27 @@ impl Ledger {
         crate::formula::runtime::orphaned_reservations(&self.conn)
     }
 
+    /// `runs/<id>/` dirs no `run.cooked` event names (#124). READ-ONLY: the
+    /// ledger says which run ids exist, the filesystem says which dirs do, and
+    /// the difference is the crash leftover.
+    pub fn orphaned_run_dirs(
+        &self,
+        camp_root: &std::path::Path,
+    ) -> Result<Vec<crate::formula::runtime::OrphanRunDir>, CoreError> {
+        crate::formula::runtime::orphaned_run_dirs(&self.conn, camp_root)
+    }
+
+    /// Remove the orphaned run dirs old enough to prove no cook is still
+    /// writing them, reporting what was swept AND what was spared. See
+    /// `sweep_orphan_run_dirs` — the caller owns the campd-must-be-down half of
+    /// the race defense.
+    pub fn sweep_orphan_run_dirs(
+        &self,
+        camp_root: &std::path::Path,
+    ) -> Result<crate::formula::runtime::SweepReport, CoreError> {
+        crate::formula::runtime::sweep_orphan_run_dirs(&self.conn, camp_root)
+    }
+
     /// A bead row by id.
     pub fn bead_row(&self, bead: &str) -> Result<Option<crate::readiness::BeadRow>, CoreError> {
         crate::readiness::get_bead(&self.conn, bead)
