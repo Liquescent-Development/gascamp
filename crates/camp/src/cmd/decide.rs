@@ -31,8 +31,22 @@ pub fn decision_request(
     if !matches!(decision.as_str(), "allow" | "allow_always" | "deny") {
         bail!("unknown decision {decision:?} — one of allow | allow_always | deny");
     }
-    if decision == "deny" && reason.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    let said = reason.as_deref().map(str::trim).unwrap_or("");
+    if decision == "deny" && said.is_empty() {
         bail!("a `deny` decision must carry a reason (the operator's message the worker sees)");
+    }
+    // The CONVERSE rule, and it is not cosmetic: campd's allow response
+    // (`ParentMessage::PermissionAllow`) has NO message field, so a reason
+    // attached to an allow reaches nobody. Accepting it would silence the
+    // operator without telling them — the worker resumes believing it was
+    // allowed with no comment, and the operator believes they said something.
+    // Fail fast instead (invariant 5): if you have something to tell the worker,
+    // that is what a deny's reason is for.
+    if decision != "deny" && !said.is_empty() {
+        bail!(
+            "an `{decision}` decision carries no message to the worker — {said:?} would be \
+             silently dropped, so it is refused rather than swallowed (only `deny` sends a reason)"
+        );
     }
     Ok(Request::SessionPermissionDecision {
         session,
@@ -118,6 +132,29 @@ mod tests {
     fn an_allow_needs_no_reason() {
         assert!(req("allow", None).is_ok());
         assert!(req("allow_always", None).is_ok());
+        assert!(req("allow", Some("   ")).is_ok(), "blank is not a message");
+    }
+
+    /// ...and an allow may not CARRY one. campd's allow response
+    /// (`ParentMessage::PermissionAllow`) has no message field, so a reason on an
+    /// allow reaches nobody: accepting it would silence the operator without
+    /// telling them. Refuse it loudly instead of swallowing it (invariant 5).
+    ///
+    /// This binds BOTH surfaces because both share this validator: `camp decide
+    /// … allow --reason x` was silently dropping the reason too.
+    #[test]
+    fn an_allow_may_not_carry_a_message_the_worker_would_never_see() {
+        for decision in ["allow", "allow_always"] {
+            let e = req(decision, Some("go ahead"))
+                .expect_err("an allow carrying a message must be refused, not silently dropped");
+            let msg = e.to_string();
+            assert!(
+                msg.contains("carries no message") && msg.contains("go ahead"),
+                "the error must name the rule and the dropped text: {msg}"
+            );
+        }
+        // A deny is the surface that DOES carry the operator's words.
+        assert!(req("deny", Some("not on prod")).is_ok());
     }
 
     /// The validated output is the WIRE REQUEST itself, carrying every field

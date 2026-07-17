@@ -295,21 +295,99 @@ pub enum Action {
     Interrupt,
     Detach,
     /// A permission answer typed at a BLOCKED worker (§5.2/#120): `/allow`,
-    /// `/allow_always`, or `/deny <reason>`.
+    /// `/allow_always`, `/deny <reason>`, or any of those naming a question —
+    /// `/allow <request_id>`, `/deny <request_id> <reason>`.
     ///
-    /// The request_id is NOT here BY DESIGN — the operator never retypes an id
-    /// the view already read off the frame it rendered for them. `reason` is
-    /// everything after the verb; whether it is REQUIRED is `camp decide`'s rule
-    /// to enforce (`decide::decision_request`), never a second copy here.
+    /// `tail` is the RAW text after the verb, unsplit BY DESIGN: whether its
+    /// first token is a request_id or the first word of a reason depends on WHICH
+    /// QUESTIONS ARE PENDING, which a line parser cannot know. `PendingPermissions
+    /// ::resolve` decides that against the live set; splitting it here would be a
+    /// guess made in the one place with no evidence.
     Decide {
         decision: String,
-        reason: Option<String>,
+        tail: Option<String>,
     },
+}
+
+/// The BLOCKED questions this view has rendered and not yet seen answered.
+///
+/// A SET, NOT ONE ID. Nothing serializes a worker's `can_use_tool` requests: the
+/// CLI issues parallel tool calls, the ledger keys `permissions` on `request_id`
+/// with a NON-UNIQUE `session`, and `pending_permission_for_session`'s `LIMIT 1`
+/// concedes the plural. A view holding one slot would overwrite the older
+/// question on every new one — answering the wrong worker's ask, or stranding a
+/// question the operator can still see on their screen but can no longer answer,
+/// which is the exact defect #120 exists to remove.
+///
+/// Owned as a type, not inlined in `run`, so the state machine is REACHABLE BY
+/// TESTS: the concurrency-adjacent half of this feature is the half that must
+/// not be proven only through a daemon and a socket.
+#[derive(Debug, Default, PartialEq)]
+pub struct PendingPermissions {
+    /// Arrival order — the order the operator saw them scroll past.
+    ids: Vec<String>,
+}
+
+impl PendingPermissions {
+    pub fn new() -> PendingPermissions {
+        PendingPermissions::default()
+    }
+
+    /// The printer rendered a question. IDEMPOTENT: a cursor-0 subscribe REPLAYS
+    /// history, so the same `control_request` frame legitimately arrives twice —
+    /// listing it twice would make one question look like two and turn a bare
+    /// `/allow` into a refusal to guess between an id and itself.
+    pub fn record(&mut self, id: String) {
+        if !self.ids.contains(&id) {
+            self.ids.push(id);
+        }
+    }
+
+    /// campd settled this question. An unknown id is a no-op: campd is the
+    /// authority on what is decided, and this view is only a mirror of it.
+    pub fn answered(&mut self, id: &str) {
+        self.ids.retain(|known| known != id);
+    }
+
+    /// Which question a typed answer targets, and the reason to send with it.
+    ///
+    /// A tail whose FIRST TOKEN names a pending question targets it (the rest is
+    /// the reason) — the only way to answer anything but the sole question on the
+    /// floor. Otherwise the whole tail is the reason and the target must be
+    /// unambiguous. The target ALWAYS comes from the pending set, so it is
+    /// impossible to answer a question this view has not seen asked.
+    pub fn resolve(&self, decision: &str, tail: Option<&str>) -> Result<(String, Option<String>)> {
+        let tail = tail.map(str::trim).filter(|t| !t.is_empty());
+        let split = tail.map(|t| t.split_once(char::is_whitespace).unwrap_or((t, "")));
+        let (target, reason) = match split {
+            Some((head, rest)) if self.ids.iter().any(|known| known == head) => {
+                (head.to_owned(), rest)
+            }
+            _ => (self.sole_question(decision)?, tail.unwrap_or("")),
+        };
+        let reason = reason.trim();
+        Ok((target, (!reason.is_empty()).then(|| reason.to_owned())))
+    }
+
+    /// The single question a BARE verb may answer — or a refusal to guess.
+    fn sole_question(&self, decision: &str) -> Result<String> {
+        match self.ids.as_slice() {
+            [] => bail!("nothing is BLOCKED in this view — there is no permission to answer"),
+            [only] => Ok(only.clone()),
+            many => bail!(
+                "{} permissions are pending — name the one you mean: /{decision} <request_id>{}. \
+                 pending: {}",
+                many.len(),
+                if decision == "deny" { " <reason>" } else { "" },
+                many.join(", ")
+            ),
+        }
+    }
 }
 
 /// Map an input line to an action. A blank line or `/q` detaches; `/interrupt`
 /// interrupts; a leading `/allow`//`/allow_always`//`/deny` is a permission
-/// answer, carrying any trailing text as its reason; anything else is a turn.
+/// answer carrying the raw trailing text; anything else is a turn.
 pub fn parse_action(line: &str) -> Action {
     let trimmed = line.trim();
     let (verb, rest) = trimmed
@@ -319,12 +397,12 @@ pub fn parse_action(line: &str) -> Action {
         "" | "/q" | "/quit" => Action::Detach,
         "/interrupt" => Action::Interrupt,
         _ if matches!(verb, "/allow" | "/allow_always" | "/deny") => {
-            let reason = rest.trim();
+            let tail = rest.trim();
             Action::Decide {
                 // The verb IS the decision vocabulary `camp decide` validates:
                 // `/allow_always` -> "allow_always". No mapping table to drift.
                 decision: verb.trim_start_matches('/').to_owned(),
-                reason: (!reason.is_empty()).then(|| reason.to_owned()),
+                tail: (!tail.is_empty()).then(|| tail.to_owned()),
             }
         }
         other => Action::Turn(other.to_owned()),
@@ -423,10 +501,10 @@ pub fn run(
     // Long-lived now: no read timeout (a quiet stream is not a wedged daemon -- §4.4).
     reader.get_ref().set_read_timeout(None)?;
 
-    // The BLOCKED question currently on the floor, as the PRINTER read it off the
-    // wire and the STEERING loop answers it (#120). This slot is why `/allow`
-    // needs no typed request_id: the view already saw the id it is showing.
-    let pending: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // The BLOCKED questions on the floor, as the PRINTER reads them off the wire
+    // and the STEERING loop answers them (#120). This is why `/allow` needs no
+    // typed request_id when there is only one question: the view already saw it.
+    let pending = Arc::new(Mutex::new(PendingPermissions::new()));
     let pending_writer = Arc::clone(&pending);
 
     // The stream reader runs on its own thread so the main thread can read stdin
@@ -460,10 +538,10 @@ pub fn run(
                             request_id: Some(id),
                         } = &out.kind
                         {
-                            let mut slot = pending_writer
+                            pending_writer
                                 .lock()
-                                .map_err(|_| anyhow!("the pending-permission slot is poisoned"))?;
-                            *slot = Some(id.clone());
+                                .map_err(|_| anyhow!("the pending-permission set is poisoned"))?
+                                .record(id.clone());
                         }
                         println!("{}", out.line);
                     }
@@ -527,43 +605,41 @@ pub fn run(
                     None => eprintln!("(campd went away; cannot interrupt)"),
                 }
             }
-            Action::Decide { decision, reason } => {
-                // #120: answer the question this view is showing, over the same
-                // `session.permission_decision` verb `camp decide` uses.
-                let request_id = pending
+            Action::Decide { decision, tail } => {
+                // #120: answer a question this view is showing, over the same
+                // `session.permission_decision` verb `camp decide` uses. Resolve
+                // the target against the LIVE pending set — never a guess.
+                let resolved = pending
                     .lock()
-                    .map_err(|_| anyhow!("the pending-permission slot is poisoned"))?
-                    .clone();
-                let Some(request_id) = request_id else {
-                    eprintln!(
-                        "(nothing is BLOCKED on {session} right now — there is no permission to answer)"
-                    );
-                    continue;
-                };
-                match decide::decision_request(
-                    session.clone(),
-                    request_id.clone(),
-                    decision,
-                    reason,
-                ) {
-                    // A bare `/deny` is the OPERATOR's slip, not the session's:
-                    // name the rule and stay attached. Detaching a live view over
-                    // a mistyped line would cost them the stream they are
-                    // answering from — and the worker is still safely BLOCKED.
+                    .map_err(|_| anyhow!("the pending-permission set is poisoned"))?
+                    .resolve(&decision, tail.as_deref());
+                let answer = resolved.and_then(|(request_id, reason)| {
+                    let request = decide::decision_request(
+                        session.clone(),
+                        request_id.clone(),
+                        decision,
+                        reason,
+                    )?;
+                    Ok((request_id, request))
+                });
+                match answer {
+                    // An unanswerable line — nothing pending, two questions and no
+                    // id, a bare `/deny`, a reason on an `/allow` — is the
+                    // OPERATOR's slip, not the session's: name the rule and stay
+                    // attached. Detaching a live view over a mistyped line would
+                    // cost them the stream they are answering from, and the worker
+                    // is still safely BLOCKED either way.
                     Err(e) => eprintln!("({e:#})"),
-                    Ok(request) => match socket::request_if_up(camp, &request) {
+                    Ok((request_id, request)) => match socket::request_if_up(camp, &request) {
                         Ok(Some(Response::PermissionDecided {
                             decision: recorded, ..
                         })) => {
-                            // Answered: the slot must not offer a stale id to the
-                            // next bare `/allow`. Clear it ONLY if the worker has
-                            // not already asked something new in the meantime.
-                            let mut slot = pending
+                            // campd settled it: drop it from the floor so a later
+                            // bare verb sees the questions that are actually left.
+                            pending
                                 .lock()
-                                .map_err(|_| anyhow!("the pending-permission slot is poisoned"))?;
-                            if slot.as_deref() == Some(request_id.as_str()) {
-                                *slot = None;
-                            }
+                                .map_err(|_| anyhow!("the pending-permission set is poisoned"))?
+                                .answered(&request_id);
                             eprintln!(
                                 "(recorded {recorded} for {request_id} on {session}, and delivered it to the worker)"
                             );
@@ -572,12 +648,15 @@ pub fn run(
                             eprintln!("(unexpected permission decision response: {other:?})")
                         }
                         Ok(None) => eprintln!("(campd went away; cannot deliver the decision)"),
-                        // campd REFUSED — "already decided by X" is §4's
-                        // first-answer-wins talking, i.e. campd ANSWERING the
-                        // operator, not a fault to tear the view down over. Loud
-                        // and complete (`{e:#}` carries the whole error chain),
-                        // never swallowed; the operator decides what to do next.
-                        Err(e) => eprintln!("(the decision was refused: {e:#})"),
+                        // NOT necessarily a refusal: this Err is campd's
+                        // `Response::Error` (a real "already decided by X"), OR a
+                        // wedged campd, OR campd going away mid-request, OR a
+                        // malformed line. Only the first is campd saying no.
+                        // Calling them all "refused" would tell the operator the
+                        // question is SETTLED when nothing was delivered and the
+                        // worker is still BLOCKED — so name the one thing that is
+                        // true of all four: it did not get there.
+                        Err(e) => eprintln!("(the decision was not delivered: {e:#})"),
                     },
                 }
             }
@@ -861,17 +940,22 @@ mod tests {
     /// (#120). Before this, every one of these lines collapsed to a hint that
     /// told the operator to go open another terminal.
     #[test]
-    fn parse_action_maps_a_permission_keypress_to_its_decision_and_reason() {
-        let decide = |decision: &str, reason: Option<&str>| Action::Decide {
+    fn parse_action_maps_a_permission_keypress_to_its_decision_and_tail() {
+        let decide = |decision: &str, tail: Option<&str>| Action::Decide {
             decision: decision.into(),
-            reason: reason.map(str::to_owned),
+            tail: tail.map(str::to_owned),
         };
         assert_eq!(parse_action("/allow"), decide("allow", None));
         assert_eq!(parse_action("/allow_always"), decide("allow_always", None));
-        // The whole tail is the reason — a reason is a sentence, not one word.
+        // The tail is carried WHOLE and UNSPLIT: only the pending set knows
+        // whether "not" begins a reason or names a question.
         assert_eq!(
             parse_action("/deny not safe on prod"),
             decide("deny", Some("not safe on prod"))
+        );
+        assert_eq!(
+            parse_action("/deny cli-gc-1 not safe"),
+            decide("deny", Some("cli-gc-1 not safe"))
         );
         // A bare `/deny` parses; the MISSING REASON is `decide`'s rule to catch,
         // not something this parser silently invents a value for.
@@ -889,6 +973,172 @@ mod tests {
         );
     }
 
+    // ===== the pending-permission set (#120): the stateful half =============
+
+    fn pending(ids: &[&str]) -> PendingPermissions {
+        let mut p = PendingPermissions::new();
+        for id in ids {
+            p.record((*id).to_owned());
+        }
+        p
+    }
+
+    /// EXACTLY ONE question is the common case, and it keeps the convenience the
+    /// whole issue is about: a bare verb answers it, no id typed.
+    #[test]
+    fn a_bare_verb_answers_the_sole_question() {
+        let p = pending(&["cli-gc-1"]);
+        assert_eq!(
+            p.resolve("allow", None).unwrap(),
+            ("cli-gc-1".into(), None),
+            "a bare /allow must answer the only question on the floor"
+        );
+        assert_eq!(
+            p.resolve("deny", Some("not on prod")).unwrap(),
+            ("cli-gc-1".into(), Some("not on prod".into())),
+            "the whole tail is the reason when it names no question"
+        );
+    }
+
+    /// NOTHING pending: there is no question to answer, and no id may be invented.
+    #[test]
+    fn an_empty_floor_has_nothing_to_answer() {
+        let e = pending(&[]).resolve("allow", None).unwrap_err();
+        assert!(
+            e.to_string().contains("nothing is BLOCKED"),
+            "must say the floor is empty: {e}"
+        );
+        // Even NAMING an id cannot conjure a question this view never saw.
+        let e = pending(&[]).resolve("allow", Some("cli-gc-1")).unwrap_err();
+        assert!(e.to_string().contains("nothing is BLOCKED"), "{e}");
+    }
+
+    /// THE CORE OF FINDING 2: with two questions on the floor, a bare verb must
+    /// REFUSE and name them. Guessing (e.g. answering the newest) would answer a
+    /// question the operator did not mean, silently — strictly worse than making
+    /// them type an id.
+    #[test]
+    fn a_bare_verb_refuses_to_guess_between_two_questions() {
+        let p = pending(&["cli-gc-1", "cli-gc-2"]);
+        for decision in ["allow", "allow_always", "deny"] {
+            let e = p.resolve(decision, None).unwrap_err();
+            let msg = e.to_string();
+            assert!(
+                msg.contains("name the one you mean"),
+                "/{decision} must refuse to guess: {msg}"
+            );
+            // The operator cannot choose what they are not shown.
+            assert!(
+                msg.contains("cli-gc-1") && msg.contains("cli-gc-2"),
+                "/{decision}'s refusal must name every pending id: {msg}"
+            );
+        }
+        // A tail that names NO pending question is a reason, not a target — so it
+        // is still ambiguous and still refused, never applied to a guess.
+        let e = p.resolve("deny", Some("too risky")).unwrap_err();
+        assert!(e.to_string().contains("name the one you mean"), "{e}");
+    }
+
+    /// Naming a question targets EXACTLY it — including the OLDER one, which a
+    /// single-slot view would have overwritten and lost.
+    #[test]
+    fn naming_a_question_targets_exactly_it() {
+        let p = pending(&["cli-gc-1", "cli-gc-2"]);
+        assert_eq!(
+            p.resolve("allow", Some("cli-gc-1")).unwrap(),
+            ("cli-gc-1".into(), None),
+            "the OLDER question must still be answerable"
+        );
+        assert_eq!(
+            p.resolve("allow", Some("cli-gc-2")).unwrap(),
+            ("cli-gc-2".into(), None)
+        );
+        // The head is the target and THE REST IS THE REASON — a reason is a
+        // sentence, and its first word must not be mistaken for an id.
+        assert_eq!(
+            p.resolve("deny", Some("cli-gc-2 not on prod")).unwrap(),
+            ("cli-gc-2".into(), Some("not on prod".into()))
+        );
+    }
+
+    /// It must be IMPOSSIBLE to answer a question this view has not seen asked:
+    /// the target always comes from the pending set. A typo'd id with one question
+    /// on the floor is read as a reason (and an allow then refuses it, since an
+    /// allow carries no message) — never sent to campd as an id.
+    #[test]
+    fn an_unknown_id_is_never_a_target() {
+        let p = pending(&["cli-gc-1"]);
+        // With ONE question the tail is a reason, so a deny still targets the only
+        // question — the unknown id never becomes the request_id on the wire.
+        assert_eq!(
+            p.resolve("deny", Some("cli-typo not on prod")).unwrap(),
+            ("cli-gc-1".into(), Some("cli-typo not on prod".into()))
+        );
+        // With TWO it is refused rather than guessed.
+        let e = pending(&["cli-gc-1", "cli-gc-2"])
+            .resolve("allow", Some("cli-typo"))
+            .unwrap_err();
+        assert!(e.to_string().contains("name the one you mean"), "{e}");
+    }
+
+    /// `record` is IDEMPOTENT: a cursor-0 subscribe REPLAYS history, so the same
+    /// control_request frame legitimately arrives twice. Listing it twice would
+    /// make one question look like two and turn a bare `/allow` into a refusal to
+    /// choose between an id and itself.
+    #[test]
+    fn recording_a_replayed_question_twice_leaves_one_question() {
+        let mut p = pending(&["cli-gc-1"]);
+        p.record("cli-gc-1".to_owned());
+        assert_eq!(
+            p.ids,
+            ["cli-gc-1"],
+            "a replayed frame duplicated a question"
+        );
+        assert_eq!(
+            p.resolve("allow", None).unwrap(),
+            ("cli-gc-1".into(), None),
+            "a duplicate made the sole question unanswerable"
+        );
+    }
+
+    /// An ANSWERED question leaves the floor — so a later bare verb sees what is
+    /// actually left. Without this the set only grows: answer the first of two and
+    /// a bare `/allow` still refuses, naming a question campd already settled.
+    #[test]
+    fn an_answered_question_leaves_the_floor() {
+        let mut p = pending(&["cli-gc-1", "cli-gc-2"]);
+        p.answered("cli-gc-1");
+        assert_eq!(p.ids, ["cli-gc-2"]);
+        // One question left: the bare verb's convenience comes BACK.
+        assert_eq!(
+            p.resolve("allow", None).unwrap(),
+            ("cli-gc-2".into(), None),
+            "answering one question must restore the bare verb for the last one"
+        );
+        p.answered("cli-gc-2");
+        assert_eq!(p.ids, [] as [String; 0]);
+        assert!(p.resolve("allow", None).is_err(), "the floor is empty now");
+    }
+
+    /// `answered` removes ONLY its own id, and an unknown id is a no-op: campd is
+    /// the authority on what is settled, and this view only mirrors it.
+    #[test]
+    fn answering_one_question_does_not_remove_another() {
+        let mut p = pending(&["cli-gc-1", "cli-gc-2"]);
+        p.answered("cli-nonexistent");
+        assert_eq!(
+            p.ids,
+            ["cli-gc-1", "cli-gc-2"],
+            "an unknown id disturbed the floor"
+        );
+        p.answered("cli-gc-2");
+        assert_eq!(
+            p.ids,
+            ["cli-gc-1"],
+            "answering cli-gc-2 removed the wrong question"
+        );
+    }
+
     /// The verb IS the wire vocabulary: `/allow_always` must send "allow_always",
     /// never "allow". The three decisions are NOT interchangeable — `allow_always`
     /// widens the worker's allowlist for the rest of the session, and silently
@@ -902,7 +1152,7 @@ mod tests {
                 parse_action(&line),
                 Action::Decide {
                     decision: verb.into(),
-                    reason: Some("a reason".into()),
+                    tail: Some("a reason".into()),
                 },
                 "{line} did not parse to the {verb} decision"
             );
