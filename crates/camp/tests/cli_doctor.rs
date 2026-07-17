@@ -189,3 +189,95 @@ fn doctor_refold_repair_restores_BEAD_METADATA_including_a_drain_reservation() {
         Some("superpowers.implementer")
     );
 }
+
+/// The same defect class as the test above, for `beads.final_disposition`
+/// (#122): `refold::STATE_TABLES` names the `beads` columns EXPLICITLY, and a
+/// column missing from that list is a column `--refold` cannot diff and
+/// `--repair` silently NULLs out — `replace_state_from_shadow` inserts only the
+/// listed columns, so a rebuild would drop every disposition camp ever
+/// recorded. "0 drift rows" over an undiffed column is a vacuous pass, which is
+/// exactly how this hides.
+///
+/// Drives the REAL binary: a disposition is recorded, corrupted behind the
+/// fold's back, DETECTED as drift, and RESTORED from the event log.
+///
+/// Mutation caught: remove `final_disposition` from the `beads` `cols` in
+/// refold.rs — the drift goes unseen (`--refold` exits 0) → RED.
+#[test]
+fn doctor_refold_repair_restores_a_beads_FINAL_DISPOSITION() {
+    let dir = tempfile::tempdir().unwrap();
+    let camp_root = seeded_camp(dir.path());
+
+    {
+        let mut ledger = Ledger::open_with_clock(
+            &camp_root.join("camp.db"),
+            Box::new(FixedClock::new("2026-07-05T21:14:03Z")),
+        )
+        .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "test".into(),
+                bead: Some("gc-9".into()),
+                data: serde_json::json!({"title": "exhausted"}),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some("gc".into()),
+                actor: "campd".into(),
+                bead: Some("gc-9".into()),
+                data: serde_json::json!({
+                    "outcome": "fail",
+                    "final_disposition": "soft_fail",
+                    "reason": "check budget (2) exhausted",
+                }),
+            })
+            .unwrap();
+    }
+
+    // A healthy ledger refolds CLEAN — the disposition round-trips through the shadow.
+    camp()
+        .current_dir(dir.path())
+        .args(["doctor", "--refold"])
+        .assert()
+        .success();
+
+    // CORRUPT the column behind the fold's back.
+    {
+        let conn = rusqlite::Connection::open(camp_root.join("camp.db")).unwrap();
+        conn.execute(
+            "UPDATE beads SET final_disposition = 'hard_fail' WHERE id = 'gc-9'",
+            [],
+        )
+        .unwrap();
+    }
+
+    // …the refold must SEE it (a column it does not diff is a column it cannot repair).
+    camp()
+        .current_dir(dir.path())
+        .args(["doctor", "--refold"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("gc-9"));
+
+    // …and --repair must RESTORE it from the log, not drop it.
+    camp()
+        .current_dir(dir.path())
+        .args(["doctor", "--refold", "--repair"])
+        .assert()
+        .success();
+
+    let ledger = Ledger::open_read_only(&camp_root.join("camp.db")).unwrap();
+    assert_eq!(
+        ledger
+            .bead_metadata("gc-9")
+            .unwrap()
+            .get("gc.final_disposition")
+            .map(String::as_str),
+        Some("soft_fail"),
+        "the disposition is restored from the event log, not NULLed by the rebuild"
+    );
+}

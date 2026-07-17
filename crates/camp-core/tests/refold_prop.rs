@@ -219,31 +219,47 @@ fn feed(ledger: &mut Ledger, ops: &[Op]) -> u64 {
     accepted
 }
 
-const DUMPS: &[(&str, &str)] = &[
-    (
-        "beads",
-        "id, rig, type, title, description, status, assignee, claimed_by, outcome, close_reason, labels, run_id, step_id, created_ts, updated_ts, closed_ts",
-    ),
-    ("bead_meta", "bead_id, key, value"),
-    ("deps", "bead_id, needs_id"),
-    (
-        "sessions",
-        "name, agent, rig, claude_session_id, transcript_path, pid, status, bead, spawned_ts, ended_ts",
-    ),
-    ("search", "bead_id, kind, content"),
-    ("counters", "prefix, high"),
-    (
-        "permissions",
-        "request_id, session, tool_name, status, decision, decided_by, requested_ts, decided_ts",
-    ),
-    ("events", "seq, ts, type, rig, actor, bead, data"),
+/// The tables this property compares — columns are DERIVED from the schema
+/// (`pragma_table_info`), never hand-listed.
+///
+/// This list used to carry its own copy of every column name, which made it a
+/// THIRD hand-maintained transcript of the `beads` columns (after the DDL and
+/// `refold::STATE_TABLES`) — and it had already rotted: `work_outcome`,
+/// `work_commit`, `work_branch` and `dispatch_failure` were all missing, so the
+/// property silently stopped covering them, and #122's `final_disposition`
+/// would have been the fifth. A property that quietly ignores new columns is
+/// how a fold bug reaches an operator. Deriving the columns means every column
+/// a state table ever grows is covered the day it is added, with nothing to
+/// remember.
+const DUMPS: &[&str] = &[
+    "beads",
+    "bead_meta",
+    "deps",
+    "sessions",
+    "search",
+    "counters",
+    "permissions",
+    "events",
 ];
 
 fn dump_state(db: &std::path::Path) -> Vec<String> {
     let conn = rusqlite::Connection::open(db).unwrap();
     let mut out = Vec::new();
-    for (table, cols) in DUMPS {
-        let quoted: Vec<String> = cols.split(", ").map(|c| format!("quote({c})")).collect();
+    for table in DUMPS {
+        let mut info = conn
+            .prepare("SELECT name FROM pragma_table_info(?1)")
+            .unwrap();
+        let names: Vec<String> = info
+            .query_map([table], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "{table}: pragma_table_info returned nothing — is the table named right?"
+        );
+        let cols = names.join(", ");
+        let quoted: Vec<String> = names.iter().map(|c| format!("quote({c})")).collect();
         let sql = format!(
             "SELECT {} FROM {table} ORDER BY {cols}",
             quoted.join(" || '|' || ")

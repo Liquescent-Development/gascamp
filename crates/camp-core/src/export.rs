@@ -982,17 +982,22 @@ mod tests {
     /// the needle disappears → RED.
     #[test]
     fn final_disposition_exports_as_gc_native_metadata() {
-        let mut bead = full_bead();
-        bead.outcome = Some("fail".into());
-        bead.work_outcome = None;
-        bead.work_commit = None;
-        bead.work_branch = None;
-        bead.final_disposition = Some("hard_fail".into());
-        let line = jsonl_line(&bd_record(&bead).unwrap()).unwrap();
-        assert!(
-            line.contains(r#""gc.final_disposition":"hard_fail""#),
-            "{line}"
-        );
+        // EVERY value camp's close vocabulary accepts must reach a city —
+        // `soft_fail` is half the vocabulary and exporting only `hard_fail`
+        // would be the same half-done round-trip #122 is about.
+        for disposition in crate::vocab::CAMP_FINAL_DISPOSITIONS {
+            let mut bead = full_bead();
+            bead.outcome = Some("fail".into());
+            bead.work_outcome = None;
+            bead.work_commit = None;
+            bead.work_branch = None;
+            bead.final_disposition = Some((*disposition).to_owned());
+            let line = jsonl_line(&bd_record(&bead).unwrap()).unwrap();
+            assert!(
+                line.contains(&format!(r#""gc.final_disposition":"{disposition}""#)),
+                "{line}"
+            );
+        }
         // additive: a bead without a disposition emits none of the key
         let plain = jsonl_line(&bd_record(&minimal_bead()).unwrap()).unwrap();
         assert!(!plain.contains("gc.final_disposition"), "{plain}");

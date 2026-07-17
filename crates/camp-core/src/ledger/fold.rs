@@ -1826,6 +1826,64 @@ mod tests {
         );
     }
 
+    /// The close vocabulary and the column CHECK are TWO hand-maintained lists
+    /// (`vocab::CAMP_FINAL_DISPOSITIONS` and the `beads` DDL). They agree
+    /// today, and the fold is strictly stronger (it also requires `outcome =
+    /// "fail"`), so no value the fold accepts is currently rejected by the
+    /// CHECK — but nothing PINS them. Add a value to the vocabulary alone and
+    /// the fold waves it through while SQLite rejects the write: a constraint
+    /// error mid-append instead of a validation, on the one path that is
+    /// supposed to fail fast with a reason. Exactly the hazard BD9 pins for
+    /// `SCHEMA_VERSION`'s two homes.
+    ///
+    /// So: EVERY disposition camp's close vocabulary accepts must actually
+    /// STORE — which is also the only place `soft_fail` is driven to a reader.
+    ///
+    /// Mutation caught: add `"controller_error"` (a real gc disposition camp
+    /// deliberately does not take at close) to `CAMP_FINAL_DISPOSITIONS`
+    /// without touching the CHECK → the append fails on the constraint → RED.
+    #[test]
+    fn every_final_disposition_the_vocabulary_accepts_actually_persists() {
+        let (_dir, mut ledger) = temp_ledger();
+        for (i, disposition) in crate::vocab::CAMP_FINAL_DISPOSITIONS.iter().enumerate() {
+            let bead = format!("gc-{}", i + 1);
+            ledger
+                .append(EventInput {
+                    kind: EventType::BeadCreated,
+                    rig: Some("gc".into()),
+                    actor: "cli".into(),
+                    bead: Some(bead.clone()),
+                    data: serde_json::json!({ "title": "work" }),
+                })
+                .unwrap();
+            ledger
+                .append(EventInput {
+                    kind: EventType::BeadClosed,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: Some(bead.clone()),
+                    data: serde_json::json!({
+                        "outcome": "fail",
+                        "final_disposition": disposition,
+                    }),
+                })
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "the fold accepts {disposition:?} but storing it failed — the CHECK and \
+                         CAMP_FINAL_DISPOSITIONS have drifted apart: {e:?}"
+                    )
+                });
+            assert_eq!(
+                ledger
+                    .bead_metadata(&bead)
+                    .unwrap()
+                    .get("gc.final_disposition")
+                    .map(String::as_str),
+                Some(*disposition),
+            );
+        }
+    }
+
     /// The other half of the projection contract: a NULL column contributes no
     /// key — absent, not empty. A close with no disposition (the common case)
     /// must not invent one.
