@@ -86,7 +86,7 @@ Consequences camp's exporter encodes:
 | `work_outcome` (`shipped`/`no-op`/`blocked`/`abandoned`) | `metadata."gc.work_outcome"` | when set; gc's WorkOutcome vocabulary verbatim |
 | `work_commit` | `metadata."gc.work_commit"` | when set (only `shipped` carries an artifact) |
 | `work_branch` | `metadata."gc.work_branch"` | when set (only `shipped` carries an artifact) |
-| *(no source yet — see below)* | `metadata."gc.final_disposition"` | defined; emitted once camp records one; legal values `hard_fail`/`soft_fail` |
+| `final_disposition` (`hard_fail`/`soft_fail`) | `metadata."gc.final_disposition"` | when set; campd stamps it at retry exhaustion, and only a `fail` bead carries one |
 | `close_reason` | `close_reason` | when set |
 | `closed_ts` | `closed_at` | RFC3339, when set |
 | `created_ts` | `created_at` | RFC3339 |
@@ -137,10 +137,6 @@ reference, which is what gc's pack discovery expects.
   in `beads.jsonl`).
 - Per-memory timestamps, rig, and status — bd memories are a KV store;
   each memory bead exports as its `key` (bead id) and `value` (the fact).
-- `metadata."gc.final_disposition"` — the mapping is defined (values
-  mirror camp's `hard_fail`/`soft_fail` vocabulary), but no camp
-  component records a final disposition yet; the key is emitted once one
-  exists.
 - Untranslatable orders when `--skip-untranslatable` was passed — each
   skip is named on stderr.
 - External `[packs]` agent layers — the export ships the camp-local

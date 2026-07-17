@@ -71,6 +71,7 @@ pub const EXCLUSIVE_DRAIN_RESERVATION: &str = "gc.exclusive_drain_reservation";
 pub const PROJECTED_METADATA: &[(&str, &str)] = &[
     ("gc.routed_to", "assignee"),
     ("gc.work_branch", "work_branch"),
+    ("gc.final_disposition", "final_disposition"),
 ];
 
 pub(crate) fn row_to_bead(row: &rusqlite::Row<'_>) -> rusqlite::Result<BeadRow> {
@@ -209,15 +210,17 @@ pub fn bead_metadata(conn: &Connection, bead: &str) -> Result<BTreeMap<String, S
         out.insert(k, v);
     }
     // The projections. A NULL column contributes no key — absent, not empty.
-    let mut stmt = conn.prepare("SELECT assignee, work_branch FROM beads WHERE id = ?1")?;
-    let cols: Option<(Option<String>, Option<String>)> = stmt
-        .query_row([bead], |r| Ok((r.get(0)?, r.get(1)?)))
+    let mut stmt =
+        conn.prepare("SELECT assignee, work_branch, final_disposition FROM beads WHERE id = ?1")?;
+    let cols: Option<(Option<String>, Option<String>, Option<String>)> = stmt
+        .query_row([bead], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;
-    if let Some((assignee, work_branch)) = cols {
+    if let Some((assignee, work_branch, final_disposition)) = cols {
         for (key, column) in PROJECTED_METADATA {
             let value = match *column {
                 "assignee" => assignee.clone(),
                 "work_branch" => work_branch.clone(),
+                "final_disposition" => final_disposition.clone(),
                 other => {
                     return Err(CoreError::Corrupt(format!(
                         "PROJECTED_METADATA names column {other:?}, which bead_metadata does not read"
