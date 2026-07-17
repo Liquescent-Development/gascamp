@@ -33,7 +33,7 @@ use camp_core::error::CoreError;
 use camp_core::event::{Event, EventInput, EventType};
 use camp_core::ledger::Ledger;
 use camp_core::orders::cron::{CatchUp, CronHeap, Fire};
-use camp_core::orders::parse::compile_orders;
+use camp_core::orders::parse::compile_all_orders;
 use camp_core::orders::{
     FireCause, Order, PendingCook, Trigger, completion_input, event_trigger_matches, execute_fire,
     fired_input, pending_cook_from_fired,
@@ -70,10 +70,11 @@ pub struct OrdersRuntime {
 }
 
 impl OrdersRuntime {
-    /// Load camp.toml, compile its orders, and arm the heap at `now`. A
-    /// config that does not parse, or a cron order that never fires, is a
-    /// hard error: campd refuses to run with broken declared automation
-    /// (fail fast).
+    /// Load camp.toml, compile its ACTIVE orders — local `[[order]]` tables
+    /// plus the imported pack orders `[orders] enabled` names (the money
+    /// invariant) — and arm the heap at `now`. A config that does not parse,
+    /// or a cron order that never fires, is a hard error: campd refuses to
+    /// run with broken declared automation (fail fast).
     pub fn build(camp_root: &Path, now: Timestamp, tz: TimeZone) -> Result<Self> {
         let config_path = camp_root.join("camp.toml");
         let raw = std::fs::read_to_string(&config_path)
@@ -232,7 +233,9 @@ fn compile_and_arm(
     // resolution (dispatcher routing, issue #28) needs it to resolve
     // relative pack paths and the local agents/ layer.
     config.root = Some(camp_root.to_path_buf());
-    let orders = compile_orders(&config).context("compiling [[order]] tables")?;
+    let orders = compile_all_orders(&config)
+        .context("compiling orders")?
+        .active;
     let mut heap = CronHeap::new(tz.clone());
     for order in &orders {
         if matches!(order.trigger, Trigger::Cron { .. }) {
@@ -1219,6 +1222,138 @@ mod tests {
         let (_dir, ledger) = fixture("");
         let now = ts("2026-07-06T07:40:00Z");
         assert_eq!(catch_up_anchor(&ledger, now).unwrap(), now);
+    }
+
+    /// A gc order file (as an imported pack ships it) shaped to fire on a
+    /// cron schedule / an event. The formula name resolves against the
+    /// camp-local `formulas/` the fixture writes.
+    const IMPORTED_CRON_ORDER: &str =
+        "[order]\nformula = \"one-step\"\ntrigger = \"cron\"\nschedule = \"0 8 * * *\"\n";
+    const IMPORTED_EVENT_ORDER: &str =
+        "[order]\nformula = \"one-step\"\ntrigger = \"event\"\non = \"bead.closed\"\n";
+
+    /// A camp root whose `bmad` import really ships `orders/nightly.toml`
+    /// (the given gc order body) — namespaced `bmad.nightly`. `enabled`
+    /// toggles the `[orders] enabled` list (the money invariant). The
+    /// formula the order names resolves via the camp-local `formulas/`.
+    fn imported_fixture(order_body: &str, enabled: &[&str]) -> (tempfile::TempDir, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut toml = format!("{BASE_TOML}[imports.bmad]\nsource=\"file:///x\"\n");
+        if !enabled.is_empty() {
+            toml.push_str(&format!(
+                "\n[orders]\nenabled = [{}]\n",
+                enabled
+                    .iter()
+                    .map(|e| format!("\"{e}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        std::fs::write(dir.path().join("camp.toml"), toml).unwrap();
+        std::fs::create_dir_all(dir.path().join("formulas")).unwrap();
+        std::fs::write(
+            dir.path().join("formulas/one-step.toml"),
+            "formula = \"one-step\"\n\n[[steps]]\nid = \"s1\"\ntitle = \"one step\"\n",
+        )
+        .unwrap();
+        let od = dir.path().join("imports/bmad/orders");
+        std::fs::create_dir_all(&od).unwrap();
+        std::fs::write(od.join("nightly.toml"), order_body).unwrap();
+        let ledger = Ledger::open(&dir.path().join("camp.db")).unwrap();
+        (dir, ledger)
+    }
+
+    /// #117: an ENABLED imported cron order is compiled AND armed on the
+    /// heap — imported orders fire, not just local `[[order]]` tables.
+    #[test]
+    fn an_enabled_imported_cron_order_is_armed() {
+        let (dir, _ledger) = imported_fixture(IMPORTED_CRON_ORDER, &["bmad.nightly"]);
+        let rt = runtime(&dir, "2026-07-06T07:20:00Z");
+        assert!(
+            rt.order("bmad.nightly").is_some(),
+            "the enabled imported order must be compiled into the runtime"
+        );
+        assert!(
+            rt.poll_timeout(ts("2026-07-06T07:20:00Z")).is_some(),
+            "and armed on the cron heap"
+        );
+    }
+
+    /// #117 money invariant: a DISABLED imported order is neither compiled
+    /// nor armed — it stays inert.
+    #[test]
+    fn a_disabled_imported_order_is_not_armed() {
+        let (dir, _ledger) = imported_fixture(IMPORTED_CRON_ORDER, &[]);
+        let rt = runtime(&dir, "2026-07-06T07:20:00Z");
+        assert!(
+            rt.order("bmad.nightly").is_none(),
+            "money invariant: a disabled imported order must never arm"
+        );
+        assert_eq!(
+            rt.poll_timeout(ts("2026-07-06T07:20:00Z")),
+            None,
+            "nothing armed on the heap"
+        );
+    }
+
+    /// #117: an ENABLED imported EVENT order fires through settle on a
+    /// matching event — the same fire path as a local event order.
+    #[test]
+    fn settle_fires_an_enabled_imported_event_order() {
+        let (dir, mut ledger) = imported_fixture(IMPORTED_EVENT_ORDER, &["bmad.nightly"]);
+        let mut rt = runtime(&dir, "2026-07-06T07:20:00Z");
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"title":"work"}),
+            })
+            .unwrap();
+        let close_seq = ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({"outcome":"pass"}),
+            })
+            .unwrap();
+        settle_all(&mut ledger, &mut rt);
+        let fired = ledger.events_of_type(EventType::OrderFired).unwrap();
+        assert_eq!(
+            fired.len(),
+            1,
+            "the enabled imported event order must fire on a matching event"
+        );
+        assert_eq!(fired[0].data["order"], "bmad.nightly");
+        assert_eq!(fired[0].data["trigger"], "event");
+        assert_eq!(fired[0].data["cause_seq"], close_seq);
+    }
+
+    /// #117 regression: campd MUST start when an imported pack ships a
+    /// DISABLED order camp cannot compile — a Gas City trigger outside camp's
+    /// cron/event subset (the real gastown pack ships `trigger = "cooldown"`).
+    /// Routing campd's startup through the full inventory must not let a
+    /// never-armed order brick the daemon (the money invariant).
+    #[test]
+    fn campd_build_tolerates_an_unsupported_disabled_imported_order() {
+        let (dir, _ledger) = imported_fixture(
+            "[order]\nformula = \"one-step\"\ntrigger = \"cooldown\"\ninterval = \"24h\"\n",
+            &[], // disabled — never armed, so its unknown trigger is inert
+        );
+        let rt = OrdersRuntime::build(dir.path(), ts("2026-07-06T07:20:00Z"), TimeZone::UTC)
+            .expect("campd must start with an unsupported DISABLED imported order present");
+        assert!(
+            rt.order("bmad.nightly").is_none(),
+            "the unsupported order never arms"
+        );
+        assert_eq!(
+            rt.poll_timeout(ts("2026-07-06T07:20:00Z")),
+            None,
+            "nothing armed on the heap"
+        );
     }
 
     #[test]

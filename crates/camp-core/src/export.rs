@@ -4,7 +4,7 @@
 //! appends nothing to camp's own ledger. Field-level mapping tables:
 //! docs/reference/export.md.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use rusqlite::Connection;
@@ -417,23 +417,50 @@ fn write_file(path: &Path, content: impl AsRef<[u8]>) -> Result<(), CoreError> {
     std::fs::write(path, content).map_err(|e| export_io("write", path, &e))
 }
 
-/// Translate every `[[order]]`; any untranslatable order fails the whole
-/// export (before a single byte is written) unless the caller opted out.
+/// Translate every ACTIVE order — local `[[order]]` tables plus the
+/// imported pack orders `[orders] enabled` names (the money invariant:
+/// disabled imported orders are inert and never exported). Any
+/// untranslatable order fails the whole export (before a single byte is
+/// written) unless the caller opted out.
 fn translate_all_orders(
     config: &CampConfig,
     options: &ExportOptions,
     report: &mut ExportReport,
 ) -> Result<Vec<(String, GcOrderFile)>, CoreError> {
-    let compiled = crate::orders::parse::compile_orders(config)?;
+    let active = crate::orders::parse::compile_all_orders(config)?.active;
+    // The compiled `Order` carries everything `translate_order` reads except
+    // `catch_up_window` — that only survives on the raw `[[order]]` config.
+    // Inline orders have one; imported orders never declare it (they always
+    // compile to the default), so a synthetic raw reconstructed FROM the
+    // compiled order represents them faithfully and lines up by construction.
+    let raw_by_name: HashMap<&str, &OrderConfig> = config
+        .orders
+        .iter()
+        .map(|raw| (raw.name.as_str(), raw))
+        .collect();
     let mut translated = Vec::new();
     let mut skipped = Vec::new();
-    for (order, raw) in compiled.iter().zip(&config.orders) {
-        if order.name != raw.name {
-            return Err(CoreError::Corrupt(format!(
-                "compiled order {:?} does not line up with config order {:?}",
-                order.name, raw.name
-            )));
-        }
+    for order in &active {
+        let synthetic;
+        let raw = match raw_by_name.get(order.name.as_str()) {
+            // Keyed BY name, so the old positional-zip lineup check is
+            // unreachable by construction — the lookup IS the lineup.
+            Some(inline) => *inline,
+            None => {
+                // An imported order: no inline `[[order]]`. Synthesize a raw
+                // that carries no `catch_up_window` (imported orders always
+                // compile to the default) and no `rig` (always None) — so
+                // `translate_order` treats it as a plain cron/event order.
+                synthetic = OrderConfig {
+                    name: order.name.clone(),
+                    on: String::new(),
+                    formula: order.formula.clone(),
+                    rig: None,
+                    catch_up_window: None,
+                };
+                &synthetic
+            }
+        };
         match translate_order(order, raw) {
             OrderTranslation::Translated { name, file } => translated.push((name, file)),
             OrderTranslation::Untranslatable { name, reason } => {
@@ -1069,6 +1096,93 @@ prefix = "gc"
         assert!(reasons[1].1.contains("rig"), "{}", reasons[1].1);
         assert_eq!(reasons[2].0, "caught-up");
         assert!(reasons[2].1.contains("catch_up_window"), "{}", reasons[2].1);
+    }
+
+    /// A camp root whose `bmad` import ships `orders/nightly.toml` + the
+    /// formula it names — namespaced `bmad.nightly`. `enabled` toggles the
+    /// `[orders] enabled` list (the money invariant).
+    fn camp_with_imported_order(root: &std::path::Path, enabled: bool) {
+        let mut toml =
+            String::from("[camp]\nname=\"golden\"\n\n[imports.bmad]\nsource=\"file:///x\"\n");
+        if enabled {
+            toml.push_str("\n[orders]\nenabled = [\"bmad.nightly\"]\n");
+        }
+        std::fs::write(root.join("camp.toml"), toml).unwrap();
+        let pack = root.join("imports/bmad");
+        std::fs::create_dir_all(pack.join("orders")).unwrap();
+        std::fs::create_dir_all(pack.join("formulas")).unwrap();
+        std::fs::write(
+            pack.join("orders/nightly.toml"),
+            "[order]\nformula = \"nightly-formula\"\ntrigger = \"cron\"\nschedule = \"0 2 * * *\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("formulas/nightly-formula.toml"),
+            "formula = \"nightly-formula\"\n",
+        )
+        .unwrap();
+    }
+
+    /// #123: an ENABLED imported order must be exported — its
+    /// `pack/orders/<binding>.<stem>.toml` written with the right formula
+    /// key and its referenced formula copied into `pack/formulas/`.
+    #[test]
+    fn export_writes_an_enabled_imported_order_and_its_formula() {
+        let (dir, ledger) = temp_ledger();
+        let camp_root = dir.path();
+        camp_with_imported_order(camp_root, true);
+        let cfg = crate::config::CampConfig::load(&camp_root.join("camp.toml")).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let city = out.path().join("city");
+        let report = export_city(
+            &ledger,
+            &cfg,
+            camp_root,
+            &city,
+            &ExportOptions {
+                skip_untranslatable: false,
+            },
+        )
+        .unwrap();
+        let order_file = city.join("pack/orders/bmad.nightly.toml");
+        assert!(
+            order_file.is_file(),
+            "the enabled imported order must be exported (namespaced filename)"
+        );
+        let text = std::fs::read_to_string(&order_file).unwrap();
+        assert!(text.contains("formula = \"nightly-formula\""), "{text}");
+        assert!(text.contains("trigger = \"cron\""), "{text}");
+        assert!(
+            city.join("pack/formulas/nightly-formula.toml").is_file(),
+            "the referenced formula must be copied into the pack"
+        );
+        assert_eq!(report.orders, 1);
+    }
+
+    /// #123 money invariant: a DISABLED imported order must NOT be exported.
+    #[test]
+    fn export_omits_a_disabled_imported_order() {
+        let (dir, ledger) = temp_ledger();
+        let camp_root = dir.path();
+        camp_with_imported_order(camp_root, false);
+        let cfg = crate::config::CampConfig::load(&camp_root.join("camp.toml")).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let city = out.path().join("city");
+        let report = export_city(
+            &ledger,
+            &cfg,
+            camp_root,
+            &city,
+            &ExportOptions {
+                skip_untranslatable: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            !city.join("pack/orders/bmad.nightly.toml").exists(),
+            "money invariant: a disabled imported order must NOT be exported"
+        );
+        assert_eq!(report.orders, 0);
     }
 
     #[test]
