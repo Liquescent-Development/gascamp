@@ -107,10 +107,12 @@ copy-pasteable; each command has a `/camp:*` equivalent where one exists.
 ## 3. Initialize a camp
 
 A **camp** is one directory (`.camp/`) holding the SQLite ledger (`camp.db`) and
-its config (`camp.toml`). Make a working directory and initialize it:
+its config (`camp.toml`). Make a working directory, turn it into a **git repo
+first**, then initialize the camp inside it:
 
 ```sh
 mkdir demo && cd demo
+git init -b work                    # git FIRST — see the note below
 camp init --no-service --no-import
 ```
 
@@ -119,7 +121,15 @@ initialized camp at /…/demo/.camp
 service: skipped (--no-service) — run `camp daemon --camp /…/demo/.camp` under your supervisor
 ```
 
-That created just two files — nothing hidden:
+**Why `git init` first.** The AI step (§8) makes this directory a **rig** —
+campd works in a git *worktree* of it and lands each worker's result as a
+commit, so it must be a git repo. Doing `git init` before `camp init` also lets
+camp write a `.gitignore` that keeps the live ledger (`camp.db`, run dirs,
+worktrees) out of git while leaving `camp.toml` — the config you *do* want
+tracked — committable. (If you only want the free lifecycle in §4.5 and never
+dispatch a worker, git is optional.)
+
+`camp init` created just two files — nothing hidden:
 
 ```sh
 ls -A .camp        # camp.db  camp.toml
@@ -175,13 +185,26 @@ demo    demo    /…/demo
 `camp.toml` is the source of truth for rigs — `rig add` appends a `[[rigs]]`
 block and records a `rig.added` event in the ledger.
 
-> **The rig is a real git repo.** When campd dispatches a worker it works in a
-> git worktree of the rig and lands the result as a commit, so the rig needs to
-> be a git repository with at least one commit. If `demo` is fresh:
-> ```sh
-> git init -b work && git add -A && git commit -m "baseline"
-> ```
-> (This matters for the AI step in §8, not for the free lifecycle in §4.5.)
+Now give the rig its **baseline commit**. campd builds a worker's worktree from
+the rig's latest commit, so a rig with *zero* commits can't host one. You
+`git init`'d in §3; add a file and commit so the rig has a base:
+
+```sh
+printf '#!/bin/sh\necho "toy ls"\n' > ls.sh   # something for a worker to touch
+git add -A && git commit -m "baseline"
+```
+
+> ⚠️ **The commit must actually land — this is the one easy mistake.** `git
+> commit` in a directory with nothing staged prints *"nothing to commit"* and
+> creates **no commit**, leaving the rig with no base. The AI step (§8) then
+> fails with `open:dispatch-failed … no git repository with a base commit`. That
+> is why we add a file first. (`git commit --allow-empty -m baseline` also gives
+> the rig a base if you truly want it empty.) camp's `.gitignore` keeps the
+> ledger out of this commit, so `git add -A` here is safe — it stages your file
+> and `camp.toml`, not `camp.db`.
+>
+> Already hit `dispatch-failed`? Fix the rig's commit as above, then re-arm the
+> bead: **`camp retry <bead>`** (campd re-dispatches it).
 
 ### 4.5. Warm-up: the free bead lifecycle ($0)
 
