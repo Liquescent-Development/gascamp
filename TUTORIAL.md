@@ -316,7 +316,7 @@ permission_mode = "acceptEdits"
 tools = ["Read", "Edit", "Write", "Bash"]
 ```
 
-Two rules worth internalizing:
+Three rules worth internalizing:
 
 - **Agents resolve as `<binding>.<agent>`.** `starter.dev` is the `dev` directory
   under the `starter` binding. `--agent starter.reviewer` routes to a specific
@@ -324,6 +324,18 @@ Two rules worth internalizing:
 - **No resolvable `tools` means no spawn** — a loud refusal that names the
   remedy, never a silent half-configured worker. A pack that ships `skills/`
   additionally needs `"Skill"` in the allowlist for its agents to resolve.
+- **`command` must be findable by campd, not just by you.** campd execs the
+  worker through *its own* process PATH — which is a snapshot from whenever campd
+  started, not your current shell. If that PATH lacks the directory holding
+  `claude` (Claude Code installs it in `~/.local/bin`), every dispatch fails with
+  `spawn failed: spawning claude: No such file or directory`. The robust fix is
+  to give the **absolute path** — run `which claude` and paste the result:
+  ```toml
+  command = "/Users/you/.local/bin/claude"   # `which claude` output, not just "claude"
+  ```
+  `command = "claude"` also works *if* campd's PATH resolves it (see the §7
+  troubleshooting note). See the README's [campd's
+  PATH](README.md#campds-path) for the supervised-campd version of this.
 
 ---
 
@@ -356,6 +368,17 @@ red: 0
 > Liveness *is* the socket (`.camp/campd.sock`) — no pidfiles. campd is
 > crash-only; `kill -9` loses nothing because all durable truth is the ledger.
 > `camp stop` shuts down a campd you started this way.
+
+> **If a dispatch later fails with `spawn failed: … No such file or directory`:**
+> this campd came up without `claude` on its PATH (see §6). Fix it and restart:
+> ```sh
+> camp stop
+> # set command = "$(which claude)" output as an absolute path in .camp/camp.toml
+> camp daemon --camp .camp &
+> camp retry <bead>          # re-arm the bead that failed
+> ```
+> A campd's PATH is fixed when it starts, so a plain restart from a shell where
+> `which claude` works also fixes it — the absolute path just makes it immune.
 
 ---
 
@@ -435,13 +458,23 @@ structure; the agents and your `check` scripts make every judgment.**
 
 A dispatched worker isn't a black box — campd holds its stdin and tails its
 output, so you can watch, steer, and answer it live. Each of these is a pure
-socket client (campd must be running):
+socket client (campd must be running).
+
+**First, get the worker's session name — don't guess it.** A session is named
+`<camp-name>/<agent>/<n>`, where `<camp-name>` is your camp directory's name (not
+the rig's) and `<n>` counts dispatches. Ask campd for the live ones:
 
 ```sh
-camp watch                       # the whole fleet, live — leave this open
-camp attach demo/starter.dev/1   # one worker's typed stream: tool calls, results, text
-camp nudge demo/starter.dev/1 "also update the README"   # send a turn into a running worker
-camp interrupt demo/starter.dev/1                        # stop its current turn
+camp sessions              # e.g.  demo/starter.dev/1   (yours reflects your camp dir + count)
+```
+
+Use that name (shown below as `<session>`):
+
+```sh
+camp watch                              # the whole fleet, live — leave this open
+camp attach <session>                   # one worker's typed stream: tool calls, results, text
+camp nudge <session> "also update the README"   # send a turn into a running worker
+camp interrupt <session>                # stop its current turn
 ```
 
 While attached, a line you type is a turn, `/interrupt` stops the turn, and `/q`
@@ -452,8 +485,8 @@ detaches.
 shows a BLOCKED row with a request id. Answer it:
 
 ```sh
-camp decide demo/starter.dev/1 <request-id> allow          # or allow_always | deny
-camp decide demo/starter.dev/1 <request-id> deny --reason "not on prod"
+camp decide <session> <request-id> allow          # or allow_always | deny
+camp decide <session> <request-id> deny --reason "not on prod"
 ```
 
 **Mail.** A worker escalates to you by sending mail:
