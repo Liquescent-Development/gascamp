@@ -135,6 +135,14 @@ dispatch a worker, git is optional.)
 ls -A .camp        # camp.db  camp.toml
 ```
 
+> **Use a fresh directory.** If you reuse a directory that ever held a camp, it
+> may still have a **leftover service unit** from that earlier life — `--no-service`
+> does not remove one that already exists. The symptom shows up later: `camp
+> stop` refuses with *"campd … is supervised by launchd/systemd."* Clear it with
+> `camp service uninstall` (run from the camp dir), which removes the unit and
+> returns the camp to the unsupervised, start-it-by-hand model this tutorial
+> uses. `camp service list` shows every camp that currently has a unit.
+
 > **Why the two flags — and what the real default is.** A **bare `camp init`**
 > is the batteries-included desktop path, and it's what you'll most likely run
 > for real. It does two extra things this tutorial deliberately turns off:
