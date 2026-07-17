@@ -25,6 +25,13 @@ enum Op {
     Close {
         id: u8,
         pass: bool,
+        /// Index into `CAMP_FINAL_DISPOSITIONS`, or `None` for a close that
+        /// carries no disposition. A FAILING close may carry one (the fold
+        /// requires `outcome = "fail"`), which is what actually populates
+        /// `beads.final_disposition` — deriving the compared columns makes the
+        /// property STRUCTURALLY cover a column, but only an op that writes a
+        /// non-NULL value makes the coverage real. NULL == NULL proves nothing.
+        disposition: Option<usize>,
     },
     Woke {
         session: u8,
@@ -102,14 +109,24 @@ fn to_input(op: &Op) -> EventInput {
             Some(bead_id(*id)),
             serde_json::json!({"title": format!("task {id} (updated)")}),
         ),
-        Op::Close { id, pass } => (
-            EventType::BeadClosed,
-            Some(bead_id(*id)),
-            serde_json::json!({
+        Op::Close {
+            id,
+            pass,
+            disposition,
+        } => {
+            let mut data = serde_json::json!({
                 "outcome": if *pass { "pass" } else { "fail" },
                 "reason": format!("closed task {id}"),
-            }),
-        ),
+            });
+            // Only a failing close may carry one; a passing close with a
+            // disposition is REFUSED by the fold, and `append` rolls back, so
+            // emitting it there would just shrink the accepted-op count.
+            if !*pass && let Some(i) = disposition {
+                data["final_disposition"] =
+                    serde_json::json!(camp_core::vocab::CAMP_FINAL_DISPOSITIONS[*i]);
+            }
+            (EventType::BeadClosed, Some(bead_id(*id)), data)
+        }
         Op::Woke { session } => (
             EventType::SessionWoke,
             None,
@@ -190,7 +207,16 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         (0u8..8, any::<bool>()).prop_map(|(id, with_needs)| Op::Create { id, with_needs }),
         (0u8..8, 0u8..4).prop_map(|(id, session)| Op::Claim { id, session }),
         (0u8..8).prop_map(|id| Op::Update { id }),
-        (0u8..8, any::<bool>()).prop_map(|(id, pass)| Op::Close { id, pass }),
+        (
+            0u8..8,
+            any::<bool>(),
+            proptest::option::of(0..camp_core::vocab::CAMP_FINAL_DISPOSITIONS.len()),
+        )
+            .prop_map(|(id, pass, disposition)| Op::Close {
+                id,
+                pass,
+                disposition,
+            }),
         (0u8..4).prop_map(|session| Op::Woke { session }),
         (0u8..4).prop_map(|session| Op::Stop { session }),
         (0u8..4).prop_map(|session| Op::Crash { session }),
@@ -219,31 +245,54 @@ fn feed(ledger: &mut Ledger, ops: &[Op]) -> u64 {
     accepted
 }
 
-const DUMPS: &[(&str, &str)] = &[
-    (
-        "beads",
-        "id, rig, type, title, description, status, assignee, claimed_by, outcome, close_reason, labels, run_id, step_id, created_ts, updated_ts, closed_ts",
-    ),
-    ("bead_meta", "bead_id, key, value"),
-    ("deps", "bead_id, needs_id"),
-    (
-        "sessions",
-        "name, agent, rig, claude_session_id, transcript_path, pid, status, bead, spawned_ts, ended_ts",
-    ),
-    ("search", "bead_id, kind, content"),
-    ("counters", "prefix, high"),
-    (
-        "permissions",
-        "request_id, session, tool_name, status, decision, decided_by, requested_ts, decided_ts",
-    ),
-    ("events", "seq, ts, type, rig, actor, bead, data"),
+/// The tables this property compares — columns are DERIVED from the schema
+/// (`pragma_table_info`), never hand-listed.
+///
+/// This list used to carry its own copy of every column name, which made it a
+/// THIRD hand-maintained transcript of the `beads` columns (after the DDL and
+/// `refold::STATE_TABLES`) — and it had already rotted: `work_outcome`,
+/// `work_commit`, `work_branch` and `dispatch_failure` were all missing, so the
+/// property silently stopped covering them, and #122's `final_disposition`
+/// would have been the fifth. A property that quietly ignores new columns is
+/// how a fold bug reaches an operator. Deriving the columns means every column
+/// a state table ever grows is compared the day it is added, with nothing to
+/// remember.
+///
+/// Deriving buys STRUCTURAL coverage only: a column no op ever populates is
+/// compared NULL to NULL, which proves nothing about the fold. `Op::Close`
+/// therefore emits a real `final_disposition`. The work axis
+/// (`work_outcome`/`work_commit`/`work_branch`) and `dispatch_failure` are
+/// still NULL-to-NULL here — no op writes them — so their real coverage lives
+/// in the daemon suite, not in this property.
+const DUMPS: &[&str] = &[
+    "beads",
+    "bead_meta",
+    "deps",
+    "sessions",
+    "search",
+    "counters",
+    "permissions",
+    "events",
 ];
 
 fn dump_state(db: &std::path::Path) -> Vec<String> {
     let conn = rusqlite::Connection::open(db).unwrap();
     let mut out = Vec::new();
-    for (table, cols) in DUMPS {
-        let quoted: Vec<String> = cols.split(", ").map(|c| format!("quote({c})")).collect();
+    for table in DUMPS {
+        let mut info = conn
+            .prepare("SELECT name FROM pragma_table_info(?1)")
+            .unwrap();
+        let names: Vec<String> = info
+            .query_map([table], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "{table}: pragma_table_info returned nothing — is the table named right?"
+        );
+        let cols = names.join(", ");
+        let quoted: Vec<String> = names.iter().map(|c| format!("quote({c})")).collect();
         let sql = format!(
             "SELECT {} FROM {table} ORDER BY {cols}",
             quoted.join(" || '|' || ")

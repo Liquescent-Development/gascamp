@@ -1,4 +1,4 @@
-//! Schema v4 for camp.db (spec §7.1/§7.4). One WAL-mode SQLite file: the
+//! Schema v5 for camp.db (spec §7.1/§7.4). One WAL-mode SQLite file: the
 //! append-only `events` table (history + bus) plus the state tables that are
 //! a fold of it. All tables are STRICT; opening a db with a different schema
 //! version is a hard error — no auto-upgrade in v1: the operator re-inits
@@ -11,7 +11,7 @@ use rusqlite::Connection;
 
 use crate::error::CoreError;
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// State tables only — everything `refold` rebuilds from the event log.
 /// (`cursors` is consumer bookkeeping, `meta`/`events` are not fold-derived.)
@@ -30,6 +30,13 @@ CREATE TABLE beads (
   work_outcome     TEXT CHECK (work_outcome IN ('shipped','no-op','blocked','abandoned')),
   work_commit      TEXT,
   work_branch      TEXT,
+  -- The retry-exhaustion classification campd stamps on a close (#122),
+  -- projected as `gc.final_disposition` (readiness::PROJECTED_METADATA). A
+  -- close NEVER carries "pass": the run-level pass disposition lives only in
+  -- `run.finalized` (vocab::CAMP_RUN_DISPOSITIONS). The fold enforces both this
+  -- vocabulary and "requires outcome = fail"; the CHECK is the storage-level
+  -- twin, so a hand-edited db cannot hold a disposition camp would refuse.
+  final_disposition TEXT CHECK (final_disposition IN ('hard_fail','soft_fail')),
   dispatch_failure TEXT,
   labels       TEXT NOT NULL DEFAULT '[]',
   run_id       TEXT,
@@ -109,7 +116,7 @@ CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 ) STRICT;
-INSERT INTO meta (key, value) VALUES ('schema_version', '4');
+INSERT INTO meta (key, value) VALUES ('schema_version', '5');
 
 CREATE TABLE events (
   seq   INTEGER PRIMARY KEY AUTOINCREMENT,

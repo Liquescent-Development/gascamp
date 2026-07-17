@@ -45,6 +45,10 @@ pub struct ExportBead {
     pub work_outcome: Option<String>,
     pub work_commit: Option<String>,
     pub work_branch: Option<String>,
+    /// #122: the retry-exhaustion classification campd stamps on a close —
+    /// exported as gc's native `gc.final_disposition`. Only a `fail` bead
+    /// carries one (the close fold's gate).
+    pub final_disposition: Option<String>,
 }
 
 pub(crate) fn export_beads(conn: &Connection) -> Result<Vec<ExportBead>, CoreError> {
@@ -58,12 +62,13 @@ pub(crate) fn export_beads(conn: &Connection) -> Result<Vec<ExportBead>, CoreErr
         needs_by_bead.entry(bead_id).or_default().push(needs_id);
     }
 
-    // The three work-axis columns are appended LAST so the existing
-    // column indices stay stable.
+    // The work-axis columns and `final_disposition` are appended LAST so the
+    // existing column indices stay stable.
     let mut stmt = conn.prepare(
         "SELECT id, rig, type, title, description, status, assignee, claimed_by,
                 outcome, close_reason, labels, run_id, step_id, created_ts,
-                updated_ts, closed_ts, work_outcome, work_commit, work_branch
+                updated_ts, closed_ts, work_outcome, work_commit, work_branch,
+                final_disposition
          FROM beads ORDER BY rowid",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -92,6 +97,7 @@ pub(crate) fn export_beads(conn: &Connection) -> Result<Vec<ExportBead>, CoreErr
             work_outcome: row.get(16)?,
             work_commit: row.get(17)?,
             work_branch: row.get(18)?,
+            final_disposition: row.get(19)?,
         })
     })?;
     let mut beads = Vec::new();
@@ -218,6 +224,12 @@ pub fn bd_record(bead: &ExportBead) -> Result<BdRecord, CoreError> {
     }
     if let Some(b) = &bead.work_branch {
         metadata.insert("gc.work_branch".into(), b.clone().into());
+    }
+    // #122: the retry-exhaustion disposition rides gc's own key, verbatim
+    // (beadmeta/keys.go at the pinned ref). Without this a fail-then-exhausted
+    // bead loses its classification on the way to a city.
+    if let Some(d) = &bead.final_disposition {
+        metadata.insert("gc.final_disposition".into(), d.clone().into());
     }
     let dependencies = bead
         .needs
@@ -907,6 +919,8 @@ mod tests {
             work_outcome: Some("shipped".into()),
             work_commit: Some("1111111111111111111111111111111111111111".into()),
             work_branch: Some("camp/gc-1".into()),
+            // `outcome = pass` — the close fold forbids a disposition here.
+            final_disposition: None,
         }
     }
 
@@ -932,6 +946,7 @@ mod tests {
             work_outcome: None,
             work_commit: None,
             work_branch: None,
+            final_disposition: None,
         }
     }
 
@@ -955,6 +970,37 @@ mod tests {
         // a bead without the axis emits NONE of the keys (additive)
         let plain = jsonl_line(&bd_record(&minimal_bead()).unwrap()).unwrap();
         assert!(!plain.contains("gc.work_"), "{plain}");
+    }
+
+    /// #122: the retry-exhaustion disposition rides gc's own key, verbatim
+    /// (`beadmeta/keys.go:104` `gc.final_disposition`), so a fail-then-exhausted
+    /// bead round-trips to a city instead of silently losing its
+    /// classification. Only `fail` beads carry one (the fold's gate), and the
+    /// key is additive: a bead without a disposition emits nothing.
+    ///
+    /// Mutation caught: drop the `metadata.insert("gc.final_disposition", …)` —
+    /// the needle disappears → RED.
+    #[test]
+    fn final_disposition_exports_as_gc_native_metadata() {
+        // EVERY value camp's close vocabulary accepts must reach a city —
+        // `soft_fail` is half the vocabulary and exporting only `hard_fail`
+        // would be the same half-done round-trip #122 is about.
+        for disposition in crate::vocab::CAMP_FINAL_DISPOSITIONS {
+            let mut bead = full_bead();
+            bead.outcome = Some("fail".into());
+            bead.work_outcome = None;
+            bead.work_commit = None;
+            bead.work_branch = None;
+            bead.final_disposition = Some((*disposition).to_owned());
+            let line = jsonl_line(&bd_record(&bead).unwrap()).unwrap();
+            assert!(
+                line.contains(&format!(r#""gc.final_disposition":"{disposition}""#)),
+                "{line}"
+            );
+        }
+        // additive: a bead without a disposition emits none of the key
+        let plain = jsonl_line(&bd_record(&minimal_bead()).unwrap()).unwrap();
+        assert!(!plain.contains("gc.final_disposition"), "{plain}");
     }
 
     #[test]

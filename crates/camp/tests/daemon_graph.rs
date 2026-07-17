@@ -320,6 +320,64 @@ fn check_budget_exhaustion_fails_the_run() {
     assert_refold_clean(&root);
 }
 
+/// #122: the anchor's retry-exhaustion disposition must SURVIVE its close.
+/// campd emitting it in the event is not enough — Phase 9 validated it in the
+/// fold and then dropped it, so it reached no reader and `camp export` could
+/// not emit it (a lossy round-trip against export's losslessness invariant).
+/// The test above asserts only the EVENT, which is exactly why the gap hid:
+/// this one drives the whole chain against a REAL campd — close →
+/// `beads.final_disposition` → projected `gc.final_disposition` → city.
+///
+/// Mutation caught: drop `final_disposition = ?6` from the fold's close UPDATE
+/// (nothing persists), or the exporter's `metadata.insert` (nothing emits) —
+/// either → RED.
+#[test]
+fn an_exhausted_anchors_disposition_persists_and_exports_to_a_city() {
+    const CHECKED_TWO: &str = "formula = \"checked\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n\
+        [[steps]]\nid = \"impl\"\ntitle = \"Implement\"\n\n[steps.check]\nmax_attempts = 2\n\n\
+        [steps.check.check]\nmode = \"exec\"\npath = \"verify.sh\"\ntimeout = \"1m\"\n";
+    let dir = tempfile::tempdir().unwrap();
+    let (root, rig) = scaffold(dir.path(), 10);
+    write_formula(&root, "checked", CHECKED_TWO);
+    write_script(&rig, "verify.sh", "#!/bin/sh\nexit 1\n"); // can never pass
+    let _campd = Daemon::spawn(&root, &[]);
+
+    sling_formula(&root, "checked");
+    wait_until(&root, "the exhausted run to finalize", |e| {
+        count(e, "run.finalized") == 1
+    });
+
+    // PERSISTED: the disposition is projected under gc's own key, so any
+    // reader sees it without knowing it lives in a column.
+    let city = dir.path().join("city");
+    camp_ok(&root, &["export", "--city", city.to_str().unwrap()]);
+    let beads = std::fs::read_to_string(city.join("beads.jsonl")).unwrap();
+    let exhausted: Vec<serde_json::Value> = beads
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["metadata"]["gc.final_disposition"] != serde_json::Value::Null)
+        .collect();
+
+    assert_eq!(
+        exhausted.len(),
+        1,
+        "exactly the exhausted anchor carries a disposition: {beads}"
+    );
+    let anchor = &exhausted[0];
+    assert_eq!(anchor["metadata"]["gc.final_disposition"], "hard_fail");
+    // Coherent with the axis it classifies: gc only reads a disposition off a
+    // failed bead, and the close names the budget that ran out.
+    assert_eq!(anchor["metadata"]["gc.outcome"], "fail");
+    assert!(
+        anchor["close_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("check budget (2) exhausted")),
+        "{anchor}"
+    );
+
+    assert_refold_clean(&root);
+}
+
 /// Master plan: "transient retry exhaustion → hard vs soft table".
 /// Rows: hard exhaustion fails the run; soft exhaustion without
 /// dependents completes it pass/soft_fail; soft exhaustion WITH a

@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc e45aded19654e7eb2e5b09c21299c6b442b2e875f3239bd880ef67fa73700bb8 # shrinks to ops = [Create { id: 2, with_needs: false }, SetMeta { id: 2, key: 0 }]
+cc eda43bed11958469ceda821b2b39a473b6394e2e82989f024119fcb129fa67c1 # shrinks to ops = [Create { id: 2, with_needs: false }, Close { id: 2, pass: false, disposition: Some(0) }]

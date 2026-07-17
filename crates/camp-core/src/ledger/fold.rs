@@ -512,14 +512,16 @@ fn bead_closed(conn: &Connection, event: &Event) -> Result<(), CoreError> {
             conn.execute(
                 "UPDATE beads SET status = 'closed', outcome = ?1, close_reason = ?2,
                                   work_outcome = ?3, work_commit = ?4, work_branch = ?5,
-                                  closed_ts = ?6, updated_ts = ?6
-                 WHERE id = ?7",
+                                  final_disposition = ?6,
+                                  closed_ts = ?7, updated_ts = ?7
+                 WHERE id = ?8",
                 params![
                     p.outcome,
                     p.reason,
                     p.work_outcome,
                     p.work_commit,
                     p.work_branch,
+                    p.final_disposition,
                     event.ts,
                     id
                 ],
@@ -1774,6 +1776,147 @@ mod tests {
             meta.get("gc.work_branch").map(String::as_str),
             Some("camp/pre"),
             "COALESCE must not clobber a pre-existing work_branch with NULL"
+        );
+    }
+
+    /// #122: a close-time `final_disposition` must be PERSISTED, not validated
+    /// and dropped. campd emits one at retry exhaustion (`dispatch.rs`), the
+    /// fold checked it against the vocabulary and then threw it away, so the
+    /// classification never reached a reader and `camp export` could not emit
+    /// it — a lossy round-trip against export's losslessness invariant.
+    ///
+    /// gc keeps it as bead metadata (`beadmeta/keys.go:104`); camp stores it in
+    /// the column its close UPDATE already writes and PROJECTS it under gc's
+    /// key, exactly as it does for `gc.routed_to` / `gc.work_branch`.
+    ///
+    /// Mutation caught: drop `final_disposition = ?6` from the close UPDATE —
+    /// the key vanishes from the metadata map → RED.
+    #[test]
+    fn close_persists_final_disposition_and_projects_it_under_gcs_key() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({ "title": "work" }),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: None,
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({
+                    "outcome": "fail",
+                    "final_disposition": "hard_fail",
+                }),
+            })
+            .unwrap();
+        assert_eq!(
+            ledger
+                .bead_metadata("gc-1")
+                .unwrap()
+                .get("gc.final_disposition")
+                .map(String::as_str),
+            Some("hard_fail"),
+            "a validated final_disposition must survive the close, not be discarded (#122)"
+        );
+    }
+
+    /// The close vocabulary and the column CHECK are TWO hand-maintained lists
+    /// (`vocab::CAMP_FINAL_DISPOSITIONS` and the `beads` DDL). They agree
+    /// today, and the fold is strictly stronger (it also requires `outcome =
+    /// "fail"`), so no value the fold accepts is currently rejected by the
+    /// CHECK — but nothing PINS them. Add a value to the vocabulary alone and
+    /// the fold waves it through while SQLite rejects the write: a constraint
+    /// error mid-append instead of a validation, on the one path that is
+    /// supposed to fail fast with a reason. Exactly the hazard BD9 pins for
+    /// `SCHEMA_VERSION`'s two homes.
+    ///
+    /// So: EVERY disposition camp's close vocabulary accepts must actually
+    /// STORE — which is also the only place `soft_fail` is driven to a reader.
+    ///
+    /// Mutation caught: add `"controller_error"` (a real gc disposition camp
+    /// deliberately does not take at close) to `CAMP_FINAL_DISPOSITIONS`
+    /// without touching the CHECK → the append fails on the constraint → RED.
+    #[test]
+    fn every_final_disposition_the_vocabulary_accepts_actually_persists() {
+        let (_dir, mut ledger) = temp_ledger();
+        for (i, disposition) in crate::vocab::CAMP_FINAL_DISPOSITIONS.iter().enumerate() {
+            let bead = format!("gc-{}", i + 1);
+            ledger
+                .append(EventInput {
+                    kind: EventType::BeadCreated,
+                    rig: Some("gc".into()),
+                    actor: "cli".into(),
+                    bead: Some(bead.clone()),
+                    data: serde_json::json!({ "title": "work" }),
+                })
+                .unwrap();
+            ledger
+                .append(EventInput {
+                    kind: EventType::BeadClosed,
+                    rig: None,
+                    actor: "campd".into(),
+                    bead: Some(bead.clone()),
+                    data: serde_json::json!({
+                        "outcome": "fail",
+                        "final_disposition": disposition,
+                    }),
+                })
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "the fold accepts {disposition:?} but storing it failed — the CHECK and \
+                         CAMP_FINAL_DISPOSITIONS have drifted apart: {e:?}"
+                    )
+                });
+            assert_eq!(
+                ledger
+                    .bead_metadata(&bead)
+                    .unwrap()
+                    .get("gc.final_disposition")
+                    .map(String::as_str),
+                Some(*disposition),
+            );
+        }
+    }
+
+    /// The other half of the projection contract: a NULL column contributes no
+    /// key — absent, not empty. A close with no disposition (the common case)
+    /// must not invent one.
+    ///
+    /// Mutation caught: persisting a literal `""`/`"hard_fail"` default instead
+    /// of the payload's `Option` — the key would appear → RED.
+    #[test]
+    fn a_close_without_a_final_disposition_projects_no_key() {
+        let (_dir, mut ledger) = temp_ledger();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadCreated,
+                rig: Some("gc".into()),
+                actor: "cli".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({ "title": "work" }),
+            })
+            .unwrap();
+        ledger
+            .append(EventInput {
+                kind: EventType::BeadClosed,
+                rig: None,
+                actor: "campd".into(),
+                bead: Some("gc-1".into()),
+                data: serde_json::json!({ "outcome": "pass" }),
+            })
+            .unwrap();
+        assert!(
+            !ledger
+                .bead_metadata("gc-1")
+                .unwrap()
+                .contains_key("gc.final_disposition"),
+            "an absent disposition must contribute no key"
         );
     }
 
