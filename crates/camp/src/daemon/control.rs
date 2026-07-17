@@ -3512,9 +3512,10 @@ mod tests {
     #[test]
     fn a_trickle_reader_that_never_moves_a_cap_per_window_is_dropped() {
         let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
-        // A cap (512 KiB) far larger than any socket buffer, so the socket fills
-        // before `out` hits the cap and there is no initial-fill credit; and a
-        // history far larger than the cap, so the source NEVER runs dry.
+        // A cap (512 KiB) far larger than the test socket buffer (`test_insert_subscriber`
+        // pins it to ≤ 32 KiB on every platform), so the socket saturates before `out`
+        // hits the cap and there is no material initial-fill credit; and a history far
+        // larger than the cap, so the source NEVER runs dry.
         let cap = 512 * 1024;
         let content = line.repeat(400_000); // ~13 MB
         let (_d, file, tail) = stream_file(content.as_bytes());
@@ -3529,10 +3530,11 @@ mod tests {
             Some(t0()),
             "the cap stopping the source must stamp `at_cap_since`"
         );
-        // The clock starts near-fresh: at most ONE socket buffer of the initial fill
-        // can land as headway (the write that races the stamp within a single pump),
-        // which against a 512 KiB cap is noise — the trickler below still cannot close
-        // the gap. It is emphatically NOT a whole cap's worth of spurious credit.
+        // The clock starts near-fresh: at most ONE socket buffer (≤ 32 KiB, ENFORCED in
+        // `test_insert_subscriber`) of the initial fill can land as headway — the write
+        // that races the stamp within a single pump. Against a 512 KiB cap that is
+        // noise; the trickler below still cannot close the gap. It is emphatically NOT
+        // a whole cap's worth of spurious credit.
         assert!(
             rt.test_sub(T).out.drained_at_cap < cap / 4,
             "the socket-fill write must not be miscounted as material headway (got {})",
@@ -3604,6 +3606,9 @@ mod tests {
     #[test]
     fn a_rate_limited_catch_up_that_moves_a_cap_per_window_survives() {
         let line = "{\"type\":\"assistant\",\"text\":\"x\"}\n";
+        // 512 KiB cap ≫ the pinned ≤ 32 KiB socket buffer (`test_insert_subscriber`),
+        // so the socket cannot swallow the backlog and `out` stays at the cap while the
+        // reader is behind — the exact state the old clear-on-empty rule would drop.
         let cap = 512 * 1024;
         let content = line.repeat(400_000); // ~13 MB — dwarfs everything drained below
         let (_d, file, tail) = stream_file(content.as_bytes());
@@ -5696,6 +5701,36 @@ impl ControlRuntime {
         tail: u64,
     ) -> (std::os::unix::net::UnixStream, Conn) {
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        // #121 PORTABILITY — PIN THE KERNEL SOCKET BUFFERS SMALL AND KNOWN. The R1b
+        // tests need the socket to saturate (WouldBlock) FAR below `cap` so that (a)
+        // the one-time initial fill cannot be miscounted as at-cap headway and (b)
+        // `out` stays pinned at the cap while a catch-up reader is behind. macOS's
+        // default AF_UNIX buffer (~8 KiB) does this by luck; the Linux default
+        // (~200 KiB+) does NOT — it swallowed >128 KiB of the initial fill as headway
+        // credit and red-CI'd both tests. Enforce the premise instead of inheriting
+        // it from the host. (Linux DOUBLES the requested SO_SNDBUF and enforces a
+        // ~4 KiB floor, so we read the ACTUAL size back and assert it, rather than
+        // assume the request took.) The send buffer on campd's writing end (`server`)
+        // is what bounds bytes in flight; the client's recv buffer is pinned too so no
+        // platform's flow control depends on the host default.
+        {
+            use socket2::SockRef;
+            SockRef::from(&server)
+                .set_send_buffer_size(8 * 1024)
+                .expect("set SO_SNDBUF on the test server socket");
+            SockRef::from(&client)
+                .set_recv_buffer_size(8 * 1024)
+                .expect("set SO_RCVBUF on the test client socket");
+            let eff = SockRef::from(&server)
+                .send_buffer_size()
+                .expect("read SO_SNDBUF back");
+            assert!(
+                eff <= 32 * 1024,
+                "test send buffer is {eff} B — not far below the R1b caps (64 KiB / \
+                 512 KiB); SO_SNDBUF did not take, so the socket-saturation premise is \
+                 UNENFORCED and the at-cap tests would depend on the host default"
+            );
+        }
         server.set_nonblocking(true).unwrap();
         // The CLIENT is non-blocking too, so test readers never need `setsockopt`
         // on a live socket (which flakes with EINVAL under parallel load) and never
