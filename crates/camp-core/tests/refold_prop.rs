@@ -25,6 +25,13 @@ enum Op {
     Close {
         id: u8,
         pass: bool,
+        /// Index into `CAMP_FINAL_DISPOSITIONS`, or `None` for a close that
+        /// carries no disposition. A FAILING close may carry one (the fold
+        /// requires `outcome = "fail"`), which is what actually populates
+        /// `beads.final_disposition` — deriving the compared columns makes the
+        /// property STRUCTURALLY cover a column, but only an op that writes a
+        /// non-NULL value makes the coverage real. NULL == NULL proves nothing.
+        disposition: Option<usize>,
     },
     Woke {
         session: u8,
@@ -102,14 +109,24 @@ fn to_input(op: &Op) -> EventInput {
             Some(bead_id(*id)),
             serde_json::json!({"title": format!("task {id} (updated)")}),
         ),
-        Op::Close { id, pass } => (
-            EventType::BeadClosed,
-            Some(bead_id(*id)),
-            serde_json::json!({
+        Op::Close {
+            id,
+            pass,
+            disposition,
+        } => {
+            let mut data = serde_json::json!({
                 "outcome": if *pass { "pass" } else { "fail" },
                 "reason": format!("closed task {id}"),
-            }),
-        ),
+            });
+            // Only a failing close may carry one; a passing close with a
+            // disposition is REFUSED by the fold, and `append` rolls back, so
+            // emitting it there would just shrink the accepted-op count.
+            if !*pass && let Some(i) = disposition {
+                data["final_disposition"] =
+                    serde_json::json!(camp_core::vocab::CAMP_FINAL_DISPOSITIONS[*i]);
+            }
+            (EventType::BeadClosed, Some(bead_id(*id)), data)
+        }
         Op::Woke { session } => (
             EventType::SessionWoke,
             None,
@@ -190,7 +207,16 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         (0u8..8, any::<bool>()).prop_map(|(id, with_needs)| Op::Create { id, with_needs }),
         (0u8..8, 0u8..4).prop_map(|(id, session)| Op::Claim { id, session }),
         (0u8..8).prop_map(|id| Op::Update { id }),
-        (0u8..8, any::<bool>()).prop_map(|(id, pass)| Op::Close { id, pass }),
+        (
+            0u8..8,
+            any::<bool>(),
+            proptest::option::of(0..camp_core::vocab::CAMP_FINAL_DISPOSITIONS.len()),
+        )
+            .prop_map(|(id, pass, disposition)| Op::Close {
+                id,
+                pass,
+                disposition,
+            }),
         (0u8..4).prop_map(|session| Op::Woke { session }),
         (0u8..4).prop_map(|session| Op::Stop { session }),
         (0u8..4).prop_map(|session| Op::Crash { session }),
@@ -229,8 +255,15 @@ fn feed(ledger: &mut Ledger, ops: &[Op]) -> u64 {
 /// property silently stopped covering them, and #122's `final_disposition`
 /// would have been the fifth. A property that quietly ignores new columns is
 /// how a fold bug reaches an operator. Deriving the columns means every column
-/// a state table ever grows is covered the day it is added, with nothing to
+/// a state table ever grows is compared the day it is added, with nothing to
 /// remember.
+///
+/// Deriving buys STRUCTURAL coverage only: a column no op ever populates is
+/// compared NULL to NULL, which proves nothing about the fold. `Op::Close`
+/// therefore emits a real `final_disposition`. The work axis
+/// (`work_outcome`/`work_commit`/`work_branch`) and `dispatch_failure` are
+/// still NULL-to-NULL here — no op writes them — so their real coverage lives
+/// in the daemon suite, not in this property.
 const DUMPS: &[&str] = &[
     "beads",
     "bead_meta",
