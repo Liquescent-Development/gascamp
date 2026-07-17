@@ -616,24 +616,52 @@ fn run_add_materialize(
     // nested `pack.toml` camp did not compose (e.g. gascity/roles/). Report each
     // so the operator imports it explicitly rather than wondering why its agents
     // do not resolve.
-    let mut nested_packs: Vec<serde_json::Value> = Vec::new();
+    let mut nested_packs: Vec<NestedPack> = Vec::new();
     for imp in &all {
         if imp.via.is_none() {
             continue;
         }
         let dir = layer_of(imp);
         for nested in find_nested_pack_tomls(&dir)? {
+            // `rel` is the nested pack's path RELATIVE to the materialized
+            // transitive layer (e.g. `roles`) — a camp-internal location.
             let rel = nested
                 .strip_prefix(&dir)
                 .unwrap_or(&nested)
                 .parent()
                 .unwrap_or(std::path::Path::new(""))
-                .display()
-                .to_string();
+                .to_string_lossy()
+                .replace('\\', "/");
+            // Its REAL location in the source repo: the transitive import's own
+            // subpath (e.g. `gascity`) joined with `rel` (#137). That — not the
+            // top-level binding — is what an explicit re-import must name.
+            let source_subpath = match &imp.subpath {
+                Some(s) if !rel.is_empty() => format!("{s}/{rel}"),
+                Some(s) => s.clone(),
+                None => rel.clone(),
+            };
             let name = read_manifest(nested.parent().unwrap_or(&dir))
                 .map(|m| m.pack.name)
                 .unwrap_or_default();
-            nested_packs.push(serde_json::json!({ "path": rel, "name": name }));
+            // A runnable `camp import add` source for exactly this nested pack.
+            // Remote: the same repo + ref, subpath swapped to the real one.
+            // Local: the pack's directory on disk (`repo_dir` is the source
+            // repo root, never camp's internal `.transitive` copy).
+            let import_source = if src.is_local_path {
+                repo_dir.join(&source_subpath).display().to_string()
+            } else {
+                let mut s = format!("{}//{}", src.repository, source_subpath);
+                if let Some(reference) = &src.reference {
+                    s.push('#');
+                    s.push_str(reference);
+                }
+                s
+            };
+            nested_packs.push(NestedPack {
+                source_subpath,
+                name,
+                import_source,
+            });
         }
     }
 
@@ -655,7 +683,11 @@ fn run_add_materialize(
             "ignored_keys": ignored_keys.iter().cloned().collect::<Vec<_>>(),
             "reported": serde_json::json!({
                 "unbound_bindings": unbound_bindings.iter().cloned().collect::<Vec<_>>(),
-                "nested_packs": nested_packs,
+                "nested_packs": nested_packs.iter().map(|np| serde_json::json!({
+                    "subpath": np.source_subpath,
+                    "name": np.name,
+                    "import_source": np.import_source,
+                })).collect::<Vec<_>>(),
             }),
             "exec_inventory": exec_json,
         }),
@@ -702,13 +734,38 @@ fn run_add_materialize(
         );
     }
     for np in &nested_packs {
-        eprintln!(
-            "note: nested pack at {} ({}) — camp did not compose it; import it explicitly with \
-             `camp import add <source>//{}/{} --name <binding>`",
-            np["path"], np["name"], binding, np["path"]
-        );
+        eprintln!("{}", nested_pack_note(np));
     }
     Ok(())
+}
+
+/// A nested pack (§7.3) camp materialized but did not compose. `gc` does not
+/// auto-compose nested packs either (its `DiscoverPackAgents` scans
+/// `<pack>/agents/` only), so the corpus deploys `gascity/roles` by exactly
+/// the explicit import this reports.
+struct NestedPack {
+    /// The nested pack's location in the SOURCE repo — the transitive import's
+    /// own subpath joined with the pack's path inside that layer (e.g.
+    /// `gascity/roles`). NOT the top-level binding, NOT the layer-relative path.
+    source_subpath: String,
+    /// The nested pack's declared `[pack].name` (e.g. `gc-roles`).
+    name: String,
+    /// A copy-pasteable `camp import add` source that re-imports this pack:
+    /// remote → `<repo>//<source_subpath>[#<ref>]`; local → the pack's dir.
+    import_source: String,
+}
+
+/// Render the §7.3 nested-pack note (#137): name the un-composed nested pack,
+/// its real source location, and a runnable `camp import add` that imports it
+/// explicitly. Only the binding is left as a placeholder — it is the one value
+/// the operator must choose (it must match the routes that reference it).
+fn nested_pack_note(np: &NestedPack) -> String {
+    format!(
+        "note: nested pack {:?} at {} was not composed — gc does not auto-compose nested packs \
+         either, so import it explicitly to use its agents:\n  \
+         camp import add \"{}\" --name <binding>",
+        np.name, np.source_subpath, np.import_source
+    )
 }
 
 /// Recursively find `pack.toml` files under `dir`, EXCLUDING `dir/pack.toml`
@@ -2083,9 +2140,139 @@ mod verb_tests {
             .events_of_type(camp_core::event::EventType::ImportAdded)
             .unwrap();
         let reported = added[0].data["reported"].to_string();
+        let np = &added[0].data["reported"]["nested_packs"][0];
+        // Bug a (#137): the reported location is the nested pack's REAL subpath
+        // in the source repo — the transitive import's subpath (`gascity`)
+        // joined with the pack's path inside that layer (`roles`) — NOT the
+        // top-level binding (`bmad/roles`) nor the bare layer-relative `roles`.
+        assert_eq!(
+            np["subpath"], "gascity/roles",
+            "nested pack must report its real source subpath: {reported}"
+        );
+        assert_eq!(np["name"], "gc-roles", "nested pack name: {reported}");
+        // The reported import source is a runnable `camp import add` argument
+        // that re-imports exactly this nested pack from the same repo.
+        let import_source = np["import_source"]
+            .as_str()
+            .unwrap_or_else(|| panic!("import_source must be a string: {reported}"));
         assert!(
-            reported.contains("roles") && reported.contains("gc-roles"),
-            "nested pack roles/ (gc-roles) must be reported: {reported}"
+            import_source.contains("//gascity/roles"),
+            "import_source must point at the real subpath: {import_source}"
+        );
+        assert!(
+            !import_source.contains("//bmad/roles"),
+            "import_source must not use the top-level binding as the path: {import_source}"
+        );
+    }
+
+    #[test]
+    fn add_reports_nested_pack_via_a_local_import_at_its_real_on_disk_path() {
+        // §7.3 / #137: a LOCAL import (not `file://` — the branch that renders
+        // `import_source` from `repo_dir.join(subpath)`) must report the nested
+        // pack's REAL on-disk source directory, never camp's internal
+        // `.transitive` materialization copy. The reported path must exist so
+        // the suggested `camp import add <path>` actually runs.
+        let repo = tempfile::tempdir().unwrap();
+        testsupport::init_repo(
+            repo.path(),
+            &[
+                (
+                    "bmad/pack.toml",
+                    "[pack]\nname=\"bmad\"\nschema=2\n[imports.gc]\nsource=\"../gascity\"\n",
+                ),
+                ("bmad/agents/a/prompt.md", "a"),
+                (
+                    "gascity/roles/pack.toml",
+                    "[pack]\nname=\"gc-roles\"\nschema=2\n",
+                ),
+            ],
+        );
+        let camp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            camp.path().join("camp.toml"),
+            "[camp]\nname=\"t\"\n[agent_defaults]\ntools=[\"Read\"]\n",
+        )
+        .unwrap();
+        camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        // An absolute local path — is_local_source treats it as a local import
+        // (no `://`), unlike the `file://` form the sibling test uses.
+        let local_src = repo.path().join("bmad");
+        run_add(
+            camp.path(),
+            local_src.to_str().unwrap(),
+            Some("bmad"),
+            None,
+            None,
+        )
+        .unwrap();
+        let led = camp_core::ledger::Ledger::open(&camp.path().join("camp.db")).unwrap();
+        let added = led
+            .events_of_type(camp_core::event::EventType::ImportAdded)
+            .unwrap();
+        let reported = added[0].data["reported"].to_string();
+        let np = &added[0].data["reported"]["nested_packs"][0];
+        assert_eq!(
+            np["subpath"], "gascity/roles",
+            "local nested pack must report its real source subpath: {reported}"
+        );
+        assert_eq!(np["name"], "gc-roles", "nested pack name: {reported}");
+        let import_source = np["import_source"]
+            .as_str()
+            .unwrap_or_else(|| panic!("import_source must be a string: {reported}"));
+        assert!(
+            import_source.ends_with("gascity/roles"),
+            "local import_source must be the on-disk source dir: {import_source}"
+        );
+        assert!(
+            !import_source.contains(".transitive"),
+            "local import_source must be the real source, never camp's \
+             internal .transitive copy: {import_source}"
+        );
+        assert!(
+            std::path::Path::new(import_source).is_dir(),
+            "local import_source must point at a directory that actually \
+             exists, so the suggested command runs: {import_source}"
+        );
+    }
+
+    #[test]
+    fn nested_pack_note_is_runnable_and_unquoted() {
+        // §7.3 / #137: the note names the un-composed nested pack, its real
+        // source subpath, and a COPY-PASTEABLE `camp import add` command — with
+        // no literal JSON quotes around the path (bug b) and the real subpath,
+        // not the top-level binding (bug a).
+        let np = NestedPack {
+            source_subpath: "gascity/roles".to_owned(),
+            name: "gc-roles".to_owned(),
+            import_source: "https://github.com/gastownhall/gascity-packs//gascity/roles#main"
+                .to_owned(),
+        };
+        let note = nested_pack_note(&np);
+        assert!(
+            note.contains("gascity/roles"),
+            "note must show the real source subpath: {note}"
+        );
+        assert!(
+            !note.contains("bmad/roles"),
+            "note must not use the top-level binding as the path: {note}"
+        );
+        // Bug b: no bare JSON-value quote artifact like `/"roles"` in the path.
+        assert!(
+            !note.contains("/\"roles\""),
+            "note must not emit literal JSON quotes around the path: {note}"
+        );
+        // A fully runnable command against the real source; the binding is the
+        // one value the operator must choose, so it stays a placeholder.
+        assert!(
+            note.contains(
+                "camp import add \
+                 \"https://github.com/gastownhall/gascity-packs//gascity/roles#main\""
+            ),
+            "note must be a runnable command quoting the real source: {note}"
+        );
+        assert!(
+            note.contains("--name <binding>"),
+            "note must leave the binding as an operator-chosen placeholder: {note}"
         );
     }
 }
