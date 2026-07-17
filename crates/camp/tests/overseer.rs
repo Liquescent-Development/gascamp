@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -181,6 +182,25 @@ fn dispatch_one(root: &Path) -> (String, String) {
     (bead, session)
 }
 
+/// Wait until `path` contains `needle`, then return its whole contents. For
+/// reading what attach told the OPERATOR (its stderr), which is a different
+/// channel from the rendered stream on stdout.
+fn wait_for_text(path: &Path, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {needle:?} in {}: {text:?}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Wait until a session's stdout FILE contains `needle`.
 fn wait_for_stdout(root: &Path, session: &str, needle: &str) {
     let path = stdout_path(root, session);
@@ -216,9 +236,22 @@ fn read_child_line_until(
     within: Duration,
     pred: impl Fn(&str) -> bool,
 ) -> Option<String> {
+    let lines = stream_child_stdout(child);
+    let found = recv_line_until(&lines, within, pred);
+    drop(lines); // the reader thread's next send fails and it returns
+    let _ = child.kill();
+    let _ = child.wait();
+    found
+}
+
+/// Stream `child`'s stdout lines onto a channel and LEAVE THE CHILD RUNNING.
+/// Split out of `read_child_line_until` (which kills the child, a one-shot
+/// discovery read) because STEERING a live attach means read a line, TYPE, then
+/// read more — all on ONE session that must stay attached throughout.
+fn stream_child_stdout(child: &mut Child) -> Receiver<String> {
     let stdout = child.stdout.take().expect("child stdout must be piped");
     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let reader = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         loop {
@@ -233,26 +266,30 @@ fn read_child_line_until(
             }
         }
     });
+    rx
+}
+
+/// Poll a `stream_child_stdout` channel until `pred` matches or `within`
+/// elapses. This is the half that makes the read BOUNDED BY CONSTRUCTION: the
+/// reader thread owns the blocking `read_line`, so a QUIET stream still lets the
+/// deadline fire on schedule.
+fn recv_line_until(
+    lines: &Receiver<String>,
+    within: Duration,
+    pred: impl Fn(&str) -> bool,
+) -> Option<String> {
     let deadline = Instant::now() + within;
-    let mut found = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            break;
+            return None;
         }
-        match rx.recv_timeout(remaining) {
-            Ok(line) if pred(&line) => {
-                found = Some(line);
-                break;
-            }
-            Ok(_) => {}      // a line that did not match — keep reading
-            Err(_) => break, // timeout, or the reader closed (EOF)
+        match lines.recv_timeout(remaining) {
+            Ok(line) if pred(&line) => return Some(line),
+            Ok(_) => {}            // a line that did not match — keep reading
+            Err(_) => return None, // timeout, or the reader closed (EOF)
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = reader.join();
-    found
 }
 
 // ===== Task 5: every §5.4 action against a fake fleet, over the socket =====
@@ -422,6 +459,187 @@ fn camp_decide_answers_a_blocked_worker_with_a_socket_discovered_request_id() {
     });
     // And the worker continued (it emits an assistant line after the answer).
     wait_for_stdout(&root, &session, "continued after permission");
+}
+
+/// Issue #120 — §5.2's "From here: send a turn, interrupt, ANSWER A PERMISSION
+/// REQUEST". The answer is typed INTO the view, on the SAME line loop as a turn
+/// and `/interrupt`: attach renders BLOCKED, the operator types `/allow`, and the
+/// WORKER CONTINUES — no second terminal, no `camp decide`, no request_id typed
+/// (the view already learned it from the frame it rendered).
+///
+/// This is the falsification the hint could never fail: `camp decide`'s test
+/// proves the OUT-OF-BAND path, and passes just as well when attach's own
+/// `/allow` does nothing at all. Only driving the keypress THROUGH attach's
+/// stdin can tell the two apart.
+#[test]
+fn camp_attach_answers_a_blocked_worker_from_its_own_line_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _agent) = scaffold(dir.path(), 10);
+    let _d = Daemon::spawn(&root, &[("FAKE_AGENT_CAN_USE_TOOL", "1")]);
+    let (_bead, session) = dispatch_one(&root);
+    wait_until(&root, "permission.pending", |events| {
+        events.iter().any(|e| e["type"] == "permission.pending")
+    });
+
+    let mut child = Command::new(BIN)
+        .env_remove("CAMP_DIR")
+        .args(["--camp", root.to_str().unwrap(), "attach", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let lines = stream_child_stdout(&mut child);
+    // The view must RENDER the question before the answer is typed — exactly
+    // what a human waits for, and what hands attach the request_id.
+    assert!(
+        recv_line_until(&lines, Duration::from_secs(20), |l| l.contains("BLOCKED")).is_some(),
+        "attach never rendered the BLOCKED line"
+    );
+
+    // THE KEYPRESS. Bare `/allow`: the operator names no id and opens no second
+    // terminal — the whole point of #120.
+    let mut stdin = child.stdin.take().expect("attach stdin must be piped");
+    stdin.write_all(b"/allow\n").unwrap();
+    stdin.flush().unwrap();
+
+    // Durable proof, over the socket alone: campd RECORDED the operator's answer.
+    wait_until(&root, "permission.decided", |events| {
+        events.iter().any(|e| {
+            e["type"] == "permission.decided"
+                && e["data"]["decision"] == "allow"
+                && e["data"]["decided_by"] == "operator"
+        })
+    });
+    // ...and the WORKER CONTINUED — recording an answer nobody delivered would
+    // still leave the worker blocked forever (§5.3).
+    wait_for_stdout(&root, &session, "continued after permission");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A worker may have MORE THAN ONE question outstanding: nothing serializes
+/// `can_use_tool` (parallel tool calls), the ledger keys `permissions` on
+/// `request_id` with a NON-UNIQUE `session`, and `pending_permission_for_session`
+/// says `LIMIT 1` — conceding the plural. A view that remembers only the NEWEST
+/// answers the wrong question, or strands the older one unanswerable and pushes
+/// the operator back to the second terminal #120 exists to remove.
+///
+/// So the view must NEVER GUESS: a bare verb REFUSES and names the ids, and
+/// `/allow <id>` answers EXACTLY that one. This test answers the OLDER id on
+/// purpose — the one a single-slot view has already forgotten.
+#[test]
+fn camp_attach_refuses_to_guess_between_two_blocked_questions() {
+    const SECOND: &str = "cli-second";
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _agent) = scaffold(dir.path(), 10);
+    let _d = Daemon::spawn(
+        &root,
+        &[
+            ("FAKE_AGENT_CAN_USE_TOOL", "1"),
+            ("FAKE_AGENT_CAN_USE_TOOL_SECOND", SECOND),
+        ],
+    );
+    let (bead, session) = dispatch_one(&root);
+    let first = format!("cli-{bead}"); // the fake agent's default id, asked FIRST
+    wait_until(&root, "two pending permissions", |events| {
+        events
+            .iter()
+            .filter(|e| e["type"] == "permission.pending")
+            .count()
+            >= 2
+    });
+
+    let err_path = root.join("attach-err.txt");
+    let mut child = Command::new(BIN)
+        .env_remove("CAMP_DIR")
+        .args(["--camp", root.to_str().unwrap(), "attach", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
+        .spawn()
+        .unwrap();
+    let lines = stream_child_stdout(&mut child);
+    for n in 1..=2 {
+        assert!(
+            recv_line_until(&lines, Duration::from_secs(20), |l| l.contains("BLOCKED")).is_some(),
+            "attach did not render BLOCKED line {n} of 2"
+        );
+    }
+    let mut stdin = child.stdin.take().expect("attach stdin must be piped");
+
+    // (1) A BARE verb must REFUSE — and name the ids it will not choose between.
+    stdin.write_all(b"/allow\n").unwrap();
+    stdin.flush().unwrap();
+    let refusal = wait_for_text(&err_path, "name the one you mean");
+    assert!(
+        refusal.contains(&first) && refusal.contains(SECOND),
+        "the refusal must name BOTH pending ids so the operator can choose: {refusal}"
+    );
+
+    // (2) ...and it must not have answered anything. A view that guesses is
+    //     worse than one that asks: the operator would never know it guessed.
+    assert_eq!(
+        events_json(&root)
+            .iter()
+            .filter(|e| e["type"] == "permission.decided")
+            .count(),
+        0,
+        "a bare verb GUESSED a target instead of refusing"
+    );
+
+    // (3) Naming the OLDER id answers EXACTLY that one. A single-slot view has
+    //     already forgotten it and would answer the newest instead.
+    stdin
+        .write_all(format!("/allow {first}\n").as_bytes())
+        .unwrap();
+    stdin.flush().unwrap();
+    wait_until(&root, "the NAMED permission decided", |events| {
+        events
+            .iter()
+            .any(|e| e["type"] == "permission.decided" && e["data"]["request_id"] == first.as_str())
+    });
+    let decided: Vec<Value> = events_json(&root)
+        .into_iter()
+        .filter(|e| e["type"] == "permission.decided")
+        .collect();
+    assert_eq!(
+        decided.len(),
+        1,
+        "answering ONE question must not answer another: {decided:#?}"
+    );
+    assert_eq!(
+        decided[0]["data"]["request_id"],
+        first.as_str(),
+        "the WRONG question was answered"
+    );
+    // The worker asked TWO questions, so one answer must NOT resume it: that is
+    // what makes step (3) evidence the NAMED question was answered, rather than
+    // just "something was".
+    assert!(
+        !std::fs::read_to_string(stdout_path(&root, &session))
+            .unwrap_or_default()
+            .contains("continued after permission"),
+        "the worker resumed with a question still outstanding"
+    );
+
+    // (4) With ONE question left, the bare verb's convenience COMES BACK — this
+    //     is what proves the steering loop DROPS an answered question from the
+    //     floor. Without that, the view would keep refusing, naming a question
+    //     campd has already settled, and the operator could never finish.
+    stdin.write_all(b"/allow\n").unwrap();
+    stdin.flush().unwrap();
+    wait_until(&root, "the last question decided", |events| {
+        events
+            .iter()
+            .any(|e| e["type"] == "permission.decided" && e["data"]["request_id"] == SECOND)
+    });
+    // Both answered: the worker finally resumes.
+    wait_for_stdout(&root, &session, "continued after permission");
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// §5.4 "read their streams": `camp attach` renders the worker's live typed

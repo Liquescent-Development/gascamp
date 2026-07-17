@@ -298,14 +298,39 @@ if [[ -n "${FAKE_AGENT_CAN_USE_TOOL:-}" ]]; then
   # the ledger would dedup, leaving all but the first worker un-blocked).
   req="${FAKE_AGENT_CAN_USE_TOOL_REQ:-cli-$CAMP_BEAD}"
   printf '{"type":"control_request","request_id":"%s","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo publish"}}}\n' "$req"
+  # FAKE_AGENT_CAN_USE_TOOL_SECOND=<id>: ask a SECOND question before blocking,
+  # so two permissions are pending for ONE session at once.
+  #
+  # WHY THIS EXISTS: nothing serializes a worker's `can_use_tool` requests — the
+  # CLI issues parallel tool calls, and the ledger keys `permissions` on
+  # `request_id` with a NON-UNIQUE `session` (schema.rs), which is exactly why
+  # `pending_permission_for_session` says LIMIT 1. Every other fixture here asks
+  # ONE question, so a view that silently remembers only the NEWEST — answering
+  # the wrong one, or stranding the older — looks perfectly correct to the whole
+  # suite. This is the only fixture that can see that bug.
+  if [[ -n "${FAKE_AGENT_CAN_USE_TOOL_SECOND:-}" ]]; then
+    printf '{"type":"control_request","request_id":"%s","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/etc/hosts"}}}\n' \
+      "$FAKE_AGENT_CAN_USE_TOOL_SECOND"
+  fi
+  # A worker resumes only when EVERY question it asked has been answered: it
+  # asked because it could not proceed. With FAKE_AGENT_CAN_USE_TOOL_SECOND that
+  # is two answers, so answering one leaves it genuinely BLOCKED on the other —
+  # which is what lets a test tell "the view answered the question I named" apart
+  # from "the view answered something".
+  _need=1
+  [[ -n "${FAKE_AGENT_CAN_USE_TOOL_SECOND:-}" ]] && _need=2
+  _got=0
   _answered=""
   while IFS= read -r _line; do
     case "$_line" in
       *'"type":"control_response"'*)
-        # our permission was answered — continue and fall through to the close
-        emit_stream '{"type":"assistant","message":{"role":"assistant","content":"continued after permission"}}'
-        _answered=1
-        break
+        _got=$((_got + 1))
+        if [ "$_got" -ge "$_need" ]; then
+          # every permission answered — continue and fall through to the close
+          emit_stream '{"type":"assistant","message":{"role":"assistant","content":"continued after permission"}}'
+          _answered=1
+          break
+        fi
         ;;
       *) : ;; # ignore anything else (e.g. a nudge that arrived before BLOCKED)
     esac
